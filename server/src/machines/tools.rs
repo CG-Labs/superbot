@@ -1,7 +1,7 @@
 //! Harness CLIs on the machine (ADR 0039). botd sends a `HarnessPlan`; this installs
 //! it under the tools folder, one harness at a time, and keeps what it did in a state
 //! file, so a restart carries on where it stopped. It knows npm packages, installer
-//! scripts and Hermes bundles (ADR 0210), not harnesses: what to install comes from
+//! scripts, and Hermes and harness bundles (ADR 0210, ADR 0242), not harnesses: what to install comes from
 //! botd's adapters. Shared by the agent binary and botd's tests, so it uses nothing of
 //! botd's but `wire` and `hermes_bundle`.
 //!
@@ -10,15 +10,16 @@
 //! - `node-<version>/`: Node.js, from the plan's pinned, SHA-256-checked tarball.
 //! - `lib/node_modules/`: npm harnesses (`npm install -g --prefix <tools>`).
 //! - `scripts/<name>/`: HOME for a harness's own installer script.
-//! - A bundle's tree is in its own prefix (`/opt/hermes`), outside the tools: it runs
-//!   only there. `bin/<name>` links to it.
+//! - A bundle's tree is in its own prefix (`/opt/hermes`, `/opt/superbot-harnesses`),
+//!   outside the tools: it runs only there. `bin/<name>` links to it. Claude Code,
+//!   Codex and Pi share one harness tree, each run through its wrapper there.
 //! - `state.json`: the plan, and what is installed.
 
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
 
 use super::hermes_bundle;
-use super::wire::{self, HarnessInstall, HarnessPlan, HarnessStatus, InstallSource, NodeRuntime};
+use super::wire::{self, BundleKind, HarnessInstall, HarnessPlan, HarnessStatus, InstallSource, NodeRuntime};
 use base64::Engine;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use serde::{Deserialize, Serialize};
@@ -293,9 +294,12 @@ pub fn check(plan: &HarnessPlan) -> Result<(), String> {
                     return Err(format!("{}: the script to run after its installer is too long.", h.name));
                 }
             }
-            InstallSource::Bundle { downloads, prefix, bin, readable, after } => {
+            InstallSource::Bundle { holds: kind, downloads, prefix, bin, readable, after } => {
                 if !prefix.strip_prefix("/opt/").is_some_and(|n| token(n, 64)) {
                     return Err(format!("{}: a bundle's prefix must be a folder of /opt, not \"{prefix}\".", h.name));
+                }
+                if *kind == BundleKind::Harnesses && (*bin != format!("{}/{}", hermes_bundle::HARNESS_OWN, h.name) || after.is_some()) {
+                    return Err(format!("{}: a harness bundle runs it as {}/{0}, with nothing after.", h.name, hermes_bundle::HARNESS_OWN));
                 }
                 if !relative(bin) || readable.len() > 16 || !readable.iter().all(|r| relative(r)) {
                     return Err(format!("{}: a bundle needs a relative bin and readable folders.", h.name));
@@ -465,10 +469,23 @@ impl Tools {
 
     /// Whether installing `h` replaces files a running job may use: an installed
     /// harness, or the Node.js npm harnesses run on.
+    /// A bundle replaces the tree in its prefix, which other harnesses may run from,
+    /// unless it is a harness tree already from that very bundle, with no swap into it
+    /// cut short.
     fn replaces(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> bool {
+        let tree = match &h.source {
+            InstallSource::Bundle { holds: kind, downloads, prefix, .. } => {
+                let dest = self.rooted(prefix);
+                let same = *kind == BundleKind::Harnesses
+                    && !swap_pending(&dest, slot(prefix))
+                    && downloads.get(std::env::consts::ARCH).is_some_and(|d| hermes_bundle::harness_tree_from(&dest, &d.sha256));
+                !same && std::fs::symlink_metadata(&dest).is_ok()
+            }
+            _ => false,
+        };
         let s = self.lock();
         let npm = matches!(h.source, InstallSource::Npm { .. });
-        s.installed.contains_key(&h.name) || (npm && s.node.is_some() && node.is_some_and(|n| !node_current(&s, n)))
+        tree || s.installed.contains_key(&h.name) || (npm && s.node.is_some() && node.is_some_and(|n| !node_current(&s, n)))
     }
 
     /// The plan's Node.js, if it isn't the one installed.
@@ -657,8 +674,8 @@ impl Tools {
                         self.npm(package, &h.version, integrity.as_deref()).await
                     }
                     InstallSource::Script { url, sha256, args, bin, after } => self.script(&h.name, url, sha256, args, bin, after.as_deref()).await,
-                    InstallSource::Bundle { downloads, prefix, bin, readable, after } => {
-                        self.bundle(h, downloads, prefix, bin, readable, after.as_deref()).await
+                    InstallSource::Bundle { holds: kind, downloads, prefix, bin, readable, after } => {
+                        self.bundle(h, *kind, downloads, prefix, bin, readable, after.as_deref()).await
                     }
                 }
             })
@@ -902,20 +919,56 @@ impl Tools {
     /// `prefix`, otherwise outside its unit through systemd, as `useradd` is (ADR 0043).
     /// Its program is linked first, and linked back if the swap fails. The swap's files
     /// are in a folder of their own, not `.dl`, which every install starts by clearing.
-    async fn bundle(&self, h: &HarnessInstall, downloads: &BTreeMap<String, wire::Download>, prefix: &str, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
+    /// Swaps are named for their prefix: Claude Code, Codex and Pi share one tree
+    /// (ADR 0242), and once one has swapped it in, the others only link to it.
+    #[allow(clippy::too_many_arguments)]
+    async fn bundle(&self, h: &HarnessInstall, kind: BundleKind, downloads: &BTreeMap<String, wire::Download>, prefix: &str, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
         let arch = std::env::consts::ARCH;
-        let d = downloads.get(arch).ok_or(format!("botd serves no {} bundle for {arch}", h.name))?;
-        self.wait_for_swap(&h.name).await?;
-        let dl = self.dir.join(format!(".swap-{}", h.name));
+        let what = match kind {
+            BundleKind::Hermes => format!("{} bundle", h.name),
+            BundleKind::Harnesses => "harness bundle".into(),
+        };
+        let d = downloads.get(arch).ok_or(format!("botd serves no {what} for {arch}"))?;
+        let slot = slot(prefix);
+        self.wait_for_swap(slot).await?;
+        if kind == BundleKind::Harnesses && self.from_tree(h, d, prefix, bin).await? {
+            return Ok(());
+        }
+        let dl = self.dir.join(format!(".swap-{slot}"));
         let _ = std::fs::remove_dir_all(&dl);
         std::fs::DirBuilder::new().mode(0o700).create(&dl).map_err(|e| format!("{}: {e}", dl.display()))?;
-        let res = self.bundle_in(h, d, &dl, prefix, bin, readable, after).await;
+        let res = self.bundle_in(h, kind, d, &dl, prefix, bin, readable, after).await;
         let _ = blocking(move || std::fs::remove_dir_all(dl).map_err(|e| e.to_string())).await;
         res
     }
 
+    /// Links `h` to the harness tree in `prefix` if that came from `d` already, and
+    /// checks it answers `--version` there. False if the tree must be swapped in first,
+    /// as it must while a swap cut short has left its stage: that tree may not have
+    /// passed its checks, and the swap puts the one before it back.
+    async fn from_tree(&self, h: &HarnessInstall, d: &wire::Download, prefix: &str, bin: &str) -> Result<bool, String> {
+        let dest = self.rooted(prefix);
+        let target = dest.join(bin);
+        if swap_pending(&dest, slot(prefix)) || !hermes_bundle::harness_tree_from(&dest, &d.sha256) || !runnable(&target) {
+            return Ok(false);
+        }
+        let manifest = dest.join(hermes_bundle::HARNESS_OWN).join("MANIFEST");
+        let text = std::fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
+        let m = hermes_bundle::Manifest::parse(&text, BundleKind::Harnesses).map_err(|e| format!("{}: {e}", manifest.display()))?;
+        let holds = m.harness_version(&h.name).unwrap_or("nothing");
+        if holds != h.version {
+            return Err(format!("the harness bundle in {prefix} holds {} {holds}, not {}", h.name, h.version));
+        }
+        let probe = self.dir.join(".dl").join("probe");
+        std::fs::create_dir_all(&probe).map_err(|e| format!("{}: {e}", probe.display()))?;
+        let env = [("PATH", self.path()), ("HOME", probe.display().to_string()), ("LANG", "C.UTF-8".into())];
+        run_step(&target.display().to_string(), &["--version"], &env, &probe).await?;
+        symlink(&target, &self.bin_dir().join(&h.name))?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    async fn bundle_in(&self, h: &HarnessInstall, d: &wire::Download, dl: &Path, prefix: &str, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
+    async fn bundle_in(&self, h: &HarnessInstall, kind: BundleKind, d: &wire::Download, dl: &Path, prefix: &str, bin: &str, readable: &[String], after: Option<&str>) -> Result<(), String> {
         let arch = std::env::consts::ARCH;
         let got = self.download(&d.url, &d.sha256, hermes_bundle::MAX_BUNDLE).await?;
         let file = dl.join("bundle.tar.gz");
@@ -930,6 +983,8 @@ impl Tools {
         };
         let swap = Swap {
             name: h.name.clone(),
+            kind,
+            sha256: d.sha256.clone(),
             file,
             commit: h.version.clone(),
             arch: arch.into(),
@@ -940,7 +995,12 @@ impl Tools {
             after,
             path: self.path(),
             probe: dl.join("probe"),
+            others: vec![],
         };
+        let mut swap = swap;
+        if kind == BundleKind::Harnesses {
+            swap.others = self.linked_into(&swap.dest, &h.name);
+        }
         let link = self.bin_dir().join(&h.name);
         let before = std::fs::read_link(&link).ok();
         symlink(&swap.dest.join(bin), &link)?;
@@ -957,6 +1017,19 @@ impl Tools {
         let old = self.dir.join("scripts").join(&h.name);
         let _ = blocking(move || std::fs::remove_dir_all(old).map_err(|e| e.to_string())).await;
         Ok(())
+    }
+
+    /// The other harnesses linked into the tree at `dest`, which a new tree there
+    /// replaces for them too.
+    fn linked_into(&self, dest: &Path, name: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.bin_dir()) else { return vec![] };
+        let mut others: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.file_name() != name && std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(dest)))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        others.sort();
+        others
     }
 
     /// Waits for a swap of `name` that outlived the agent which started it: its unit
@@ -991,7 +1064,7 @@ impl Tools {
         let spec = swap.file.with_file_name("swap.json");
         std::fs::write(&spec, serde_json::to_vec(swap).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", spec.display()))?;
         let exe = std::env::current_exe().map_err(|e| format!("the agent's own path: {e}"))?;
-        let unit = format!("--unit=superbot-swap-{}", swap.name);
+        let unit = format!("--unit=superbot-swap-{}", slot(&swap.prefix));
         let limit = format!("--property=RuntimeMaxSec={}", STEP_TIMEOUT.as_secs());
         let (exe, spec) = (exe.display().to_string(), spec.display().to_string());
         let args = ["--quiet", "--wait", "--collect", "--pipe", &unit, &limit, "--", &exe, "swap-in", &spec];
@@ -1003,7 +1076,13 @@ impl Tools {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Swap {
     pub name: String,
+    #[serde(default)]
+    pub kind: BundleKind,
+    /// The download's SHA-256, which a harness tree keeps as the bundle it came from.
+    #[serde(default)]
+    pub sha256: String,
     pub file: PathBuf,
+    /// What the bundle must hold of `name`: Hermes's commit, or a harness's version.
     pub commit: String,
     pub arch: String,
     /// Where the tree was made to run, as its `MANIFEST` must say.
@@ -1016,6 +1095,16 @@ pub struct Swap {
     pub path: String,
     /// An empty home for the `--version` check.
     pub probe: PathBuf,
+    /// Other harnesses that run from a harness tree at `dest` now: the new tree must
+    /// run them too, or it isn't kept.
+    #[serde(default)]
+    pub others: Vec<String>,
+}
+
+/// What a swap into `prefix` is named for: its folder (`hermes`, `superbot-harnesses`).
+/// `check` makes that a token.
+fn slot(prefix: &str) -> &str {
+    prefix.rsplit('/').next().unwrap_or(prefix)
 }
 
 /// Whether this process can make folders beside `dest`.
@@ -1028,6 +1117,13 @@ fn writable_beside(dest: &Path) -> bool {
     let Ok(c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else { return false };
     // SAFETY: `c` is a valid NUL-terminated path.
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Whether a swap into `dest` was cut short and left its stage beside it.
+fn swap_pending(dest: &Path, name: &str) -> bool {
+    let mark = format!(".superbot-{name}.");
+    let Some(parent) = dest.parent() else { return false };
+    std::fs::read_dir(parent).is_ok_and(|mut entries| entries.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with(&mark))))
 }
 
 /// What an install cut short left beside `dest`: the tree before it goes back, and the
@@ -1055,34 +1151,43 @@ fn recover(dest: &Path, name: &str) -> Result<(), String> {
 /// (the next install puts it back), and removed once nothing has.
 pub async fn swap_in(s: &Swap) -> Result<(), String> {
     let dest = s.dest.clone();
-    let name = s.name.clone();
+    let name = slot(&s.prefix).to_string();
     blocking(move || recover(&dest, &name)).await?;
     let parent = s.dest.parent().ok_or("a bundle's prefix needs a parent folder")?.to_path_buf();
-    let stage = parent.join(format!(".superbot-{}.{}", s.name, now_ms()));
+    let stage = parent.join(format!(".superbot-{}.{}", slot(&s.prefix), now_ms()));
     std::fs::DirBuilder::new().mode(0o700).create(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
     let (tree, previous) = (stage.join("tree"), stage.join("previous"));
     let mut stuck = false;
     let res = async {
         std::fs::create_dir(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
-        let (f, t, p) = (s.file.clone(), tree.clone(), s.prefix.clone());
+        let (f, t, p, kind) = (s.file.clone(), tree.clone(), s.prefix.clone(), s.kind);
         let m = blocking(move || {
-            let (m, _) = hermes_bundle::read(&f, Some(&t)).map_err(|e| format!("the bundle: {e}"))?;
-            hermes_bundle::tree_ok(&t.join(hermes_bundle::TOP), &p).map_err(|e| format!("the bundle's tree: {e}"))?;
+            let (m, _) = hermes_bundle::read(&f, kind, Some(&t)).map_err(|e| format!("the bundle: {e}"))?;
+            hermes_bundle::tree_ok(&t.join(hermes_bundle::top(kind)), &p).map_err(|e| format!("the bundle's tree: {e}"))?;
             Ok(m)
         })
         .await?;
         let _ = std::fs::remove_file(&s.file);
-        if (m.commit.as_str(), m.prefix.as_str(), m.arch.as_str()) != (s.commit.as_str(), s.prefix.as_str(), s.arch.as_str()) {
+        let holds = match s.kind {
+            BundleKind::Hermes => m.commit.as_str(),
+            BundleKind::Harnesses => m.harness_version(&s.name).unwrap_or("nothing"),
+        };
+        if (holds, m.prefix.as_str(), m.arch.as_str()) != (s.commit.as_str(), s.prefix.as_str(), s.arch.as_str()) {
             return Err(format!(
-                "the bundle holds {} {} for {} on {}, not {} for {} on {}",
-                s.name, m.commit, m.prefix, m.arch, s.commit, s.prefix, s.arch
+                "the bundle holds {} {holds} for {} on {}, not {} for {} on {}",
+                s.name, m.prefix, m.arch, s.commit, s.prefix, s.arch
             ));
+        }
+        let top = tree.join(hermes_bundle::top(s.kind));
+        if s.kind == BundleKind::Harnesses {
+            let (t, d, sha) = (top.clone(), s.dest.clone(), s.sha256.clone());
+            blocking(move || hermes_bundle::ready_harness_tree(&t, &d, &m, &sha)).await.map_err(|e| format!("the bundle: {e}"))?;
         }
         let had = std::fs::symlink_metadata(&s.dest).is_ok();
         if had {
             std::fs::rename(&s.dest, &previous).map_err(|e| format!("couldn't move {} aside: {e}", s.dest.display()))?;
         }
-        if let Err(e) = settle(s, &tree.join(hermes_bundle::TOP)).await {
+        if let Err(e) = settle(s, &top).await {
             let d = s.dest.clone();
             let _ = blocking(move || std::fs::remove_dir_all(d).map_err(|e| e.to_string())).await;
             if had && let Err(back) = std::fs::rename(&previous, &s.dest) {
@@ -1112,13 +1217,16 @@ async fn settle(s: &Swap, tree: &Path) -> Result<(), String> {
     }
     let (d, r, b) = (dest.clone(), s.readable.clone(), s.bin.clone());
     blocking(move || hermes_bundle::open_up(&d, &r, &b)).await?;
-    let target = dest.join(&s.bin);
-    if !runnable(&target) {
-        return Err(format!("the bundle left no program at {}", s.bin));
-    }
     std::fs::create_dir_all(&s.probe).map_err(|e| format!("{}: {e}", s.probe.display()))?;
     let env = [("PATH", s.path.clone()), ("HOME", s.probe.display().to_string()), ("LANG", "C.UTF-8".into())];
-    run_step(&target.display().to_string(), &["--version"], &env, &s.probe).await?;
+    let others = s.others.iter().map(|o| format!("{}/{o}", hermes_bundle::HARNESS_OWN));
+    for bin in std::iter::once(s.bin.clone()).chain(others) {
+        let target = dest.join(&bin);
+        if !runnable(&target) {
+            return Err(format!("the bundle left no program at {bin}"));
+        }
+        run_step(&target.display().to_string(), &["--version"], &env, &s.probe).await?;
+    }
     Ok(())
 }
 
@@ -1221,6 +1329,7 @@ mod tests {
             name: "hermes".into(),
             version: "ae2a81cc".into(),
             source: InstallSource::Bundle {
+                holds: BundleKind::Hermes,
                 downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: url.into(), sha256: sha.into() })]),
                 prefix: prefix.into(),
                 bin: bin.into(),
@@ -1246,6 +1355,27 @@ mod tests {
             downloads.clear();
         }
         assert!(check(&plan(vec![none], None)).is_err(), "no bundle at all");
+
+        let harness = |name: &str, bin: &str, after: Option<&str>| HarnessInstall {
+            name: name.into(),
+            version: "2.1.329".into(),
+            source: InstallSource::Bundle {
+                holds: BundleKind::Harnesses,
+                downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: "https://10.0.0.5:8443/v1/harnesses/x86_64".into(), sha256: sha.clone() })]),
+                prefix: "/opt/superbot-harnesses".into(),
+                bin: bin.into(),
+                readable: vec!["bin".into(), "lib".into(), "superbot".into()],
+                after: after.map(String::from),
+            },
+        };
+        assert!(check(&plan(vec![harness("claude", "superbot/claude", None), harness("codex", "superbot/codex", None)], None)).is_ok());
+        for (h, why) in [
+            (harness("claude", "bin/claude", None), "not through its wrapper"),
+            (harness("claude", "superbot/codex", None), "another harness's wrapper"),
+            (harness("claude", "superbot/claude", Some("true\n")), "a script after it"),
+        ] {
+            assert!(check(&plan(vec![h], None)).unwrap_err().contains("harness bundle runs it as superbot/claude"), "{why}");
+        }
     }
 
     /// Serves `body` once over plain HTTP on 127.0.0.1, for a download test.
@@ -1298,6 +1428,7 @@ mod tests {
             name: "hermes".into(),
             version: version.into(),
             source: InstallSource::Bundle {
+                holds: BundleKind::Hermes,
                 downloads: BTreeMap::from([(arch.into(), wire::Download { url: url.into(), sha256: sha.clone() })]),
                 prefix: "/opt/hermes".into(),
                 bin: ".hermes/superbot/hermes".into(),
@@ -1367,6 +1498,8 @@ mod tests {
         // What `superbot-machine swap-in` reads, when the agent's unit can't write there.
         let swap = Swap {
             name: "hermes".into(),
+            kind: BundleKind::Hermes,
+            sha256: sha.clone(),
             file: dir.join("b.tar.gz"),
             commit: commit.into(),
             arch: arch.into(),
@@ -1377,11 +1510,103 @@ mod tests {
             after: None,
             path: "/usr/bin:/bin".into(),
             probe: dir.join("probe"),
+            others: vec![],
         };
         let back: Swap = serde_json::from_slice(&serde_json::to_vec(&swap).unwrap()).unwrap();
-        assert_eq!((back.dest, back.prefix), (dest.clone(), swap.prefix));
+        assert_eq!((back.dest, back.prefix, back.kind), (dest.clone(), swap.prefix.clone(), BundleKind::Hermes));
+        let mut older = serde_json::to_value(&swap).unwrap();
+        older.as_object_mut().unwrap().retain(|k, _| k != "kind" && k != "sha256");
+        let older: Swap = serde_json::from_value(older).unwrap();
+        assert_eq!(older.kind, BundleKind::Hermes, "a swap an older agent started is a Hermes one");
         std::fs::write(dir.join("file"), "").unwrap();
         assert!(writable_beside(&dest) && !writable_beside(&dir.join("file/hermes")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn harness_clis_install_from_one_tree_swapped_in_once() {
+        let arch = std::env::consts::ARCH;
+        let dir = std::env::temp_dir().join(format!("superbot-tools-harnesses-{}", now_ms()));
+        let t = Tools::new(dir.join("tools"), None, dir.join("login")).unwrap();
+        t.set_root(dir.join("root"));
+        let made = |clis: &[(&str, &str)]| {
+            let body = hermes_bundle::standin::good_harnesses(arch, clis, &hermes_bundle::standin::harness_pins(clis));
+            let sha: String = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
+            (body, sha)
+        };
+        let cli = |name: &str, version: &str, url: &str, sha: &str| HarnessInstall {
+            name: name.into(),
+            version: version.into(),
+            source: InstallSource::Bundle {
+                holds: BundleKind::Harnesses,
+                downloads: BTreeMap::from([(arch.into(), wire::Download { url: url.into(), sha256: sha.into() })]),
+                prefix: "/opt/superbot-harnesses".into(),
+                bin: format!("superbot/{name}"),
+                readable: vec!["bin".into(), "lib".into(), "superbot".into()],
+                after: None,
+            },
+        };
+        let (opt, dest) = (dir.join("root/opt"), dir.join("root/opt/superbot-harnesses"));
+        let leftovers = || std::fs::read_dir(&opt).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name() != "superbot-harnesses").count();
+        let run = |name: &str| {
+            let out = std::process::Command::new(dir.join("tools/bin").join(name)).arg("--version").env_clear().output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let (body, sha) = made(&[("claude", "2.1.329"), ("codex", "0.171.0")]);
+
+        let url = serve_once(body.clone()).await;
+        let claude = cli("claude", "2.1.329", &url, &sha);
+        assert!(!t.replaces(&claude, None), "nothing there yet");
+        assert_eq!(t.install(&claude, None).await.unwrap(), "2.1.329");
+        assert_eq!(std::fs::read_link(dir.join("tools/bin/claude")).unwrap(), dest.join("superbot/claude"));
+        assert_eq!(run("claude"), "2.1.329 (claude)", "its wrapper runs it, on the tree's own Node.js");
+        assert!(hermes_bundle::harness_tree_from(&dest, &sha));
+        assert_eq!(leftovers(), 0);
+        assert!(!dir.join("tools/.swap-superbot-harnesses").exists());
+
+        // The next CLI in the same bundle needs no download: nothing serves this.
+        let codex = cli("codex", "0.171.0", "http://127.0.0.1:9/v1/harnesses/x86_64", &sha);
+        assert!(!t.replaces(&codex, None), "it replaces nothing");
+        assert_eq!(t.install(&codex, None).await.unwrap(), "0.171.0");
+        assert_eq!(run("codex"), "0.171.0 (codex)");
+        let err = t.install(&cli("codex", "0.172.0", "http://127.0.0.1:9/x", &sha), None).await.unwrap_err();
+        assert!(err.contains("holds codex 0.171.0, not 0.172.0"), "{err}");
+
+        // A bundle that doesn't hold the CLI is refused before anything moves.
+        let (only_claude, other) = made(&[("claude", "2.1.329")]);
+        let url = serve_once(only_claude).await;
+        let pi = cli("pi", "1.5.2", &url, &other);
+        assert!(t.replaces(&pi, None), "a new bundle replaces the tree other CLIs run from");
+        let err = t.install(&pi, None).await.unwrap_err();
+        assert!(err.contains("holds pi nothing"), "{err}");
+        assert!(hermes_bundle::harness_tree_from(&dest, &sha) && run("codex") == "0.171.0 (codex)");
+        assert_eq!(leftovers(), 0);
+
+        // A tree that would leave a CLI already linked to it with nothing to run isn't
+        // kept, even when the CLI being installed runs.
+        let (no_codex, no_codex_sha) = made(&[("claude", "2.2.0")]);
+        let url = serve_once(no_codex).await;
+        let err = t.install(&cli("claude", "2.2.0", &url, &no_codex_sha), None).await.unwrap_err();
+        assert!(err.contains("no program at superbot/codex"), "{err}");
+        assert_eq!((run("claude"), run("codex")), ("2.1.329 (claude)".to_string(), "0.171.0 (codex)".to_string()));
+        assert!(hermes_bundle::harness_tree_from(&dest, &sha));
+        assert_eq!(leftovers(), 0);
+
+        // A swap cut short leaves its stage: the tree in place may not have passed its
+        // checks, so the next CLI swaps it in again rather than only linking to it.
+        std::fs::create_dir_all(opt.join(".superbot-superbot-harnesses.1")).unwrap();
+        assert!(t.replaces(&cli("codex", "0.171.0", "http://127.0.0.1:9/x", &sha), None), "and waits for running jobs to do it");
+        let url = serve_once(body.clone()).await;
+        assert_eq!(t.install(&cli("codex", "0.171.0", &url, &sha), None).await.unwrap(), "0.171.0");
+        assert_eq!(leftovers(), 0, "and clears the stage");
+
+        // A new bundle swaps the whole tree, and the CLIs linked to it run the new one.
+        let (newer, newer_sha) = made(&[("claude", "2.2.0"), ("codex", "0.171.0")]);
+        let url = serve_once(newer).await;
+        assert_eq!(t.install(&cli("claude", "2.2.0", &url, &newer_sha), None).await.unwrap(), "2.2.0");
+        assert_eq!((run("claude"), run("codex")), ("2.2.0 (claude)".to_string(), "0.171.0 (codex)".to_string()));
+        assert!(hermes_bundle::harness_tree_from(&dest, &newer_sha));
+        assert_eq!(leftovers(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 

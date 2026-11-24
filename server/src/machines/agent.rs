@@ -1565,6 +1565,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_LOCKED_DOWN,
             wire::CAN_HARNESS_MIRRORS,
             wire::CAN_HARNESS_BUNDLES,
+            wire::CAN_HARNESS_CLI_BUNDLES,
             wire::CAN_HARNESS_MIRROR_LOGIN,
             wire::CAN_TEAM_NETWORK,
         ]

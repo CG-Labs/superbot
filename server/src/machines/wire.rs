@@ -9,6 +9,7 @@
 //!   machine (its own `BOT_TOKEN`, for one of the machine's user's Bots).
 //! - `GET /v1/agent`, `GET /v1/botctl`: binaries, for cloud-init to install.
 //! - `GET /v1/hermes/{arch}`: a Hermes bundle (ADR 0210). The machine's own certificate.
+//! - `GET /v1/harnesses/{arch}`: a harness bundle (ADR 0242). The machine's own certificate.
 //! - `GET /v1/npm-login` -> `NpmLogin`: the npm registry's login, for a plan with
 //!   `npm_login` (ADR 0219). The machine's own certificate.
 //!
@@ -134,6 +135,9 @@ pub const CAN_SECCOMP: &str = "seccomp";
 pub const CAN_HARNESS_MIRRORS: &str = "harness_mirrors";
 /// Installs `InstallSource::Bundle` from botd's machine port (ADR 0210).
 pub const CAN_HARNESS_BUNDLES: &str = "harness_bundles";
+/// Installs `InstallSource::Bundle` of `BundleKind::Harnesses`: Claude Code, Codex and Pi
+/// from a harness bundle (ADR 0242).
+pub const CAN_HARNESS_CLI_BUNDLES: &str = "harness_cli_bundles";
 /// Takes `HarnessPlan::npm_login`: fetches the registry's login from botd for each
 /// npm install, and keeps it only in a root-only file while npm runs (ADR 0219).
 pub const CAN_HARNESS_MIRROR_LOGIN: &str = "harness_mirror_login";
@@ -908,8 +912,11 @@ pub enum InstallSource {
     /// only place its tree runs. `bin` and `readable` are under `prefix`: the program,
     /// and the folders opened to every account, since Bots run as their own users.
     /// `after` runs as for `Script`, with HOME `prefix`. Only an agent that says
-    /// `CAN_HARNESS_BUNDLES` is sent one.
+    /// `CAN_HARNESS_BUNDLES` is sent one. When it `holds` a harness bundle (ADR 0242),
+    /// only one that also says `CAN_HARNESS_CLI_BUNDLES` is.
     Bundle {
+        #[serde(default, skip_serializing_if = "BundleKind::is_hermes")]
+        holds: BundleKind,
         downloads: BTreeMap<String, Download>,
         prefix: String,
         bin: String,
@@ -918,6 +925,25 @@ pub enum InstallSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },
+}
+
+/// What an `InstallSource::Bundle` holds. Left out of a plan for Hermes, so plans from
+/// before harness bundles keep their JSON and id.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BundleKind {
+    /// Hermes Agent as its installer leaves it (ADR 0200).
+    #[default]
+    Hermes,
+    /// Node.js with Claude Code, Codex and Pi installed into it (ADR 0232). One tree
+    /// serves every harness it holds; the plan names it once per harness.
+    Harnesses,
+}
+
+impl BundleKind {
+    pub fn is_hermes(&self) -> bool {
+        *self == BundleKind::Hermes
+    }
 }
 
 /// A harness CLI on a machine.
