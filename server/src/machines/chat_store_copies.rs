@@ -29,6 +29,8 @@ use std::sync::Mutex;
 pub const NAME: &str = "REGION_DATA_S3";
 const RECIPIENTS: &str = "REGION_DATA_AGE_RECIPIENTS";
 pub const COPIED: &str = "residency.chat_store_backups_copied";
+pub const FORGOTTEN: &str = "residency.chat_store_copies_forgotten";
+const FORGET: &str = "REGION_DATA_S3_FORGET";
 const ACTOR: &str = "residency";
 
 /// The settings' names for region `region`'s bucket: `REGION_DATA_S3_GB_LON`.
@@ -68,12 +70,13 @@ impl Settings {
     /// `REGION_DATA_AGE_RECIPIENTS` (or `_FILE`) are shared. `named`: the regions whose
     /// bucket is set (`named`), each of which must have a store. None: no bucket is set.
     pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String, dirs: &chat_stores::Settings, named: &[String]) -> Result<Option<Settings>, String> {
-        if let Some(r) = named.iter().find(|r| !dirs.dirs.iter().any(|(d, _)| d == *r)) {
+        let set = |r: &str| !var(&format!("{}_BUCKET", store_name(r))).trim().is_empty();
+        if let Some(r) = named.iter().find(|r| set(r) && !dirs.dirs.iter().any(|(d, _)| d == *r)) {
             return Err(format!("{}_BUCKET is set, but {} gives {r} no chat store to copy (ADR 0246)", store_name(r), chat_stores::SETTING));
         }
         let mut stores = Vec::new();
         for (r, _) in &dirs.dirs {
-            if !var(&format!("{}_BUCKET", store_name(r))).trim().is_empty() {
+            if set(r) {
                 stores.push((r.clone(), s3::Settings::from_env_named(&store_name(r), store, var)?));
             }
         }
@@ -136,6 +139,13 @@ impl Copies {
 
     pub fn settings(&self) -> &Settings {
         &self.s
+    }
+
+    /// Where `store`'s copies go: endpoint, bucket and key prefix. None: its region has no
+    /// bucket.
+    pub fn destination(&self, store: &ChatStore) -> Option<String> {
+        let b = self.bucket(&store.region)?;
+        Some(format!("{}/{}/{}", b.endpoint.trim_end_matches('/'), b.bucket, self.store_prefix(store)))
     }
 
     /// For the startup log.
@@ -339,6 +349,47 @@ impl Copies {
     }
 }
 
+fn recorded(store: &ChatStore) -> String {
+    format!("chat_store_copies.{}", store.id)
+}
+
+/// At startup: each store's copies must go where they went before, since botd only ever
+/// deletes copies (of rows that left the store) where it copies to now. A store whose
+/// bucket or prefix changed, or was unset, stops botd until the operator, having deleted the
+/// earlier copies (or kept them as theirs to answer for), names its region in
+/// REGION_DATA_S3_FORGET; each is then audited as `residency.chat_store_copies_forgotten`.
+/// The first destination of each store is recorded. Warnings for the log.
+pub fn check_destinations(db: &Db, copies: Option<&Copies>, var: &dyn Fn(&str) -> String) -> Result<Vec<String>, String> {
+    let forget: Vec<String> = var(FORGET).split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_string).collect();
+    let mut warnings = Vec::new();
+    for store in db.chat_stores() {
+        let (key, now) = (recorded(&store), copies.and_then(|c| c.destination(&store)));
+        let before = db.setting(&key);
+        if before == now {
+            if forget.contains(&store.region) {
+                warnings.push(format!("{FORGET} names {}, whose chat store's backups are copied where they were before, so nothing was forgotten. Remove it from the setting (ADR 0246).", store.region));
+            }
+            continue;
+        }
+        if let Some(b) = &before {
+            if !forget.contains(&store.region) {
+                let to = now.as_deref().map_or("nowhere".to_string(), |n| format!("to {n}"));
+                return Err(format!(
+                    "{}'s chat store's backups were copied to {b}, and are now copied {to}. botd only deletes copies of rows that left the store where it copies now, so the earlier ones may still hold them. Delete them (or put the setting back), then start botd with {FORGET}={} (ADR 0246)",
+                    store.region, store.region
+                ));
+            }
+            db.record(&Who::system(ACTOR).event(FORGOTTEN).details(json!({ "region": store.region, "previous": b, "now": now })));
+            warnings.push(format!("{}'s chat store's earlier copies at {b} are forgotten, as {FORGET} says; botd no longer looks after them. Remove {} from the setting (ADR 0246).", store.region, store.region));
+        }
+        match &now {
+            Some(n) => db.set_setting(&key, n),
+            None => db.clear_setting(&key),
+        }
+    }
+    Ok(warnings)
+}
+
 /// `f`'s bytes, a megabyte at a time.
 fn file_stream(f: tokio::fs::File) -> super::provider::ByteStream {
     use tokio::io::AsyncReadExt;
@@ -384,6 +435,7 @@ mod tests {
             Settings::from_env(&keys, &move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &d, &named)
         };
         assert!(with(&[]).unwrap().is_none());
+        assert!(with(&[("REGION_DATA_S3_US_EAST_BUCKET", " ")]).unwrap().is_none(), "an empty setting is none");
         assert!(crate::secrets::server_secret("REGION_DATA_S3_GB_LON_SECRET_ACCESS_KEY"), "botd's own, never a Bot's");
         assert!(!crate::secrets::server_secret("REGION_DATA_S3_GB_LON_BUCKET"));
         assert_eq!(named(["REGION_DATA_S3_GB_LON_BUCKET".to_string(), "REGION_DATA_S3_PREFIX".into(), "REGION_DATA_S3__BUCKET".into(), "MACHINE_BACKUP_S3_GB_LON_BUCKET".into()]), ["gb-lon"]);
@@ -585,6 +637,33 @@ mod tests {
         std::fs::write(&dir, b"not a folder").unwrap();
         assert!(c.pass(&w.db, now()).await["gb-lon"].is_err());
         assert_eq!(w.s3.keys().len(), 1, "the copy is kept");
+    }
+
+    #[tokio::test]
+    async fn a_store_whose_copies_go_somewhere_else_now_stops_botd_until_the_earlier_ones_are_forgotten() {
+        let w = world().await;
+        let c = copies(&w.s3, Vec::new());
+        let none = |_: &str| String::new();
+        assert_eq!(check_destinations(&w.db, None, &none), Ok(Vec::new()), "no bucket, nothing recorded");
+        assert_eq!(check_destinations(&w.db, Some(&c), &none), Ok(Vec::new()), "the first destination is recorded");
+        assert_eq!(check_destinations(&w.db, Some(&c), &none), Ok(Vec::new()));
+
+        let moved = Copies::new(Settings { stores: vec![("gb-lon".into(), w.s3.settings())], prefix: "elsewhere/".into(), recipients: Vec::new() }).unwrap();
+        for now in [Some(&moved), None] {
+            let e = check_destinations(&w.db, now, &none).unwrap_err();
+            assert!(e.starts_with("gb-lon's chat store's backups were copied to ") && e.contains("/t/region-data/gb-lon/") && e.contains("REGION_DATA_S3_FORGET=gb-lon"), "{e}");
+        }
+        assert!(check_destinations(&w.db, None, &none).unwrap_err().contains("are now copied nowhere"));
+
+        let forget = |k: &str| if k == FORGET { "gb-lon".to_string() } else { String::new() };
+        let warned = check_destinations(&w.db, Some(&moved), &forget).unwrap();
+        assert!(warned[0].contains("earlier copies at ") && warned[0].contains("are forgotten"), "{warned:?}");
+        let f = crate::audit::Filter { actions: vec![FORGOTTEN.into()], ..Default::default() };
+        let e = serde_json::to_value(&w.db.audit_events(&f, 10, false)[0]).unwrap();
+        assert!(e["details"]["previous"].as_str().unwrap().contains("/t/region-data/gb-lon/"), "{e}");
+        assert!(e["details"]["now"].as_str().unwrap().contains("/elsewhere/region-data/gb-lon/"), "{e}");
+        assert_eq!(check_destinations(&w.db, Some(&moved), &none), Ok(Vec::new()), "the new one is recorded");
+        assert!(check_destinations(&w.db, Some(&moved), &forget).unwrap()[0].contains("nothing was forgotten. Remove it"));
     }
 
     #[tokio::test]

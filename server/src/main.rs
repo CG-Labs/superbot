@@ -547,6 +547,9 @@ async fn main() {
     for line in &opened.lines {
         log_info!("{line}");
     }
+    for w in machines::chat_store_copies::check_destinations(&db, control_plane.chat_copies.as_deref(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Regional chat stores: {e}"))) {
+        log_warn!("WARNING: {w}");
+    }
     // Only once every regional chat store opens under the new key, and its approvals are
     // sealed under it, can the previous one go.
     for (warn, line) in rotation_lines(&secrets_report, opened.rekeyed, &opened.approvals) {
