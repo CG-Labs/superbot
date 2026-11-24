@@ -1688,6 +1688,37 @@ EOF
   elif [[ -f "$BACKUP_IDENTITY_FILE" ]]; then
     warn "The backup key is still on this host at $BACKUP_IDENTITY_FILE. Once you have a copy off the host, delete it here (shred -u $BACKUP_IDENTITY_FILE)."
   fi
+  offline_settings_check "$home"
+}
+
+# Offline installs: what botd's settings would reach outside the network
+# (docs/adr/0257-checking-settings-for-air-gapped-networks.md). botd reads only its .env, as its
+# unit does, and opens no connection. Settings on the internet are warned about, not refused:
+# the operator may still be connected, and changes them in .env.
+offline_settings_check() {
+  local home=$1 out rc=0 doc="docs/ops/air-gapped.md#checking-settings-before-going-offline"
+  [[ -n "$OFFLINE_BUNDLE" ]] || return 0
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would check botd's settings for anything on the internet: botd offline check --home $home"
+    return 0
+  fi
+  [[ -x "$BIN_DIR/botd" ]] || return 0
+  out=$(cd / && env -i PATH=/usr/bin:/bin "$BIN_DIR/botd" offline check --home "$home" 2>&1) || rc=$?
+  case $rc in
+    0)
+      log "botd offline check: nothing botd's settings name is on the internet ($doc)"
+      if grep -qE '^  check ' <<<"$out"; then
+        log "Check these, which botd can't place from their names:"
+        grep -E '^  check ' <<<"$out"
+      fi
+      ;;
+    1)
+      warn "botd offline check: some of botd's settings reach the internet, which an air-gapped network can't. Change them in $home/superbot/.env and restart botd ($doc):"
+      grep -E '^  (internet|check) ' <<<"$out" >&2 || printf '%s\n' "$out" >&2
+      warn "Run it again with: sudo -u $SUPERBOT_USER botd offline check --home $home [--internal <your DNS suffix>]"
+      ;;
+    *) warn "botd offline check didn't run (status $rc): $out" ;;
+  esac
 }
 
 # --- Offline installs (docs/adr/0128-air-gapped-self-host.md) ---------------------------------

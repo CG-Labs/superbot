@@ -959,6 +959,40 @@ else
   ok "the Caddyfile is the same without a certificate; with one, no CA and no OCSP (caddy not here to validate)"
 fi
 
+# The summary's botd offline check (ADR 0257), with a stand-in botd that answers as the
+# real one does for each outcome. botd runs with only its .env, never the installer's environment.
+mkdir -p "$T/obin"
+cat >"$T/obin/botd" <<EOF
+#!/bin/sh
+[ "\$1 \$2 \$3 \$4" = "offline check --home /home/sb" ] || { echo "botd \$*"; exit 2; }
+[ -z "\${LEAK:-}" ] || { echo "the installer's environment reached botd"; exit 3; }
+case \$(cat "$T/obin/mode") in
+  internet) printf '  internet  Billing                BILLING: Billing at api.stripe.com: Stripe, on the internet.\n  check     Backups                SERVER_BACKUP_S3_ENDPOINT: at s3.example.net\n  ok        License                fine\n'; exit 1 ;;
+  check) printf '  check     Backups                SERVER_BACKUP_S3_ENDPOINT: at s3.example.net\n  ok        License                fine\n'; exit 0 ;;
+  clean) printf '  ok        License                fine\n'; exit 0 ;;
+  *) echo "no such subcommand"; exit 2 ;;
+esac
+EOF
+chmod 0755 "$T/obin/botd"
+ocheck() { echo "$1" >"$T/obin/mode"; (BIN_DIR=$T/obin OFFLINE_BUNDLE=$B DRY_RUN=false SUPERBOT_USER=sb LEAK=1; export LEAK; offline_settings_check /home/sb) 2>&1; }
+out=$(ocheck clean)
+grep -Fq "botd offline check: nothing botd's settings name is on the internet" <<<"$out" || fail "a clean offline check wasn't said: $out"
+if grep -Eq '^!!|Check these' <<<"$out"; then fail "a clean offline check warned: $out"; fi
+out=$(ocheck check)
+for want in "nothing botd's settings name is on the internet" "Check these" "SERVER_BACKUP_S3_ENDPOINT"; do
+  grep -Fq -- "$want" <<<"$out" || fail "an offline check with names to check didn't say $want: $out"
+done
+out=$(ocheck internet)
+for want in "!! botd offline check: some of botd's settings reach the internet" "BILLING: Billing at api.stripe.com" "SERVER_BACKUP_S3_ENDPOINT" \
+  "sudo -u sb botd offline check --home /home/sb"; do
+  grep -Fq -- "$want" <<<"$out" || fail "an offline check with settings on the internet didn't say $want: $out"
+done
+if grep -Fq "License" <<<"$out"; then fail "the offline check's warning listed settings that are fine: $out"; fi
+out=$(ocheck old)
+grep -Fq "botd offline check didn't run (status 2)" <<<"$out" || fail "an offline check that didn't run wasn't said: $out"
+[[ -z $( (OFFLINE_BUNDLE='' BIN_DIR=$T/obin; offline_settings_check /home/sb) 2>&1) ]] || fail "an online install ran the offline check"
+ok "an offline install's summary says what botd's settings reach on the internet (botd offline check)"
+
 # A dry run of the whole offline install, as main runs it, without root. With unprivileged
 # namespaces, it runs with no network at all.
 cat >"$T/run.sh" <<'EOF'
@@ -979,7 +1013,8 @@ if unshare -rn true 2>/dev/null; then net=(unshare -rn); fi
 for want in "Offline bundle $VERSION ($ARCH" "Bundle SHA-256 matches" "would copy deploy templates from the bundle" \
   "/bin/botd /usr/local/bin/botd" "would install the bundle's web client into root-owned /var/www/superbot-app" \
   "would install the landing page from /tmp/" "would serve offline.test with the certificate in $T/good.pem" \
-  "would record bundle $VERSION" "Offline: no packages" "--offline <newer bundle> --upgrade --domain offline.test" "SuperBot is installed."; do
+  "would record bundle $VERSION" "Offline: no packages" "--offline <newer bundle> --upgrade --domain offline.test" "SuperBot is installed." \
+  "would check botd's settings for anything on the internet: botd offline check --home"; do
   grep -Fq -- "$want" "$T/dry.log" || { cat "$T/dry.log" >&2; fail "the offline dry run didn't say: $want"; }
 done
 if grep -Ei 'apt-get|rustup|nodesource|cloudsmith|would fetch|git clone|npm ci|build the web client in|cargo build' "$T/dry.log"; then
