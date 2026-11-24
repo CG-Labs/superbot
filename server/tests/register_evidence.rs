@@ -4,7 +4,8 @@
 //! excepting a setting no exception approved, and is refused, writing nothing, for a
 //! register that doesn't hold together, a baseline from outside the period, or a period
 //! longer than a month. ADR 0214: the code of conduct is acknowledged like the other
-//! policies, and conduct concerns are checked in `conduct.json`, by id only.
+//! policies, and conduct concerns are checked in `conduct.json`, by id only. ADR 0223:
+//! security incidents, breach notices, reviews, actions and tabletops in `incidents.json`.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -87,6 +88,16 @@ fn register() -> Value {
             { "id": "CC-1", "received": "2026-10-02", "triaged": "2026-10-05", "handledBy": "p-a", "closed": "2026-10-20", "outcome": "substantiated", "notes": "Dave said Erin took a gift" },
             { "id": "CC-2", "received": "2026-10-10" },
         ],
+        "breachNoticeHours": 48,
+        "incidents": [
+            { "id": "INC-1", "detected": "2026-10-05", "triaged": "2026-10-05", "commander": "p-b", "severity": "SEV-4", "closed": "2026-10-06", "notes": "Frank's laptop flagged" },
+            {
+                "id": "INC-2", "detected": "2026-10-12", "triaged": "2026-10-12", "commander": "p-c", "severity": "SEV-2", "breach": true,
+                "awareAt": "2026-10-12T09:30:00Z", "customersNotifiedAt": "2026-10-13T12:00:00Z", "closed": "2026-10-14",
+                "notes": "Globex's files were readable",
+            },
+        ],
+        "tabletops": [{ "at": "2026-09-20", "attendees": ["p-a", "p-b", "p-c"], "recordSha256": hex(b"tabletop record"), "actions": [{ "id": "T-1", "owner": "Operator", "due": "2026-12-01" }] }],
     })
 }
 
@@ -130,6 +141,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         "vendors.json: no exceptions; evidence for CC6.4-1, CC9.2-1",
         "policy-exceptions.json: baselineExceptionNotApproved 1; evidence for CC5.1-1",
         "conduct.json: triagedLate 1; evidence for CC1.1-1",
+        "incidents.json: reviewOverdue 1; evidence for CC7.3-1, CC7.4-1, CC7.4-2, CC7.5-1",
     ] {
         assert!(out.contains(want), "{want}\n{out}");
     }
@@ -141,15 +153,19 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         assert_eq!(fs::metadata(&tar).unwrap().permissions().mode() & 0o777, 0o600, "private to its owner");
     }
     let raw = fs::read(&tar).unwrap();
-    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift"] {
+    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex"] {
         assert!(!raw.windows(never.len()).any(|w| w == never.as_bytes()), "{never:?} is in the bundle");
     }
     let folder = unpack(&dir, &tar);
     let manifest = json_in(&folder, "manifest.json");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(2), Some(true), Some(2)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(3), Some(true), Some(2)));
     assert_eq!(manifest["source"]["registerSha256"].as_str(), Some(hex(&fs::read(dir.join("register.json")).unwrap()).as_str()), "identifies the register kept beside it");
     let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
-    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json"]);
+    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json", "incidents.json"]);
+    let incidents = json_in(&folder, "incidents.json");
+    assert_eq!(incidents["exceptions"]["reviewOverdue"], json!(["INC-2 (closed 2026-10-14, not reviewed, due 2026-10-28)"]), "a possible breach needs a written review: {incidents:#}");
+    assert_eq!(incidents["incidents"][1]["noticeDue"], "2026-10-14T09:30:00Z", "{incidents:#}");
+    assert_eq!((incidents["summary"]["detectedInPeriodBySeverity"]["SEV-2"].as_u64(), incidents["incidentResponsePlan"]["lastTabletop"].as_str()), (Some(1), Some("2026-09-20")), "{incidents:#}");
     let ex = json_in(&folder, "policy-exceptions.json");
     assert_eq!(ex["exceptions"]["baselineExceptionNotApproved"].as_array().map(Vec::len), Some(1), "{ex:#}");
     assert!(ex["exceptions"]["baselineExceptionNotApproved"][0].as_str().unwrap().contains("AUTH_MFA"), "{ex:#}");
@@ -168,12 +184,13 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     let r: Value = serde_json::from_slice(&o.stdout).unwrap();
     let kind = r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "policy-register").unwrap();
     assert_eq!((kind["complete"].as_bool(), r["bundles"][0]["verified"].as_bool()), (Some(true), Some(true)), "{r:#}");
-    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1"] {
+    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1", "CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"] {
         let x = r["rows"].as_array().unwrap().iter().find(|x| x["row"] == row).unwrap_or_else(|| panic!("{row}: {r:#}"));
         assert_eq!(x["complete"], true, "{row}");
     }
     assert_eq!(r["bundles"][0]["exceptions"]["policy-exceptions.json"]["baselineExceptionNotApproved"], 1);
     assert_eq!(r["bundles"][0]["exceptions"]["conduct.json"]["triagedLate"], 1);
+    assert_eq!(r["bundles"][0]["exceptions"]["incidents.json"]["reviewOverdue"], 1);
 
     // A policy changed since its approval is flagged; the same command never writes over a file.
     let changed = dir.join("policies");

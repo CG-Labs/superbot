@@ -114,7 +114,7 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 13] = [
+const EXCEPTION_FILES: [&str; 14] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -128,6 +128,7 @@ const EXCEPTION_FILES: [&str; 13] = [
     "vendors.json",
     "policy-exceptions.json",
     "conduct.json",
+    "incidents.json",
 ];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
@@ -881,36 +882,54 @@ mod tests {
         assert!(!check(format!("{name}.tar"), &name, &files).verified(), "changed after it was made");
     }
 
+    /// A register bundle of manifest format `n` with `file` taken out, then put back with
+    /// `body` mapped to `rows` when given, consistently sealed, and checked.
+    fn register_bundle_with(n: u64, file: &str, body: Option<(&[u8], &[&str], &[&str])>) -> Found {
+        let kind = KINDS.iter().find(|k| k.id == "policy-register").unwrap();
+        let (name, mut fs) = bundle(kind, p("2027-01-01", "2027-02-01"), "2027-02-01T00:05:00Z");
+        let mut m: Value = serde_json::from_slice(&fs["manifest.json"]).unwrap();
+        m["format"] = json!(n);
+        m["files"].as_array_mut().unwrap().retain(|f| f["name"] != file);
+        fs.remove(file);
+        if let Some((body, criteria, rows)) = body {
+            m["files"].as_array_mut().unwrap().push(json!({ "name": file, "sha256": sha256(body), "criteria": criteria, "checklist": rows }));
+            fs.insert(file.into(), body.to_vec());
+        }
+        fs.insert("manifest.json".into(), json_file(&m));
+        seal(&mut fs);
+        check(format!("{name}.tar"), &name, &fs)
+    }
+
     /// Register bundles gained `conduct.json` in format 2 (ADR 0214): one of format 1
     /// without it still checks, one of format 2 must have it, and its exceptions count.
     #[test]
     fn register_bundles_have_conduct_json_from_format_2() {
-        let kind = KINDS.iter().find(|k| k.id == "policy-register").unwrap();
-        assert_eq!(kind.format, 2);
-        let (name, files) = bundle(kind, p("2027-01-01", "2027-02-01"), "2027-02-01T00:05:00Z");
-        let with_format = |n: u64, conduct: Option<&[u8]>| {
-            let mut fs = files.clone();
-            let mut m: Value = serde_json::from_slice(&fs["manifest.json"]).unwrap();
-            m["format"] = json!(n);
-            m["files"].as_array_mut().unwrap().retain(|f| f["name"] != "conduct.json");
-            fs.remove("conduct.json");
-            if let Some(body) = conduct {
-                m["files"].as_array_mut().unwrap().push(json!({ "name": "conduct.json", "sha256": sha256(body), "criteria": ["CC1.1"], "checklist": ["CC1.1-1"] }));
-                fs.insert("conduct.json".into(), body.to_vec());
-            }
-            fs.insert("manifest.json".into(), json_file(&m));
-            seal(&mut fs);
-            check(format!("{name}.tar"), &name, &fs)
-        };
-        let old = with_format(1, None);
+        let old = register_bundle_with(1, "conduct.json", None);
         assert!(old.verified(), "made before conduct.json: {:?}", old.problems);
-        let missing = with_format(2, None);
+        let missing = register_bundle_with(2, "conduct.json", None);
         assert!(!missing.verified() && missing.problems.iter().any(|x| x.contains("it has no conduct.json")), "{:?}", missing.problems);
         let body = json_file(&json!({ "exceptions": { "triagedLate": ["CC-1 (received 2027-01-02, not triaged, due 2027-01-09)"], "closedLate": [], "handlerNotInRole": [] } }));
-        let f = with_format(2, Some(&body));
+        let f = register_bundle_with(2, "conduct.json", Some((&body, &["CC1.1"], &["CC1.1-1"])));
         assert!(f.verified(), "{:?}", f.problems);
         assert_eq!(f.exceptions["conduct.json"]["triagedLate"], 1);
         assert!(f.files.iter().any(|(n, _, rows)| n == "conduct.json" && rows == &["CC1.1-1".to_string()]));
+    }
+
+    /// Register bundles gained `incidents.json` in format 3 (ADR 0223): one of format 2
+    /// without it still checks, one of format 3 must have it, and its exceptions count.
+    #[test]
+    fn register_bundles_have_incidents_json_from_format_3() {
+        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 3);
+        let old = register_bundle_with(2, "incidents.json", None);
+        assert!(old.verified(), "made before incidents.json: {:?}", old.problems);
+        let missing = register_bundle_with(3, "incidents.json", None);
+        assert!(!missing.verified() && missing.problems.iter().any(|x| x.contains("it has no incidents.json")), "{:?}", missing.problems);
+        let body = json_file(&json!({ "exceptions": { "notTriaged": [], "reviewOverdue": ["INC-1 (closed 2027-01-04, not reviewed, due 2027-01-18)"], "actionOverdue": ["A-1 of incident INC-1 (Operator, due 2027-01-20)", "A-2 of incident INC-1 (Operator, due 2027-01-21)"] } }));
+        let rows: &[&str] = &["CC7.3-1", "CC7.4-2", "CC7.5-1"];
+        let f = register_bundle_with(3, "incidents.json", Some((&body, &["CC7.3", "CC7.4", "CC7.5"], rows)));
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!((f.exceptions["incidents.json"]["reviewOverdue"], f.exceptions["incidents.json"]["actionOverdue"]), (1, 2));
+        assert!(f.files.iter().any(|(n, _, r)| n == "incidents.json" && r == &rows.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
     }
 
     #[test]
