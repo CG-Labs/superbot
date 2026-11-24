@@ -105,6 +105,6 @@ The `release-bundle` job builds the tag's botd, makes a harness bundle per arch 
     Also tested without root: the wrapper, the flags, putting back on an exit mid-swap (old tree, the operator's own file and botd), the upgrade notice, and a dry run with `--harness-bundle` with no network.
   - CI (`offline.yml`), as root on Ubuntu 22.04 and 24.04: the real bundle, built from the PR's botd, installed with no network, as described above.
 - Not covered:
-  - Users' machines. They install the same pins from mirrors (ADR 0186, ADR 0219). Serving a harness bundle to machines with no npm mirror is still open.
+  - Users' machines. They install the same pins from mirrors (ADR 0186, ADR 0219), or, since [ADR 0242](0242-harness-bundle-on-air-gapped-machines.md), from this bundle, which botd serves them.
   - aarch64 isn't installed in CI. The release job builds and verifies its bundle on an arm64 runner.
   - The release check (ADR 0172) downloads only `superbot-offline-*`, not the Hermes or harness bundles.
