@@ -387,6 +387,8 @@ async fn a_retried_erasure_still_erases_what_its_deleted_bots_wrote() {
     assert_eq!(code, 200, "{v}");
     assert_eq!(app.db.message(wrote).unwrap().text, "[erased]");
     assert!(app.db.erasing_bots(&ada).is_empty(), "forgotten once erased");
+    let kept: Vec<String> = serde_json::from_str(&app.db.setting(&format!("{}{ada}", crate::db::ERASED_BOTS)).unwrap()).unwrap();
+    assert_eq!(kept, [gone], "kept for restoring a chat store backup made mid-erasure");
 }
 
 #[tokio::test]

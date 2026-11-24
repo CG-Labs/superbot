@@ -19,6 +19,11 @@ impl EnvStore {
         EnvStore(Some(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()))
     }
 
+    /// These variables instead of the process's: an env file's over them, for offline commands.
+    pub fn vars(vars: HashMap<String, String>) -> EnvStore {
+        EnvStore(Some(vars))
+    }
+
     fn var(&self, k: &str) -> Option<String> {
         match &self.0 {
             Some(vars) => vars.get(k).cloned(),

@@ -409,6 +409,9 @@ async fn main() {
     if args.first().is_some_and(|a| a == "support") {
         std::process::exit(support_check::cli(&args[1..]));
     }
+    if args.first().is_some_and(|a| a == "chat-store") {
+        std::process::exit(machines::chat_store_restore::cli(&args[1..]).await);
+    }
     if args.first().is_some_and(|a| a == "harness") {
         std::process::exit(adapters::install::cli(&args[1..]));
     }

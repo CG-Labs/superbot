@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod chats;
-pub use chats::{ChatMove, ChatStore, Held, drop_from_copy, held_in_copy};
+pub use chats::{ChatMove, ChatStore, Held, bots_kept_in, compare_copy, drop_from_copy, held_in_copy, keep_only_in_copy, upgrade_copy};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 
@@ -164,6 +164,41 @@ pub const ERASED_NAME: &str = "Erased user";
 /// erasure would rewrite.
 const SENT_BY: &str = "(CASE WHEN json_valid(m.requested_by) THEN json_extract(m.requested_by, '$.actor.id') = ?1 OR json_extract(m.requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(m.requested_by, '$.actor.carries') WHERE value = ?1) END)";
 const SENT_BY_ANY: &str = "(CASE WHEN json_valid(requested_by) THEN json_extract(requested_by, '$.actor.id') = ?1 OR json_extract(requested_by, '$.actor.asker') = ?1 OR EXISTS (SELECT 1 FROM json_each(requested_by, '$.actor.carries') WHERE value = ?1) END)";
+
+/// What an erasure does to chats, routines and approvals, in each place they are kept
+/// (`on_places` tokens). Run again on a regional chat store's backup before it is restored
+/// (ADR 0256), so a restore never brings back what an erasure took out.
+/// `?1` the erased user.
+const ERASE_ROUTINES: &str = "DELETE FROM {routines} WHERE author_id = ?1";
+/// `?1` the erased user, `?2` their pseudonym.
+const ERASE_APPROVALS: &str = "UPDATE {approvals} SET decided_by = ?2, note = NULL WHERE decided_by = ?1";
+
+/// `?1` the erased user, `?2` their Bots as a JSON array.
+fn erase_messages() -> String {
+    format!(
+        "UPDATE {{messages}} SET text = '{ERASED_TEXT}', question = NULL, requested_by = NULL
+         WHERE role IN ('user', 'routine') AND {SENT_BY_ANY}
+            OR from_bot IN (SELECT value FROM json_each(?2))"
+    )
+}
+
+/// `?1` the erased user.
+fn erase_requested_by() -> String {
+    format!("UPDATE {{messages}} SET requested_by = NULL WHERE {SENT_BY_ANY}")
+}
+
+/// Runs an erasure of `user_id` (pseudonym `pseudonym`, whose Bots were `bots`) on a copy
+/// of a regional chat store opened on `c` (ADR 0256): their routines deleted, what they
+/// and their Bots wrote replaced, their approval decisions pseudonymised. What it changed.
+pub(crate) fn erase_in_copy(c: &Connection, user_id: &str, pseudonym: &str, bots: &[String]) -> rusqlite::Result<Held> {
+    let bots = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
+    let main = |sql: &str| sql.replace("{messages}", "main.messages").replace("{routines}", "main.routines").replace("{approvals}", "main.approvals");
+    let routines = c.execute(&main(ERASE_ROUTINES), [user_id])? as i64;
+    let messages = c.execute(&main(&erase_messages()), params![user_id, bots])? as i64;
+    c.execute(&main(&erase_requested_by()), [user_id])?;
+    let approvals = c.execute(&main(ERASE_APPROVALS), params![user_id, pseudonym])? as i64;
+    Ok(Held { messages, routines, approvals })
+}
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
 /// pseudonym wherever it appears, as does an email of theirs (any case); a string that is
@@ -3037,6 +3072,9 @@ fn migrate_server_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
 const AUDIT_ERASING: &str = "audit_erasing";
 /// Settings key prefix for the Bots an unfinished erasure took on, by user id.
 const ERASING_BOTS: &str = "erasing_bots:";
+/// The Bots an erasure deleted, kept for good: restoring a regional chat store backup made
+/// mid-erasure needs all of them, and audit events may be pruned or clip the list (ADR 0256).
+pub(crate) const ERASED_BOTS: &str = "erased_bots:";
 
 /// Erasing a user (ADR 0102): the user row stays as a tombstone, with when, by whom and
 /// as which pseudonym. The audit log stays append-only except that, inside an erasure's
@@ -7244,6 +7282,7 @@ impl Db {
         let run = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.execute(sql, p).map_err(db_err);
         let mut out = Erased::default();
         run("DELETE FROM settings WHERE key = ?", &[&format!("{ERASING_BOTS}{user_id}")])?;
+        run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", &[&format!("{ERASED_BOTS}{user_id}"), &bots_json])?;
         run("DELETE FROM push_devices WHERE user_id = ?", &[&user_id])?;
         out.sessions = run("DELETE FROM sessions WHERE user_id = ?", &[&user_id])?;
         out.login_codes = run("DELETE FROM login_codes WHERE user_id = ?", &[&user_id])?;
@@ -7277,20 +7316,10 @@ impl Db {
                 run("UPDATE residency_pins SET reference = ?3 WHERE subject_type = ?1 AND subject_id = ?2", &[&kind, &id, &r])?;
             }
         }
-        out.routines = self.on_places(&tx, "DELETE FROM {routines} WHERE author_id = ?", &[&user_id]).map_err(db_err)?;
-        out.messages = self
-            .on_places(
-                &tx,
-                &format!(
-                    "UPDATE {{messages}} SET text = '{ERASED_TEXT}', question = NULL, requested_by = NULL
-                     WHERE role IN ('user', 'routine') AND {SENT_BY_ANY}
-                        OR from_bot IN (SELECT value FROM json_each(?2))"
-                ),
-                &[&user_id, &bots_json],
-            )
-            .map_err(db_err)?;
-        self.on_places(&tx, &format!("UPDATE {{messages}} SET requested_by = NULL WHERE {SENT_BY_ANY}"), &[&user_id]).map_err(db_err)?;
-        out.approvals = self.on_places(&tx, "UPDATE {approvals} SET decided_by = ?2, note = NULL WHERE decided_by = ?1", &[&user_id, &pseudonym]).map_err(db_err)?;
+        out.routines = self.on_places(&tx, ERASE_ROUTINES, &[&user_id]).map_err(db_err)?;
+        out.messages = self.on_places(&tx, &erase_messages(), &[&user_id, &bots_json]).map_err(db_err)?;
+        self.on_places(&tx, &erase_requested_by(), &[&user_id]).map_err(db_err)?;
+        out.approvals = self.on_places(&tx, ERASE_APPROVALS, &[&user_id, &pseudonym]).map_err(db_err)?;
         out.disk_reports = run(
             "UPDATE machines SET disk_files = NULL, disk_files_partial = 0, disk_files_at = NULL WHERE user_id = ? AND (disk_files IS NOT NULL OR disk_files_at IS NOT NULL)",
             &[&user_id],
