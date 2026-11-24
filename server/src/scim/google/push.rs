@@ -5,8 +5,13 @@
 //! A notification is a hint, never state: botd reads nothing from it but which channel
 //! sent it, and starts the same full pass as the schedule, with its fail-closed reads and
 //! removal guards. A forged or replayed one can do no more than start a pass early, and
-//! the schedule goes on if push stops. Group membership has no watch in the Directory
-//! API, so someone taken out of a group still waits for the schedule.
+//! the schedule goes on if push stops.
+//!
+//! Group membership has no watch in the Directory API. With GOOGLE_DIRECTORY_PUSH_GROUPS
+//! (ADR 0244), botd also watches the Reports API's admin activity for members added to
+//! or removed from a group, and groups deleted, with a token of its own that carries only
+//! the audit read-only scope. Those channels are made, renewed and fail apart from the
+//! user ones, so a missing delegation of that scope never stops user push.
 //!
 //! Each channel's token is an HMAC of its id under a key derived from the master key, so
 //! botd knows the channels it made before a restart without storing them, and stops each
@@ -22,6 +27,12 @@ pub const PATH: &str = "/scim/google/push";
 pub const MAX_BODY: usize = 16 * 1024;
 /// One channel each. `makeAdmin` changes nothing SuperBot keeps.
 pub const EVENTS: [&str; 4] = ["add", "update", "delete", "undelete"];
+/// Admin activity that changes who is in a group, made in the Admin console or through
+/// the Directory API (a directory sync tool, an HR system), one channel each. Google
+/// logs these within a couple of minutes.
+pub const GROUP_EVENTS: [&str; 3] = ["ADD_GROUP_MEMBER", "REMOVE_GROUP_MEMBER", "DELETE_GROUP"];
+/// Asked for only by the group channels' own token, never by a pass.
+pub const REPORTS_SCOPE: &str = "https://www.googleapis.com/auth/admin.reports.audit.readonly";
 /// Asked of Google, which may give less (2 hours by default, 2 days at most).
 const TTL: Duration = Duration::from_secs(6 * 3600);
 /// New channels are made this long before the old ones end, or at three quarters of
@@ -39,9 +50,56 @@ const MIN_GAP: Duration = Duration::from_secs(30);
 /// Google's limit on a channel id.
 const MAX_ID: usize = 64;
 const PREFIX: &str = "superbot-";
+const GROUPS_PREFIX: &str = "superbot-g-";
 const KEY_PURPOSE: &str = "scim/google-push-channel";
 /// Leftover channels being stopped at once.
 const MAX_STOPPING: usize = 64;
+
+/// What a set of channels watches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watch {
+    /// Users, through the Directory API (ADR 0216).
+    Users,
+    /// Group membership, through the Reports API's admin activity (ADR 0244).
+    Groups,
+}
+
+impl Watch {
+    const ALL: [Watch; 2] = [Watch::Users, Watch::Groups];
+
+    fn events(self) -> &'static [&'static str] {
+        match self {
+            Watch::Users => &EVENTS,
+            Watch::Groups => &GROUP_EVENTS,
+        }
+    }
+
+    /// A channel's id says which API made it, so a leftover is stopped where it lives.
+    fn prefix(self) -> &'static str {
+        match self {
+            Watch::Users => PREFIX,
+            Watch::Groups => GROUPS_PREFIX,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Watch::Users => "users",
+            Watch::Groups => "groups",
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Watch::Users => "user changes",
+            Watch::Groups => "group membership changes",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
 
 /// GOOGLE_DIRECTORY_PUSH: off, or the address on PUBLIC_URL Google sends changes to.
 pub fn address(var: &dyn Fn(&str) -> String) -> Result<Option<String>, String> {
@@ -55,28 +113,43 @@ pub fn address(var: &dyn Fn(&str) -> String) -> Result<Option<String>, String> {
     Ok(Some(format!("{base}{PATH}")))
 }
 
+/// GOOGLE_DIRECTORY_PUSH_GROUPS: whether group membership changes are watched too.
+/// `names_groups`: the sync reads at least one group, so a change to one can matter.
+pub fn groups(var: &dyn Fn(&str) -> String, address: Option<&str>, names_groups: bool) -> Result<bool, String> {
+    if !on_off("GOOGLE_DIRECTORY_PUSH_GROUPS", &var("GOOGLE_DIRECTORY_PUSH_GROUPS"))? {
+        return Ok(false);
+    }
+    if address.is_none() {
+        return Err("GOOGLE_DIRECTORY_PUSH_GROUPS=on needs GOOGLE_DIRECTORY_PUSH=on: group changes come to the same address.".into());
+    }
+    if !names_groups {
+        return Err("GOOGLE_DIRECTORY_PUSH_GROUPS=on needs a group in GOOGLE_DIRECTORY_GROUPS, GOOGLE_DIRECTORY_TEAM_GROUPS or GOOGLE_DIRECTORY_ROLE_GROUPS: the sync reads no group, and moves between organizational units are pushed as user changes already.".into());
+    }
+    Ok(true)
+}
+
 pub(crate) fn channel_token(id: &str) -> String {
     let key = crate::secrets::sealed::cipher().derive(KEY_PURPOSE);
     let tag = aws_lc_rs::hmac::sign(&aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &key[..]), id.as_bytes());
     crate::audit_line::hex(tag.as_ref())
 }
 
-/// Why a notification isn't from a channel botd made, if it isn't.
-fn check(id: &str, token: &str) -> Result<(), &'static str> {
+/// What a notification's channel watches, or why it isn't one botd made.
+fn check(id: &str, token: &str) -> Result<Watch, &'static str> {
     if id.is_empty() || token.is_empty() {
         return Err("missing");
     }
-    let shaped = id.len() <= MAX_ID && id.strip_prefix(PREFIX).is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_hexdigit()));
-    if !shaped {
-        return Err("unknown_channel");
-    }
-    aws_lc_rs::constant_time::verify_slices_are_equal(channel_token(id).as_bytes(), token.as_bytes()).map_err(|_| "bad_token")
+    let shaped = |w: &Watch| id.strip_prefix(w.prefix()).is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_hexdigit()));
+    let Some(watch) = Watch::ALL.into_iter().filter(|_| id.len() <= MAX_ID).find(shaped) else { return Err("unknown_channel") };
+    aws_lc_rs::constant_time::verify_slices_are_equal(channel_token(id).as_bytes(), token.as_bytes()).map_err(|_| "bad_token")?;
+    Ok(watch)
 }
 
 #[derive(Clone, Debug)]
 struct Channel {
     id: String,
     resource_id: String,
+    watch: Watch,
     event: &'static str,
     /// Unix ms, if Google gave one.
     expires_at: Option<i64>,
@@ -88,8 +161,9 @@ struct State {
     /// Ids of channels this process asked for and hasn't stopped, so a `sync` message
     /// that beats the watch answer isn't taken for a leftover.
     made: HashSet<String>,
-    renewed_at: Option<i64>,
-    failure: Option<Value>,
+    /// By `Watch::index`: each set is renewed, and fails, on its own.
+    renewed_at: [Option<i64>; 2],
+    failure: [Option<Value>; 2],
     notifications: u64,
     last_notification: Option<i64>,
     /// What Google said changed since the last pass started.
@@ -101,9 +175,9 @@ struct State {
 }
 
 impl State {
-    /// Channels that haven't ended: a failed renewal keeps old ones past their end.
-    fn live(&self, now: i64) -> usize {
-        self.channels.iter().filter(|c| c.expires_at.is_none_or(|e| e > now)).count()
+    /// A set's channels that haven't ended: a failed renewal keeps old ones past their end.
+    fn live(&self, watch: Watch, now: i64) -> usize {
+        self.channels.iter().filter(|c| c.watch == watch && c.expires_at.is_none_or(|e| e > now)).count()
     }
 }
 
@@ -111,13 +185,20 @@ impl State {
 pub struct Push {
     /// None: push is off, and channels left from when it was on are stopped.
     address: Option<String>,
+    /// Group membership is watched too (GOOGLE_DIRECTORY_PUSH_GROUPS).
+    groups: bool,
     nudge: tokio::sync::Notify,
     state: std::sync::Mutex<State>,
 }
 
 impl Push {
-    pub fn new(address: Option<String>) -> Push {
-        Push { address, nudge: tokio::sync::Notify::new(), state: Default::default() }
+    pub fn new(address: Option<String>, groups: bool) -> Push {
+        let groups = groups && address.is_some();
+        Push { address, groups, nudge: tokio::sync::Notify::new(), state: Default::default() }
+    }
+
+    fn watches(&self, watch: Watch) -> bool {
+        self.address.is_some() && (watch == Watch::Users || self.groups)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -178,25 +259,36 @@ impl Push {
         self.state().last_started = None;
     }
 
-    fn note(&self, change: &str) {
+    /// `channel`: the event the notifying channel was made for, if this process made it,
+    /// named when the resource state isn't an event (a generic `exists`, say).
+    fn note(&self, change: &str, channel: Option<&'static str>) {
         let mut s = self.state();
         s.notifications += 1;
         s.last_notification = Some(crate::db::now());
-        s.pending.insert(EVENTS.into_iter().find(|e| *e == change).unwrap_or("other"));
+        s.pending.insert(EVENTS.into_iter().chain(GROUP_EVENTS).find(|e| *e == change).or(channel).unwrap_or("other"));
         drop(s);
         self.nudge.notify_one();
     }
 
+    /// The user channels' state at the top, as before group push; the group channels'
+    /// under `groups`.
     pub fn status(&self) -> Value {
         let Some(address) = &self.address else { return json!({ "enabled": false }) };
         let s = self.state();
+        let now = crate::db::now();
+        let (users, groups) = (Watch::Users.index(), Watch::Groups.index());
         json!({
             "enabled": true,
             "address": address,
-            "watching": s.live(crate::db::now()) > 0,
-            "channels": s.channels.iter().map(|c| json!({ "event": c.event, "expiresAt": c.expires_at })).collect::<Vec<_>>(),
-            "renewedAt": s.renewed_at,
-            "failure": s.failure,
+            "watching": s.live(Watch::Users, now) > 0,
+            "channels": s.channels.iter().map(|c| json!({ "watch": c.watch.name(), "event": c.event, "expiresAt": c.expires_at })).collect::<Vec<_>>(),
+            "renewedAt": s.renewed_at[users],
+            "failure": s.failure[users],
+            "groups": if self.groups {
+                json!({ "enabled": true, "watching": s.live(Watch::Groups, now) > 0, "renewedAt": s.renewed_at[groups], "failure": s.failure[groups] })
+            } else {
+                json!({ "enabled": false })
+            },
             "notifications": s.notifications,
             "lastNotificationAt": s.last_notification,
             "refused": s.refused,
@@ -208,7 +300,7 @@ impl Push {
 // Google's side: watch and stop.
 
 async fn post(d: &Directory, token: &str, url: url::Url, body: &Value, what: &str) -> Result<Vec<u8>, Failure> {
-    let res = d.http.post(url).bearer_auth(token).json(body).send().await.map_err(|e| fail("unreachable", format!("Google's Directory API couldn't be reached for {what}: {}", e.without_url())))?;
+    let res = d.http.post(url).bearer_auth(token).json(body).send().await.map_err(|e| fail("unreachable", format!("Google's Admin SDK API couldn't be reached for {what}: {}", e.without_url())))?;
     let status = res.status();
     let bytes = read(res, what).await?;
     if !status.is_success() {
@@ -217,12 +309,49 @@ async fn post(d: &Directory, token: &str, url: url::Url, body: &Value, what: &st
     Ok(bytes)
 }
 
-async fn watch(d: &Directory, token: &str, address: &str, event: &'static str) -> Result<Channel, Failure> {
-    let id = format!("{PREFIX}{}", crate::random_hex(16));
+/// The Admin SDK path under GOOGLE_DIRECTORY_API_URL.
+fn api_url(d: &Directory, segments: &[&str], query: &[(&str, &str)]) -> Result<url::Url, Failure> {
+    let mut url = url::Url::parse(&d.settings.api).map_err(|e| fail("google_error", e.to_string()))?;
+    url.path_segments_mut().map_err(|_| fail("google_error", "GOOGLE_DIRECTORY_API_URL can't have a path"))?.pop_if_empty().extend(segments);
+    url.query_pairs_mut().extend_pairs(query);
+    Ok(url)
+}
+
+/// Where a set's channels are made: users.watch, or activities.watch on everyone's
+/// admin activity, one event name each.
+fn watch_url(d: &Directory, watch: Watch, event: &str) -> Result<url::Url, Failure> {
+    let customer = d.settings.customer.as_str();
+    match watch {
+        Watch::Users => d.url(&["users", "watch"], &[("customer", customer), ("event", event)]),
+        Watch::Groups => {
+            let mut query = vec![("eventName", event)];
+            // The Reports API takes no `my_customer`: it is the admin's own customer.
+            if customer != "my_customer" {
+                query.push(("customerId", customer));
+            }
+            api_url(d, &["admin", "reports", "v1", "activity", "users", "all", "applications", "admin", "watch"], &query)
+        }
+    }
+}
+
+/// The token a set's calls use: a pass's for users, one with only the audit read-only
+/// scope for groups, so a pass never holds audit access.
+async fn token_for(d: &Directory, watch: Watch) -> Result<Zeroizing<String>, Failure> {
+    match watch {
+        Watch::Users => d.token().await,
+        Watch::Groups => d.token_with(REPORTS_SCOPE).await,
+    }
+}
+
+async fn watch(d: &Directory, token: &str, address: &str, watch: Watch, event: &'static str) -> Result<Channel, Failure> {
+    let id = format!("{}{}", watch.prefix(), crate::random_hex(16));
     d.push.state().made.insert(id.clone());
-    let what = format!("users' {event} events");
+    let what = match watch {
+        Watch::Users => format!("users' {event} events"),
+        Watch::Groups => format!("admin activity {event}"),
+    };
     let body = json!({ "id": id, "type": "web_hook", "address": address, "token": channel_token(&id), "params": { "ttl": TTL.as_secs().to_string() } });
-    let url = d.url(&["users", "watch"], &[("customer", d.settings.customer.as_str()), ("event", event)])?;
+    let url = watch_url(d, watch, event)?;
     let answer = async {
         let v: Value = serde_json::from_slice(&post(d, token, url, &body, &what).await?).map_err(|_| odd(&what))?;
         if v["kind"] != "api#channel" || v["id"] != id.as_str() {
@@ -236,7 +365,7 @@ async fn watch(d: &Directory, token: &str, address: &str, event: &'static str) -
             Value::Number(n) => Some(n.as_i64().ok_or_else(|| odd(&what))?),
             _ => return Err(odd(&what)),
         };
-        Ok(Channel { id: id.clone(), resource_id, event, expires_at })
+        Ok(Channel { id: id.clone(), resource_id, watch, event, expires_at })
     }
     .await;
     if answer.is_err() {
@@ -250,10 +379,13 @@ fn resource_shaped(r: &str) -> bool {
     !r.is_empty() && r.len() <= 256 && r.bytes().all(|b| b.is_ascii_graphic())
 }
 
-async fn stop(d: &Directory, token: &str, id: &str, resource_id: &str) -> Result<(), Failure> {
-    let mut url = url::Url::parse(&d.settings.api).map_err(|e| fail("google_error", e.to_string()))?;
-    // channels.stop is under directory_v1, not directory/v1 like the rest.
-    url.path_segments_mut().map_err(|_| fail("google_error", "GOOGLE_DIRECTORY_API_URL can't have a path"))?.pop_if_empty().extend(["admin", "directory_v1", "channels", "stop"]);
+async fn stop(d: &Directory, token: &str, watch: Watch, id: &str, resource_id: &str) -> Result<(), Failure> {
+    // channels.stop is under directory_v1 and reports_v1, not directory/v1 like the rest.
+    let api = match watch {
+        Watch::Users => "directory_v1",
+        Watch::Groups => "reports_v1",
+    };
+    let url = api_url(d, &["admin", api, "channels", "stop"], &[])?;
     d.push.state().made.remove(id);
     match post(d, token, url, &json!({ "id": id, "resourceId": resource_id }), &format!("the channel {id}")).await {
         Err(f) if f.reason == "not_found" => Ok(()),
@@ -263,7 +395,7 @@ async fn stop(d: &Directory, token: &str, id: &str, resource_id: &str) -> Result
 
 async fn stop_all(d: &Directory, token: &str, channels: &[Channel]) {
     for c in channels {
-        if let Err(f) = stop(d, token, &c.id, &c.resource_id).await {
+        if let Err(f) = stop(d, token, c.watch, &c.id, &c.resource_id).await {
             crate::obs::log::log_warn!("Google Workspace push: couldn't stop the channel {} ({}); it ends by itself.", c.id, f.detail);
         }
     }
@@ -275,17 +407,19 @@ fn renew_wait(ends: Option<i64>, now: i64) -> Duration {
     left.saturating_sub(RENEW_BEFORE).max(left * 3 / 4).max(MIN_RENEW)
 }
 
-/// Makes a channel for each event, then stops the ones they replace. A failure keeps
-/// the old ones (they still work until they end) and is audited once until channels
-/// are made again. Returns how long until the next renewal.
-pub async fn renew(a: &Arc<Auth>, d: &Directory) -> Duration {
-    let Some(address) = d.push.address.as_deref() else { return TTL };
+/// Makes a channel for each of a set's events, then stops the ones they replace. A
+/// failure keeps the old ones (they still work until they end) and is audited once
+/// until the set's channels are made again; the other set is untouched. Returns how
+/// long until the set's next renewal.
+pub async fn renew(a: &Arc<Auth>, d: &Directory, set: Watch) -> Duration {
+    let Some(address) = d.push.address.as_deref().filter(|_| d.push.watches(set)) else { return TTL };
     let Some(app) = a.app.clone() else { return WATCH_RETRY };
+    let i = set.index();
     let made = async {
-        let token = d.token().await?;
+        let token = token_for(d, set).await?;
         let mut made = Vec::new();
-        for event in EVENTS {
-            match watch(d, &token, address, event).await {
+        for event in set.events() {
+            match watch(d, &token, address, set, event).await {
                 Ok(c) => made.push(c),
                 Err(f) => {
                     stop_all(d, &token, &made).await;
@@ -304,52 +438,54 @@ pub async fn renew(a: &Arc<Auth>, d: &Directory) -> Duration {
             let ends = made.iter().filter_map(|c| c.expires_at).min();
             let (old, first, recovered) = {
                 let mut st = d.push.state();
-                let old = std::mem::replace(&mut st.channels, made);
-                let first = st.renewed_at.is_none();
-                st.renewed_at = Some(now);
-                (old, first, st.failure.take().is_some())
+                let (old, kept): (Vec<Channel>, Vec<Channel>) = std::mem::take(&mut st.channels).into_iter().partition(|c| c.watch == set);
+                st.channels = kept;
+                st.channels.extend(made);
+                let first = st.renewed_at[i].is_none();
+                st.renewed_at[i] = Some(now);
+                (old, first, st.failure[i].take().is_some())
             };
             stop_all(d, &token, &old).await;
             if first || recovered {
-                let details = json!({ "tenant": s.tenant, "address": address, "events": EVENTS, "expiresAt": ends, "recovered": recovered });
+                let details = json!({ "tenant": s.tenant, "address": address, "watch": set.name(), "events": set.events(), "expiresAt": ends, "recovered": recovered });
                 app.db.record(&who.event("scim.google_push_watching").target("scim_tenant", &s.tenant).details(details));
-                crate::obs::log::log_info!("Google Workspace push: watching user changes, sent to {address}.");
+                crate::obs::log::log_info!("Google Workspace push: watching {}, sent to {address}.", set.what());
             }
             renew_wait(ends, now)
         }
         Err(f) => {
             let (first, left, until) = {
                 let mut st = d.push.state();
-                let first = st.failure.is_none();
-                st.failure = Some(json!({ "reason": f.reason, "detail": f.detail, "at": now }));
-                (first, st.live(now), st.channels.iter().filter_map(|c| c.expires_at).filter(|e| *e > now).min())
+                let first = st.failure[i].is_none();
+                st.failure[i] = Some(json!({ "reason": f.reason, "detail": f.detail, "at": now }));
+                (first, st.live(set, now), st.channels.iter().filter(|c| c.watch == set).filter_map(|c| c.expires_at).filter(|e| *e > now).min())
             };
             if first {
-                let details = json!({ "tenant": s.tenant, "address": address, "reason": f.reason, "detail": f.detail, "channelsLeft": left, "channelsEnd": until });
+                let details = json!({ "tenant": s.tenant, "address": address, "watch": set.name(), "reason": f.reason, "detail": f.detail, "channelsLeft": left, "channelsEnd": until });
                 app.db.record(&who.event("scim.google_push_failed").target("scim_tenant", &s.tenant).outcome(Outcome::Failure).details(details));
             }
-            crate::obs::log::log_warn!("Google Workspace push: couldn't watch user changes ({}); the sync still runs every {} minutes.", f.detail, s.interval.as_secs() / 60);
+            crate::obs::log::log_warn!("Google Workspace push: couldn't watch {} ({}); the sync still runs every {} minutes.", set.what(), f.detail, s.interval.as_secs() / 60);
             WATCH_RETRY
         }
     }
 }
 
-/// Makes channels once botd is serving, and new ones before they end.
+/// Makes each set's channels once botd is serving, and new ones before they end.
 pub fn start(a: Arc<Auth>, d: Arc<Directory>) {
-    if d.push.address.is_none() {
-        return;
+    for set in Watch::ALL.into_iter().filter(|w| d.push.watches(*w)) {
+        let (a, d) = (a.clone(), d.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(FIRST_WATCH).await;
+            loop {
+                let wait = renew(&a, &d, set).await;
+                tokio::time::sleep(wait).await;
+            }
+        });
     }
-    tokio::spawn(async move {
-        tokio::time::sleep(FIRST_WATCH).await;
-        loop {
-            let wait = renew(&a, &d).await;
-            tokio::time::sleep(wait).await;
-        }
-    });
 }
 
 /// Stops a channel botd made before a restart, or before push was turned off, once.
-fn stop_leftover(d: &Arc<Directory>, id: &str, resource_id: &str) {
+fn stop_leftover(d: &Arc<Directory>, watch: Watch, id: &str, resource_id: &str) {
     if !resource_shaped(resource_id) {
         return;
     }
@@ -361,8 +497,8 @@ fn stop_leftover(d: &Arc<Directory>, id: &str, resource_id: &str) {
     }
     let (d, id, resource_id) = (d.clone(), id.to_string(), resource_id.to_string());
     tokio::spawn(async move {
-        let done = match d.token().await {
-            Ok(token) => stop(&d, &token, &id, &resource_id).await,
+        let done = match token_for(&d, watch).await {
+            Ok(token) => stop(&d, &token, watch, &id, &resource_id).await,
             Err(f) => Err(f),
         };
         let mut st = d.push.state();
@@ -377,9 +513,10 @@ fn stop_leftover(d: &Arc<Directory>, id: &str, resource_id: &str) {
     });
 }
 
-/// `POST /scim/google/push`: Google's notification that a user changed. Answered at
-/// once; the pass runs after. 404 while the sync is off, 401 for a channel botd didn't
-/// make (audited as `scim.google_push_refused`, throttled per address).
+/// `POST /scim/google/push`: Google's notification that a user, or a group's members,
+/// changed. Answered at once; the pass runs after. 404 while the sync is off, 401 for a
+/// channel botd didn't make (audited as `scim.google_push_refused`, throttled per
+/// address).
 pub async fn receive(Extension(a): Extension<Arc<Auth>>, req: Request) -> Response {
     let Some(d) = a.scim.google.clone() else {
         return (StatusCode::NOT_FOUND, "The Google Workspace sync is off on this server.").into_response();
@@ -390,25 +527,31 @@ pub async fn receive(Extension(a): Extension<Arc<Auth>>, req: Request) -> Respon
     let h = req.headers();
     let header = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).unwrap_or("").trim();
     let (id, token, change, resource) = (header("x-goog-channel-id"), header("x-goog-channel-token"), header("x-goog-resource-state"), header("x-goog-resource-id"));
-    if let Err(reason) = check(id, token) {
-        d.push.state().refused += 1;
-        let source = crate::request_source(&req, a.trust_forwarded);
-        if let Some(missed) = a.logins.failure(&format!("{}|google_push", source.ip.as_deref().unwrap_or("")), crate::db::now()) {
-            let actor = Actor { kind: ActorKind::System, id: Some("scim:google-push".into()), method: Some("google_push".into()), ..Default::default() };
-            let details = json!({ "tenant": d.settings.tenant, "reason": reason, "unloggedSinceLast": missed });
-            app.db.record(&Who { actor, source }.event("scim.google_push_refused").target("scim_tenant", &d.settings.tenant).outcome(Outcome::Failure).details(details));
+    let watch = match check(id, token) {
+        Ok(watch) => watch,
+        Err(reason) => {
+            d.push.state().refused += 1;
+            let source = crate::request_source(&req, a.trust_forwarded);
+            if let Some(missed) = a.logins.failure(&format!("{}|google_push", source.ip.as_deref().unwrap_or("")), crate::db::now()) {
+                let actor = Actor { kind: ActorKind::System, id: Some("scim:google-push".into()), method: Some("google_push".into()), ..Default::default() };
+                let details = json!({ "tenant": d.settings.tenant, "reason": reason, "unloggedSinceLast": missed });
+                app.db.record(&Who { actor, source }.event("scim.google_push_refused").target("scim_tenant", &d.settings.tenant).outcome(Outcome::Failure).details(details));
+            }
+            return StatusCode::UNAUTHORIZED.into_response();
         }
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let current = d.push.address.is_some() && {
+    };
+    let (current, event) = if d.push.watches(watch) {
         let st = d.push.state();
-        st.made.contains(id) || st.channels.iter().any(|c| c.id == id)
+        let event = st.channels.iter().find(|c| c.id == id).map(|c| c.event);
+        (event.is_some() || st.made.contains(id), event)
+    } else {
+        (false, None)
     };
     if !current {
-        stop_leftover(&d, id, resource);
+        stop_leftover(&d, watch, id, resource);
     }
     if d.push.address.is_some() && change != "sync" {
-        d.push.note(change);
+        d.push.note(change, event);
     }
     StatusCode::OK.into_response()
 }
@@ -436,13 +579,49 @@ mod tests {
     fn only_channels_botd_made_are_taken() {
         let id = format!("{PREFIX}{}", "ab".repeat(16));
         let token = channel_token(&id);
-        assert_eq!(check(&id, &token), Ok(()));
+        assert_eq!(check(&id, &token), Ok(Watch::Users));
         assert_eq!(check(&id, &token[1..]), Err("bad_token"));
         assert_eq!(check(&format!("{PREFIX}{}", "cd".repeat(16)), &token), Err("bad_token"), "a token is for its own channel only");
         assert_eq!(check("someone-elses", &token), Err("unknown_channel"));
         assert_eq!(check(&format!("{PREFIX}{}", "a".repeat(64)), &token), Err("unknown_channel"));
         assert_eq!(check(&id, ""), Err("missing"));
         assert_eq!(check("", &token), Err("missing"));
+
+        // A group channel's id says so, and its token is its own.
+        let group = format!("{GROUPS_PREFIX}{}", "ab".repeat(16));
+        assert_eq!(check(&group, &channel_token(&group)), Ok(Watch::Groups));
+        assert_eq!(check(&group, &token), Err("bad_token"), "a user channel's token isn't a group channel's");
+        assert_eq!(check(&format!("{GROUPS_PREFIX}{}", "a".repeat(64)), &channel_token(&group)), Err("unknown_channel"));
+        assert_eq!(check("superbot-x-ab", &channel_token("superbot-x-ab")), Err("unknown_channel"));
+        assert_eq!(check(GROUPS_PREFIX, &channel_token(GROUPS_PREFIX)), Err("unknown_channel"));
+    }
+
+    #[test]
+    fn group_push_needs_user_push_and_a_group() {
+        let push = Some("https://superbot.example.com/scim/google/push");
+        assert_eq!(groups(&vars(&[]), push, true), Ok(false), "off by default");
+        assert_eq!(groups(&vars(&[("GOOGLE_DIRECTORY_PUSH_GROUPS", "on")]), push, true), Ok(true));
+        assert!(groups(&vars(&[("GOOGLE_DIRECTORY_PUSH_GROUPS", "on")]), None, true).unwrap_err().contains("GOOGLE_DIRECTORY_PUSH=on"));
+        assert!(groups(&vars(&[("GOOGLE_DIRECTORY_PUSH_GROUPS", "on")]), push, false).unwrap_err().contains("GOOGLE_DIRECTORY_GROUPS"));
+        assert!(groups(&vars(&[("GOOGLE_DIRECTORY_PUSH_GROUPS", "sometimes")]), push, true).is_err());
+        assert_eq!(groups(&vars(&[("GOOGLE_DIRECTORY_PUSH_GROUPS", "off")]), None, false), Ok(false));
+    }
+
+    #[test]
+    fn group_changes_are_named_in_the_pass_they_start() {
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), true);
+        p.note("REMOVE_GROUP_MEMBER", None);
+        p.note("DELETE_GROUP", None);
+        p.note("CHANGE_GROUP_NAME", None);
+        p.note("update", None);
+        assert_eq!(p.begin(), vec!["DELETE_GROUP", "REMOVE_GROUP_MEMBER", "other", "update"]);
+        // A generic state names the event the channel was made for, or "other" from a leftover.
+        p.note("exists", Some("ADD_GROUP_MEMBER"));
+        p.note("exists", None);
+        p.note("REMOVE_GROUP_MEMBER", Some("ADD_GROUP_MEMBER"));
+        assert_eq!(p.begin(), vec!["ADD_GROUP_MEMBER", "REMOVE_GROUP_MEMBER", "other"]);
+        assert!(!Push::new(None, true).watches(Watch::Groups), "group push needs push");
+        assert!(!Push::new(Some("https://superbot.example.com/scim/google/push".into()), false).watches(Watch::Groups));
     }
 
     #[test]
@@ -459,12 +638,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_push_ends_the_wait_after_the_burst_settles_and_not_sooner_than_the_gap() {
         use tokio::time::Instant;
-        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), false);
         let hour = Duration::from_secs(3600);
         assert!(matches!(p.wait(Duration::from_secs(1)).await, Trigger::Schedule));
-        p.note("update");
-        p.note("delete");
-        p.note("makeAdmin");
+        p.note("update", None);
+        p.note("delete", None);
+        p.note("makeAdmin", None);
         let t = Instant::now();
         assert!(matches!(p.wait(hour).await, Trigger::Push), "a change pushed before the wait began still counts");
         assert!((SETTLE..SETTLE + Duration::from_secs(1)).contains(&t.elapsed()), "{:?}", t.elapsed());
@@ -481,15 +660,15 @@ mod tests {
         tokio::time::sleep(MIN_GAP).await;
         let started = Instant::now();
         p.begin();
-        p.note("add");
+        p.note("add", None);
         assert!(matches!(p.wait(hour).await, Trigger::Push));
         assert!((MIN_GAP..MIN_GAP + Duration::from_secs(1)).contains(&started.elapsed()), "{:?}", started.elapsed());
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_change_a_failed_pass_took_gets_another() {
-        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
-        p.note("update");
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), false);
+        p.note("update", None);
         let taken = p.begin();
         p.give_back(&[]);
         assert!(matches!(p.wait(Duration::from_secs(60)).await, Trigger::Schedule), "the note's nudge was spent by that pass");
@@ -503,13 +682,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_admin_pass_while_a_burst_settles_restarts_the_gap() {
         use tokio::time::{sleep, Instant};
-        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
-        p.note("add");
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), false);
+        p.note("add", None);
         let admin = async {
             sleep(SETTLE / 2).await;
             let began = Instant::now();
             assert_eq!(p.begin(), vec!["add"]);
-            p.note("update");
+            p.note("update", None);
             began
         };
         let (trigger, began) = tokio::join!(p.wait(Duration::from_secs(3600)), admin);
@@ -520,15 +699,22 @@ mod tests {
 
     #[test]
     fn channels_past_their_end_arent_watching() {
-        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()));
+        let p = Push::new(Some("https://superbot.example.com/scim/google/push".into()), true);
         let now = crate::db::now();
-        let channel = |expires_at| Channel { id: format!("{PREFIX}00"), resource_id: "r".into(), event: "update", expires_at };
-        p.state().channels = vec![channel(Some(now - 1_000)), channel(Some(now - 1))];
+        let channel = |watch, expires_at| Channel { id: format!("{PREFIX}00"), resource_id: "r".into(), watch, event: "update", expires_at };
+        p.state().channels = vec![channel(Watch::Users, Some(now - 1_000)), channel(Watch::Users, Some(now - 1))];
         assert_eq!(p.status()["watching"], false, "a failed renewal keeps ended channels");
-        assert_eq!(p.state().live(now), 0);
-        p.state().channels.push(channel(Some(now + 60_000)));
+        assert_eq!(p.state().live(Watch::Users, now), 0);
+        p.state().channels.push(channel(Watch::Users, Some(now + 60_000)));
         assert_eq!(p.status()["watching"], true);
-        p.state().channels = vec![channel(None)];
+        p.state().channels = vec![channel(Watch::Users, None)];
         assert_eq!(p.status()["watching"], true, "no end given");
+
+        // Each set is watching on its own.
+        assert_eq!(p.status()["groups"], json!({ "enabled": true, "watching": false, "renewedAt": null, "failure": null }));
+        p.state().channels = vec![channel(Watch::Groups, Some(now + 60_000))];
+        assert_eq!((p.status()["watching"].as_bool(), p.status()["groups"]["watching"].as_bool()), (Some(false), Some(true)));
+        let off = Push::new(Some("https://superbot.example.com/scim/google/push".into()), false);
+        assert_eq!(off.status()["groups"], json!({ "enabled": false }));
     }
 }
