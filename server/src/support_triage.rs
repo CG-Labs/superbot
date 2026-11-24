@@ -23,12 +23,26 @@ pub const USAGE: &str = "Usage: botctl support-triage <bundle.tar | bundle.tar.g
 /// A bundle, unpacked, at most this big; botd's own are well under 1 MiB.
 pub const MAX_BYTES: u64 = 64 << 20;
 /// The newest bundle formats this reads: `botctl support-bundle`'s, `botd support bundle`'s.
-pub const ONLINE_FORMAT: u64 = 2;
+pub const ONLINE_FORMAT: u64 = 3;
 pub const OFFLINE_FORMAT: u64 = 1;
 /// Every file either bundle has. Anything else in the tar is left unread.
-pub const FILES: [&str; 11] =
-    ["README.txt", "version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "logs.jsonl", "audit-summary.json", "check.json", "logs.txt", "manifest.json"];
+pub const FILES: [&str; 12] = [
+    "README.txt",
+    "version.json",
+    "config.json",
+    "health.json",
+    "health-score.json",
+    "health-score-history.json",
+    "onboarding.json",
+    "logs.jsonl",
+    "audit-summary.json",
+    "check.json",
+    "logs.txt",
+    "manifest.json",
+];
 const ONLINE_FILES: [&str; 7] = ["version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "logs.jsonl", "audit-summary.json"];
+/// Files an online bundle has from this format on, so an older bundle isn't asked for them.
+const ONLINE_SINCE: [(&str, u64); 1] = [("onboarding.json", 3)];
 const OFFLINE_FILES: [&str; 4] = ["version.json", "check.json", "config.json", "logs.txt"];
 /// Longest text taken from the bundle into the triage, in characters.
 const TEXT: usize = 240;
@@ -522,6 +536,32 @@ fn health_rules(health: &Value, version: Option<&Value>, out: &mut Vec<Finding>)
     }
 }
 
+/// The onboarding check in the bundle (ADR 0243): open items, for the TAM rather than the
+/// incident, so no severity. `first_bundle` is left out, since the bundle itself is one,
+/// made after the check ran.
+fn onboarding_rules(onboarding: &Value, out: &mut Vec<Finding>) {
+    let items = onboarding["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let id_ok = |id: &str| !id.is_empty() && id.len() <= 40 && id.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_');
+    let open: Vec<String> = items
+        .iter()
+        .filter(|i| str_at(i, "status") == Some("open"))
+        .filter_map(|i| str_at(i, "id").filter(|id| id_ok(id) && *id != "first_bundle").map(|id| (id, i)))
+        .map(|(id, i)| match str_at(i, "label").map(clean) {
+            Some(label) => format!("{label} ({id})"),
+            None => id.to_string(),
+        })
+        .collect();
+    if open.is_empty() {
+        return;
+    }
+    let total = items.len();
+    out.push(
+        Finding::new("onboarding.open", Level::Info, None, format!("Onboarding check {} of {total} items open: {}", open.len(), open.join("; ")), "onboarding.json items")
+            .runbook("support/onboarding-check.md")
+            .next("For the TAM: items agreed at kickoff show open here, since the bundle has no skips; check them against the onboarding record and raise the rest."),
+    );
+}
+
 /// The runbook a set of sign-in reason codes points at.
 fn sign_in_books(codes: &[String], saml_used: bool) -> Vec<&'static str> {
     let saml = saml_used || codes.iter().any(|c| SAML_REASONS.contains(&c.as_str()));
@@ -967,6 +1007,7 @@ pub fn triage(b: &Bundle, o: &Options) -> Result<Triage, String> {
         Kind::Online => (read("health.json"), read("health-score.json"), read("health-score-history.json"), read("audit-summary.json"), None),
         Kind::Offline => (None, None, None, None, read("check.json")),
     };
+    let onboarding = if kind == Kind::Online { read("onboarding.json") } else { None };
     let mut findings = out;
     if let Some(v) = &version {
         version_rules(v, kind, o, &mut findings);
@@ -987,6 +1028,9 @@ pub fn triage(b: &Bundle, o: &Options) -> Result<Triage, String> {
     if let Some(c) = &check {
         check_rules(c, &mut findings);
     }
+    if let Some(o) = &onboarding {
+        onboarding_rules(o, &mut findings);
+    }
     let log_file = if kind == Kind::Online { "logs.jsonl" } else { "logs.txt" };
     if let Some(t) = b.text(log_file) {
         log_rules(log_file, &t, &mut findings);
@@ -1004,8 +1048,12 @@ pub fn triage(b: &Bundle, o: &Options) -> Result<Triage, String> {
     let testing = health.as_ref().is_some_and(|h| h["license"]["summary"]["testing"] == true)
         || check.as_ref().is_some_and(|c| c["findings"].as_array().into_iter().flatten().any(|f| f["id"] == "license" && f["details"]["edition"] == "testing"));
     findings.sort_by(|a, b| b.level.cmp(&a.level).then(a.severity.unwrap_or(9).cmp(&b.severity.unwrap_or(9))));
-    let expected: &[&str] = if kind == Kind::Online { &ONLINE_FILES } else { &OFFLINE_FILES };
-    let missing = expected.iter().copied().filter(|f| !b.has(f)).collect();
+    let format = version.as_ref().and_then(|v| v["bundleFormat"].as_u64()).unwrap_or(0);
+    let expected: Vec<&'static str> = match kind {
+        Kind::Online => ONLINE_FILES.into_iter().chain(ONLINE_SINCE.iter().filter(|(_, since)| format >= *since).map(|(f, _)| *f)).collect(),
+        Kind::Offline => OFFLINE_FILES.to_vec(),
+    };
+    let missing = expected.into_iter().filter(|f| !b.has(f)).collect();
     Ok(Triage {
         name: if b.name.is_empty() { "(unnamed)".into() } else { clean(&b.name) },
         kind,
@@ -1487,17 +1535,43 @@ mod tests {
     }
 
     #[test]
+    fn open_onboarding_items_are_for_the_tam_and_set_no_severity() {
+        let mut v = version();
+        v["bundleFormat"] = json!(3);
+        let item = |id: &str, label: &str, status: &str| json!({ "id": id, "section": "identity", "label": label, "status": status, "detail": "x", "guide": "docs/x.md" });
+        let onboarding = json!({ "format": 1, "ready": false, "items": [
+            item("idp", "Identity provider set up", "done"),
+            item("break_glass", "Break-glass sign-in off", "open"),
+            item("first_bundle", "A first support bundle made", "open"),
+            item("contacts", "Customer contacts recorded", "confirm"),
+            item("Bad Id!", "Not an item", "open"),
+            item("server_backups", "Server backups\u{1b}[31m off the host,\n encrypted", "open"),
+        ] });
+        let t = triage(&online(vec![("version.json", v.clone()), ("onboarding.json", onboarding)]), &opts()).unwrap();
+        let f = find(&t, "onboarding.open");
+        assert_eq!((f.level, f.severity), (Level::Info, None));
+        assert_eq!(f.summary, "Onboarding check 2 of 6 items open: Break-glass sign-in off (break_glass); Server backups [31m off the host, encrypted (server_backups)");
+        assert_eq!((f.evidence.as_str(), f.runbooks.clone()), ("onboarding.json items", vec!["support/onboarding-check.md"]));
+        assert!(t.severity().is_none() && t.missing.is_empty(), "{:?}", t.missing);
+
+        let ready = json!({ "items": [item("first_bundle", "A first support bundle made", "open"), item("idp", "Identity provider set up", "done")] });
+        assert!(triage(&online(vec![("version.json", v.clone()), ("onboarding.json", ready)]), &opts()).unwrap().findings.is_empty(), "this bundle is the first bundle");
+        assert_eq!(triage(&online(vec![("version.json", v)]), &opts()).unwrap().missing, ["onboarding.json"], "format 3 has it");
+        assert!(triage(&online(vec![]), &opts()).unwrap().missing.is_empty(), "format 2 bundles didn't");
+    }
+
+    #[test]
     fn versions_age_and_formats() {
         let mut v = version();
         v["uptimeSeconds"] = json!(90);
-        v["bundleFormat"] = json!(3);
+        v["bundleFormat"] = json!(4);
         let mut o = opts();
         o.as_of = at("2026-11-27T05:00:00Z");
         o.latest = semver("1.6.1");
         let t = triage(&online(vec![("version.json", v.clone())]), &o).unwrap();
         assert_eq!(find(&t, "version.behind").level, Level::Warn, "a minor release behind");
         assert_eq!(find(&t, "botd.restarted").summary, "botd started 90 s before the bundle was made: a restart, or a crash it came back from");
-        assert!(find(&t, "bundle.format").summary.contains("bundle format 3; this botctl reads 2"));
+        assert!(find(&t, "bundle.format").summary.contains("bundle format 4; this botctl reads 3"));
         assert_eq!(find(&t, "bundle.stale").summary, "The bundle was made 3 days before this triage");
         o.latest = semver("1.4.3");
         assert_eq!(find(&triage(&online(vec![("version.json", v.clone())]), &o).unwrap(), "version.behind").level, Level::Info);

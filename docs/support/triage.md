@@ -64,6 +64,7 @@ A server in testing mode isn't production, and Severity 1 and 2 are for producti
 | `machines.error`, `machines.hosts`, `machines.rpo` | machines | A machine in error; an Incus host down or lost; a machine past its RPO | 3; 2; 2 | [Machine down](runbook-machine-down.md) |
 | `harness.none` | `version.json` | No harness on the server and no managed machines | 2 | [Harness outage](runbook-harness-outage.md) |
 | `setup.open` | the setup checklist | Items not done | 4 | [Onboarding](onboarding.md) |
+| `onboarding.open` | `onboarding.json` | Onboarding checklist items botd sees open, for the TAM. Not `first_bundle`, since the bundle is one; items agreed at kickoff show too, as the bundle has no skips | | [Onboarding check](onboarding-check.md) |
 | `signal.identity` | `health-score.json` | At risk; watch. The reasons pick SAML or other sign-in, and SCIM | 2; 3 | [SAML](runbook-saml.md#reasons-and-fixes), [sign-in](runbook-sign-in.md#reasons-and-fixes), [SCIM](../sso/scim.md) |
 | `signal.backups` | the same | At risk (past the RPO); watch | 2; none | [Machine down](runbook-machine-down.md), [backup and restore](../ops/backup-restore.md) |
 | `signal.license` | the same | At risk; watch | 2; 4 | [License](health-score.md#license) |
