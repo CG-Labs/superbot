@@ -498,6 +498,8 @@ export interface CustomRoleRef {
   name: string;
   /** When a role given by hand ends, in Unix ms; null or absent when it doesn't (ADR 0197). */
   expiresAt?: number | null;
+  /** In a team: their identity provider gives it (a SCIM group), so only its mapping changes it (ADR 0254). */
+  fromIdp?: boolean;
 }
 
 /** A permission a custom role can hold; `team` ones also apply when given within a team. */
@@ -1359,6 +1361,8 @@ export interface TeamMember {
   active: boolean;
   /** A custom role given within this team (ADR 0123): only its team permissions apply here. */
   customRole?: CustomRoleRef | null;
+  /** Read-only across the server, so no custom role in the team; shown to those who manage members (ADR 0254). */
+  readOnly?: boolean;
   /** Only for the team's owners and admins; null when they have none. */
   machine?: TeamMachine | null;
 }
@@ -1390,6 +1394,19 @@ export interface Team {
   billing?: TeamBilling;
   /** Where members' machines and backups live (ADR 0117), unless one has their own; null is the server's default. */
   region?: string | null;
+  /** Owners and admins only: the custom roles they may give in the team (ADR 0254). */
+  roleChoices?: TeamRoleChoice[];
+}
+
+/** A custom role a team's owners and admins may give in it, and what it adds there (ADR 0254). */
+export interface TeamRoleChoice {
+  id: string;
+  name: string;
+  description: string;
+  /** Its team permissions: all it does in a team. */
+  applies: string[];
+  /** Time-bound: given only with an end at most this many days away (ADR 0197). */
+  maxDays: number | null;
 }
 
 /** A team's plan, paid for by the team for everyone on it (ADR 0093). Never a Stripe id. */

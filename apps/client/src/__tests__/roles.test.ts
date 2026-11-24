@@ -8,6 +8,7 @@ import {
   effectivePermissions,
   emptyDraft,
   endChoices,
+  endNear,
   endsAt,
   endsLabel,
   holdersLabel,
@@ -145,6 +146,15 @@ describe("time-bound roles (ADR 0197)", () => {
     expect(endChoices(1).map((c) => c.value)).toEqual(["8h", "1d"]);
     expect(defaultEnd()).toBe("none");
     expect(defaultEnd(30)).toBe("8h");
+  });
+
+  it("starts a change near the end someone holds now", () => {
+    expect(endNear(null, null, 0)).toBe("none");
+    expect(endNear(7, null, 0)).toBe("8h");
+    expect(endNear(null, 5 * D, 0)).toBe("7d");
+    expect(endNear(null, 2 * H, 0)).toBe("8h");
+    expect(endNear(7, 60 * D, 0)).toBe("7d");
+    expect(endNear(null, 200 * D, 0)).toBe("90d");
   });
 
   it("turns a choice into an end", () => {

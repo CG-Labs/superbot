@@ -1,9 +1,12 @@
 import { ApiError, SuperBotApi } from "../api";
 import {
+  appliesLine,
   assignableRoles,
   blockedReason,
   canLeave,
   canRemove,
+  customRoleActions,
+  customRoleLine,
   leaveBlocked,
   looksLikeEmail,
   machineStatus,
@@ -150,6 +153,30 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
     expect(looksLikeEmail("cy")).toBe(false);
     expect(looksLikeEmail("cy@example")).toBe(false);
   });
+
+  it("lets owners and admins give custom roles to other plain members, never over the IdP (ADR 0254)", () => {
+    const choices = [{ id: "r1", name: "Team people", description: "", applies: ["users.manage"], maxDays: null }];
+    const team = { role: "admin" as const, roleChoices: choices };
+    const held = { id: "r1", name: "Team people" };
+    expect(customRoleActions(team, member("cy", "member"), "me")).toEqual({ give: true, take: false });
+    expect(customRoleActions(team, { ...member("cy", "member"), customRole: held }, "me")).toEqual({ give: true, take: true });
+    expect(customRoleActions(team, { ...member("cy", "member"), customRole: { ...held, fromIdp: true } }, "me")).toEqual({ give: false, take: false });
+    expect(customRoleActions(team, { ...member("cy", "member"), readOnly: true }, "me")).toEqual({ give: false, take: false });
+    expect(customRoleActions(team, { ...member("ev", "admin"), customRole: held }, "me")).toEqual({ give: false, take: true });
+    expect(customRoleActions(team, member("ev", "owner"), "me")).toEqual({ give: false, take: false });
+    expect(customRoleActions(team, member("me", "member"), "me")).toEqual({ give: false, take: false });
+    expect(customRoleActions({ role: "admin", roleChoices: [] }, member("cy", "member"), "me")).toEqual({ give: false, take: false });
+    expect(customRoleActions({ role: "member", roleChoices: choices }, member("cy", "member"), "me")).toEqual({ give: false, take: false });
+  });
+
+  it("puts a teammate's custom role in a few words", () => {
+    const now = Date.UTC(2026, 10, 24);
+    expect(customRoleLine(null)).toBeNull();
+    expect(customRoleLine({ id: "r1", name: "Team people" }, now)).toBe("Team people");
+    expect(customRoleLine({ id: "r1", name: "On call", expiresAt: now + 3 * 86_400_000 }, now)).toBe("On call · ends in 3 days");
+    expect(customRoleLine({ id: "r1", name: "Billing", fromIdp: true }, now)).toBe("Billing · from your identity provider");
+    expect(appliesLine({ applies: ["users.manage", "machines.manage"] })).toBe("In this team: users.manage, machines.manage. Nothing changes for them across the server.");
+  });
 });
 
 describe("team API", () => {
@@ -179,6 +206,12 @@ describe("team API", () => {
     answer(200, {});
     await api.setTeamRole("u1", "admin");
     expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("/api/team/members/u1"), expect.objectContaining({ method: "PATCH", body: '{"role":"admin"}' }));
+    answer(200, {});
+    await api.giveTeamCustomRole("u 1", "r1", { expiresAt: 5 });
+    expect(fetchMock).toHaveBeenLastCalledWith("https://bots.example.com/api/team/members/u%201/custom-role", expect.objectContaining({ method: "PUT", body: '{"role":"r1","expiresAt":5}' }));
+    answer(200, {});
+    await api.takeTeamCustomRole("u1");
+    expect(fetchMock).toHaveBeenLastCalledWith("https://bots.example.com/api/team/members/u1/custom-role", expect.objectContaining({ method: "DELETE" }));
     answer(200, {});
     await api.removeTeammate("u1");
     expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("/api/team/members/u1"), expect.objectContaining({ method: "DELETE" }));

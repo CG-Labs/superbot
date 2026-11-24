@@ -3,10 +3,14 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 import type { SuperBotApi } from "../src/api";
 import { checkoutNotice, limitSummary, openBillingPage } from "../src/billing";
 import { confirmAsync } from "../src/dialogs";
+import { defaultEnd, endChoices, endNear, endsAt } from "../src/roles";
 import {
+  appliesLine,
   assignableRoles,
   blockedReason,
   canRemove,
+  customRoleActions,
+  customRoleLine,
   leaveBlocked,
   looksLikeEmail,
   machineStatus,
@@ -20,7 +24,7 @@ import {
   type Tone,
 } from "../src/team";
 import { colors } from "../src/theme";
-import type { MyTeamInvite, Team, TeamBilling, TeamMember, TeamRole } from "../src/types";
+import type { CustomRoleRef, MyTeamInvite, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
 import { Chips } from "./Chips";
 
 interface Props {
@@ -48,6 +52,46 @@ const TONE: Record<Tone, object> = {
   dim: { color: colors.textDim },
 };
 
+/** Giving a teammate one of the team's custom roles, for how long (ADR 0254). */
+function GiveRole({
+  choices,
+  held,
+  busy,
+  onGive,
+  onCancel,
+}: {
+  choices: TeamRoleChoice[];
+  /** The role they hold now: a change starts on it, and near its end. */
+  held?: CustomRoleRef | null;
+  busy: boolean;
+  onGive: (roleId: string, ends: string) => void;
+  onCancel: () => void;
+}) {
+  const [roleId, setRoleId] = useState((choices.find((c) => c.id === held?.id) ?? choices[0]).id);
+  const choice = choices.find((c) => c.id === roleId) ?? choices[0];
+  const [ends, setEnds] = useState(() => (held && held.id === choice.id ? endNear(choice.maxDays, held.expiresAt, Date.now()) : defaultEnd(choice.maxDays)));
+  const pick = (id: string) => {
+    setRoleId(id);
+    setEnds(defaultEnd(choices.find((c) => c.id === id)?.maxDays));
+  };
+  return (
+    <View style={styles.rolePanel} testID="give-role">
+      <Chips options={choices.map((c) => ({ value: c.id, label: c.name }))} value={choice.id} onChange={pick} disabled={busy} />
+      {choice.description ? <Text style={styles.dim}>{choice.description}</Text> : null}
+      <Text style={styles.faint}>{appliesLine(choice)}</Text>
+      <Chips options={endChoices(choice.maxDays)} value={ends} onChange={setEnds} disabled={busy} />
+      <View style={styles.actions}>
+        <Pressable style={styles.primaryBtn} disabled={busy} onPress={() => onGive(choice.id, ends)} accessibilityRole="button">
+          <Text style={styles.primaryText}>Give {choice.name}</Text>
+        </Pressable>
+        <Pressable style={styles.btn} disabled={busy} onPress={onCancel} accessibilityRole="button">
+          <Text style={styles.btnText}>Cancel</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 function MemberRow({
   m,
   team,
@@ -56,6 +100,8 @@ function MemberRow({
   busy,
   onRole,
   onRemove,
+  onGiveRole,
+  onTakeRole,
 }: {
   m: TeamMember;
   team: Team;
@@ -64,9 +110,15 @@ function MemberRow({
   busy: boolean;
   onRole: (m: TeamMember, role: TeamRole) => void;
   onRemove: (m: TeamMember) => void;
+  onGiveRole: (m: TeamMember, roleId: string, ends: string) => void;
+  onTakeRole: (m: TeamMember) => void;
 }) {
+  const [giving, setGiving] = useState(false);
   const roles = manage ? assignableRoles(team.role, m) : [];
   const status = manage ? machineStatus(m.machine) : null;
+  const custom = manage ? customRoleActions(team, m, meId) : { give: false, take: false };
+  const roleLine = customRoleLine(m.customRole);
+  const who = m.name ?? m.email ?? m.id;
   return (
     <View style={styles.member} accessibilityLabel={`Teammate ${m.name ?? m.email ?? m.id}`}>
       <View style={styles.memberHead}>
@@ -93,6 +145,36 @@ function MemberRow({
           disabled={busy}
           onChange={(r) => r !== m.role && onRole(m, r)}
         />
+      ) : null}
+      {roleLine ? (
+        <Text style={styles.dim} testID={`custom-role-${m.id}`}>
+          Team role: {roleLine}
+        </Text>
+      ) : null}
+      {giving && custom.give ? (
+        <GiveRole
+          choices={team.roleChoices ?? []}
+          held={m.customRole}
+          busy={busy}
+          onGive={(roleId, ends) => {
+            setGiving(false);
+            onGiveRole(m, roleId, ends);
+          }}
+          onCancel={() => setGiving(false)}
+        />
+      ) : custom.give || custom.take ? (
+        <View style={styles.actions}>
+          {custom.give ? (
+            <Pressable style={styles.btn} disabled={busy} onPress={() => setGiving(true)} accessibilityRole="button" accessibilityLabel={`${m.customRole ? "Change" : "Give"} team role for ${who}`}>
+              <Text style={styles.btnText}>{m.customRole ? "Change team role" : "Give a team role"}</Text>
+            </Pressable>
+          ) : null}
+          {custom.take ? (
+            <Pressable style={styles.btn} disabled={busy} onPress={() => onTakeRole(m)} accessibilityRole="button" accessibilityLabel={`Take away team role from ${who}`}>
+              <Text style={styles.btnText}>Take away role</Text>
+            </Pressable>
+          ) : null}
+        </View>
       ) : null}
       {manage && canRemove(team.role, m, meId) ? (
         <Pressable style={styles.dangerBtn} disabled={busy} onPress={() => onRemove(m)} accessibilityRole="button" accessibilityLabel={`Remove ${m.name ?? m.email ?? m.id}`}>
@@ -197,6 +279,15 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
       if (to === "owner" && !(await confirmAsync(`Make ${who} an owner?`, "Owners can make and remove other owners, and take anyone off the team.", "Make owner"))) return;
       if (m.id === meId && !(await confirmAsync("Change your own role?", `You'll be ${TEAM_ROLE_LABEL[to].toLowerCase()} and may not be able to change it back.`, "Change"))) return;
       await api.setTeamRole(m.id, to);
+    });
+
+  const giveRole = (m: TeamMember, roleId: string, ends: string) => run(() => api.giveTeamCustomRole(m.id, roleId, { expiresAt: endsAt(ends, Date.now()) }));
+
+  const takeRole = (m: TeamMember) =>
+    run(async () => {
+      const who = m.name ?? m.email ?? "them";
+      if (!(await confirmAsync(`Take ${m.customRole?.name ?? "their role"} away from ${who}?`, "They keep their place on the team, and lose what the role let them do in it.", "Take away"))) return;
+      await api.takeTeamCustomRole(m.id);
     });
 
   const remove = (m: TeamMember) =>
@@ -337,7 +428,7 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>People</Text>
               {team.members.map((m) => (
-                <MemberRow key={m.id} m={m} team={team} meId={meId} manage={manage} busy={busy} onRole={changeRole} onRemove={remove} />
+                <MemberRow key={m.id} m={m} team={team} meId={meId} manage={manage} busy={busy} onRole={changeRole} onRemove={remove} onGiveRole={giveRole} onTakeRole={takeRole} />
               ))}
             </View>
 
@@ -395,6 +486,7 @@ const styles = StyleSheet.create({
   dangerBtn: { alignSelf: "flex-start", borderWidth: 1, borderColor: "#5a2a2c", borderRadius: 999, paddingVertical: 6, paddingHorizontal: 14 },
   dangerText: { color: colors.danger, fontSize: 14 },
   inviteRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  rolePanel: { gap: 8, paddingTop: 4 },
   link: { color: colors.blueDot },
   empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
   error: { color: colors.danger },

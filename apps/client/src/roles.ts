@@ -52,6 +52,14 @@ export function defaultEnd(maxDays?: number | null): string {
   return endChoices(maxDays)[0].value;
 }
 
+/** The choice nearest an end someone holds now (none, or the first that lasts as long), for changing it. */
+export function endNear(maxDays: number | null | undefined, expiresAt: number | null | undefined, now: number): string {
+  const choices = endChoices(maxDays);
+  if (expiresAt == null) return choices[0].value;
+  const timed = ENDS.filter((e) => e.ms != null && choices.some((c) => c.value === e.value));
+  return (timed.find((e) => (e.ms ?? 0) >= expiresAt - now) ?? timed[timed.length - 1] ?? choices[0]).value;
+}
+
 /** When a role given now with `choice` ends, in Unix ms, or null for none. */
 export function endsAt(choice: string, now: number): number | null {
   const ms = ENDS.find((e) => e.value === choice)?.ms;
