@@ -86,6 +86,31 @@ async fn it_drafts_from_what_botd_recorded() {
     run(&claude.id, "error");
     run(&codex.id, "done");
     run(&codex.id, "timeout");
+    // Runs are counted under the harness that ran them, even once their Bot moved on or went.
+    let ran = |bot: &str, harness: &str, run_id: &str| {
+        app.db.record(&Event::new(Actor::system("runner"), "bot.run_finished").bot(bot).outcome(Outcome::Success).details(json!({ "result": "done", "runId": run_id })));
+        let row = crate::db::TokenRow {
+            user_id: "u".into(),
+            bot_id: bot.into(),
+            run_id: run_id.into(),
+            message_id: None,
+            harness: harness.into(),
+            model: None,
+            reported: false,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            at: crate::db::now(),
+            meter: None,
+        };
+        app.db.record_tokens(&[row]).unwrap();
+    };
+    ran(&codex.id, "hermes", "run_before_the_switch");
+    let gone = app.db.create_bot("Gone", "#fff", "waddle", "codex", None, false);
+    ran(&gone.id, "codex", "run_of_a_deleted_bot");
+    run(&gone.id, "done");
+    app.db.delete_bot(&gone.id);
     for reason in ["tier_limit", "storage_limit", "egress_policy_pending"] {
         app.db.record(&Event::new(Actor::system("runner"), "bot.run_refused").outcome(Outcome::Denied).details(json!({ "reason": reason })));
     }
@@ -102,10 +127,18 @@ async fn it_drafts_from_what_botd_recorded() {
     let r = parse(&body);
     let now = &r["months"][2];
     assert_eq!((now["month"].clone(), now["soFar"].clone()), (json!(this_month()), json!(true)));
-    assert_eq!((now["runsFinished"].clone(), now["runsFailed"].clone(), now["refusedAtLimit"].clone()), (json!(11), json!(2), json!(2)), "{now:#}");
+    assert_eq!((now["runsFinished"].clone(), now["runsFailed"].clone(), now["refusedAtLimit"].clone()), (json!(14), json!(2), json!(2)), "{now:#}");
     assert_eq!(now["healthChecks"], 1);
     assert!(now["lastCheck"]["open"].as_array().unwrap().contains(&json!("incidents")), "the check saw the incident: {now:#}");
-    assert_eq!(r["harnesses"], json!([{ "harness": "claude", "finished": 9, "failed": 1 }, { "harness": "codex", "finished": 2, "failed": 1 }]));
+    assert_eq!(
+        r["harnesses"],
+        json!([
+            { "harness": "claude", "finished": 9, "failed": 1 },
+            { "harness": "codex", "finished": 3, "failed": 1 },
+            { "harness": "hermes", "finished": 1, "failed": 0 },
+            { "harness": "unrecorded", "finished": 1, "failed": 0 },
+        ])
+    );
     assert_eq!(r["incidents"].as_array().unwrap().len(), 1);
     assert_eq!((r["incidents"][0]["id"].as_str(), r["incidents"][0]["reviewed"].as_bool()), (Some(major.as_str()), Some(false)));
     assert_eq!(r["accessReviews"].as_array().unwrap().len(), 1);
@@ -115,7 +148,7 @@ async fn it_drafts_from_what_botd_recorded() {
     for want in [
         format!("**no**: `botctl incident review {major}`"),
         format!("| Resolve incident `{major}`, still open |"),
-        "`claude` 9 runs, 1 (11%) failed or timed out; `codex` 2 runs, 1 (50%) failed or timed out".into(),
+        "`claude` 9 runs, 1 (11%) failed or timed out; `codex` 3 runs, 1 (33%) failed or timed out; `hermes` 1 run, 0 (0%) failed or timed out; Deleted Bots, harness not recorded: 1 run, 0 (0%) failed or timed out.".into(),
         "- Access review signed off on ".into(),
     ] {
         assert!(md.contains(&want), "no {want:?} in:\n{md}");

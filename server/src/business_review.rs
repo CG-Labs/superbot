@@ -39,6 +39,8 @@ pub const TEMPLATE: &str = "docs/support/qbr-template.md";
 const TODO: &str = "_To fill in._";
 const MINUTE: i64 = 60_000;
 const DAY_MS: i64 = 86_400_000;
+/// Runs with no record of their harness whose Bot is gone.
+pub const UNRECORDED: &str = "unrecorded";
 
 /// Counted for each month; the health score's own reading of them (ADR 0144).
 const MONTH_ACTIONS: [&str; 12] = [
@@ -267,8 +269,11 @@ pub struct Adoption {
     /// The license's seats, when there is one.
     pub seats_used: Option<u64>,
     pub seat_cap: Option<u64>,
-    pub license_days_left: Option<i64>,
+    /// None in testing mode with no license.
     pub license_mode: Option<String>,
+    pub license_usable: bool,
+    /// When the license ends, unix ms.
+    pub license_ends_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -409,8 +414,9 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
 
     let bots: HashMap<String, String> = app.db.bots().into_iter().map(|b| (b.id, b.harness)).collect();
     let mut by: BTreeMap<String, Harness> = BTreeMap::new();
-    for (bot, result, n) in app.db.run_results_by_bot(start, end) {
-        let name = bot.and_then(|b| bots.get(&b).cloned()).map_or_else(|| "deleted Bots".to_string(), |h| code(&h).to_string());
+    for (bot, ran, result, n) in app.db.run_results_by_harness(start, end) {
+        // Runs from before botd kept each run's harness fall back to their Bot's harness now.
+        let name = ran.or_else(|| bot.and_then(|b| bots.get(&b).cloned())).map_or_else(|| UNRECORDED.to_string(), |h| code(&h).to_string());
         let h = by.entry(name.clone()).or_insert_with(|| Harness { harness: name, ..Default::default() });
         h.finished += n;
         if result.as_deref().is_some_and(|r| RUN_FAILURES.contains(&r)) {
@@ -463,7 +469,7 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
     let lf = &license["facts"];
     let cp = &a.machines;
     let machines = cp.enabled().then(|| {
-        let restores: Vec<crate::db::MachineRestore> = app.db.machine_restores_recent(1000).into_iter().filter(|r| r.created_at >= start && r.created_at < end).collect();
+        let restores = app.db.machine_restores_between(start, end);
         Machines {
             restores: restores.len(),
             restores_past_rto: restores.iter().filter(|r| r.rto_exceeded_at.is_some()).count(),
@@ -490,8 +496,9 @@ pub fn build(app: &App, a: &Auth, to: Ym, now_ms: i64) -> Draft {
             active: adoption["facts"]["active"].as_u64().unwrap_or(0),
             seats_used: lf["seatsUsed"].as_u64(),
             seat_cap: lf["seats"].as_u64(),
-            license_days_left: lf["daysLeft"].as_i64(),
             license_mode: lf["mode"].as_str().map(|m| code(m).to_string()),
+            license_usable: lf["usable"] == true,
+            license_ends_at: lf.is_object().then(|| app.license.status_at(now_ms).expires_at()).flatten(),
         },
         harnesses,
         incidents,
@@ -671,7 +678,14 @@ impl Draft {
         if self.harnesses.is_empty() {
             let _ = writeln!(m, "- No Bot run finished this quarter.");
         } else {
-            let by: Vec<String> = self.harnesses.iter().map(|h| format!("`{}` {}, {} failed or timed out", code(&h.harness), plural(h.finished, "run", "runs"), share(h.failed, h.finished))).collect();
+            let by: Vec<String> = self
+                .harnesses
+                .iter()
+                .map(|h| {
+                    let name = if h.harness == UNRECORDED { "Deleted Bots, harness not recorded:".to_string() } else { format!("`{}`", code(&h.harness)) };
+                    format!("{name} {}, {} failed or timed out", plural(h.finished, "run", "runs"), share(h.failed, h.finished))
+                })
+                .collect();
             let _ = writeln!(m, "- By harness, over the quarter: {}.", by.join("; "));
         }
         let _ = writeln!(m, "- Usage against the plan's limits, and who was at a limit: `botctl usage`.");
@@ -740,12 +754,17 @@ impl Draft {
 
         let _ = writeln!(m, "## 6. What's next\n");
         let _ = writeln!(m, "- botd {} now. {TODO} Releases since the last review that matter to them, and the next upgrade window.", code(&self.version));
-        match (a.license_mode.as_deref(), a.license_days_left) {
-            (Some("grace"), _) => _ = writeln!(m, "- The license has ended and is in its grace period: the renewal is with the account owner."),
-            (Some(_), Some(d)) if d >= 0 => _ = writeln!(m, "- The license ends in {} ({}).", plural(d as u64, "day", "days"), date(self.drafted_at + d * DAY_MS)),
-            (Some(_), Some(_)) => _ = writeln!(m, "- The license has ended."),
-            (Some(_), None) => _ = writeln!(m, "- The license doesn't end."),
+        match (a.license_mode.as_deref(), a.license_ends_at) {
             (None, _) => {}
+            (Some(mode), _) if !a.license_usable => _ = writeln!(m, "- There's no usable license ({mode}), so Bots don't run: `botctl license`."),
+            (Some("grace"), _) => _ = writeln!(m, "- The license has ended and is in its grace period: the renewal is with the account owner."),
+            (Some(_), Some(end)) if end > self.drafted_at => {
+                let days = (end - self.drafted_at).div_euclid(DAY_MS);
+                let _ = writeln!(m, "- The license ends in {}, on {}.", plural(days as u64, "day", "days"), date(end));
+            }
+            (Some(_), Some(_)) => _ = writeln!(m, "- The license has ended."),
+            (Some("active"), None) => _ = writeln!(m, "- The license doesn't end."),
+            (Some(_), None) => {}
         }
         let _ = writeln!(m, "- {TODO} Roadmap items they asked for, with what the Provider can say about them (no dates that aren't committed).");
         let _ = writeln!(m, "- {TODO} Their plans for next quarter: new teams, regions, identity provider or network changes, renewals and seats.\n");
@@ -870,7 +889,15 @@ mod tests {
             regions: vec!["uk".into(), "eu".into()],
             months,
             trend: json!({ "from": "2026-08-01", "to": "2026-10-31", "fromScore": 92, "toScore": 64, "worse": ["backups"], "better": [] }),
-            adoption: Adoption { people: 40, active: 31, seats_used: Some(40), seat_cap: Some(60), license_days_left: Some(200), license_mode: Some("active".into()) },
+            adoption: Adoption {
+                people: 40,
+                active: 31,
+                seats_used: Some(40),
+                seat_cap: Some(60),
+                license_mode: Some("active".into()),
+                license_usable: true,
+                license_ends_at: Some(NOW + 200 * DAY_MS + 3 * 3_600_000),
+            },
             harnesses: vec![Harness { harness: "hermes".into(), finished: 500, failed: 25 }, Harness { harness: "claude".into(), finished: 130, failed: 4 }],
             incidents: vec![
                 Incident { id: "inc_a1".into(), impact: "major".into(), posted_at: NOW - 60 * DAY_MS, resolved_at: Some(NOW - 60 * DAY_MS + 95 * MINUTE), minutes: 95, reviewed: true },
@@ -991,7 +1018,7 @@ mod tests {
             "- Backups now: The newest server backup off the host is 3 hours old",
             "- Machine restores this quarter: 2, 1 past the RTO.",
             "- Residency warnings now: 0 (`botctl regions`).",
-            "- The license ends in 200 days (2027-06-12).",
+            "- The license ends in 200 days, on 2027-06-13.",
             "| Act on the `backups` signal, at risk at the quarter's end | _To fill in._ | |",
             "| Draft and hold the review of incident `inc_b2` | _To fill in._ | |",
         ] {
@@ -1069,6 +1096,33 @@ mod tests {
         for leak in ["@", "s3://", "http://"] {
             assert!(!text.contains(leak), "{leak} in {text}");
         }
+    }
+
+    #[test]
+    fn the_license_line_says_what_the_license_is() {
+        let line = |mode: Option<&str>, usable: bool, ends_at: Option<i64>| {
+            let mut d = draft();
+            d.adoption.license_mode = mode.map(String::from);
+            d.adoption.license_usable = usable;
+            d.adoption.license_ends_at = ends_at;
+            d.markdown().lines().find(|l| l.contains("license") && l.starts_with("- ") && !l.contains("seats")).map(String::from)
+        };
+        assert_eq!(line(Some("active"), true, Some(NOW + 2 * 3_600_000)).as_deref(), Some("- The license ends in 0 days, on 2026-11-25."), "the day it ends, not the days left from today");
+        assert_eq!(line(Some("active"), true, None).as_deref(), Some("- The license doesn't end."));
+        assert_eq!(line(Some("grace"), true, Some(NOW - DAY_MS)).as_deref(), Some("- The license has ended and is in its grace period: the renewal is with the account owner."));
+        for mode in ["unlicensed", "expired", "invalid"] {
+            assert_eq!(line(Some(mode), false, None), Some(format!("- There's no usable license ({mode}), so Bots don't run: `botctl license`.")), "{mode} never reads as a license that doesn't end");
+        }
+        assert_eq!(line(None, true, None), None, "testing mode with no license");
+    }
+
+    #[test]
+    fn runs_with_no_harness_left_to_name_say_so() {
+        let mut d = draft();
+        d.harnesses.push(Harness { harness: UNRECORDED.into(), finished: 3, failed: 1 });
+        let md = d.markdown();
+        assert!(md.contains("; Deleted Bots, harness not recorded: 3 runs, 1 (33%) failed or timed out."), "{md}");
+        assert!(!md.contains("[text]"), "{md}");
     }
 
     /// Each section of the draft is a section of the template, in its order.

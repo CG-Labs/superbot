@@ -9422,16 +9422,21 @@ impl Db {
         .collect()
     }
 
-    /// Finished runs from `from` up to `to` (unix ms), counted by Bot and result (ADR 0262).
-    pub fn run_results_by_bot(&self, from: i64, to: i64) -> Vec<(Option<String>, Option<String>, u64)> {
+    /// Finished runs from `from` up to `to` (unix ms), counted by Bot, the harness that ran
+    /// each (its `token_usage` rows, None when it has none) and result (ADR 0262).
+    pub fn run_results_by_harness(&self, from: i64, to: i64) -> Vec<(Option<String>, Option<String>, Option<String>, u64)> {
         let c = self.c();
         let mut s = c
             .prepare(
-                "SELECT bot_id, CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.result') AS TEXT) END AS result, COUNT(*)
-                 FROM audit_events WHERE action = 'bot.run_finished' AND at >= ? AND at < ? GROUP BY bot_id, result ORDER BY bot_id, result",
+                "SELECT e.bot_id, (SELECT t.harness FROM token_usage t WHERE t.run_id = e.run_id LIMIT 1) AS harness, e.result, COUNT(*)
+                 FROM (SELECT bot_id,
+                         CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.runId') AS TEXT) END AS run_id,
+                         CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.result') AS TEXT) END AS result
+                       FROM audit_events WHERE action = 'bot.run_finished' AND at >= ? AND at < ?) e
+                 GROUP BY e.bot_id, harness, e.result ORDER BY e.bot_id, harness, e.result",
             )
             .unwrap();
-        s.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)?.max(0) as u64))).unwrap().filter_map(Result::ok).collect()
+        s.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)?.max(0) as u64))).unwrap().filter_map(Result::ok).collect()
     }
 
     /// Active people, the owner aside as seats count them, and how many of them signed in
@@ -10909,6 +10914,13 @@ impl Db {
     }
 
     /// The newest restores of every machine, newest first.
+    /// Restores asked for from `from` up to `to` (unix ms), however many (ADR 0262).
+    pub fn machine_restores_between(&self, from: i64, to: i64) -> Vec<MachineRestore> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_restores WHERE created_at >= ? AND created_at < ? ORDER BY created_at, id").unwrap();
+        s.query_map([from, to], machine_restore_row).unwrap().filter_map(Result::ok).collect()
+    }
+
     pub fn machine_restores_recent(&self, limit: u32) -> Vec<MachineRestore> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machine_restores ORDER BY created_at DESC, id DESC LIMIT ?").unwrap();
@@ -12145,6 +12157,25 @@ mod tests {
         // No team pin: nothing to keep.
         db.unpin_residency(PinOn::Team, &t.id).unwrap();
         assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true), Ok((true, None))));
+    }
+
+    #[test]
+    fn restores_between_two_times_are_all_of_them_however_many_came_after() {
+        let db = Db::open(&temp_path("restores-between").join("app.sqlite")).unwrap();
+        let ada = db.create_user(None, Some("ada@example.com"), "ada", Role::Member).unwrap();
+        let new = NewMachine { user_id: &ada.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let m = db.add_machine(&new).unwrap();
+        let b = NewMachineBackup { id: "b1", machine: &m, object_key: "t/b1.incus", store_region: None, encrypted: false, created_by: None };
+        db.machine_backup_start(&b).unwrap();
+        let ids: Vec<String> = (0..1003).map(|i| format!("r{i:04}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            db.machine_restore_start(&NewMachineRestore { id, machine: &m, backup_id: "b1", by: None, rto_ms: None, from_host: None, to_host: None, reason: None }).unwrap();
+            assert!(db.machine_restore_move(id, &["importing"], "failed", None));
+            db.c().execute("UPDATE machine_restores SET created_at = ? WHERE id = ?", params![1_000 + i as i64, id]).unwrap();
+        }
+        let got: Vec<String> = db.machine_restores_between(1_000, 1_003).into_iter().map(|r| r.id).collect();
+        assert_eq!(got, ["r0000", "r0001", "r0002"], "the oldest, behind 1000 newer");
+        assert!(db.machine_restores_recent(1000).iter().all(|r| r.created_at >= 1_003));
     }
 
     #[test]
