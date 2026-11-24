@@ -12,11 +12,12 @@
 //! It is also the `leases::Issuer` of `AZURE_RUN_CREDENTIALS` (ADR 0213): an access token
 //! of an Entra app that trusts botd's user-assigned managed identity or workload identity
 //! as a federated credential, made for each run by trading botd's own token for the
-//! app's. Entra can't revoke one, so it is let go at its expiry.
+//! app's. Entra can't revoke one, so it is let go at its expiry. A multitenant app's token
+//! may come from another tenant it is provisioned in, with the same assertion (ADR 0250).
 
 use super::external::{self, Provider, Scope};
 use super::http::{self, Bearer, Worker};
-use super::leases::{Field, Issuer, Lease};
+use super::leases::{Field, Issuer, Lease, Narrowed};
 use super::{Error, SecretStore};
 use crate::audit::{Event, Outcome};
 use serde_json::{json, Value};
@@ -544,13 +545,16 @@ impl Inner {
     }
 
     /// A new access token of the Entra app in `path` (`<client id>[@<resource host>]`) for
-    /// one run of `bot_id`, traded for botd's own token. When Entra refuses a kept managed
+    /// one run of `bot_id`, traded for botd's own token, from `other` tenant if given (a
+    /// multitenant app provisioned there) or botd's own. When Entra refuses a kept managed
     /// identity token, gets a new one and asks once more.
-    async fn app_token(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
+    async fn app_token(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str, other: Option<&str>) -> Result<Lease, Error> {
         let (app, resource) = path.split_once('@').unwrap_or((path, arm_host(&self.cfg.authority)));
-        let tenant = self.cfg.run_tenant().ok_or_else(|| Error::Unavailable("Azure Entra ID: AZURE_RUN_CREDENTIALS needs AZURE_TENANT_ID".into()))?;
+        let home = self.cfg.run_tenant().ok_or_else(|| Error::Unavailable("Azure Entra ID: AZURE_RUN_CREDENTIALS needs AZURE_TENANT_ID".into()))?;
+        let tenant = other.unwrap_or(home);
+        let elsewhere = !tenant.eq_ignore_ascii_case(home);
         let scope = format!("https://{resource}/.default");
-        let what = format!("a token of app {app} for {resource}");
+        let what = if elsewhere { format!("a token of app {app} for {resource} in tenant {tenant}") } else { format!("a token of app {app} for {resource}") };
         let kept = matches!(self.cfg.auth, Auth::ManagedIdentity { .. });
         for fresh in [false, true] {
             let assertion = self.assertion(fresh).await?;
@@ -566,12 +570,17 @@ impl Inner {
             if code == "invalid_client" && kept && !fresh {
                 continue;
             }
+            // The federated credential is on the app's registration in botd's own tenant,
+            // whichever tenant the token comes from.
             let hint = match code.as_str() {
                 "invalid_client" => format!(
-                    "; the app needs a federated credential trusting botd's identity with audience {}: for a managed identity, issuer {}/{tenant}/v2.0 and the identity's object (principal) id as subject; for workload identity, the cluster's issuer and botd's service account",
+                    "; the app needs a federated credential trusting botd's identity with audience {}: for a managed identity, issuer {}/{home}/v2.0 and the identity's object (principal) id as subject; for workload identity, the cluster's issuer and botd's service account",
                     exchange_audience(&self.cfg.authority),
                     self.cfg.authority
                 ),
+                "unauthorized_client" if elsewhere => {
+                    format!("; is {app} a multitenant app registered in tenant {home}, and has an admin of tenant {tenant} consented to it there?")
+                }
                 "unauthorized_client" => format!("; is {app} an app registered in tenant {tenant}?"),
                 "invalid_scope" | "invalid_resource" => format!("; is {resource} a resource in this cloud that the app may use?"),
                 _ => String::new(),
@@ -606,8 +615,15 @@ impl Issuer for KeyVault {
     }
 
     fn issue(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
-        let (inner, path, fields, bot_id) = (Arc::clone(&self.inner), path.to_string(), fields.to_vec(), bot_id.to_string());
-        self.worker.run(async move { inner.app_token(&path, &fields, run_for, &bot_id).await })
+        self.issue_narrowed(path, fields, run_for, bot_id, &Narrowed::default())
+    }
+
+    fn issue_narrowed(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
+        if narrowed.narrows_session() || narrowed.boundary.is_some() {
+            return Err(Error::Unavailable("Azure Entra ID: a token can't be narrowed with a session policy, tags or an access boundary".into()));
+        }
+        let (inner, path, fields, bot_id, tenant) = (Arc::clone(&self.inner), path.to_string(), fields.to_vec(), bot_id.to_string(), narrowed.tenant.clone());
+        self.worker.run(async move { inner.app_token(&path, &fields, run_for, &bot_id, tenant.as_deref()).await })
     }
 
     fn revoke(&self, _lease_id: &str) -> Result<(), Error> {
@@ -684,6 +700,9 @@ mod tests {
 
     type F = Arc<Fake>;
 
+    /// Tenants other than botd's own (`tenant-1`), by id and by domain.
+    const OTHER_TENANTS: [&str; 2] = ["fabrikam.onmicrosoft.com", "22222222-0000-0000-0000-000000000002"];
+
     fn issue(f: &Fake, asked: HashMap<String, String>) -> Json<Value> {
         let n = f.sign_ins.fetch_add(1, Ordering::SeqCst);
         let token = format!("eyJ.azure-{n}");
@@ -736,7 +755,8 @@ mod tests {
     /// identity token for the exchange audience that it made, or the federated token
     /// `federated-jwt-1`. Apps ending `dead` trust neither, `0bad` aren't registered,
     /// `0dd0` get an answer with no token and `f00d` a token of ten minutes; resources on
-    /// `nowhere.example.com` don't exist.
+    /// `nowhere.example.com` don't exist. In `OTHER_TENANTS` only multitenant apps ending
+    /// `cafe` (and `dead`, which trusts nothing) are provisioned, as an admin there consented.
     fn app_token(f: &Fake, tenant: &str, form: HashMap<String, String>) -> (StatusCode, Json<Value>) {
         f.exchanged.lock().unwrap().push((tenant.to_string(), form.clone()));
         let refuse = |code: StatusCode, error: &str| (code, Json(json!({ "error": error, "error_description": "AADSTS70021: quoting-the-request" })));
@@ -744,13 +764,14 @@ mod tests {
             return refuse(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
         }
         let get = |k: &str| form.get(k).map(String::as_str).unwrap_or_default();
-        if tenant != "tenant-1" || get("grant_type") != "client_credentials" || get("client_assertion_type") != ASSERTION_TYPE {
+        let elsewhere = OTHER_TENANTS.contains(&tenant);
+        if !(tenant == "tenant-1" || elsewhere) || get("grant_type") != "client_credentials" || get("client_assertion_type") != ASSERTION_TYPE {
             return refuse(StatusCode::BAD_REQUEST, "invalid_request");
         }
         let assertion = get("client_assertion");
         let trusted = assertion == "federated-jwt-1" || f.exchange_tokens.lock().unwrap().iter().any(|t| t == assertion);
         let app = get("client_id");
-        if app.ends_with("0bad") {
+        if app.ends_with("0bad") || (elsewhere && !app.ends_with("cafe") && !app.ends_with("dead")) {
             return refuse(StatusCode::BAD_REQUEST, "unauthorized_client");
         }
         if !trusted || app.ends_with("dead") {
@@ -1062,6 +1083,94 @@ mod tests {
 
         f.down.store(true, Ordering::SeqCst);
         assert!(matches!(rc.issue("uaz8", "baz8", true, RUN), Err(Error::Unavailable(_))), "Entra down: refused, never a run without its token");
+    }
+
+    const CAFE_APP: &str = "cccccccc-0000-0000-0000-00000000cafe";
+
+    #[test]
+    fn a_multitenant_apps_token_comes_from_another_tenant_with_the_same_assertion() {
+        let (url, f) = stand_in();
+        let [fabrikam, by_id] = OTHER_TENANTS;
+        let rc = run_credentials(&url, &format!("{CAFE_APP} tenant={fabrikam}; {CAFE_APP}@storage.azure.com tenant={by_id} BLOB_TOKEN=accessToken; {APP} HOME_TOKEN=accessToken"));
+        assert!(rc.describe().contains(&format!("{CAFE_APP} (tenant {fabrikam}), {CAFE_APP}@storage.azure.com (tenant {by_id}), {APP}")), "{}", rc.describe());
+        let (env, _l) = rc.issue("uaz10", "baz10", false, RUN).unwrap();
+        let v = values(&env);
+        assert_eq!(v.len(), 3, "a tenant isn't the owner's: runs for anyone get it");
+        let calls = f.exchanged.lock().unwrap().clone();
+        let asked: Vec<(&str, &str)> = calls.iter().map(|(t, form)| (t.as_str(), form["client_id"].as_str())).collect();
+        assert_eq!(asked, [(fabrikam, CAFE_APP), (by_id, CAFE_APP), ("tenant-1", APP)], "each from its own tenant's token endpoint");
+        let mi = f.exchange_tokens.lock().unwrap().clone();
+        assert!(mi.len() == 1 && calls.iter().all(|(_, form)| form["client_assertion"] == mi[0]), "one managed identity token, from botd's own tenant, for every tenant");
+        assert!(f.run_tokens.lock().unwrap().contains(&v["AZURE_ACCESS_TOKEN"]));
+
+        let ev: Vec<_> = audited(CAFE_APP).into_iter().filter(|e| e.bot_id.as_deref() == Some("baz10") && e.action == "secret.lease_issued").collect();
+        assert_eq!(ev[0].details["tenant"], fabrikam, "which tenant, in the audit");
+        let home = audited(APP).into_iter().find(|e| e.bot_id.as_deref() == Some("baz10") && e.action == "secret.lease_issued").unwrap();
+        assert!(home.details.get("tenant").is_none(), "botd's own tenant isn't named");
+
+        // Not provisioned there (single-tenant, or no admin consented), or no federated credential.
+        for (entry, err) in [
+            (format!("{APP} tenant={fabrikam}"), format!("(unauthorized_client) for a token of app {APP} for management.azure.com in tenant {fabrikam}; is {APP} a multitenant app registered in tenant tenant-1, and has an admin of tenant {fabrikam} consented to it there?")),
+            (
+                format!("aaaaaaaa-0000-0000-0000-00000000dead tenant={fabrikam}"),
+                format!("(invalid_client) for a token of app aaaaaaaa-0000-0000-0000-00000000dead for management.azure.com in tenant {fabrikam}; the app needs a federated credential trusting botd's identity with audience api://AzureADTokenExchange: for a managed identity, issuer {url}/tenant-1/v2.0"),
+            ),
+        ] {
+            let e = run_credentials(&url, &entry).issue("uaz10", "baz10", true, RUN).err().unwrap().to_string();
+            assert!(e.contains(&err) && !e.contains("quoting"), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn each_user_gets_their_own_app_from_the_apps_file() {
+        let (url, f) = stand_in();
+        let file = crate::db::temp_path("azure-apps").join("apps.json");
+        let write = |v: Value| std::fs::write(&file, v.to_string()).unwrap();
+        write(json!({ "uapp1": APP, "uapp2": { "app": CAFE_APP, "tenant": OTHER_TENANTS[0] } }));
+        let rc = run_credentials(&url, &format!("{{owner}}@storage.azure.com apps={} USER_AZURE_TOKEN=accessToken; {BLOB_APP}", file.display()));
+        assert!(rc.describe().contains(&format!("{{owner}}@storage.azure.com (each user's app from {})", file.display())), "{}", rc.describe());
+        let made = || f.exchanged.lock().unwrap().iter().map(|(t, form)| (t.clone(), form["client_id"].clone(), form["scope"].clone())).collect::<Vec<_>>();
+        let storage = "https://storage.azure.com/.default".to_string();
+
+        let (e1, _l1) = rc.issue("uapp1", "bapp1", true, RUN).unwrap();
+        assert!(values(&e1).contains_key("USER_AZURE_TOKEN") && values(&e1).contains_key("AZURE_ACCESS_TOKEN"));
+        assert_eq!(made()[0], ("tenant-1".to_string(), APP.to_string(), storage.clone()), "the owner's app, for the entry's resource");
+        let (e2, _l2) = rc.issue("uapp2", "bapp2", true, RUN).unwrap();
+        assert_eq!(made()[2], (OTHER_TENANTS[0].to_string(), CAFE_APP.to_string(), storage.clone()), "in the user's own tenant");
+        assert_ne!(values(&e1)["USER_AZURE_TOKEN"], values(&e2)["USER_AZURE_TOKEN"]);
+
+        let ev = audited(&format!("{APP}@storage.azure.com"));
+        let issued = ev.iter().find(|e| e.action == "secret.lease_issued" && e.bot_id.as_deref() == Some("bapp1")).unwrap();
+        assert_eq!((issued.details["userId"].as_str(), issued.details.get("tenant")), (Some("uapp1"), None), "which user's app, in the audit");
+        let theirs = audited(&format!("{CAFE_APP}@storage.azure.com")).into_iter().find(|e| e.bot_id.as_deref() == Some("bapp2")).unwrap();
+        assert_eq!((theirs.details["userId"].as_str(), theirs.details["tenant"].as_str()), (Some("uapp2"), Some(OTHER_TENANTS[0])));
+
+        // Someone the file doesn't name, or a run for someone else: no token from the entry, and none inherited.
+        let before = made().len();
+        let (e3, l3) = rc.issue("uapp3", "bapp3", true, RUN).unwrap();
+        assert_eq!((values(&e3).contains_key("USER_AZURE_TOKEN"), l3.cleared()), (false, &["USER_AZURE_TOKEN".to_string()][..]));
+        let (e4, _l4) = rc.issue("uapp1", "bapp1", false, RUN).unwrap();
+        assert!(!values(&e4).contains_key("USER_AZURE_TOKEN"));
+        assert_eq!(made().len(), before + 2, "only the shared app's tokens");
+
+        // Edits apply from the next run, without a restart.
+        write(json!({ "uapp2": CAFE_APP }));
+        let (e1, _l1) = rc.issue("uapp1", "bapp1", true, RUN).unwrap();
+        assert!(!values(&e1).contains_key("USER_AZURE_TOKEN"), "taken out of the file: no token from the next run");
+        rc.issue("uapp2", "bapp2", true, RUN).unwrap();
+        let m = made();
+        assert_eq!((m[m.len() - 2].0.as_str(), m[m.len() - 2].1.as_str()), ("tenant-1", CAFE_APP), "no tenant in the file now: botd's own");
+
+        // A file that no longer reads refuses the runs that need it, never the map it had.
+        for broken in ["{\"uapp2\": ", "[]"] {
+            std::fs::write(&file, broken).unwrap();
+            let e = rc.issue("uapp2", "bapp2", true, RUN).err().unwrap().to_string();
+            assert!(e.contains(&format!("{{owner}}@storage.azure.com: apps={}", file.display())), "{e}");
+        }
+        assert!(audited("{owner}@storage.azure.com").iter().any(|e| e.outcome == Outcome::Failure && e.details["error"] == "apps" && e.details["userId"] == "uapp2"));
+        std::fs::remove_file(&file).unwrap();
+        assert!(rc.issue("uapp2", "bapp2", true, RUN).err().unwrap().to_string().contains("can't be read"));
+        rc.issue("uapp2", "bapp2", false, RUN).expect("a run for someone else never reads it");
     }
 
     #[test]
