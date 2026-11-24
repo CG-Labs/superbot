@@ -221,6 +221,14 @@ jobs:
           ' _ deploy/install.sh "$RUNNER_TEMP/b/superbot-offline-$OLD-$arch.tar.gz" "$RUNNER_TEMP/tls.pem" "$RUNNER_TEMP/tls.key" | tee /tmp/offline-install.log
           grep -Fq "Offline bundle $OLD ($arch" /tmp/offline-install.log
           grep -Fq 'SuperBot is installed.' /tmp/offline-install.log
+          # The installer's own settings name nothing on the internet; one that does is found (ADR 0257).
+          grep -Fq "botd offline check: nothing botd's settings name is on the internet" /tmp/offline-install.log
+          printf 'BILLING=on\nSMTP_HOST=10.0.0.25\nSMTP_FROM=bots@offline.test\n' >"$RUNNER_TEMP/internet.env"
+          if sudo ip netns exec offline env -i /usr/local/bin/botd offline check --env-file "$RUNNER_TEMP/internet.env" >/tmp/offline-check.log; then
+            echo "botd offline check passed a setting on the internet" >&2; exit 1
+          fi
+          grep -Eq '^  internet +Billing +BILLING: Billing at api\.stripe\.com' /tmp/offline-check.log
+          grep -Eq '^  ok +Email +SMTP_HOST: Email at 10\.0\.0\.25: a private address' /tmp/offline-check.log
       - name: The offline install serves the operator's certificate and asked no CA
         run: |
           set -euo pipefail

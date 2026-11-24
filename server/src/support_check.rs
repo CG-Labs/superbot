@@ -162,7 +162,7 @@ impl Settings {
         all.into_iter().collect()
     }
 
-    fn source(&self) -> Value {
+    pub(crate) fn source(&self) -> Value {
         json!({ "envFile": self.file.as_ref().map(|p| p.display().to_string()), "home": self.home.as_ref().map(|p| p.display().to_string()) })
     }
 }

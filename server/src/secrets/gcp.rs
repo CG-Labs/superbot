@@ -246,6 +246,71 @@ impl Drop for Google {
     }
 }
 
+struct Endpoints {
+    location: Option<String>,
+    endpoint: String,
+    iam_endpoint: String,
+    sts_endpoint: String,
+}
+
+fn endpoints(var: &dyn Fn(&str) -> String) -> Result<Endpoints, String> {
+    let location = match var("GCP_SECRET_MANAGER_LOCATION").trim() {
+        "" => None,
+        l => Some(name_setting("GCP_SECRET_MANAGER_LOCATION", l, "europe-west2")?),
+    };
+    let endpoint = match (var("GCP_SECRET_MANAGER_ENDPOINT").trim(), &location) {
+        ("", None) => "https://secretmanager.googleapis.com".to_string(),
+        ("", Some(l)) => format!("https://secretmanager.{l}.rep.googleapis.com"),
+        (e, _) => http::base_url("GCP_SECRET_MANAGER_ENDPOINT", e, "https://secretmanager.googleapis.com")?,
+    };
+    let iam_endpoint = match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
+        "" => IAM_CREDENTIALS.to_string(),
+        e => http::base_url("GCP_IAM_CREDENTIALS_ENDPOINT", e, IAM_CREDENTIALS)?,
+    };
+    let sts_endpoint = match var("GCP_STS_ENDPOINT").trim() {
+        "" => STS.to_string(),
+        e => http::base_url("GCP_STS_ENDPOINT", e, STS)?,
+    };
+    Ok(Endpoints { location, endpoint, iam_endpoint, sts_endpoint })
+}
+
+/// Where signing in to Google as `method_var` says reaches, as `(setting, URL, what)`, for
+/// `botd offline check` (ADR 0257). A service account key's own `token_uri` is read from
+/// `GCP_SERVICE_ACCOUNT_KEY_FILE` when it can be; a key kept elsewhere is taken to use Google's.
+pub fn sign_in_reaches(var: &dyn Fn(&str) -> String, method_var: &str, method: &str) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+    match method.trim() {
+        "" | "metadata" => {
+            let host = match var("GCE_METADATA_HOST").trim() {
+                "" => METADATA_HOST.to_string(),
+                h => h.to_string(),
+            };
+            Ok(vec![("GCE_METADATA_HOST", format!("http://{host}"), "Google's metadata server")])
+        }
+        "service-account-key" => {
+            let file = var("GCP_SERVICE_ACCOUNT_KEY_FILE");
+            let from_key = std::fs::read_to_string(file.trim()).ok().and_then(|j| serde_json::from_str::<Value>(&j).ok()).and_then(|v| v["token_uri"].as_str().map(String::from));
+            Ok(vec![("GCP_SERVICE_ACCOUNT_KEY", from_key.unwrap_or_else(|| TOKEN_URI.to_string()), "the service account key's token URI")])
+        }
+        other => Err(format!("{method_var} must be metadata or service-account-key, not {other:?}")),
+    }
+}
+
+/// What Secret Manager reaches with these settings, as `(setting, URL, what)`, for `botd
+/// offline check` (ADR 0257): its endpoint, sign-in, and IAM Credentials and STS for runs.
+pub fn reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+    let e = endpoints(var)?;
+    let mut out = vec![("GCP_SECRET_MANAGER_ENDPOINT", e.endpoint, "Google Secret Manager")];
+    out.extend(sign_in_reaches(var, "GCP_SECRET_MANAGER_AUTH", &var("GCP_SECRET_MANAGER_AUTH"))?);
+    let runs = var("GCP_RUN_CREDENTIALS");
+    if !runs.trim().is_empty() {
+        out.push(("GCP_IAM_CREDENTIALS_ENDPOINT", e.iam_endpoint, "IAM Credentials, for runs' credentials"));
+        if runs.contains("boundary=") {
+            out.push(("GCP_STS_ENDPOINT", e.sts_endpoint, "Google STS, for runs' narrowed credentials"));
+        }
+    }
+    Ok(out)
+}
+
 impl Config {
     /// `GCP_*` settings; the key comes from `store` (the environment), so `_FILE` works.
     pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Config, String> {
@@ -256,26 +321,10 @@ impl Config {
             (p, _) => p.to_string(),
         };
         let project = name_setting("GCP_SECRET_MANAGER_PROJECT", &project, "my-project-123")?;
-        let location = match var("GCP_SECRET_MANAGER_LOCATION").trim() {
-            "" => None,
-            l => Some(name_setting("GCP_SECRET_MANAGER_LOCATION", l, "europe-west2")?),
-        };
-        let endpoint = match (var("GCP_SECRET_MANAGER_ENDPOINT").trim(), &location) {
-            ("", None) => "https://secretmanager.googleapis.com".to_string(),
-            ("", Some(l)) => format!("https://secretmanager.{l}.rep.googleapis.com"),
-            (e, _) => http::base_url("GCP_SECRET_MANAGER_ENDPOINT", e, "https://secretmanager.googleapis.com")?,
-        };
+        let Endpoints { location, endpoint, iam_endpoint, sts_endpoint } = endpoints(var)?;
         let parent = match &location {
             None => format!("projects/{project}"),
             Some(l) => format!("projects/{project}/locations/{l}"),
-        };
-        let iam_endpoint = match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
-            "" => IAM_CREDENTIALS.to_string(),
-            e => http::base_url("GCP_IAM_CREDENTIALS_ENDPOINT", e, IAM_CREDENTIALS)?,
-        };
-        let sts_endpoint = match var("GCP_STS_ENDPOINT").trim() {
-            "" => STS.to_string(),
-            e => http::base_url("GCP_STS_ENDPOINT", e, STS)?,
         };
         Ok(Config { endpoint, parent, prefix: prefix_setting(&var("GCP_SECRET_MANAGER_PREFIX"))?, auth, iam_endpoint, sts_endpoint })
     }
