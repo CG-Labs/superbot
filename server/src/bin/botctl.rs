@@ -235,6 +235,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl bot grant <bot> <user> <viewer|operator>  viewer: read its chat; operator: also run it. <user> may be
                                                    a service account's id: never more than its owner can do
   botctl bot revoke <bot> <user>
+  botctl bot keep <bot> <service-account>          One of the Bot owner's service accounts keeps and manages it
+                                                   (owner or admin); it stays the owner's. Takes over from another
+  botctl bot release <bot>                         The service account keeping it stops; it stays the owner's
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
   botctl policy set <global|bot> [mode=ask|bypass] [sandbox=on|off] [timeout=<minutes>] [<class>=allow|ask|deny]...
@@ -1153,6 +1156,7 @@ fn move_bots_request(args: &[&str]) -> Result<(String, String), String> {
 fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let access = |bot: &str| format!("/api/bots/{}/access", encode(bot));
     let grant = |bot: &str, user: &str| format!("/api/bots/{}/grants/{}", encode(bot), encode(user));
+    let keeper = |bot: &str| format!("/api/bots/{}/keeper", encode(bot));
     Ok(match args {
         ["access", bot] => ("GET", access(bot), None),
         [v @ ("share" | "private"), bot] => {
@@ -1163,6 +1167,10 @@ fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), S
         ["grant", bot, user, level @ ("viewer" | "operator")] => ("PUT", grant(bot, user), Some(json!({ "level": level }).to_string())),
         ["grant", ..] => return Err("Usage: botctl bot grant <bot> <user> <viewer|operator>".into()),
         ["revoke", bot, user] => ("DELETE", grant(bot, user), None),
+        // ADR 0229: the account's id, as `bot grant` takes it.
+        ["keep", bot, account] => ("PUT", keeper(bot), Some(json!({ "serviceAccount": account }).to_string())),
+        ["keep", ..] => return Err("Usage: botctl bot keep <bot> <service-account>".into()),
+        ["release", bot] => ("DELETE", keeper(bot), None),
         _ => return Err("Unknown bot command. See botctl admin.".into()),
     })
 }
@@ -3716,6 +3724,9 @@ mod tests {
         assert_eq!(req(&["grant", "b1", "a+b@example.com", "operator"]), Ok(("PUT", "/api/bots/b1/grants/a%2Bb%40example.com".into(), Some(json!({ "level": "operator" })))));
         assert_eq!(req(&["revoke", "b1", "u1"]), Ok(("DELETE", "/api/bots/b1/grants/u1".into(), None)));
         assert!(req(&["grant", "b1", "u1", "owner"]).is_err());
+        assert_eq!(req(&["keep", "b1", "sa1"]), Ok(("PUT", "/api/bots/b1/keeper".into(), Some(json!({ "serviceAccount": "sa1" })))));
+        assert_eq!(req(&["release", "b/1"]), Ok(("DELETE", "/api/bots/b%2F1/keeper".into(), None)));
+        assert!(req(&["keep", "b1"]).unwrap_err().starts_with("Usage: botctl bot keep"));
         assert!(req(&["share"]).is_err());
         assert!(req(&[]).is_err());
     }

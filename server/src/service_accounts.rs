@@ -106,7 +106,7 @@ pub fn person_only(method: &Method, path: &str) -> Option<&'static str> {
         (_, ["auth", ..]) => "A service account has no sign-in, session or second factor.",
         (_, ["me", ..] | ["machine", ..] | ["billing", ..] | ["team", "leave"] | ["team", "billing", ..]) => "This is about a person's own account, which a service account doesn't have.",
         (_, ["service-accounts", ..]) => "A service account can't manage service accounts.",
-        ("PATCH", ["bots", _, "access"]) | (_, ["bots", _, "grants", ..]) => "Who owns a Bot and who can use it is for a person to decide.",
+        ("PATCH", ["bots", _, "access"]) | (_, ["bots", _, "grants" | "keeper", ..]) => "Who owns a Bot and who can use it is for a person to decide.",
         (_, ["bots", _, "screen"]) => "Screens are for people.",
         (_, ["approvals", _, "approve" | "deny"]) => "Deciding an approval needs a person.",
         _ => return None,
@@ -620,6 +620,11 @@ pub async fn get(State(app): State<AppState>, Extension(c): Extension<Caller>, E
     let at = crate::db::now();
     v["tokenList"] = json!(app.db.service_tokens(&sa.user.id).iter().map(|t| token_view(t, at)).collect::<Vec<_>>());
     v["bots"] = bots_view(&app, &sa);
+    // Every Bot it keeps, even while its owner lends nothing, so it can be let go; and those
+    // the caller may hand it (ADR 0229).
+    let kept: Vec<Value> = app.db.kept_bots(&sa.user.id).iter().filter_map(|id| app.db.bot(id)).map(|b| json!({ "id": b.id, "name": b.name, "visibility": b.visibility })).collect();
+    v["keptBotList"] = json!(kept);
+    v["keepable"] = crate::kept_bots::keepable(&app, &c, &by, &sa);
     Ok(Json(v))
 }
 
@@ -888,6 +893,8 @@ mod tests {
             ("PATCH", "/api/bots/b1/access"),
             ("PUT", "/api/bots/b1/grants/u2"),
             ("DELETE", "/api/bots/b1/grants/u2"),
+            ("PUT", "/api/bots/b1/keeper"),
+            ("DELETE", "/api/bots/b1/keeper"),
             ("GET", "/api/bots/b1/screen"),
             ("POST", "/api/approvals/a1/approve"),
             ("POST", "/api/approvals/a1/deny"),
