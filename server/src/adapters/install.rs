@@ -5,7 +5,7 @@
 //! The `harness-e2e` workflow tests approvals through exactly these pins
 //! (`deploy/install-harness-clis.sh` reads them from here, ADR 0057), so a bump runs it.
 
-use crate::machines::wire::{CAN_INSTALL_AFTER, Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
+use crate::machines::wire::{BundleKind, CAN_INSTALL_AFTER, Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
 
 enum Source {
     /// `integrity`: the registry's SHA-512 of the package's own tarball. npm checks
@@ -205,11 +205,34 @@ const HERMES_READABLE: [&str; 4] = [".hermes/hermes-agent", ".hermes/installs", 
 pub fn hermes_from_bundles(h: &HarnessInstall, downloads: std::collections::BTreeMap<String, Download>) -> HarnessInstall {
     HarnessInstall {
         source: InstallSource::Bundle {
+            holds: BundleKind::Hermes,
             downloads,
             prefix: HERMES_PREFIX.into(),
             bin: HERMES_SHARED_BIN.into(),
             readable: HERMES_READABLE.map(String::from).into(),
             after: Some(HERMES_SHARE.into()),
+        },
+        ..h.clone()
+    }
+}
+
+/// Where a harness bundle's tree runs, as `deploy/install.sh` installs it (ADR 0232).
+pub const HARNESSES_PREFIX: &str = "/opt/superbot-harnesses";
+/// What other accounts run in it: Node.js and the CLIs, and SuperBot's wrappers.
+const HARNESSES_READABLE: [&str; 3] = ["bin", "lib", "superbot"];
+
+/// `h`, an npm harness at its pins, from harness bundles botd serves (ADR 0242)
+/// instead of npm: `downloads` by arch, each pinned to its bundle's SHA-256. Every npm
+/// harness shares the one tree; each runs through its wrapper there.
+pub fn harness_from_bundles(h: &HarnessInstall, downloads: std::collections::BTreeMap<String, Download>) -> HarnessInstall {
+    HarnessInstall {
+        source: InstallSource::Bundle {
+            holds: BundleKind::Harnesses,
+            downloads,
+            prefix: HARNESSES_PREFIX.into(),
+            bin: format!("{}/{}", crate::machines::hermes_bundle::HARNESS_OWN, h.name),
+            readable: HARNESSES_READABLE.map(String::from).into(),
+            after: None,
         },
         ..h.clone()
     }
@@ -481,6 +504,27 @@ mod tests {
             want.push(format!("harness_{b}={} {package} {i}", h.version));
         }
         assert_eq!(String::from_utf8_lossy(&out.stdout).lines().collect::<Vec<_>>(), want);
+    }
+
+    /// Machines run each CLI in a harness bundle through the wrapper deploy/install.sh
+    /// writes on a server (ADR 0242), so both say the same.
+    #[test]
+    fn machines_wrap_harness_bundle_clis_as_install_sh_does() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for bin in ["claude", "codex", "pi"] {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg("SUPERBOT_INSTALL_NO_MAIN=1 source deploy/install.sh && HARNESSES_DIR=\"$2\" harness_wrapper \"$1\"")
+                .arg("bash")
+                .arg(bin)
+                .arg(HARNESSES_PREFIX)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let ours = crate::machines::hermes_bundle::harness_wrapper(bin, std::path::Path::new(HARNESSES_PREFIX));
+            assert_eq!(String::from_utf8_lossy(&out.stdout), ours, "{bin}");
+        }
     }
 
     /// The pins, really installed: `cargo test -- --ignored real_harness_installs`.

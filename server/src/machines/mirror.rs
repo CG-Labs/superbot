@@ -22,6 +22,7 @@ use axum::http::StatusCode;
 use base64::Engine;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
@@ -384,9 +385,9 @@ async fn npm(http: &Fetch<'_>, package: &str, version: &str, pin: Option<&str>) 
 
 /// Fetches everything `plan` names from where machines would, with the CA they'd
 /// trust and, when the plan says the registry needs one, the login they'd use (`login`),
-/// and checks each against its pin. The Hermes bundles botd serves (`hermes`) are read
-/// again from disk: machines fetch them from botd itself.
-pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bundles>, login: Option<&Login>) -> Value {
+/// and checks each against its pin. The bundles botd serves (`served`: Hermes and harness
+/// bundles) are read again from disk, each file once: machines fetch them from botd itself.
+pub async fn check(plan: &HarnessPlan, served: &[&super::hermes_serve::Bundles], login: Option<&Login>) -> Value {
     // Every redirect followed, so `reach` checks where the files really came from.
     let hops = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen = hops.clone();
@@ -412,6 +413,7 @@ pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bund
         v
     };
     let mut items = Vec::new();
+    let mut rechecked: BTreeMap<String, Result<(), String>> = BTreeMap::new();
     if let Some(n) = &plan.node {
         for (arch, d) in &n.downloads {
             let res = digests(&http, &d.url, MAX_FILE).await.and_then(|(got, _)| {
@@ -434,14 +436,22 @@ pub async fn check(plan: &HarnessPlan, hermes: Option<&super::hermes_serve::Bund
                 v["note"] = json!("Its installer then downloads from GitHub and PyPI, which no mirror setting covers.");
                 items.push(v);
             }
-            InstallSource::Bundle { downloads, .. } => {
+            InstallSource::Bundle { holds, downloads, .. } => {
+                let key = super::hermes_serve::key(*holds);
                 for (arch, d) in downloads {
-                    let res = match hermes {
-                        Some(b) => b.recheck(arch, &d.sha256).await,
-                        None => Err("botd serves no Hermes bundles (MACHINE_HERMES_BUNDLE)".into()),
+                    let res = match rechecked.get(&d.url) {
+                        Some(r) => r.clone(),
+                        None => {
+                            let r = match served.iter().find(|b| b.kind == *holds) {
+                                Some(b) => b.recheck(arch, &d.sha256).await,
+                                None => Err(format!("botd serves no such bundles ({key})")),
+                            };
+                            rechecked.insert(d.url.clone(), r.clone());
+                            r
+                        }
                     };
                     let mut v = item(json!({ "name": h.name, "version": h.version, "arch": arch, "url": d.url }), res);
-                    v["note"] = json!("Served by botd from MACHINE_HERMES_BUNDLE, to enrolled machines over the machine port.");
+                    v["note"] = json!(format!("Served by botd from {key}, to enrolled machines over the machine port."));
                     items.push(v);
                 }
             }
@@ -543,7 +553,8 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
         .plan
         .clone()
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is none, so machines get no harnesses to check.".into()))?;
-    let mut v = check(&plan, e.upkeep.hermes.as_ref(), e.upkeep.mirrors.as_ref().and_then(|m| m.login.as_ref())).await;
+    let served: Vec<_> = [e.upkeep.hermes.as_ref(), e.upkeep.harness_bundle.as_ref()].into_iter().flatten().collect();
+    let mut v = check(&plan, &served, e.upkeep.mirrors.as_ref().and_then(|m| m.login.as_ref())).await;
     if let Some(out) = Outbound::from_env(&|k| std::env::var(k).unwrap_or_default()) {
         reach(&mut v, &out).await;
     }
@@ -756,7 +767,7 @@ mod tests {
         let plan = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(pin)), ("codex", "fake-codex", "1.0.0", None)]);
         assert!(plan.npm_login);
 
-        let v = check(&plan, None, Some(&token)).await;
+        let v = check(&plan, &[], Some(&token)).await;
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["npmLogin"], "token", "{v}");
         let authorized = mirror.authorized();
@@ -769,17 +780,17 @@ mod tests {
 
         // No login where the plan wants one, a login the registry refuses, and one the
         // plan doesn't ask for (not sent).
-        let v = check(&plan, None, None).await;
+        let v = check(&plan, &[], None).await;
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("MACHINE_NPM_TOKEN"), "{v}");
         let wrong = Login::Basic { username: "svc".into(), auth: Zeroizing::new("c3ZjOm5vcGU=".into()) };
-        let v = check(&plan, None, Some(&wrong)).await;
+        let v = check(&plan, &[], Some(&wrong)).await;
         assert_eq!(v["ok"], false);
         let err = v["items"][1]["error"].as_str().unwrap();
         assert!(err.contains("refused botd's login (401 Unauthorized)") && err.contains("MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD"), "{err}");
         assert!(!v.to_string().contains("c3ZjOm5vcGU="), "{v}");
         let before = mirror.authorized().len();
-        let v = check(&HarnessPlan { npm_login: false, ..plan.clone() }, None, Some(&token)).await;
+        let v = check(&HarnessPlan { npm_login: false, ..plan.clone() }, &[], Some(&token)).await;
         assert_eq!(v["ok"], false);
         assert_eq!(v["npmLogin"], Value::Null);
         assert!(v["items"][1]["error"].as_str().unwrap().contains("the registry wants a login (401 Unauthorized)"), "{v}");
@@ -800,7 +811,7 @@ mod tests {
         mirror.package("fake-codex", "1.0.0", b"codex's tarball");
         let plan = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(good.clone())), ("codex", "fake-codex", "1.0.0", None)]);
 
-        let v = check(&plan, None, None).await;
+        let v = check(&plan, &[], None).await;
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["items"].as_array().unwrap().len(), 3, "{v}");
         assert!(v["items"][1]["url"].as_str().unwrap().starts_with(&mirror.url), "{v}");
@@ -808,7 +819,7 @@ mod tests {
         assert!(calls.iter().any(|c| c == "/npm/@corp%2ffake-claude"), "scoped packages are asked for as npm does: {calls:?}");
 
         // No CA: the mirror's certificate isn't trusted.
-        let v = check(&HarnessPlan { ca: None, ..plan.clone() }, None, None).await;
+        let v = check(&HarnessPlan { ca: None, ..plan.clone() }, &[], None).await;
         assert_eq!(v["ok"], false);
         assert!(v["items"][0]["error"].as_str().unwrap().contains("couldn't fetch"), "{v}");
 
@@ -818,7 +829,7 @@ mod tests {
         let wrong_pin = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([1u8; 64]));
         let mut bad = mirror.plan(&node, vec![("claude", "@corp/fake-claude", "9.9.9", Some(wrong_pin)), ("codex", "fake-codex", "1.0.0", None), ("pi", "fake-codex", "2.0.0", None)]);
         bad.node.as_mut().unwrap().downloads.values_mut().for_each(|d| d.sha256 = "b".repeat(64));
-        let v = check(&bad, None, None).await;
+        let v = check(&bad, &[], None).await;
         assert_eq!(v["ok"], false);
         let errors: Vec<&str> = v["items"].as_array().unwrap().iter().map(|i| i["error"].as_str().unwrap_or("")).collect();
         assert!(errors[0].contains("not the pinned"), "{errors:?}");
@@ -845,7 +856,7 @@ mod tests {
             .unwrap()
         };
 
-        let mut v = check(&plan, None, None).await;
+        let mut v = check(&plan, &[], None).await;
         assert_eq!(v["ok"], true, "{v}");
         reach(&mut v, &incus("")).await;
         assert_eq!(v["ok"], false, "{v}");
@@ -853,7 +864,7 @@ mod tests {
         assert_eq!(blocked.len(), 1, "one place, however many files: {v}");
         assert!(blocked[0]["error"].as_str().unwrap().contains(&format!("add {here} to INCUS_EGRESS_ALLOW")), "{v}");
 
-        let mut v = check(&plan, None, None).await;
+        let mut v = check(&plan, &[], None).await;
         reach(&mut v, &incus(&here)).await;
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["blocked"], json!([]));
@@ -867,7 +878,7 @@ mod tests {
                 ("MACHINE_FIREWALL_EGRESS", egress.to_string()),
             ]))
         };
-        let mut v = check(&plan, None, None).await;
+        let mut v = check(&plan, &[], None).await;
         reach(&mut v, &linode("").unwrap()).await;
         assert_eq!(v["ok"], false, "{v}");
         assert!(v["blocked"][0]["error"].as_str().unwrap().contains("MACHINE_FIREWALL_EGRESS=off"), "{v}");
@@ -881,7 +892,7 @@ mod tests {
             ("INCUS_HOSTS", "b=https://127.0.0.1:8443".into()),
         ]))
         .unwrap();
-        let mut v = check(&plan, None, None).await;
+        let mut v = check(&plan, &[], None).await;
         reach(&mut v, &fleet).await;
         assert_eq!(v["blocked"].as_array().unwrap().len(), 1, "{v}");
     }
@@ -898,7 +909,7 @@ mod tests {
         let other = url::Url::parse(&mirror.other).unwrap();
         let there = format!("{}:{}", other.host_str().unwrap(), other.port().unwrap());
 
-        let mut v = check(&plan, None, None).await;
+        let mut v = check(&plan, &[], None).await;
         assert_eq!(v["ok"], true, "the redirected tarball is still the pinned one: {v}");
         assert_eq!(v["redirects"], json!([format!("{}/stored/npm/fake-codex/-/fake-codex-1.0.0.tgz", mirror.other)]));
         let incus = Outbound::from_env(&env(&[
