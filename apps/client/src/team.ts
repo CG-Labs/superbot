@@ -2,7 +2,8 @@ import { AppState } from "react-native";
 import type { SuperBotApi } from "./api";
 import { subscriptionLine } from "./billing";
 import { relativeTime } from "./invite";
-import type { OffboardingPreview, Team, TeamBilling, TeamMachine, TeamMember, TeamRole, WorkPolicy } from "./types";
+import { endsLabel } from "./roles";
+import type { CustomRoleRef, OffboardingPreview, Team, TeamBilling, TeamMachine, TeamMember, TeamRole, TeamRoleChoice, WorkPolicy } from "./types";
 
 /**
  * The team screen's rules (ADR 0088). They mirror the server's (ADR 0087) so the screen
@@ -37,6 +38,32 @@ export function assignableRoles(myRole: TeamRole | undefined, member: Pick<TeamM
 export function canRemove(myRole: TeamRole | undefined, member: Pick<TeamMember, "id" | "role">, meId: string | null | undefined): boolean {
   if (!managesTeam(myRole) || member.id === meId) return false;
   return member.role !== "owner" || myRole === "owner";
+}
+
+/**
+ * What you may do with `member`'s custom role in the team (ADR 0254): owners and admins
+ * give one to its other plain members who aren't read-only, and take one away from anyone
+ * else, but never a role their identity provider gives them.
+ */
+export function customRoleActions(
+  team: Pick<Team, "role" | "roleChoices">,
+  member: Pick<TeamMember, "id" | "role" | "customRole" | "readOnly">,
+  meId: string | null | undefined,
+): { give: boolean; take: boolean } {
+  if (!managesTeam(team.role) || member.id === meId || member.customRole?.fromIdp) return { give: false, take: false };
+  return { give: member.role === "member" && !member.readOnly && !!team.roleChoices?.length, take: !!member.customRole };
+}
+
+/** A teammate's custom role in a few words: "Team people · ends in 3 days", or null with none. */
+export function customRoleLine(role: CustomRoleRef | null | undefined, now = Date.now()): string | null {
+  if (!role) return null;
+  const ends = endsLabel(role.expiresAt, now);
+  return [role.name, ends, role.fromIdp ? "from your identity provider" : ""].filter(Boolean).join(" · ");
+}
+
+/** What giving `choice` lets them do in the team. */
+export function appliesLine(choice: Pick<TeamRoleChoice, "applies">): string {
+  return `In this team: ${choice.applies.join(", ")}. Nothing changes for them across the server.`;
 }
 
 /** The team's owners: a team keeps at least one. */
