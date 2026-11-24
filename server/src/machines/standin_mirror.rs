@@ -22,6 +22,12 @@ struct World {
     base: String,
     /// Paths answered with a 302 to a URL.
     redirects: BTreeMap<String, String>,
+    /// The `Authorization` the registry (`/npm/`) wants, and what `/v1/npm-login`
+    /// hands out, standing in for botd (ADR 0219).
+    login: Option<String>,
+    served_login: Option<Value>,
+    /// Paths asked for with an `Authorization` header.
+    authorized: Vec<String>,
 }
 
 pub struct Mirror {
@@ -51,10 +57,23 @@ fn ca() -> (rcgen::Certificate, rcgen::Issuer<'static, rcgen::KeyPair>) {
     (cert, rcgen::Issuer::new(p, key))
 }
 
-async fn handle(axum::extract::State(w): axum::extract::State<Arc<Mutex<World>>>, uri: Uri) -> Response {
+async fn handle(axum::extract::State(w): axum::extract::State<Arc<Mutex<World>>>, headers: axum::http::HeaderMap, uri: Uri) -> Response {
     let path = uri.path().to_string();
     let mut w = w.lock().unwrap();
     w.calls.push(path.clone());
+    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+    if auth.is_some() {
+        w.authorized.push(path.clone());
+    }
+    if path == "/v1/npm-login" {
+        return match &w.served_login {
+            Some(v) => ([("content-type", "application/json")], v.to_string()).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    if path.starts_with("/npm/") && w.login.as_deref().is_some_and(|want| auth != Some(want)) {
+        return (StatusCode::UNAUTHORIZED, [("www-authenticate", "Basic realm=\"stand-in\"")], "log in").into_response();
+    }
     if let Some(to) = w.redirects.get(&path) {
         return (StatusCode::FOUND, [("location", to.clone())]).into_response();
     }
@@ -129,6 +148,15 @@ impl Mirror {
         w.redirects.insert(path.into(), format!("{}/stored{path}", self.other));
     }
 
+    /// Answers `path` with a redirect to `/stored<path>` on this same host and port:
+    /// outside the registry's path, though npm's key for the host still matches.
+    pub fn redirect_within(&self, path: &str) {
+        let mut w = self.world.lock().unwrap();
+        let body = w.files[path].clone();
+        w.files.insert(format!("/stored{path}"), body);
+        w.redirects.insert(path.into(), format!("{}/stored{path}", self.url));
+    }
+
     pub fn ca_pem(&self) -> String {
         self.ca_pem.clone()
     }
@@ -183,10 +211,26 @@ impl Mirror {
                 .collect(),
             npm_registry: Some(self.registry()),
             ca: Some(self.ca_pem()),
+            npm_login: self.world.lock().unwrap().login.is_some(),
         }
     }
 
     pub fn calls(&self) -> Vec<String> {
         self.world.lock().unwrap().calls.clone()
+    }
+
+    /// From now on the registry answers 401 to any request without `authorization`.
+    pub fn require(&self, authorization: &str) {
+        self.world.lock().unwrap().login = Some(authorization.into());
+    }
+
+    /// Serves `login` at `/v1/npm-login`, as botd would to an enrolled machine.
+    pub fn serve_login(&self, login: &super::wire::NpmLogin) {
+        self.world.lock().unwrap().served_login = Some(serde_json::to_value(login).unwrap());
+    }
+
+    /// The paths asked for with an `Authorization` header.
+    pub fn authorized(&self) -> Vec<String> {
+        self.world.lock().unwrap().authorized.clone()
     }
 }

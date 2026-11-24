@@ -100,7 +100,8 @@ pub fn parse_harnesses(raw: &str) -> Result<Option<HarnessPlan>, String> {
 }
 
 impl Upkeep {
-    pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Upkeep, String> {
+    /// Settings from `var`; the npm registry's login from `store`, botd's secrets.
+    pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn crate::secrets::SecretStore) -> Result<Upkeep, String> {
         let upgrades = match var("MACHINE_AGENT_UPGRADES").trim().to_ascii_lowercase().as_str() {
             "" | "manual" => Upgrades::Manual,
             "auto" => Upgrades::Auto,
@@ -108,7 +109,7 @@ impl Upkeep {
         };
         let rebuilds = super::rebuild::Rebuilds::parse(&var("MACHINE_LEGACY_REBUILDS"))?;
         let raw = var("MACHINE_HARNESSES");
-        let mirrors = Mirrors::from_env(var)?;
+        let mirrors = Mirrors::from_env(var, store)?;
         let hermes = Bundles::from_env(var)?;
         let mut u = Upkeep { plan: None, upgrades, rebuilds, unset: raw.trim().is_empty(), defaulted: false, mirrors, hermes };
         u.plan = parse_harnesses(&raw)?.map(|p| u.served(p)).transpose()?;
@@ -384,12 +385,14 @@ async fn send_plan(app: &App, e: &Enrollment, m: &Machine, plan: &HarnessPlan, b
 
 /// Whether an agent that says `can` installs `plan`. One from before ADR 0186 would
 /// refuse a plan with mirrors in it, or fetch it from the internet; one from before
-/// ADR 0210 would refuse a Hermes bundle.
+/// ADR 0210 would refuse a Hermes bundle; one from before ADR 0219 would refuse a plan
+/// whose registry needs a login.
 fn takes(plan: &HarnessPlan, can: &[String]) -> bool {
     let has = |c: &str| can.iter().any(|x| x == c);
     has(wire::CAN_HARNESSES)
         && (!mirror::needs_agent_support(plan) || has(wire::CAN_HARNESS_MIRRORS))
         && (!hermes_serve::bundled(plan) || has(wire::CAN_HARNESS_BUNDLES))
+        && (!plan.npm_login || has(wire::CAN_HARNESS_MIRROR_LOGIN))
 }
 
 /// Whether the agent should be sent the plan now.
@@ -576,6 +579,12 @@ pub async fn harnesses_now(
             "Its agent can't install Hermes Agent from MACHINE_HERMES_BUNDLE: it is older than ADR 0210. Upgrade it first: botctl machine upgrade <user>.".into(),
         ));
     }
+    if plan.npm_login && !hb.can.iter().any(|c| c == wire::CAN_HARNESS_MIRROR_LOGIN) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Its agent can't sign in to MACHINE_NPM_REGISTRY: it is older than ADR 0219. Upgrade it first: botctl machine upgrade <user>.".into(),
+        ));
+    }
     if !takes(plan, &hb.can) {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -591,10 +600,14 @@ pub async fn harnesses_now(
 mod tests {
     use super::*;
 
+    fn no_secrets() -> crate::secrets::env::EnvStore {
+        crate::secrets::env::EnvStore::fixed(&[])
+    }
+
     #[test]
     fn settings() {
         let none = |_: &str| String::new();
-        let u = Upkeep::from_env(&none).unwrap();
+        let u = Upkeep::from_env(&none, &no_secrets()).unwrap();
         assert!(u.plan.is_none() && u.upgrades == Upgrades::Manual, "off by default");
         assert_eq!(u.rebuilds, super::super::rebuild::Rebuilds::Manual);
         let env = |k: &str| match k {
@@ -602,7 +615,7 @@ mod tests {
             "MACHINE_AGENT_UPGRADES" => "AUTO".into(),
             _ => String::new(),
         };
-        let u = Upkeep::from_env(&env).unwrap();
+        let u = Upkeep::from_env(&env, &no_secrets()).unwrap();
         assert_eq!(u.upgrades, Upgrades::Auto);
         let p = u.plan.unwrap();
         assert_eq!(names(&p), ["claude@2.1.329", "codex@0.172.0", "pi@1.5.2"]);
@@ -616,7 +629,7 @@ mod tests {
             ("MACHINE_LEGACY_REBUILDS", "yes"),
         ] {
             let bad = |key: &str| if key == k { v.to_string() } else { String::new() };
-            assert!(Upkeep::from_env(&bad).is_err(), "{k}={v}");
+            assert!(Upkeep::from_env(&bad, &no_secrets()).is_err(), "{k}={v}");
         }
     }
 
@@ -628,7 +641,7 @@ mod tests {
             "MACHINE_NPM_REGISTRY" => "https://mirror.corp.example/npm".into(),
             _ => String::new(),
         };
-        let u = Upkeep::from_env(&env).unwrap();
+        let u = Upkeep::from_env(&env, &no_secrets()).unwrap();
         let p = u.plan.clone().unwrap();
         assert_eq!(p.npm_registry.as_deref(), Some("https://mirror.corp.example/npm/"));
         assert!(p.node.as_ref().unwrap().downloads.values().all(|d| d.url.starts_with("https://mirror.corp.example/nodejs/v")));
@@ -636,15 +649,36 @@ mod tests {
         let can = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_MIRRORS])));
         assert!(!takes(&p, &can(&[wire::CAN_HARNESSES])), "an agent from before ADR 0186 isn't sent it");
-        let plain = Upkeep::from_env(&|k: &str| if k == "MACHINE_HARNESSES" { "claude".into() } else { String::new() }).unwrap().plan.unwrap();
+        let plain = Upkeep::from_env(&|k: &str| if k == "MACHINE_HARNESSES" { "claude".into() } else { String::new() }, &no_secrets()).unwrap().plan.unwrap();
         assert!(takes(&plain, &can(&[wire::CAN_HARNESSES])), "without mirrors, older agents get the plan as before");
 
         // The managed tiers' default goes through the mirrors too, and Hermes is named
         // as still needing the internet.
-        let mut u = Upkeep::from_env(&|k: &str| if k == "MACHINE_HARNESSES" { String::new() } else { env(k) }).unwrap();
+        let mut u = Upkeep::from_env(&|k: &str| if k == "MACHINE_HARNESSES" { String::new() } else { env(k) }, &no_secrets()).unwrap();
         u.default_to(&["hermes", "pi"]).unwrap();
         assert!(u.plan.as_ref().unwrap().npm_registry.is_some());
         assert!(u.describe().contains("hermes still download"), "{}", u.describe());
+    }
+
+    #[test]
+    fn a_registry_login_goes_only_to_agents_that_fetch_it() {
+        let env = |k: &str| match k {
+            "MACHINE_HARNESSES" => "claude".into(),
+            "MACHINE_NPM_REGISTRY" => "https://mirror.corp.example/npm".into(),
+            _ => String::new(),
+        };
+        let secrets = crate::secrets::env::EnvStore::fixed(&[("MACHINE_NPM_TOKEN", "upkeep-test-token-2b9f")]);
+        let u = Upkeep::from_env(&env, &secrets).unwrap();
+        let p = u.plan.clone().unwrap();
+        assert!(p.npm_login);
+        assert!(u.describe().contains("signing in with MACHINE_NPM_TOKEN") && !u.describe().contains("upkeep-test-token-2b9f"), "{}", u.describe());
+        let can = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_MIRRORS, wire::CAN_HARNESS_MIRROR_LOGIN])));
+        assert!(!takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_MIRRORS])), "an agent from before ADR 0219 isn't sent it");
+        let anonymous = Upkeep::from_env(&env, &no_secrets()).unwrap().plan.unwrap();
+        assert!(!anonymous.npm_login && takes(&anonymous, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_MIRRORS])), "without a login, nothing changes");
+        let err = Upkeep::from_env(&|k: &str| if k == "MACHINE_NPM_REGISTRY" { String::new() } else { env(k) }, &secrets).unwrap_err();
+        assert!(err.contains("need MACHINE_NPM_REGISTRY"), "{err}");
     }
 
     #[test]
@@ -668,7 +702,7 @@ mod tests {
                 _ => String::new(),
             }
         };
-        let u = Upkeep::from_env(&env("claude,hermes")).unwrap();
+        let u = Upkeep::from_env(&env("claude,hermes"), &no_secrets()).unwrap();
         let p = u.plan.clone().unwrap();
         assert!(matches!(p.harnesses[0].source, InstallSource::Npm { .. }));
         assert!(matches!(p.harnesses[1].source, InstallSource::Bundle { .. }), "{p:?}");
@@ -677,15 +711,15 @@ mod tests {
         let can = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_BUNDLES])));
         assert!(!takes(&p, &can(&[wire::CAN_HARNESSES, wire::CAN_HARNESS_MIRRORS])), "an agent from before ADR 0210 isn't sent it");
-        let without = Upkeep::from_env(&env("claude")).unwrap().plan.unwrap();
+        let without = Upkeep::from_env(&env("claude"), &no_secrets()).unwrap().plan.unwrap();
         assert!(takes(&without, &can(&[wire::CAN_HARNESSES])), "without Hermes in the plan, the bundles change nothing");
         assert_eq!(without, parse_harnesses("claude").unwrap().unwrap(), "nor the plan's id");
 
         // The managed tiers' default goes through them too.
-        let mut u = Upkeep::from_env(&env("")).unwrap();
+        let mut u = Upkeep::from_env(&env(""), &no_secrets()).unwrap();
         u.default_to(&["hermes"]).unwrap();
         assert!(matches!(u.plan.unwrap().harnesses[0].source, InstallSource::Bundle { .. }));
-        let pinned = Upkeep::from_env(&env("hermes@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")).unwrap_err();
+        let pinned = Upkeep::from_env(&env("hermes@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), &no_secrets()).unwrap_err();
         assert!(pinned.contains("but machines' plan pins bbbbbbbbbbbb"), "{pinned}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -694,7 +728,7 @@ mod tests {
     fn machines_get_the_managed_default_unless_told_otherwise() {
         let with = |v: &'static str| move |k: &str| if k == "MACHINE_HARNESSES" { v.to_string() } else { String::new() };
         // Unset: the managed tiers' default, at its pin.
-        let mut u = Upkeep::from_env(&with("")).unwrap();
+        let mut u = Upkeep::from_env(&with(""), &no_secrets()).unwrap();
         assert!(u.unset && !u.defaulted);
         assert_eq!(u.lacks(&["hermes"]), ["hermes"]);
         u.default_to(&["hermes"]).unwrap();
@@ -703,14 +737,14 @@ mod tests {
         assert!(u.defaulted && u.describe().contains("the managed tiers' default"), "{}", u.describe());
         assert!(u.lacks(&["hermes"]).is_empty());
         // No managed tiers (self-host): still nothing.
-        let mut open = Upkeep::from_env(&with("")).unwrap();
+        let mut open = Upkeep::from_env(&with(""), &no_secrets()).unwrap();
         open.default_to(&[]).unwrap();
         assert!(open.plan.is_none() && !open.defaulted);
         // `none`, or a list of its own, is what machines get.
-        let mut none = Upkeep::from_env(&with("none")).unwrap();
+        let mut none = Upkeep::from_env(&with("none"), &no_secrets()).unwrap();
         none.default_to(&["hermes"]).unwrap();
         assert!(none.plan.is_none() && !none.unset && none.describe().contains("harnesses on machines: none"));
-        let mut own = Upkeep::from_env(&with("claude")).unwrap();
+        let mut own = Upkeep::from_env(&with("claude"), &no_secrets()).unwrap();
         own.default_to(&["hermes"]).unwrap();
         assert_eq!(names(own.plan.as_ref().unwrap()), ["claude@2.1.329"]);
         assert_eq!(own.lacks(&["hermes", "claude"]), ["hermes"]);

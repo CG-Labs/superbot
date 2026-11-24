@@ -401,7 +401,7 @@ mod tests {
     #[ignore]
     async fn real_harness_installs() {
         let dir = crate::db::temp_path("real-tools");
-        let tools = crate::machines::tools::Tools::new(dir.clone(), None).unwrap();
+        let tools = crate::machines::tools::Tools::new(dir.clone(), None, std::path::PathBuf::from(format!("{}-login", dir.display()))).unwrap();
         let p = plan(["claude", "codex", "pi"].map(|b| install(b, None, None).unwrap()).into());
         tools.set_plan(p).unwrap();
         let worker = tokio::spawn(tools.clone().work());

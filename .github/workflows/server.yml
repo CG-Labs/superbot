@@ -144,13 +144,16 @@ jobs:
             machines_redteam_tests::as_root_red_team_a_run_cant_exhaust_the_machine
       # ADR 0186: an air-gapped network's machines install harness CLIs from its own
       # mirrors: the real npm and Node.js layout, a registry with a CA of its own, no network.
+      # ADR 0219: and sign in to one that wants a login.
       - name: Machines install harness CLIs from mirrors with no network
         run: |
           sudo env "PATH=$PATH" unshare --net -- sh -c '
             set -e
             ip link set lo up
             if curl -sS -m 5 -o /dev/null https://registry.npmjs.org/ 2>/dev/null; then echo "the network is up" >&2; exit 1; fi
-            exec /tmp/botd-tests --ignored --exact machines_upkeep_tests::real_npm_installs_from_a_mirror_with_no_network'
+            exec /tmp/botd-tests --ignored --exact \
+              machines_upkeep_tests::real_npm_installs_from_a_mirror_with_no_network \
+              machines_upkeep_tests::real_npm_signs_in_to_a_registry_that_wants_a_login'
       # ADR 0210: their Hermes Agent comes from botd's Hermes bundle, with no network.
       - name: Machines install Hermes Agent from botd's bundle with no network
         run: |

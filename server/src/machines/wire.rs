@@ -8,6 +8,9 @@
 //! - `ANY /v1/machines/{id}/api/{path}`: botd's `/api/{path}`, for a Bot running on that
 //!   machine (its own `BOT_TOKEN`, for one of the machine's user's Bots).
 //! - `GET /v1/agent`, `GET /v1/botctl`: binaries, for cloud-init to install.
+//! - `GET /v1/hermes/{arch}`: a Hermes bundle (ADR 0210). The machine's own certificate.
+//! - `GET /v1/npm-login` -> `NpmLogin`: the npm registry's login, for a plan with
+//!   `npm_login` (ADR 0219). The machine's own certificate.
 //!
 //! The agent (MACHINE_AGENT_PORT), for botd's certificate only:
 //! - `GET /v1/heartbeat[?bin=<name>...]` -> `Heartbeat`.
@@ -131,6 +134,9 @@ pub const CAN_SECCOMP: &str = "seccomp";
 pub const CAN_HARNESS_MIRRORS: &str = "harness_mirrors";
 /// Installs `InstallSource::Bundle` from botd's machine port (ADR 0210).
 pub const CAN_HARNESS_BUNDLES: &str = "harness_bundles";
+/// Takes `HarnessPlan::npm_login`: fetches the registry's login from botd for each
+/// npm install, and keeps it only in a root-only file while npm runs (ADR 0219).
+pub const CAN_HARNESS_MIRROR_LOGIN: &str = "harness_mirror_login";
 /// Lets its harness egress rules through to its team network's subnet, or stops
 /// letting them (`PUT /v1/team-network`, ADR 0202).
 pub const CAN_TEAM_NETWORK: &str = "team_network";
@@ -815,6 +821,30 @@ pub struct HarnessPlan {
     /// besides the system's (MACHINE_MIRROR_CA_FILE, ADR 0186).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca: Option<String>,
+    /// `npm_registry` needs a login (MACHINE_NPM_TOKEN, or MACHINE_NPM_USERNAME and
+    /// MACHINE_NPM_PASSWORD, ADR 0219). The login itself is never in the plan, which the
+    /// agent keeps on disk: it fetches it from botd (`GET /v1/npm-login`) for each install.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub npm_login: bool,
+}
+
+/// `GET /v1/npm-login` on botd's machine port (ADR 0219): how npm signs in to
+/// `registry`, which must be the plan's. Exactly one of `token` (npm's `_authToken`)
+/// and `auth` (npm's `_auth`, base64 of `user:password`).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NpmLogin {
+    pub registry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+}
+
+impl std::fmt::Debug for NpmLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("NpmLogin").field("registry", &self.registry).field("token", &self.token.as_ref().map(|_| "…")).field("auth", &self.auth.as_ref().map(|_| "…")).finish()
+    }
 }
 
 impl HarnessPlan {

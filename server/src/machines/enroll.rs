@@ -145,6 +145,7 @@ impl Enrollment {
     /// (default 7443) are optional.
     pub fn from_env(
         var: &dyn Fn(&str) -> String,
+        store: &dyn crate::secrets::SecretStore,
         cipher: &Cipher,
         bin_dir: &FsPath,
     ) -> Result<Option<Enrollment>, String> {
@@ -158,6 +159,7 @@ impl Enrollment {
                 "MACHINE_NODE_MIRROR",
                 "MACHINE_NPM_REGISTRY",
                 "MACHINE_MIRROR_CA_FILE",
+                "MACHINE_NPM_USERNAME",
                 "MACHINE_AGENT_UPGRADES",
                 "MACHINE_LEGACY_REBUILDS",
                 "MACHINE_HARNESS_LOGINS",
@@ -174,6 +176,11 @@ impl Enrollment {
                 "MACHINE_RUN_LIMITS",
             ] {
                 if !var(k).trim().is_empty() {
+                    return Err(format!("{k} needs MACHINE_CONTROL_URL"));
+                }
+            }
+            for k in ["MACHINE_NPM_TOKEN", "MACHINE_NPM_PASSWORD"] {
+                if store.get(k).map_err(|e| format!("{k}: {e}"))?.is_some() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
                 }
             }
@@ -238,7 +245,7 @@ impl Enrollment {
         )?;
         e.botctl = read(BOTCTL_BIN);
         e.enroll_timeout_ms = timeout * 60_000;
-        e.upkeep = Upkeep::from_env(var)?;
+        e.upkeep = Upkeep::from_env(var, store)?;
         e.logins = match var("MACHINE_HARNESS_LOGINS").trim() {
             "" | "off" => false,
             "on" => true,
@@ -1323,6 +1330,29 @@ async fn hermes_bundle(
     super::hermes_serve::body(&b.file).await.unwrap_or_else(|e| reply(StatusCode::INTERNAL_SERVER_ERROR, &e))
 }
 
+/// `GET /v1/npm-login`: MACHINE_NPM_REGISTRY's login (ADR 0219), for enrolled machines
+/// only, asked for each time one installs an npm harness. Audited, since it hands out a
+/// credential; the event names the kind, never the value.
+async fn npm_login(AxState(p): AxState<Arc<Port>>, Extension(peer): Extension<Peer>) -> Response {
+    let id = peer.cert.as_ref().and_then(|der| p.app.db.machine_cert(&pki::fingerprint(der))).map(|c| c.machine_id);
+    let m = match authenticate(&p, &peer, id.as_deref().unwrap_or_default()) {
+        Err(r) => return r,
+        Ok((_, m)) => m,
+    };
+    let Some((registry, login)) = p.e.upkeep.mirrors.as_ref().and_then(|x| Some((x.npm.as_deref()?, x.login.as_ref()?))) else {
+        return reply(StatusCode::NOT_FOUND, "This server has no npm registry login (MACHINE_NPM_TOKEN, or MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD).");
+    };
+    record(
+        &p.app,
+        &agent_who(&m.user_id, &peer),
+        "machine.npm_login_sent",
+        &m.id,
+        Outcome::Success,
+        json!({ "userId": m.user_id, "registry": registry, "login": login.kind() }),
+    );
+    Json(login.wire(registry)).into_response()
+}
+
 /// Headers a Bot's call carries through the relay; nothing else crosses.
 const RELAYED: [header::HeaderName; 4] = [
     header::AUTHORIZATION,
@@ -1415,6 +1445,7 @@ pub fn router(app: AppState, e: Arc<Enrollment>, api: Option<Api>) -> axum::Rout
         .route("/v1/botctl", get(botctl_binary))
         .route("/v1/voxl", get(voxl_binary))
         .route("/v1/hermes/{arch}", get(hermes_bundle))
+        .route("/v1/npm-login", get(npm_login))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::new(Port { app, e, api }))
 }
@@ -1821,11 +1852,20 @@ mod tests {
                         .map(|(_, v)| v.to_string())
                         .unwrap_or_default()
                 },
+                &crate::secrets::env::EnvStore::fixed(&[]),
                 &cipher,
                 &bin,
             )
         };
         assert!(with(&[]).unwrap().is_none(), "off unless asked");
+        let secret = crate::db::temp_path("enroll-secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("v"), "a-registry-login\n").unwrap();
+        let file = secret.join("v").display().to_string();
+        for (k, v) in [("MACHINE_NPM_TOKEN", "a-registry-login"), ("MACHINE_NPM_TOKEN_FILE", file.as_str()), ("MACHINE_NPM_PASSWORD_FILE", file.as_str())] {
+            let err = Enrollment::from_env(&|_| String::new(), &crate::secrets::env::EnvStore::fixed(&[(k, v)]), &cipher, &bin).err();
+            assert!(err.as_deref().is_some_and(|e| e.ends_with("needs MACHINE_CONTROL_URL")), "{k}: {err:?}");
+        }
         assert!(
             with(&[("MACHINE_AGENT_PORT", "7000")]).is_err(),
             "agent settings alone are a mistake"
@@ -1845,7 +1885,7 @@ mod tests {
         assert!(e.unit().contains("StateDirectoryMode=0700"), "{}", e.unit());
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
         assert!(e.describe().contains("teammates' own users off"), "{}", e.describe());
-        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS"] {
+        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS", "MACHINE_NPM_USERNAME"] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
             assert!(with(vars).is_err(), "{v} needs enrollment");
         }
@@ -1937,6 +1977,7 @@ mod tests {
                     String::new()
                 }
             },
+            &crate::secrets::env::EnvStore::fixed(&[]),
             &other,
             &bin,
         )
