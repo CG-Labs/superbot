@@ -1610,12 +1610,10 @@ pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> O
     let slo = match (&idp.slo, &idp.slo_soap) {
         (Some(slo), _) if browser => slo.clone(),
         (_, Some(soap)) => {
-            let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no back-channel logout: {e}", p.id)).ok()?;
-            let id = saml_sp::request_id();
-            let xml = saml_slo::logout_request(sp_entity_id, &id, soap, &login, db::now());
-            let signed = key.sign_enveloped(&xml, &id).map_err(|e| crate::obs::log::log_warn!("SSO {}: no back-channel logout: {e}", p.id)).ok()?;
-            let (a, provider, url, session, request) = (a.clone(), p.id.clone(), soap.clone(), s.id.clone(), id.clone());
-            tokio::spawn(async move { back_channel_logout(&a, &provider, &idp, &url, &session, &request, &signed).await });
+            let b = BackChannel::new(app, p, sp_entity_id, idp.clone(), soap, &s.id, &login, db::now()).map_err(|e| crate::obs::log::log_warn!("SSO {}: no back-channel logout: {e}", p.id)).ok()?;
+            let id = b.request.clone();
+            let (http, app) = (a.sso.http().clone(), app.clone());
+            tokio::spawn(async move { back_channel_logout(&http, &app, &b, "logout").await });
             return Some(IdpLogout::BackChannel { id });
         }
         _ => return None,
@@ -1671,39 +1669,113 @@ fn post_page(url: &str, param: &str, xml: &str, relay: Option<&str>, to: &str) -
     ([(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")), (header::CONTENT_SECURITY_POLICY, csp)], page).into_response()
 }
 
-/// Posts our signed LogoutRequest `signed` (ID `request`) to the IdP's SOAP SLO URL and audits
-/// its answer as `auth.slo_response`, against the session that was signed out. Its body is read
-/// up to `MAX_RESPONSE`, and redirects aren't followed: the URL is the one the metadata names.
-async fn back_channel_logout(a: &Auth, provider: &str, idp: &saml_sp::IdpMetadata, url: &str, session: &str, request: &str, signed: &str) {
-    let sent = a
-        .sso
-        .http()
-        .post(url)
+/// A signed LogoutRequest for one session, to the IdP's SOAP SLO URL (ADR 0208).
+struct BackChannel {
+    provider: String,
+    idp: Arc<saml_sp::IdpMetadata>,
+    url: String,
+    session: String,
+    request: String,
+    signed: String,
+}
+
+impl BackChannel {
+    #[allow(clippy::too_many_arguments)]
+    fn new(app: &AppState, p: &Provider, sp_entity_id: &str, idp: Arc<saml_sp::IdpMetadata>, url: &str, session: &str, login: &db::SamlLogin, at: i64) -> Result<BackChannel, String> {
+        let key = sp_key(app, p)?;
+        let request = saml_sp::request_id();
+        let xml = saml_slo::logout_request(sp_entity_id, &request, url, login, at);
+        let signed = key.sign_enveloped(&xml, &request)?;
+        Ok(BackChannel { provider: p.id.clone(), idp, url: url.into(), session: session.into(), request, signed })
+    }
+}
+
+/// Most back-channel LogoutRequests one admin action sends: one per IdP session, and a person
+/// rarely has more than a few.
+const MAX_ENDED_LOGOUTS: usize = 20;
+
+/// Sessions ended without their holder signing out: an admin revoked them, disabled or erased
+/// the user, or SCIM deprovisioned or deleted them (ADR 0258). There's no browser to send to
+/// the IdP, so each one a native SAML IdP vouched for, live until now, gets a signed
+/// LogoutRequest to the IdP's SOAP SLO URL from botd, once per IdP session, sent in the
+/// background and audited like a sign-out's (ADR 0208). Only cached IdP metadata is used:
+/// the admin's action never waits on the IdP. `reason` is the sessions' revoke reason. Returns
+/// the request IDs, for the action's own audit event.
+pub fn sessions_ended(a: &Auth, app: &AppState, sessions: &[db::Session], reason: &str) -> Vec<String> {
+    let at = db::now();
+    let mut seen = std::collections::HashSet::new();
+    let mut sends = Vec::new();
+    for s in sessions.iter().filter(|s| s.method == "sso" && s.unexpired_at(at, a.sessions.idle_ms, a.sessions.max_ms)) {
+        let Some(p) = s.idp_provider.as_deref().and_then(|id| a.sso.provider(id)) else { continue };
+        let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { continue };
+        let Some(idp) = p.idp_loaded() else { continue };
+        let Some(soap) = idp.slo_soap.clone() else { continue };
+        // Without a SessionIndex the request would name only the person, ending IdP sessions
+        // on devices nobody revoked.
+        let Some(login) = app.db.saml_session(&s.id).filter(|l| l.session_index.is_some()) else { continue };
+        if !seen.insert((p.id.clone(), login.name_id.clone(), login.session_index.clone())) {
+            continue;
+        }
+        if sends.len() == MAX_ENDED_LOGOUTS {
+            crate::obs::log::log_warn!("SSO {}: back-channel logout sent for the first {MAX_ENDED_LOGOUTS} IdP sessions only", p.id);
+            break;
+        }
+        match BackChannel::new(app, p, sp_entity_id, idp, &soap, &s.id, &login, at) {
+            Ok(b) => sends.push(b),
+            Err(e) => crate::obs::log::log_warn!("SSO {}: no back-channel logout: {e}", p.id),
+        }
+    }
+    let ids = sends.iter().map(|b| b.request.clone()).collect();
+    if !sends.is_empty() {
+        let (http, app, reason) = (a.sso.http().clone(), app.clone(), reason.to_string());
+        tokio::spawn(async move {
+            for b in sends {
+                back_channel_logout(&http, &app, &b, &reason).await;
+            }
+        });
+    }
+    ids
+}
+
+/// Posts `b`'s signed LogoutRequest to the IdP's SOAP SLO URL and audits its answer as
+/// `auth.slo_response`, against the session that ended (`reason`, its revoke reason). Its body
+/// is read up to `MAX_RESPONSE`, and redirects aren't followed: the URL is the one the
+/// metadata names.
+async fn back_channel_logout(http: &reqwest::Client, app: &AppState, b: &BackChannel, reason: &str) {
+    let sent = http
+        .post(&b.url)
         .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
         .header("SOAPAction", saml_slo::SOAP_ACTION)
-        .body(saml_slo::soap_envelope(signed))
+        .body(saml_slo::soap_envelope(&b.signed))
         .send()
         .await;
     let answer = match sent {
         Err(e) => Err(Refused("unreachable", Some(crate::audit::clip(&e.without_url().to_string(), 128)))),
         // SOAP 1.1 faults come with a 500, so the body is read either way.
         Ok(res) => match capped_body(res, saml_sp::MAX_RESPONSE).await {
-            Some((code, body)) => saml_slo::receive_soap_response(&body, idp, request, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("http_error", Some(code.as_u16().to_string())) } else { r }),
+            Some((code, body)) => saml_slo::receive_soap_response(&body, &b.idp, &b.request, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("http_error", Some(code.as_u16().to_string())) } else { r }),
             None => Err(Refused("bad_message", None)),
         },
     };
+    let provider = b.provider.as_str();
     let (outcome, mut details) = match &answer {
         Ok(status) => (if status.is_none() { Outcome::Success } else { Outcome::Failure }, json!({ "status": status.as_deref().unwrap_or("Success") })),
-        Err(Refused(reason, detail)) => {
-            crate::obs::log::log_warn!("SSO {provider}: the IdP's back-channel logout answer: {reason}");
-            (Outcome::Failure, json!({ "status": "none", "reason": reason, "detail": detail }))
+        Err(Refused(why, detail)) => {
+            crate::obs::log::log_warn!("SSO {provider}: the IdP's back-channel logout answer: {why}");
+            (Outcome::Failure, json!({ "status": "none", "reason": why, "detail": detail }))
         }
     };
     if let Value::Object(d) = &mut details {
-        d.extend([("provider".into(), json!(provider)), ("idp".into(), json!("saml")), ("requestId".into(), json!(request)), ("binding".into(), json!("soap"))]);
+        d.extend([
+            ("provider".into(), json!(provider)),
+            ("idp".into(), json!("saml")),
+            ("requestId".into(), json!(b.request)),
+            ("binding".into(), json!("soap")),
+            ("revokeReason".into(), json!(reason)),
+        ]);
     }
     let actor = Actor { idp: Some("saml".into()), idp_provider: Some(provider.into()), ..Actor::system("sso") };
-    a.record(Event::new(actor, "auth.slo_response").target("session", session).outcome(outcome).details(details));
+    app.db.record(&Event::new(actor, "auth.slo_response").target("session", &b.session).outcome(outcome).details(details));
 }
 
 /// A response's status and body, or None when it's over `max` bytes or not UTF-8.

@@ -1540,6 +1540,14 @@ pub struct Session {
     pub mfa: Option<String>,
 }
 
+impl Session {
+    /// Whether its idle and absolute TTLs and its own end (`SESSION_LIVE` but for
+    /// revocation) still had it live at `at`: a session revoked just now was, if this holds.
+    pub fn unexpired_at(&self, at: i64, idle_ms: i64, max_ms: i64) -> bool {
+        at < self.expires_at && at < self.created_at + max_ms && at < self.last_seen_at + idle_ms
+    }
+}
+
 /// What a native SAML sign-in's assertion said about the person and the IdP's session
 /// (ADR 0137): our LogoutRequest names them, and the IdP's names them back.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -8472,18 +8480,16 @@ impl Db {
     }
 
     /// Revokes every session of a user and drops their unused sign-in codes and push
-    /// devices. Returns how many sessions.
-    pub fn revoke_user_sessions(&self, user_id: &str, by: &str, reason: &str) -> usize {
+    /// devices. Returns the sessions it revoked, so native SAML IdPs can be told (ADR 0258).
+    pub fn revoke_user_sessions(&self, user_id: &str, by: &str, reason: &str) -> Vec<Session> {
         let c = self.c();
         let _ = c.execute("DELETE FROM push_devices WHERE user_id = ?", [user_id]);
-        let n = c
-            .execute(
-                "UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL",
-                params![now(), by, reason, user_id],
-            )
-            .unwrap_or(0);
+        let revoked = c
+            .prepare("UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL RETURNING *")
+            .and_then(|mut s| s.query_map(params![now(), by, reason, user_id], session_row)?.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default();
         let _ = c.execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]);
-        n
+        revoked
     }
 
     pub fn add_login_code(&self, code_hash: &str, user_id: &str, created_by: &str, expires_at: i64) {
