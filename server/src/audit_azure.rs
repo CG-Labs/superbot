@@ -483,11 +483,12 @@ mod tests {
         (StatusCode::OK, axum::Json(json!({ "access_token": token, "expires_in": "86399", "token_type": "Bearer" })))
     }
 
-    async fn upload(State(a): State<A>, Path((dcr, stream)): Path<(String, String)>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, body: String) -> (StatusCode, axum::Json<Value>) {
+    async fn upload(State(a): State<A>, Path((dcr, stream)): Path<(String, String)>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, axum::Json(body): axum::Json<Vec<Value>>) -> (StatusCode, axum::Json<Value>) {
         a.requests.fetch_add(1, Ordering::SeqCst);
         assert_eq!((dcr.as_str(), stream.as_str(), q.get("api-version").map(String::as_str)), (DCR, "Custom-SuperBotAudit", Some(API_VERSION)));
         assert_eq!(h.get("content-type").and_then(|v| v.to_str().ok()), Some("application/json"));
-        assert!(body.len() <= MAX_BODY, "{}", body.len());
+        let size: usize = h.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).expect("a request's size");
+        assert!(size <= MAX_BODY, "{size}");
         let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let known = a.tokens.lock().unwrap().iter().any(|t| auth == format!("Bearer {t}"));
         if !known || a.revoked.lock().unwrap().iter().any(|t| auth == format!("Bearer {t}")) {
@@ -497,7 +498,7 @@ mod tests {
             0 => {}
             s => return (StatusCode::from_u16(s as u16).unwrap(), axum::Json(json!({ "error": { "code": "OperationFailed", "message": "The authentication token provided does not have access to ingest data for the data collection rule" } }))),
         }
-        a.records.lock().unwrap().extend(serde_json::from_str::<Vec<Value>>(&body).unwrap());
+        a.records.lock().unwrap().extend(body);
         (StatusCode::NO_CONTENT, axum::Json(Value::Null))
     }
 
