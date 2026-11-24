@@ -147,8 +147,25 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
         assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/role-requests", "/api/role-requests/x/approve", "/api/role-requests/x/deny", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate"] {
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x", "/api/role-requests", "/api/role-requests/x/approve", "/api/role-requests/x/deny", "/api/service-accounts", "/api/service-accounts/x", "/api/service-accounts/x/tokens", "/api/service-accounts/x/tokens/x", "/api/service-accounts/x/tokens/x/rotate", "/api/support/onboarding"] {
         assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
+    }
+}
+
+/// ADR 0243: the Support tab checks onboarding only when asked, since each check is
+/// audited, and sends the skips typed for it.
+#[test]
+fn the_console_checks_onboarding_only_when_asked() {
+    let start = CONSOLE_JS.find("async function loadSupport(").expect("loadSupport");
+    let load = &CONSOLE_JS[start..start + CONSOLE_JS[start..].find("\n}\n").expect("function end")];
+    assert!(!load.contains("/api/support/onboarding"), "opening the Support tab would record a check");
+    let calls: Vec<&str> = CONSOLE_JS.lines().filter(|l| l.contains("/api/support/onboarding")).collect();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].contains("renderOnboarding(") && calls[0].contains("?skip=${key(skip)}"), "{}", calls[0]);
+    let submit = CONSOLE_JS.find(r#"$("sup-onboarding-form").addEventListener("submit""#).expect("the check runs from its form");
+    assert!(CONSOLE_JS[submit..].find("/api/support/onboarding").is_some_and(|n| n < 400), "the form's handler makes the call");
+    for id in ["sup-onboarding-form", "sup-skip", "sup-onboarding", "sup-onboarding-items", "Check onboarding"] {
+        assert!(CONSOLE_HTML.contains(id), "{id}");
     }
 }
 

@@ -2340,6 +2340,39 @@ async function loadHistory() {
 
 $("sup-days").addEventListener("change", loadHistory);
 
+// Onboarding (ADR 0233, 0243): on request rather than with the tab, since each check is audited.
+const ONBOARDING_STATUS = { done: ["Done", "sig-ok"], open: ["Open", "sig-risk"], confirm: ["Confirm", "sig-watch"], "n/a": ["n/a", ""], skipped: ["Skipped", ""] };
+
+function renderOnboarding(r) {
+  const c = r.counts;
+  const skips = r.unneededSkips.length ? `<p class="hint">Not needed, done or not applicable anyway: ${esc(r.unneededSkips.join(", "))}.</p>` : "";
+  $("sup-onboarding").innerHTML = `<div class="bar"><b>${r.ready ? "Nothing open" : `${esc(c.open)} open`}</b>
+      <span class="sub">${esc(c.done)} done · ${esc(c.confirm)} to confirm with the customer · ${esc(c.notApplicable)} not applicable · ${esc(c.skipped)} skipped</span>
+      <span class="sub push">Checked ${esc(fmt(r.checkedAt))}</span></div>
+    <p class="hint">${r.ready ? "Confirm each item marked Confirm with the customer, then go-live in writing." : "Go-live waits until nothing is open."} <code>botctl onboarding markdown</code> prints this for the onboarding record.</p>${skips}`;
+  const rows = [];
+  for (const s of r.sections) {
+    rows.push(`<tr class="section"><td colspan="4">${esc(s.title)}</td></tr>`);
+    for (const i of r.items.filter((i) => i.section === s.id)) {
+      const [label, cls] = ONBOARDING_STATUS[i.status] || [i.status, ""];
+      rows.push(`<tr><td>${esc(i.label)} <span class="sub"><code>${esc(i.id)}</code></span></td>
+        <td><span class="tag ${cls}">${esc(label)}</span></td><td>${esc(i.detail)}</td><td><code>${esc(i.guide)}</code></td></tr>`);
+    }
+  }
+  $("sup-onboarding-items").innerHTML = rows.join("");
+  $("sup-onboarding").hidden = $("sup-onboarding-table").hidden = false;
+}
+
+$("sup-onboarding-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const skip = $("sup-skip").value.split(",").map((s) => s.trim()).filter(Boolean).join(",");
+  try {
+    renderOnboarding(await api("GET", `/api/support/onboarding${skip ? `?skip=${key(skip)}` : ""}`));
+  } catch (err) {
+    fail(err);
+  }
+});
+
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
 const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, "service-accounts": () => loadServiceAccounts({ keepForm: true }), audit: () => loadAudit(), status: loadStatus, support: loadSupport, settings: loadSettings, setup: loadSetup };

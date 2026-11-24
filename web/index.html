@@ -258,6 +258,17 @@
         <tbody id="sup-history"></tbody>
       </table>
       <div class="empty" id="sup-history-empty" hidden></div>
+      <h2>Onboarding</h2>
+      <form class="bar" id="sup-onboarding-form" autocomplete="off">
+        <span class="hint">The onboarding checklist judged from botd's own settings and records. Each check is audited.</span>
+        <input id="sup-skip" class="push" placeholder="Skips agreed at kickoff, e.g. scim,database_encryption" maxlength="400" title="Item ids, comma-separated. Not kept: pass them each time." />
+        <button type="submit" class="btn">Check onboarding</button>
+      </form>
+      <div class="card" id="sup-onboarding" hidden></div>
+      <table class="grid" id="sup-onboarding-table" hidden>
+        <thead><tr><th>Item</th><th>Status</th><th>What botd saw</th><th>Guide</th></tr></thead>
+        <tbody id="sup-onboarding-items"></tbody>
+      </table>
     </section>
 
     <section id="tab-settings" hidden>
