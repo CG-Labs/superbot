@@ -473,7 +473,7 @@ pub async fn end_kept(app: &App, cp: &ControlPlane) -> usize {
 /// (ADR 0184).
 pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
     let mut out: Vec<String> = app.tiers().unknown_regions(&cp.regions).into_iter().map(|w| format!("The tiers file's {w} (ADR 0139).")).collect();
-    out.extend(super::chat_stores::warnings(app, crate::db::now()));
+    out.extend(super::chat_stores::warnings(app, cp, crate::db::now()));
     let pins = app.db.residency_pins();
     let earlier = if pins.is_empty() { 0 } else { cp.server_data.earlier_copies(app) };
     if earlier > 0 {

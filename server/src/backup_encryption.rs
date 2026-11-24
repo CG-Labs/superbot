@@ -1,6 +1,7 @@
 //! Whether every backup target is encrypted (ADR 0114): the server's archives in
-//! BACKUP_DIR (superbot-backup, ADR 0030), their off-host copies (ADR 0109) and machines'
-//! off-host backups (ADR 0071). All three use age, and botd only ever holds public keys.
+//! BACKUP_DIR (superbot-backup, ADR 0030), their off-host copies (ADR 0109), machines'
+//! off-host backups (ADR 0071) and regional chat stores' off-host copies (ADR 0246). All
+//! use age, and botd only ever holds public keys.
 //!
 //! SUPERBOT_BACKUP_ENCRYPTION says what a plain target means: `auto` (the default) warns
 //! at startup, keeps the setup checklist's item open and shows it in `/metrics`;
@@ -10,7 +11,7 @@
 //! `server.backup_encryption_changed`.
 
 use crate::audit::{Actor, Event};
-use crate::machines::backup;
+use crate::machines::{backup, chat_store_copies};
 use crate::obs::metrics;
 use crate::runner::App;
 use crate::server_backups::{self, ServerBackups};
@@ -54,7 +55,7 @@ impl Policy {
 /// One backup target and whether what it holds now is encrypted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
-    /// `server_archives`, `server_copies` or `machines`: the label in `/metrics`.
+    /// `server_archives`, `server_copies`, `machines` or `chat_stores`: the label in `/metrics`.
     pub id: &'static str,
     pub label: &'static str,
     pub encrypted: bool,
@@ -66,8 +67,9 @@ fn target(id: &'static str, label: &'static str, encrypted: bool, detail: String
 }
 
 /// Every target this server has, from its settings and the newest archive in BACKUP_DIR.
-/// `machines`: the off-host machine backups' settings, when they're on.
-pub fn targets(sb: &ServerBackups, machines: Option<&backup::Settings>) -> Vec<Target> {
+/// `machines`: the off-host machine backups' settings, when they're on; `regional`: the
+/// regional chat stores' off-host copies' (ADR 0246).
+pub fn targets(sb: &ServerBackups, machines: Option<&backup::Settings>, regional: Option<&chat_store_copies::Settings>) -> Vec<Target> {
     let newest = server_backups::archives(&sb.dir).pop();
     let archives_encrypted = match &newest {
         Some(a) => a.encrypted,
@@ -96,13 +98,20 @@ pub fn targets(sb: &ServerBackups, machines: Option<&backup::Settings>) -> Vec<T
         };
         out.push(target("machines", "Machines' off-host backups", !m.recipients.is_empty(), detail));
     }
+    if let Some(c) = regional {
+        let detail = match c.recipients.len() {
+            0 => "regional chat stores' backups are copied plain: set REGION_DATA_AGE_RECIPIENTS".to_string(),
+            n => format!("encrypted to {n} age recipients"),
+        };
+        out.push(target("chat_stores", "Regional chat stores' off-host copies", !c.recipients.is_empty(), detail));
+    }
     out
 }
 
 /// What the settings promise, not what's on disk now: with `required`, botd refuses to
 /// start unless every target is set to be encrypted. An archive written plain before the
 /// recipients were set doesn't stop botd, but it is never copied off the host plain.
-pub fn check(sb: &ServerBackups, machines: Option<&backup::Settings>) -> Result<(), String> {
+pub fn check(sb: &ServerBackups, machines: Option<&backup::Settings>, regional: Option<&chat_store_copies::Settings>) -> Result<(), String> {
     if sb.encryption != Policy::Required {
         return Ok(());
     }
@@ -115,6 +124,9 @@ pub fn check(sb: &ServerBackups, machines: Option<&backup::Settings>) -> Result<
     }
     if machines.is_some_and(|m| m.recipients.is_empty()) {
         missing.push("machines' off-host backups (set MACHINE_BACKUP_AGE_RECIPIENTS)");
+    }
+    if regional.is_some_and(|c| c.recipients.is_empty()) {
+        missing.push("regional chat stores' off-host copies (set REGION_DATA_AGE_RECIPIENTS)");
     }
     match missing.is_empty() {
         true => Ok(()),
@@ -129,10 +141,14 @@ fn machines(app: &App) -> Option<&backup::Settings> {
     app.control_plane.get().and_then(|cp| cp.offsite.as_ref()).map(|o| &o.s)
 }
 
+fn regional(app: &App) -> Option<&chat_store_copies::Settings> {
+    app.control_plane.get().and_then(|cp| cp.chat_copies.as_deref()).map(|c| c.settings())
+}
+
 /// This server's targets now; none before server backups are set up.
 pub fn current(app: &App) -> Option<(Policy, Vec<Target>)> {
     let sb = app.server_backups.get()?;
-    Some((sb.encryption, targets(sb, machines(app))))
+    Some((sb.encryption, targets(sb, machines(app), regional(app))))
 }
 
 /// The lines botd logs at startup: one summary, then a warning per plain target unless
