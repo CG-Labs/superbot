@@ -677,7 +677,8 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone()), ("de-fra-2".into(), fra.clone())], keep: 7, forget: Vec::new() };
     let set = settings.clone();
     let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
-    let lines = chat_stores::open(&app.db, &settings, None).unwrap();
+    let (lines, rekeyed) = chat_stores::open(&app.db, &settings, None).unwrap();
+    assert_eq!(rekeyed, 0);
     assert!(lines.iter().any(|l| l.contains("made gb-lon's store")) && lines.iter().any(|l| l.contains("made de-fra-2's store")), "{lines:?}");
     let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
     let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;

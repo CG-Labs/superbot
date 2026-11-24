@@ -8,6 +8,8 @@ You give botd the new key as its master key and the old key as the **previous** 
 
 An encrypted database ([database encryption](database-encryption.md), [ADR 0116](../adr/0116-database-encrypted-at-rest.md)) is re-encrypted first: botd writes a copy under a key derived from the new master key, checks every table's rows came across, and swaps it in, before it seals values again. Each step can be repeated: a database already under the new key is left as it is, and one still under the old key is re-encrypted on the next start with both keys. No copy under the old key is kept.
 
+Regional chat stores (`REGION_DATA_DIRS`, [ADR 0215](../adr/0215-pinned-chats-in-a-store-in-their-region.md)) are re-encrypted the same way, after the database. botd says to remove the previous key only once every store has opened under the new key; if a store's volume isn't mounted, botd stops first, and the previous key is still needed.
+
 What is sealed again: saved secrets (`botctl secret set`, `/api/secrets`), each user's own secrets, approvals' tool input, push tokens, TOTP secrets for two-factor sign-in, and native SAML providers' generated SP keys ([ADR 0137](../adr/0137-saml-signed-requests-and-single-logout.md)), so their certificates don't change. Derived keys, such as the machine CA, are kept, so enrolled machines keep working (see [after a leak](#after-a-leak)). Backup encryption uses age keys, not the master key ([backup guide](backup-restore.md#encryption)).
 
 | Setting | Meaning |
@@ -61,7 +63,7 @@ If `.env` holds the key itself (`SUPERBOT_MASTER_KEY=`), add `SUPERBOT_MASTER_KE
 
 ## Check it worked
 
-- The log says `Master key rotated from ...: sealed N values again under the new key`, and, for an encrypted database, `Database encryption: ... re-encrypted under the new master key`.
+- The log says `Master key rotated from ...: sealed N values again under the new key` (with `and re-encrypted N regional chat stores` when there are any), and, for an encrypted database, `Database encryption: ... re-encrypted under the new master key`.
 - The audit log has one `secret.master_key_rotated` event (`/api/audit?action=secret.master_key_rotated`, or the console's audit page), with the counts. `unreadable` above 0 means some values were already unreadable before the rotation; they are left as they were, and botd warns.
 - After removing the previous key and restarting, botd starts with the new key alone and `botctl secrets` lists what it did before.
 
@@ -75,6 +77,8 @@ If `.env` holds the key itself (`SUPERBOT_MASTER_KEY=`), add `SUPERBOT_MASTER_KE
 | `SUPERBOT_MASTER_KEY_PREVIOUS is set but there is no new master key` | The new key is missing | Set it. botd never makes a key during a rotation |
 | `wrong key` after removing the previous key | The previous key was removed before botd rotated | Put it back and restart |
 | `nothing to rotate` | The current key already opens everything (already rotated, or the same key twice) | Remove the previous key |
+| `Regional chat stores: ...` and botd stops during a rotation | A regional chat store couldn't be opened or re-encrypted (its volume isn't mounted, or it is under neither key) | Keep the previous key set, fix the store, and restart. Remove the previous key only after the log says to |
+| `Master key rotation from ...: re-encrypted N regional chat stores` | botd's own data was rotated on an earlier start, and a chat store was still under the old key | Remove the previous key now |
 | The new key is lost after the rotation | The old key no longer opens the data | As for any lost key: restore a backup from before the rotation with the old key. With a plain database, `SUPERBOT_FORGET_SEALED=1` also works ([master key](../../deploy/README.md#master-key)); an encrypted one can't be opened without its key |
 
 ## Restoring a backup from before a rotation

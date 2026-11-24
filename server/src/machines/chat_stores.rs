@@ -132,13 +132,17 @@ impl Settings {
 /// brings each store under botd's database key (`previous`: the key before a rotation),
 /// checks them against botd's record and attaches them, redacts known secrets from them,
 /// and moves chats to where they belong. Run with no stores too, so a store that still
-/// holds chats can't be dropped from the settings. Lines for the startup log.
-pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>) -> Result<Vec<String>, String> {
+/// holds chats can't be dropped from the settings. Lines for the startup log, and how
+/// many stores were re-encrypted from the previous key, mid-rotation.
+pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>) -> Result<(Vec<String>, usize), String> {
     let key = database_encryption::installed();
+    let mut rekeyed = 0;
     for (_, dir) in &s.dirs {
         let path = dir.join("chats.sqlite");
         std::mem::forget(database_encryption::lock_data_dir(&path)?);
+        let was_encrypted = database_encryption::format(&path)? == database_encryption::Format::Encrypted;
         if database_encryption::prepare_store(&path, key, previous)? {
+            rekeyed += usize::from(was_encrypted);
             log_info!("Regional chat stores: {} brought under botd's database key (ADR 0215).", path.display());
         }
     }
@@ -159,7 +163,7 @@ pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>) -> Result<Vec<Strin
     for m in place(db) {
         lines.push(format!("Regional chat stores: moved {} messages of {} Bots from {} to {}.", m.messages, m.bots, place_name(&m.from), place_name(&m.to)));
     }
-    Ok(lines)
+    Ok((lines, rekeyed))
 }
 
 fn place_name(region: &Option<String>) -> String {
