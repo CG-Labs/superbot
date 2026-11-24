@@ -461,7 +461,7 @@ botctl audit verify-lines siem-export-2026-11.jsonl.gz --key <checkpoint public 
 
 `aws s3 cp` takes each key's latest version, while botd's archive check reads the first, which Object Lock keeps. If someone wrote a version over a locked object, this checks theirs; `botctl audit verify --archive` names it as `overwritten`.
 
-It reads files, directories (their `.jsonl`, `.ndjson`, `.json` and `.log` files, and each of those with `.gz`) and `-` for stdin, in any order, copies and all. It gunzips whatever starts as gzip, so a gzipped archive, `cat audit/*/*/*/*.jsonl.gz | botctl audit verify-lines -` and a `.gz` SIEM export need no `zcat`. A syslog line is read from its first `{`. Lines from other sources are counted as `ignored`. For each `host` it checks:
+It reads files, directories (their `.jsonl`, `.ndjson`, `.json` and `.log` files, and each of those with `.gz`) and `-` for stdin, in any order, copies and all. It gunzips whatever starts as gzip, so a gzipped archive, `cat audit/*/*/*/*.jsonl.gz | botctl audit verify-lines -` and a `.gz` SIEM export need no `zcat`. Each gzipped input may unpack to at most `--max-gunzip-mb` (default 4096), so a small file can't fill memory; past it, the check stops and names the file. A syslog line is read from its first `{`. Lines from other sources are counted as `ignored`. For each `host` it checks:
 
 - each line against its own hash: `chainHash` from `chainPrev`, the fields no erasure changes and `chainDigest`, and with `chainSalt`, `chainDigest` from the other fields (`digest` otherwise);
 - copies of one event against each other (`conflict`);

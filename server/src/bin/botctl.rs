@@ -256,15 +256,16 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    --archive: also read the write-once S3 archive,
                                                    check it has no gaps, and hold every event here
                                                    to the hash it has there
-  botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>] [--timestamp-ca <pem>]...
+  botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>] [--timestamp-ca <pem>]... [--max-gunzip-mb <n>]
                                                    Check exported events (SIEM or archive copies, any
                                                    order) with no botd: each line's hash, the chain
                                                    between them, signed checkpoints and their RFC 3161
                                                    timestamps. --digests-after: digestsAfter from
                                                    botctl audit siem, so lines with their digests
                                                    taken out fail. --timestamp-ca: the TSA's CA
-                                                   certificates (PEM). Reads gzip too. Exits 1 on
-                                                   a break
+                                                   certificates (PEM). Reads gzip too, each input
+                                                   up to --max-gunzip-mb (default 4096) unpacked.
+                                                   Exits 1 on a break
   botctl audit siem                                The SIEM export: sink, delivered, pending, failing
   botctl audit chain                               The chain's state: head, last checkpoint and
                                                    timestamp, export lag, last check
@@ -948,17 +949,19 @@ fn verify_query(rest: &[&str]) -> Result<String, String> {
     Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
 }
 
-/// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>] [--timestamp-ca <pem>]...`
+/// `botctl audit verify-lines <file|dir|->... [--key <hex>]... [--digests-after <id>] [--timestamp-ca <pem>]... [--max-gunzip-mb <n>]`
 /// (ADR 0199, ADR 0207): checks exported events where they landed, with no botd. A
 /// directory is read for its `.jsonl`, `.ndjson`, `.json` and `.log` files, gzipped or
 /// not (ADR 0227), `-` is stdin.
 fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, String> {
     let (mut paths, mut keys, mut after, mut cas) = (Vec::new(), Vec::new(), None, String::new());
+    let mut max_mb = MAX_GUNZIP_MB;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--key" => keys.push(audit_line::parse_public_key(it.next().ok_or("--key needs a public key in hex (botctl audit key)")?)?),
             "--digests-after" => after = Some(it.next().and_then(|v| v.parse::<i64>().ok()).ok_or("--digests-after needs an event id (digestsAfter in botctl audit siem)")?),
+            "--max-gunzip-mb" => max_mb = it.next().and_then(|v| v.parse::<u64>().ok()).filter(|&n| n > 0).ok_or("--max-gunzip-mb needs a whole number of MB, at least 1")?,
             "--timestamp-ca" => {
                 let f = it.next().ok_or("--timestamp-ca needs a PEM file of the TSA's CA certificates (as AUDIT_TIMESTAMP_CA_FILE)")?;
                 let pem = std::fs::read_to_string(f).map_err(|e| format!("--timestamp-ca {f}: {e}"))?;
@@ -971,7 +974,7 @@ fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, Stri
         }
     }
     if paths.is_empty() {
-        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]... [--digests-after <event id>] [--timestamp-ca <pem file>]...".into());
+        return Err("Usage: botctl audit verify-lines <file|dir|->... [--key <public key hex>]... [--digests-after <event id>] [--timestamp-ca <pem file>]... [--max-gunzip-mb <n>]".into());
     }
     let pinned = !keys.is_empty();
     let trust = if cas.is_empty() { tsa::Trust::default() } else { tsa::Trust::from_pem(&cas)? };
@@ -982,14 +985,14 @@ fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, Stri
         if p == "-" {
             let mut bytes = Vec::new();
             stdin.take().ok_or("stdin (-) can be read once")?.read_to_end(&mut bytes).map_err(|e| format!("stdin: {e}"))?;
-            read_lines(&mut lines, &unzipped(bytes, "stdin")?, "-");
+            read_lines(&mut lines, &unzipped(bytes, "stdin", max_mb)?, "-");
             files += 1;
             continue;
         }
         for f in line_files(std::path::Path::new(p))? {
             let name = f.display().to_string();
             let bytes = std::fs::read(&f).map_err(|e| format!("{name}: {e}"))?;
-            read_lines(&mut lines, &unzipped(bytes, &name)?, &name);
+            read_lines(&mut lines, &unzipped(bytes, &name, max_mb)?, &name);
             files += 1;
         }
     }
@@ -1016,8 +1019,19 @@ fn verify_lines(rest: &[&str], stdin: impl std::io::Read) -> Result<String, Stri
 
 /// The text of a file or stdin, gunzipped when it is gzip (ADR 0227), as a gzipped archive
 /// object or `cat *.jsonl.gz` is, whatever it is called.
-fn unzipped(bytes: Vec<u8>, name: &str) -> Result<String, String> {
-    let bytes = if audit_line::gzipped(&bytes) { audit_line::gunzip(&bytes, u64::MAX).map_err(|e| format!("{name}: {e}"))? } else { bytes };
+/// Default `--max-gunzip-mb`: a cap on what one gzipped input may expand to, so a small
+/// file can't fill memory. Archive objects hold at most 256 MB.
+const MAX_GUNZIP_MB: u64 = 4096;
+
+fn unzipped(bytes: Vec<u8>, name: &str, max_mb: u64) -> Result<String, String> {
+    let bytes = if audit_line::gzipped(&bytes) {
+        audit_line::gunzip(&bytes, max_mb.saturating_mul(1 << 20)).map_err(|e| {
+            let hint = if e.contains("more than") { "; if it's yours, raise --max-gunzip-mb" } else { "" };
+            format!("{name}: {e}{hint}")
+        })?
+    } else {
+        bytes
+    };
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -1030,8 +1044,9 @@ fn read_lines(lines: &mut audit_line::Lines, text: &str, name: &str) {
 /// `path` itself, or the event files under it, sorted so the output is stable.
 /// A `.jsonl`, `.ndjson`, `.json` or `.log` file, gzipped (`.jsonl.gz`) or not.
 fn line_file(p: &std::path::Path) -> bool {
-    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    let name = name.strip_suffix(".gz").unwrap_or(name);
+    // Lossy, so a name that isn't UTF-8 before its suffix is still read, not skipped.
+    let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let name = name.strip_suffix(".gz").unwrap_or(&name);
     name.rsplit_once('.').is_some_and(|(stem, x)| !stem.is_empty() && ["jsonl", "ndjson", "json", "log"].contains(&x))
 }
 
@@ -2984,7 +2999,26 @@ mod tests {
         let cut = gz(&[&lines[0], &lines[1]]);
         std::fs::write(&named, &cut[..cut.len() / 2]).unwrap();
         let e = verify_lines(&[named.to_str().unwrap()], std::io::empty()).unwrap_err();
-        assert!(e.contains("export.bin: it isn't gzip, or is cut short"), "{e}");
+        assert!(e.contains("export.bin: it isn't gzip, or is cut short") && !e.contains("--max-gunzip-mb"), "{e}");
+        // A small file can't unpack past the cap: a bomb stops with the file named.
+        std::fs::write(&named, audit_line::gzip(&vec![b'\n'; (1 << 20) + 1])).unwrap();
+        let e = verify_lines(&[named.to_str().unwrap(), "--max-gunzip-mb", "1"], std::io::empty()).unwrap_err();
+        assert!(e.contains("export.bin: it holds more than 1048576 bytes uncompressed; if it's yours, raise --max-gunzip-mb"), "{e}");
+        assert!(verify_lines(&["-", "--max-gunzip-mb", "1"], audit_line::gzip(&vec![b'\n'; 2 << 20]).as_slice()).unwrap_err().starts_with("stdin: it holds more than"));
+        for bad in ["0", "x", "-1"] {
+            assert!(verify_lines(&[d, "--max-gunzip-mb", bad], std::io::empty()).unwrap_err().contains("--max-gunzip-mb needs"), "{bad}");
+        }
+        #[cfg(unix)]
+        {
+            // A name that isn't UTF-8 is still read by its suffix, not skipped.
+            use std::os::unix::ffi::OsStrExt;
+            let odd = dir.join(std::ffi::OsStr::from_bytes(b"\xffodd.jsonl"));
+            std::fs::write(&odd, format!("{}\n", lines[3])).unwrap();
+            assert!(line_file(&odd));
+            std::fs::remove_file(&named).unwrap();
+            let out: Value = serde_json::from_str(&verify_lines(&[d], std::io::empty()).unwrap()).unwrap();
+            assert_eq!((out["files"].clone(), out["hosts"][0]["events"].clone()), (json!(3), json!(4)), "{out}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
         for (name, read) in [("a.jsonl.gz", true), ("a.log.gz", true), ("a.ndjson", true), ("a.gz", false), (".jsonl.gz", false), ("a.txt.gz", false), ("a.jsonl.gz.gz", false)] {
             assert_eq!(line_file(std::path::Path::new(name)), read, "{name}");
