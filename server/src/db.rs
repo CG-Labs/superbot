@@ -9380,8 +9380,13 @@ impl Db {
     /// throttled failure's `unloggedSinceLast` is summed apart as `skipped`: the failures
     /// it stands for were of any reason, not necessarily its own.
     pub fn audit_counts(&self, from: i64, actions: &[&str]) -> Vec<AuditCount> {
+        self.audit_counts_between(from, i64::MAX, actions)
+    }
+
+    /// `audit_counts` for events from `from` up to, not including, `to` (unix ms).
+    pub fn audit_counts_between(&self, from: i64, to: i64, actions: &[&str]) -> Vec<AuditCount> {
         use rusqlite::types::Value as V;
-        let mut args = vec![V::Integer(from)];
+        let mut args = vec![V::Integer(from), V::Integer(to)];
         let mut parts = Vec::new();
         for a in actions {
             match a.strip_suffix('*') {
@@ -9403,7 +9408,7 @@ impl Db {
                CASE WHEN json_valid(details) THEN CAST(COALESCE(json_extract(details, '$.result'), json_extract(details, '$.reason')) AS TEXT) END AS code,
                COUNT(*),
                SUM(CASE WHEN json_valid(details) THEN max(0, CAST(COALESCE(json_extract(details, '$.unloggedSinceLast'), 0) AS INTEGER)) ELSE 0 END)
-             FROM audit_events WHERE at >= ? AND ({})
+             FROM audit_events WHERE at >= ? AND at < ? AND ({})
              GROUP BY action, outcome, auth_method, code ORDER BY action, outcome, code",
             parts.join(" OR ")
         );
@@ -9415,6 +9420,18 @@ impl Db {
         .unwrap()
         .filter_map(Result::ok)
         .collect()
+    }
+
+    /// Finished runs from `from` up to `to` (unix ms), counted by Bot and result (ADR 0262).
+    pub fn run_results_by_bot(&self, from: i64, to: i64) -> Vec<(Option<String>, Option<String>, u64)> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT bot_id, CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.result') AS TEXT) END AS result, COUNT(*)
+                 FROM audit_events WHERE action = 'bot.run_finished' AND at >= ? AND at < ? GROUP BY bot_id, result ORDER BY bot_id, result",
+            )
+            .unwrap();
+        s.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)?.max(0) as u64))).unwrap().filter_map(Result::ok).collect()
     }
 
     /// Active people, the owner aside as seats count them, and how many of them signed in

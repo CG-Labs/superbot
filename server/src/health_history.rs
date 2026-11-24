@@ -59,6 +59,11 @@ fn settings() -> Settings {
     SETTINGS.get().copied().unwrap_or_default()
 }
 
+/// Whether botd records the score each day (not `HEALTH_SCORE_HISTORY_DAYS=0`).
+pub fn recording() -> bool {
+    settings().keep_days.is_some()
+}
+
 pub fn date_of(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default()
 }

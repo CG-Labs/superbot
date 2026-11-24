@@ -302,6 +302,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    item of the TAM's checklist done, open, to confirm or n/a,
                                                    from the health score and botd's records. Exits 1 while any
                                                    item is open
+  botctl business-review [--to <YYYY-MM>] [--json] [-o <file>]
+                                                   Draft the quarterly business review (ADR 0262) as Markdown:
+                                                   the three months to --to (the last whole month by default),
+                                                   each month's score, health checks, runs and failures, and
+                                                   the quarter's incidents, access reviews and changes; goals,
+                                                   tickets and actions left "To fill in"
   botctl support-report <tickets.csv | -> [--plan <plan>] [--customer <name>] [--from <YYYY-MM> --to <YYYY-MM>]
     [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>] [--holidays <dates>]
     [--target <sev>=<30m|1h|4bh|1bd>]... [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
@@ -2361,6 +2367,15 @@ fn run(args: &[String]) -> Result<String, String> {
             }
             Ok(out)
         }
+        ["business-review", rest @ ..] => {
+            let (path, json, out) = business_review_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let res = if json { pretty(res) } else { res };
+            match out {
+                Some(file) => save_private(file, res.as_bytes()).map(|_| format!("Saved {file}. Fill in what's marked \"To fill in\" before you send it.")),
+                None => Ok(res),
+            }
+        }
         ["incidents"] => Ok(incidents_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/status/incidents", None)?).map_err(|e| e.to_string())?)),
         ["incidents", "json"] => op("GET", "/api/status/incidents", None),
         ["incident", "review", rest @ ..] => {
@@ -2799,6 +2814,34 @@ fn incident_review_request<'a>(rest: &[&'a str]) -> Result<(String, bool, Option
     }
     let q = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
     Ok((format!("/api/status/incidents/{}/review{q}", encode(id)), json, out))
+}
+
+/// `botctl business-review [--to <YYYY-MM>] [--json] [-o <file>]`: the path, whether to
+/// print JSON, and the file to save to.
+fn business_review_request<'a>(rest: &[&'a str]) -> Result<(String, bool, Option<&'a str>), String> {
+    let usage = || "Usage: botctl business-review [--to <YYYY-MM>] [--json] [-o <file>]".to_string();
+    let (mut to, mut json, mut out) = (None, false, None);
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        match *flag {
+            "--json" | "json" if !json => json = true,
+            "--to" if to.is_none() => {
+                let month = it.next().filter(|m| m.len() == 7 && m.as_bytes()[4] == b'-' && m.bytes().enumerate().all(|(i, b)| i == 4 || b.is_ascii_digit()));
+                to = Some(*month.ok_or("--to needs the quarter's last month, YYYY-MM")?);
+            }
+            "-o" | "--out" if out.is_none() => out = Some(*it.next().filter(|f| !f.starts_with('-')).ok_or_else(usage)?),
+            _ => return Err(usage()),
+        }
+    }
+    let mut query = Vec::new();
+    if let Some(m) = to {
+        query.push(format!("to={m}"));
+    }
+    if !json {
+        query.push("format=markdown".into());
+    }
+    let q = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
+    Ok((format!("/api/support/business-review{q}"), json, out))
 }
 
 /// `botctl incidents`: one line each, open ones first as botd lists them.
@@ -3481,6 +3524,19 @@ mod tests {
         assert_eq!(incident_review_request(&["inc_1", "--json"]), Ok(("/api/status/incidents/inc_1/review".into(), true, None)));
         for bad in [&[][..], &["--json"], &["inc_1", "--lead-hours", "many"], &["inc_1", "--detected"], &["inc_1", "-o"], &["inc_1", "--days", "3"]] {
             assert!(incident_review_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_business_review_is_markdown_for_a_quarter_unless_asked_for_json() {
+        assert_eq!(business_review_request(&[]), Ok(("/api/support/business-review?format=markdown".into(), false, None)));
+        assert_eq!(
+            business_review_request(&["--to", "2026-09", "-o", "qbr.md"]),
+            Ok(("/api/support/business-review?to=2026-09&format=markdown".into(), false, Some("qbr.md")))
+        );
+        assert_eq!(business_review_request(&["--json", "--to", "2026-12"]), Ok(("/api/support/business-review?to=2026-12".into(), true, None)));
+        for bad in [&["--to"][..], &["--to", "Q3"], &["--to", "2026-9"], &["--to", "2026-09&x=1"], &["--to", "2026-09", "--to", "2026-10"], &["-o"], &["-o", "--json"], &["--days", "90"], &["markdown"]] {
+            assert!(business_review_request(bad).is_err(), "{bad:?}");
         }
     }
 

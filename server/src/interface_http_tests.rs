@@ -189,6 +189,22 @@ fn the_console_runs_the_health_check_only_when_asked() {
     }
 }
 
+/// ADR 0262: the business review draft is a download the admin clicks, never fetched when
+/// the Support tab loads, since each draft is audited; the month picked only changes its link.
+#[test]
+fn the_console_drafts_the_business_review_only_when_clicked() {
+    let start = CONSOLE_JS.find("async function loadSupport(").expect("loadSupport");
+    let load = &CONSOLE_JS[start..start + CONSOLE_JS[start..].find("\n}\n").expect("function end")];
+    assert!(!load.contains("business-review"), "opening the Support tab would record a draft");
+    let link = CONSOLE_HTML.lines().find(|l| l.contains(r#"id="sup-qbr""#)).expect("the download link");
+    assert!(link.contains(r#"href="/api/support/business-review?format=markdown" download"#) && link.contains("Draft business review"), "{link}");
+    assert!(CONSOLE_HTML.contains(r#"<input id="sup-qbr-to""#) && CONSOLE_HTML.contains(r#"type="month""#));
+    let on = CONSOLE_JS.find(r#"$("sup-qbr-to").addEventListener("change""#).expect("the month changes the link");
+    let handler = &CONSOLE_JS[on..on + CONSOLE_JS[on..].find("\n});\n").expect("handler end")];
+    assert!(handler.contains(r#"$("sup-qbr").href = "#) && !handler.contains("api("), "it only sets the link: {handler}");
+    assert!(handler.contains("encodeURIComponent(to)") && handler.contains(r"/^\d{4}-\d{2}$/.test(to)"), "only a month goes in the link: {handler}");
+}
+
 /// ADR 0132: the console asks before it takes a custom role away, across the server or
 /// within a team, and finds people by email the way the server does (in any case).
 #[test]
