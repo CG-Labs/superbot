@@ -525,16 +525,18 @@ fn bots_view(app: &AppState, sa: &ServiceAccount) -> Value {
 /// so a leaked token can't fill its owner's machine.
 pub const MAX_KEPT_BOTS: u32 = 20;
 
-/// Records each Bot in `ids` that `id` no longer keeps as `bot.service_account_released`
-/// with `reason`. The triggers of ADR 0222 already let them go. Returns how many.
+/// Records each Bot in `ids`, which `id` no longer keeps, as `bot.service_account_released`
+/// with `reason`, and stops the runs it asked for there: they started as its owner's, with
+/// their keys (ADR 0222). The triggers of ADR 0222 already let them go. Returns how many.
 pub fn note_released(app: &AppState, by: &Who, id: &str, ids: &[String], reason: &str) -> usize {
-    let still = app.db.kept_bots(id);
-    let gone: Vec<&String> = ids.iter().filter(|b| !still.contains(b)).collect();
-    for bot in &gone {
+    for bot in ids {
         let d = json!({ "serviceAccount": id, "reason": reason, "owner": app.db.bot(bot).map(|b| b.owner_id) });
         app.db.record(&by.event("bot.service_account_released").target("bot", bot).bot(bot).details(d));
+        if let Some(b) = app.db.bot(bot).filter(|b| app.live_run(&b.id).is_some() && app.requested_by(b) == id) {
+            app.stop(&b.id);
+        }
     }
-    gone.len()
+    ids.len()
 }
 
 fn view(app: &AppState, sa: &ServiceAccount, refused: &[ServiceRefusal]) -> Value {
@@ -676,8 +678,7 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
         p.role = Some((role_now, org_now));
         p.team = Some(team_now.map(|t| (t, team_role_now)));
     }
-    let kept = app.db.kept_bots(&id);
-    app.db.update_service_account(&id, &p).map_err(|e| if e == "not found" { not_found("Service account") } else { write_error(e) })?;
+    let kept = app.db.update_service_account(&id, &p).map_err(|e| if e == "not found" { not_found("Service account") } else { write_error(e) })?;
     let after = app.db.service_account(&id).ok_or_else(|| not_found("Service account"))?;
     // Its Bots stay with the person who owns them; a new owner doesn't get them (ADR 0222).
     let released = note_released(&app, &by, &id, &kept, "owner_changed");
@@ -757,8 +758,7 @@ fn drop_grants(app: &AppState, by: &Who, id: &str, reason: &str, which: impl Fn(
 /// taken away, it's disabled and the work it asked for stops; the audit log keeps naming it.
 pub async fn delete(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let sa = need_account(&app, &c, &by, &key)?;
-    let kept = app.db.kept_bots(&sa.user.id);
-    let revoked = app.db.delete_service_account(&sa.user.id, by.actor.id.as_deref()).ok_or_else(|| not_found("Service account"))?;
+    let (revoked, kept) = app.db.delete_service_account(&sa.user.id, by.actor.id.as_deref()).ok_or_else(|| not_found("Service account"))?;
     let grants = drop_grants(&app, &by, &sa.user.id, "service_account_deleted", |_| true);
     // The Bots it kept stay its owner's, with their chats (ADR 0222).
     let released = note_released(&app, &by, &sa.user.id, &kept, "service_account_deleted");

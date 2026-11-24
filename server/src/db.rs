@@ -2422,6 +2422,11 @@ fn migrate_service_account_bots(c: &Connection, _fresh: bool) -> rusqlite::Resul
     )
 }
 
+fn kept_in(c: &Connection, account: &str) -> rusqlite::Result<Vec<String>> {
+    let mut s = c.prepare("SELECT id FROM bots WHERE service_account_id = ? ORDER BY created_at, id")?;
+    s.query_map([account], |r| r.get(0))?.collect()
+}
+
 /// Requests for a role (ADR 0209): a person asks for a requestable, time-bound role for
 /// some hours, across the server or in their team, and an admin approves or denies it.
 /// One pending request per person, role and scope. A request goes with its role, team
@@ -4830,9 +4835,7 @@ impl Db {
 
     /// The ids of the Bots service account `account` keeps (ADR 0222), oldest first.
     pub fn kept_bots(&self, account: &str) -> Vec<String> {
-        let c = self.c();
-        let mut s = c.prepare("SELECT id FROM bots WHERE service_account_id = ? ORDER BY created_at, id").unwrap();
-        s.query_map([account], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+        kept_in(&self.c(), account).unwrap_or_default()
     }
 
     // Bot ACLs (ADR 0017)
@@ -6794,14 +6797,17 @@ impl Db {
 
     /// Saves the fields given, in one transaction. `role` is the built-in role and the
     /// custom role across the server (None: none); `team` the team and the custom role there.
-    pub fn update_service_account(&self, id: &str, p: &ServiceAccountPatch) -> Result<(), String> {
+    /// Returns the Bots it no longer keeps (ADR 0222), read in the same transaction.
+    pub fn update_service_account(&self, id: &str, p: &ServiceAccountPatch) -> Result<Vec<String>, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
         let at = now();
+        let mut released = Vec::new();
         let res = (|| {
             if tx.execute("UPDATE service_accounts SET user_id = user_id WHERE user_id = ?1 AND deleted_at IS NULL", [id])? == 0 {
                 return Ok(Some(false));
             }
+            let kept = kept_in(&tx, id)?;
             let roles = [p.role.as_ref().and_then(|r| r.1.as_deref()), p.team.as_ref().and_then(|t| t.as_ref()).and_then(|t| t.1.as_deref())];
             for r in roles.into_iter().flatten() {
                 if role_time_bound_in(&tx, r)? {
@@ -6822,10 +6828,12 @@ impl Db {
                 own("team_id", &team.as_ref().map(|t| t.0.clone()))?;
                 own("team_role_id", &team.as_ref().and_then(|t| t.1.clone()))?;
             }
+            let still = kept_in(&tx, id)?;
+            released = kept.into_iter().filter(|b| !still.contains(b)).collect();
             Ok::<_, rusqlite::Error>(Some(true))
         })();
         match res {
-            Ok(Some(true)) => tx.commit().map_err(|e| e.to_string()),
+            Ok(Some(true)) => tx.commit().map(|_| released).map_err(|e| e.to_string()),
             Ok(Some(false)) => Err("not found".into()),
             Ok(None) => Err(SA_TIME_BOUND.into()),
             Err(e) => Err(e.to_string()),
@@ -6834,12 +6842,14 @@ impl Db {
 
     /// Deletes a service account for good: every live token revoked, the account disabled
     /// and its roles taken away, in one transaction. The row stays, so the audit log keeps
-    /// naming it. Returns how many tokens were revoked, or None if it was gone already.
-    pub fn delete_service_account(&self, id: &str, by: Option<&str>) -> Option<usize> {
+    /// naming it. Returns how many tokens were revoked and the Bots it kept, which stay
+    /// their owner's (ADR 0222), or None if it was gone already.
+    pub fn delete_service_account(&self, id: &str, by: Option<&str>) -> Option<(usize, Vec<String>)> {
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
         let at = now();
         let res = (|| {
+            let kept = kept_in(&tx, id)?;
             if tx.execute("UPDATE service_accounts SET deleted_at = ?1, team_id = NULL, team_role_id = NULL WHERE user_id = ?2 AND deleted_at IS NULL", params![at, id])? == 0 {
                 return Ok(None);
             }
@@ -6848,7 +6858,7 @@ impl Db {
                 "UPDATE service_tokens SET revoked_at = ?1, revoked_by = ?2, revoked_reason = 'account_deleted' WHERE account_id = ?3 AND revoked_at IS NULL AND expires_at > ?1",
                 params![at, by, id],
             )?;
-            Ok::<_, rusqlite::Error>(Some(n))
+            Ok::<_, rusqlite::Error>(Some((n, kept)))
         })();
         match res {
             Ok(Some(n)) => tx.commit().ok().map(|_| n),
@@ -11604,7 +11614,7 @@ mod tests {
         let sa = db.service_account(&sa.user.id).unwrap();
         assert_eq!((sa.user.role_id, sa.team_id), (None, None), "nothing saved");
         assert_eq!(db.service_accounts().len(), 1);
-        assert_eq!(db.update_service_account(&sa.user.id, &ServiceAccountPatch { name: Some("CI 2".into()), ..Default::default() }), Ok(()));
+        assert_eq!(db.update_service_account(&sa.user.id, &ServiceAccountPatch { name: Some("CI 2".into()), ..Default::default() }), Ok(vec![]));
     }
 
     #[test]
@@ -11768,7 +11778,7 @@ mod tests {
         let rotated = db.rotate_service_token(&tok.id, &next, None, None).unwrap();
         assert!(db.rotate_service_token(&tok.id, &NewServiceToken { token_hash: "h3", ..next }, None, None).is_none(), "only once");
         assert_eq!(db.service_token(&tok.id).unwrap().rotated_to.as_deref(), Some(rotated.id.as_str()));
-        assert_eq!(db.delete_service_account(&sa.user.id, None), Some(1));
+        assert_eq!(db.delete_service_account(&sa.user.id, None), Some((1, vec![])));
         assert_eq!(db.delete_service_account(&sa.user.id, None), None);
         assert!(db.service_token(&rotated.id).unwrap().revoked_at.is_some());
         assert!(!db.user(&sa.user.id).unwrap().active());
@@ -11801,12 +11811,16 @@ mod tests {
         // A Bot that changes owner leaves it; so do all of them when it changes owner or is deleted.
         assert!(db.set_bot_owner_capped(&one.id, &bea.id, None));
         assert_eq!(db.bot(&one.id).unwrap().service_account_id, None);
-        db.update_service_account(&sa, &ServiceAccountPatch { owner: Some(bea.id.clone()), ..Default::default() }).unwrap();
+        let mut released = db.update_service_account(&sa, &ServiceAccountPatch { owner: Some(bea.id.clone()), ..Default::default() }).unwrap();
+        let mut both = vec![two.id.clone(), other.id.clone()];
+        released.sort();
+        both.sort();
+        assert_eq!(released, both, "read in the same transaction as the change");
         assert!(db.kept_bots(&sa).is_empty());
         assert_eq!(db.bot(&two.id).unwrap().owner_id, ana.id, "they stay Ana's");
         assert_eq!(make(&ana.id, None, 9).err(), Some(KeptBotRefusal::Account), "nor makes more for Ana");
         let three = make(&bea.id, None, 9).unwrap();
-        assert_eq!(db.delete_service_account(&sa, None), Some(0));
+        assert_eq!(db.delete_service_account(&sa, None), Some((0, vec![three.id.clone()])));
         assert!(db.kept_bots(&sa).is_empty() && db.bot(&three.id).is_some());
         assert!(db.c().execute("UPDATE bots SET service_account_id = ?1 WHERE id = ?2", [&sa, &three.id]).is_err(), "a deleted account keeps nothing");
     }

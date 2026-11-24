@@ -39,7 +39,7 @@ The Bot always stays its owner's. The account stops keeping it when:
 - The account is given another owner.
 - The account is deleted.
 
-SQLite triggers clear `service_account_id` in each case, and refuse a link to anything but a live service account of the Bot's own owner, so no code path can leave a stale or foreign link. Every read also checks the account is live and still the Bot owner's (`acl::kept_by`). Each release is audited as `bot.service_account_released` with `reason` (`bot_owner_changed`, `owner_changed`, `service_account_deleted`), and `service_account.updated`/`.deleted` (and the delete reply) count them as `keptBotsReleased`.
+SQLite triggers clear `service_account_id` in each case, and refuse a link to anything but a live service account of the Bot's own owner, so no code path can leave a stale or foreign link. Every read also checks the account is live and still the Bot owner's (`acl::kept_by`). The released Bots are read in the same transaction as the change, so one made meanwhile isn't missed. Each release is audited as `bot.service_account_released` with `reason` (`bot_owner_changed`, `owner_changed`, `service_account_deleted`), and `service_account.updated`/`.deleted` (and the delete reply) count them as `keptBotsReleased`. A run the account started on a released Bot stops, even if it can still use the Bot some other way: that run began as the owner's, with their keys.
 
 Disabling the account keeps the link: its tokens stop working, and it keeps the Bot again once enabled.
 

@@ -212,6 +212,29 @@ async fn kept_bots_stay_with_their_owner_when_the_account_or_the_bot_changes_han
     assert_eq!((released[0]["targetId"].as_str(), released[0]["details"]["reason"].as_str()), (Some(kept.as_str()), Some("service_account_deleted")));
 }
 
+#[tokio::test]
+async fn a_run_it_started_as_keeper_stops_when_it_lets_the_bot_go_even_if_it_can_still_use_it() {
+    use crate::deprovision_http_tests::{held_claude, run_token, send, until};
+    let (port, app, admin, _) = serve_app().await;
+    app.shared_bots.set(SharedBots::Isolated).unwrap();
+    let env = held_claude(&app);
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (_, tok) = hers(port, &admin, &ana, "Ana's CI", json!({})).await;
+    let (ci, _) = make(port, &tok, "PR checks").await;
+    let sa = app.db.bot(&ci).unwrap().service_account_id.unwrap();
+    assert_eq!(call(port, "PATCH", &format!("/api/bots/{ci}/access"), &ana_auth, r#"{"visibility":"shared"}"#).await.0, 200);
+
+    // Its run, as keeper, has Ana's setup; handed to Bea, it can still use the shared Bot, but that run ends.
+    send(port, &tok, &ci, "check the PR").await;
+    run_token(&env).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &owner(&bea)).await.0, 200);
+    let (_, list) = json_call(port, "GET", "/api/bots", &tok, "").await;
+    assert_eq!(access_of(&list, &ci).as_deref(), Some("operate"), "{list}");
+    until("the keeper's run never stopped", || app.live_run(&ci).is_none()).await;
+    std::fs::write(app.cfg.bin_dir.join("claude.go"), "").unwrap();
+}
+
 /// A stand-in `claude` that says whether it got Ada's key, her fact, a list naming her
 /// private Bot "Ledger", and the note that the run is for someone else.
 fn fake_claude(app: &App, key: &str, fact: &str) {
