@@ -773,7 +773,7 @@ async fn remove(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &
     let d = || json!({ "team": team, "label": n.label, "region": n.region, "subnet": n.subnet, "teamDeletedAt": deleted_at });
     let note = |why: &str| {
         let mut noted = cp.network_remove_noted.lock().unwrap_or_else(|e| e.into_inner());
-        noted.insert(n.id.clone(), why.to_string()).as_deref() != Some(why)
+        noted.entry(n.id.clone()).or_default().insert(why.to_string())
     };
     match p.remove_team_network(n).await {
         Ok(true) => {

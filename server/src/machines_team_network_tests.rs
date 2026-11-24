@@ -238,16 +238,19 @@ async fn a_deleted_teams_network_is_removed_once_nothing_is_on_it() {
     assert_eq!(kept[0]["details"]["reason"], "something is still on it");
     assert_eq!(env.fake.networks().into_iter().find(|n| n.id == globex_net).unwrap().members.into_iter().collect::<Vec<_>>(), ["globex-database"]);
 
-    // Once the service is moved off it goes, though a failure first is said once and
-    // tried again.
-    env.fake.leave_network(&globex_net, "globex-database");
+    // A failure between passes that find it kept is said once, as is that it is kept.
     for _ in 0..2 {
         env.fake.fail_next("remove_team_network", crate::machines::provider::ProviderError::Api { status: 500, message: "try later".into() });
         assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "errors": 1 }));
+        assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "kept": 1 }));
     }
+    assert_eq!(events(&env, "machine.team_network_kept").await.len(), 1);
     let failed: Vec<Value> = events(&env, "machine.team_network_removed").await.into_iter().filter(|e| e["outcome"] == "failure").collect();
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert!(failed[0]["details"]["error"].as_str().unwrap().contains("try later"), "{failed:?}");
+
+    // Once the service is moved off it goes.
+    env.fake.leave_network(&globex_net, "globex-database");
     assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "removed": 1 }));
     assert!(!has_network(&env, &globex_net));
     assert!(reconcile(&env).await.get("teamNetworks").is_none());
