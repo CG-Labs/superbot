@@ -1,10 +1,10 @@
-# 0249: A record of deleted teams, and a view of team networks
+# 0251: A record of deleted teams, and a view of team networks
 
 ## Status
 
 Accepted (24 Nov 2026). The twelfth slice of [#54](https://github.com/CG-Labs/superbot/issues/54) (M5, per-user computer hardening). It does two things [ADR 0236](0236-removing-the-networks-of-teams-that-are-gone.md) deferred: "removing a gone team's network when audit retention has pruned its `team.deleted` event", and "a `botctl` view listing each team network with its team (or that it is gone) and what is on it".
 
-Numbered 0249 because that number was reserved for this work.
+Numbered 0251. It was first merged as 0249, a number the uptime evidence ADR also took.
 
 ## Context
 
