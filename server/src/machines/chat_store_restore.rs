@@ -25,8 +25,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const RESTORED: &str = "residency.chat_store_restored";
-/// Left in the store's folder by a restore, for botd to audit at its next start.
-const NOTE: &str = "restored.json";
+/// Notes left in the store's folder by restores (`restored-<time>.json`), one each, for
+/// botd to audit at its next start.
+const NOTE: &str = "restored-";
 /// Work files of a restore in the store's folder; a restore that was cut off leaves them.
 const WORK: &str = ".restore-";
 const ACTOR: &str = "residency";
@@ -36,7 +37,8 @@ const USAGE: &str = "Usage: botd chat-store list <region> [--home <dir> | --env-
        botd chat-store restore <region> <backup | newest> [--identity <file>] [--replace-unreadable] [--yes]
                                [--home <dir> | --env-file <file>]
 
-Run on the server with botd stopped, as the user botd runs as (or root).
+Run on the server with botd stopped, as the user botd runs as (the owner of DATA_DIR and
+the region's folder): sudo -u superbot botd chat-store ...
   <backup>              a backup in the region's folder (chats-<time>.sqlite) or a copy in its
                         bucket (chats-<time>-<sha256>.sqlite[.age]), as `list` shows them;
                         newest: the folder's newest backup, else the bucket's newest copy
@@ -168,31 +170,53 @@ pub fn drop_leftovers(folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// At botd's start: audits each restore made while it was stopped, from the note it left
-/// in the store's folder, as `residency.chat_store_restored` by botd itself, then deletes
-/// the note. Lines for the startup log.
+/// At botd's start: audits each restore made while it was stopped, oldest first, from the
+/// notes it left in the store's folder, as `residency.chat_store_restored` by botd itself,
+/// then deletes them. A note is written before the store is replaced, so one whose file is
+/// neither the store nor one of its backups is of a restore cut off before it replaced the
+/// store: it is only logged. Lines for the startup log.
 pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
     let mut lines = Vec::new();
     for (region, dir) in dirs {
-        let path = dir.join(NOTE);
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let note: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let mut details = json!({ "region": region });
-        for k in ["storeId", "backup", "from", "backupAt", "restoredAt", "kept", "replacedUnreadable", "held", "dropped", "erased", "back", "gone", "uid"] {
-            match &note[k] {
-                Value::String(v) => details[k] = json!(clip(v, 200)),
-                Value::Null => {}
-                v => details[k] = v.clone(),
+        let mut notes: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(NOTE) && n.ends_with(".json")))
+            .map(|e| e.path())
+            .collect();
+        notes.sort();
+        let files = inodes(dir);
+        for path in notes {
+            let note: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+            let backup = note["backup"].as_str().map_or("a backup".to_string(), |b| clip(b, 200));
+            if note["file"].as_u64().is_some_and(|f| files.contains(&f)) {
+                let mut details = json!({ "region": region });
+                for k in ["storeId", "backup", "from", "backupAt", "restoredAt", "kept", "replacedUnreadable", "held", "dropped", "erased", "back", "gone", "uid"] {
+                    match &note[k] {
+                        Value::String(v) => details[k] = json!(clip(v, 200)),
+                        Value::Null => {}
+                        v => details[k] = v.clone(),
+                    }
+                }
+                db.record(&Who::system(ACTOR).event(RESTORED).target("chat_store", region).details(details));
+                lines.push(format!("Regional chat stores: {region}'s store was restored from {backup} while botd was stopped; audited as {RESTORED} (ADR 0256)."));
+            } else {
+                lines.push(format!("Regional chat stores: a restore of {region}'s store from {backup} was cut off before it replaced the store, so nothing was restored (ADR 0256)."));
             }
-        }
-        db.record(&Who::system(ACTOR).event(RESTORED).target("chat_store", region).details(details));
-        let backup = note["backup"].as_str().map_or("a backup".to_string(), |b| clip(b, 200));
-        lines.push(format!("Regional chat stores: {region}'s store was restored from {backup} while botd was stopped; audited as {RESTORED} (ADR 0256)."));
-        if let Err(e) = std::fs::remove_file(&path) {
-            lines.push(format!("Regional chat stores: {} couldn't be deleted ({e}), so the restore will be audited again at the next start; delete it (ADR 0256).", path.display()));
+            if let Err(e) = std::fs::remove_file(&path) {
+                lines.push(format!("Regional chat stores: {} couldn't be deleted ({e}), so it will be read again at the next start; delete it (ADR 0256).", path.display()));
+            }
         }
     }
     lines
+}
+
+/// The inodes of a store's file and its backups, which a restore's note names.
+fn inodes(dir: &Path) -> Vec<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let backups = std::fs::read_dir(dir.join("backups")).into_iter().flatten().flatten().map(|e| e.path());
+    std::iter::once(dir.join("chats.sqlite")).chain(backups).filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.ino()).collect()
 }
 
 // Listing
@@ -472,6 +496,10 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
         }
         Some(_) => {}
     }
+    let db_path = place.db_path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", place.db_path.display()))?;
+    c.execute("ATTACH DATABASE ?1 AS botd KEY ?2", rusqlite::params![db_path, place.db_key.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
+    crate::db::upgrade_copy(&c, "botd").map_err(err)?;
+    c.execute("DETACH DATABASE botd", []).map_err(err)?;
     let db = place.db()?;
     let kept = crate::db::bots_kept_in(&db, &place.region).map_err(|e| format!("botd's database: {e}"))?;
     let (people, bots) = erasures(&db, at)?;
@@ -517,7 +545,8 @@ fn elsewhere(c: &Connection, schema: &str, kept: &[String]) -> rusqlite::Result<
 }
 
 /// Keeps the store now as a backup made at `at` in its folder's `backups/`, as one file,
-/// so it is cleared and copied off the host like any other. Its name.
+/// so it is cleared and copied off the host like any other: a second link to it, so the
+/// store stays in place until the restored one replaces it in one rename. Its name.
 fn keep_current(place: &Place, key: Option<&DbKey>, at: i64) -> Result<String, String> {
     let p = &place.store.path;
     let err = |e: rusqlite::Error| format!("{}: {e}", p.display());
@@ -536,7 +565,7 @@ fn keep_current(place: &Place, key: Option<&DbKey>, at: i64) -> Result<String, S
         let name = format!("chats-{stamp}.sqlite");
         let dest = dir.join(&name);
         if std::fs::symlink_metadata(&dest).is_err() {
-            std::fs::rename(p, &dest).map_err(io(&dest))?;
+            std::fs::hard_link(p, &dest).map_err(io(&dest))?;
             sync_dir(&dir);
             return Ok(name);
         }
@@ -584,6 +613,7 @@ pub struct Restore {
 /// without `o.yes`), holding botd's locks, so botd must be stopped. Nothing changes unless
 /// every check passes; the work file is deleted when one fails.
 pub async fn restore(place: &Place, o: &Options<'_>, at: i64) -> Result<Restore, String> {
+    same_user(&[place.db_path.parent().unwrap_or(Path::new("/")), place.folder()], euid())?;
     let _locks = lock(place)?;
     drop_leftovers(place.folder())?;
     let chosen = choose(place, o.backup).await?;
@@ -600,20 +630,22 @@ pub async fn restore(place: &Place, o: &Options<'_>, at: i64) -> Result<Restore,
         }
         let kept = match &now {
             Current::Readable(k) => Some(keep_current(place, k.as_ref(), at)?),
-            Current::Unreadable(_) => {
-                match std::fs::remove_file(&place.store.path) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(&place.store.path)(e)),
-                    _ => {}
-                }
-                None
-            }
-            Current::Missing => None,
+            _ => None,
         };
-        remove_sidecars(&place.store.path)?;
-        std::fs::rename(&work, &place.store.path).map_err(io(&place.store.path))?;
-        sync_dir(place.folder());
         let r = Restore { chosen: chosen.clone(), plan, kept, done: true };
-        write_note(place, &r, at)?;
+        let mut note = None;
+        let swapped = (|| {
+            note = Some(write_note(place, &r, &work, at)?);
+            remove_sidecars(&place.store.path)?;
+            std::fs::rename(&work, &place.store.path).map_err(io(&place.store.path))?;
+            sync_dir(place.folder());
+            Ok::<_, String>(())
+        })();
+        if let Err(e) = swapped {
+            let _ = note.map(std::fs::remove_file);
+            let _ = r.kept.as_ref().map(|k| std::fs::remove_file(chat_stores::backups_dir(&place.store).join(k)));
+            return Err(e);
+        }
         Ok(r)
     })();
     if r.is_err() {
@@ -622,9 +654,11 @@ pub async fn restore(place: &Place, o: &Options<'_>, at: i64) -> Result<Restore,
     r
 }
 
-fn write_note(place: &Place, r: &Restore, at: i64) -> Result<(), String> {
+/// Leaves a note of the restore `r` for botd to audit, naming the restored file `work`
+/// by its inode. Its path.
+fn write_note(place: &Place, r: &Restore, work: &Path, at: i64) -> Result<PathBuf, String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let note = json!({
         "storeId": place.store.id,
         "backup": r.chosen.name,
@@ -638,17 +672,48 @@ fn write_note(place: &Place, r: &Restore, at: i64) -> Result<(), String> {
         "erased": r.plan.erased,
         "back": r.plan.back,
         "gone": r.plan.gone,
-        "uid": own_uid(),
+        "uid": euid(),
+        "file": std::fs::metadata(work).map_err(io(work))?.ino(),
     });
-    let path = place.folder().join(NOTE);
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path).map_err(io(&path))?;
-    f.write_all(note.to_string().as_bytes()).and_then(|_| f.sync_all()).map_err(io(&path))
+    let mut t = at;
+    loop {
+        let path = place.folder().join(format!("{NOTE}{t}.json"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(mut f) => {
+                let wrote = f.write_all(note.to_string().as_bytes()).and_then(|_| f.sync_all());
+                if let Err(e) = wrote {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(io(&path)(e));
+                }
+                sync_dir(place.folder());
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => t += 1,
+            Err(e) => return Err(io(&path)(e)),
+        }
+    }
 }
 
-/// The user this command runs as, for the audit: the owner of `/proc/self`.
-fn own_uid() -> Option<u32> {
+fn euid() -> u32 {
+    // SAFETY: geteuid can't fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Refuses unless `uid` owns each of `dirs` (DATA_DIR and the store's folder): files a
+/// restore makes as another user, root included, would keep botd from opening the store.
+fn same_user(dirs: &[&Path], uid: u32) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+    for d in dirs {
+        let owner = std::fs::metadata(d).map_err(io(d))?.uid();
+        if owner != uid {
+            return Err(format!(
+                "{} belongs to uid {owner}, and this runs as uid {uid}. Run it as the user botd runs as, so botd can open what it writes: sudo -u \"$(stat -c %U {})\" botd chat-store ...",
+                d.display(),
+                d.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Restore {
@@ -851,6 +916,12 @@ mod tests {
         Options { backup, yes, ..Options::default() }
     }
 
+    fn notes(dir: &Path) -> Vec<PathBuf> {
+        let mut n: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(NOTE)).collect();
+        n.sort();
+        n
+    }
+
     fn work_files(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(WORK)).collect()
     }
@@ -883,7 +954,7 @@ mod tests {
         assert_eq!((r.plan.back.unwrap().total(), r.plan.gone.unwrap().messages), (0, 1), "{r:?}");
         assert!(text.contains("1 chat message made since the backup go"), "{text}");
         assert_eq!(std::fs::read(w.store()).unwrap(), before, "a dry run changes nothing");
-        assert!(work_files(&w.lon).is_empty() && !w.lon.join(NOTE).exists());
+        assert!(work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
 
         std::fs::write(w.lon.join(format!("{WORK}cut-off.sqlite")), "chat-2b-moved-to-frankfurt").unwrap();
         let restored_at = now();
@@ -895,21 +966,32 @@ mod tests {
         let kept = chat_stores::backups_dir(&place.store).join(r.kept.as_deref().unwrap());
         assert!(texts(&kept).contains(&"chat-3c-after-the-backup".to_string()), "the store it replaced is a backup, so this can be undone");
         assert_eq!(chat_stores::backups_strictly(&place.store).unwrap().len(), 2);
-        let note: Value = serde_json::from_str(&std::fs::read_to_string(w.lon.join(NOTE)).unwrap()).unwrap();
+        let note: Value = serde_json::from_str(&std::fs::read_to_string(&notes(&w.lon)[0]).unwrap()).unwrap();
         assert_eq!((note["from"].as_str(), note["restoredAt"].as_i64(), note["dropped"]["messages"].as_i64()), (Some("folder"), Some(restored_at), Some(1)), "{note}");
 
-        // botd's next start audits it once.
+        // Undone before botd starts: the store as it was comes back, and both are noted.
+        let undo = restore(&place, &opts(r.kept.as_deref().unwrap(), true), restored_at + 5000).await.unwrap();
+        assert_eq!(texts(&w.store()), ["chat-1a-from-the-backup", "chat-3c-after-the-backup"]);
+        assert_eq!(undo.plan.back.unwrap().messages, 1);
+        // A note of a restore cut off before it replaced the store names no file there.
+        std::fs::write(w.lon.join(format!("{NOTE}1.json")), json!({ "backup": "chats-20200101-000000.sqlite", "file": 1 }).to_string()).unwrap();
+        assert_eq!(notes(&w.lon).len(), 3);
+
+        // botd's next start audits each once, oldest first.
         let db = Db::open(&w.app).unwrap();
         db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
         let lines = audit_restores(&db, &w.dirs());
-        assert!(lines.len() == 1 && lines[0].contains("gb-lon's store was restored"), "{lines:?}");
-        assert!(!w.lon.join(NOTE).exists() && audit_restores(&db, &w.dirs()).is_empty());
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("was cut off before it replaced the store, so nothing was restored"), "{lines:?}");
+        assert!(lines[1].contains("gb-lon's store was restored from chats-") && lines[2].contains(r.kept.as_deref().unwrap()), "{lines:?}");
+        assert!(notes(&w.lon).is_empty() && audit_restores(&db, &w.dirs()).is_empty());
         let f = crate::audit::Filter { actions: vec![RESTORED.into()], ..Default::default() };
-        let events: Vec<Value> = db.audit_events(&f, 10, false).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
-        assert_eq!(events.len(), 1);
+        let events: Vec<Value> = db.audit_events(&f, 10, true).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+        assert_eq!(events.len(), 2, "the cut-off one isn't audited: {events:?}");
         let d = &events[0]["details"];
         assert_eq!((d["region"].as_str(), d["storeId"].as_str(), d["held"]["messages"].as_i64(), events[0]["actorId"].as_str()), (Some("gb-lon"), Some(place.store.id.as_str()), Some(1), Some(ACTOR)), "{events:?}");
-        assert_eq!(db.chat_store_counts().iter().find(|(s, _)| s.region == "gb-lon").unwrap().1.messages, 1, "botd opens the restored store");
+        assert_eq!(events[1]["details"]["backup"].as_str(), r.kept.as_deref());
+        assert_eq!(db.chat_store_counts().iter().find(|(s, _)| s.region == "gb-lon").unwrap().1.messages, 2, "botd opens the restored store");
     }
 
     #[tokio::test]
@@ -957,7 +1039,7 @@ mod tests {
         let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
         assert!(e.contains("audit log no longer goes back that far") && e.contains("Restore a newer backup"), "{e}");
         assert_eq!(std::fs::read(w.store()).unwrap(), before);
-        assert!(work_files(&w.lon).is_empty() && !w.lon.join(NOTE).exists());
+        assert!(work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
     }
 
     #[tokio::test]
@@ -1052,6 +1134,38 @@ mod tests {
         let mut s = w.settings(&[("REGION_DATA_DIRS", &format!("gb-lon={}", unrecorded.path().display()))]);
         s = Settings::new(None, None, s.vars().into_iter().map(|(k, v)| if k == "DATA_DIR" { (k, unrecorded.path().join("data").display().to_string()) } else { (k, v) }).collect());
         assert!(Place::locate(&s, "gb-lon").err().unwrap().contains("no botd database"));
+    }
+
+    #[tokio::test]
+    async fn a_backup_from_before_routines_and_approvals_were_in_the_store_is_brought_up_to_date() {
+        let (w, db) = World::new();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
+        db.add_message(&ada, "user", "chat-12l-older-botd", None, false, None);
+        db.add_routine_by(&ada, "daily", "0 9 * * *", "chat-13m-newer", true, None);
+        let at = now() + 2000;
+        backup_pass(&db, 7, at);
+        let backup = chat_stores::backups_strictly(&w.place().store).unwrap()[0].1.clone();
+        Connection::open(&backup).unwrap().execute_batch("DROP TABLE routines; DROP TABLE approvals; ALTER TABLE messages DROP COLUMN from_bot; VACUUM").unwrap();
+        db.erase_user(&bob, "erased-c41d", None, &[]).unwrap();
+        drop(db);
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.messages, r.plan.gone.unwrap().routines), (1, 1), "{r:?}");
+        let c = Connection::open(w.store()).unwrap();
+        let n: i64 = c.query_row("SELECT (SELECT COUNT(*) FROM routines) + (SELECT COUNT(*) FROM approvals) + (SELECT COUNT(from_bot) FROM messages)", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "the tables and columns botd keeps now, empty");
+        assert_eq!(texts(&w.store()), ["chat-12l-older-botd"]);
+    }
+
+    #[test]
+    fn only_the_user_botd_runs_as_restores() {
+        let t = Scratch::new();
+        use std::os::unix::fs::MetadataExt;
+        let me = std::fs::metadata(t.path()).unwrap().uid();
+        assert!(same_user(&[t.path()], me).is_ok());
+        let e = same_user(&[t.path()], me + 1).unwrap_err();
+        assert!(e.contains(&format!("belongs to uid {me}")) && e.contains("sudo -u"), "{e}");
     }
 
     #[test]

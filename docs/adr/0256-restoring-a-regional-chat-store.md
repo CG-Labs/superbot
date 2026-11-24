@@ -32,6 +32,7 @@ Each regional chat store has daily backups in its folder and, with ADR 0246, cop
 
 ### Checks before anything changes
 
+- It must run as the user botd runs as: the owner of `DATA_DIR` and of the store's folder. Files it made as another user, root included, would keep botd from opening the restored store.
 - botd's data lock and the store's lock are taken (ADR 0215), so it refuses while botd runs, and botd can't start during a restore.
 - The region must be in `REGION_DATA_DIRS`, its folder must exist (the volume mounted), and botd's database must exist and record a store for the region. Restoring botd's own database is the server restore's job (`docs/support/runbook-server-restore.md`), and must come first.
 - A copy from the bucket is downloaded into the store's own folder, never the host's temp folder, decrypted there if encrypted, and checked against the SHA-256 in its name.
@@ -46,13 +47,15 @@ The backup is copied into a work file `.restore-<name>` in the store's folder, w
 - **Erasures since are run on it again.** For each erased person, with the pseudonym they were given, the same statements botd ran on their stores run on it: their routines deleted, what they and their Bots wrote replaced with `[erased]`, their approval decisions pseudonymised. The statements are shared with botd's erasure, so the two can't drift. Their Bots come from the audit log (`bot.deleted` with reason `user_erased`). When someone was erased after the backup was made and the audit log no longer reaches back that far (`AUDIT_RETENTION_DAYS` pruned it), their Bots can't all be found, so the restore is refused: restore a newer backup.
 - **Only the region's Bots are kept.** Every row of a Bot whose owner's pin (their team's, else their own) isn't in the region now is deleted: Bots that moved out since, and Bots deleted since. So a restore never brings a moved Bot's chats back into a region it left, and needs no move to clear.
 - Both use `secure_delete`, and the file is rebuilt with `VACUUM` and checked again, so no page of what was taken out is left in it.
+- A backup from an older botd (before routines and approvals were kept in the store, ADR 0228) is first given the tables and columns botd keeps now, from botd's own database, as attaching a store does.
 - It is compared with the store now, by row id: what comes back (rows the store lost) and what goes (rows made since the backup).
 
 ### Restoring
 
-- The store now, if it opens, is checkpointed into one file and moved into `backups/` as a backup made now (`chats-<now>.sqlite`). So it is cleared of moved rows (ADR 0238) and copied off the host (ADR 0246) like any other backup, and the restore can be undone by restoring it. A store that doesn't open is deleted, and only with `--replace-unreadable`.
-- The work file replaces `chats.sqlite`, and the folder is synced.
-- A note (`restored.json`, mode 0600) is left in the folder. At its next start botd audits the restore as `residency.chat_store_restored` by the system actor `residency`, with `region`, `storeId`, `backup`, `from` (folder or bucket), `backupAt`, `restoredAt`, the backup `kept`, `replacedUnreadable`, the counts `held`, `dropped`, `erased`, `back` and `gone`, and the user it ran as, then deletes the note.
+- The store now, if it opens, is checkpointed into one file and linked into `backups/` as a backup made now (`chats-<now>.sqlite`). So it is cleared of moved rows (ADR 0238) and copied off the host (ADR 0246) like any other backup, and the restore can be undone by restoring it. A store that doesn't open is replaced, not kept, and only with `--replace-unreadable`.
+- A note (`restored-<time>.json`, mode 0600, one per restore) is written, naming the restored file by its inode.
+- The work file then replaces `chats.sqlite` in one rename, and the folder is synced. The store is never missing: cut off at any point, the folder holds the old store or the restored one. When the rename fails, the note and the new backup link are deleted.
+- At its next start botd audits each note, oldest first, as `residency.chat_store_restored` by the system actor `residency`, with `region`, `storeId`, `backup`, `from` (folder or bucket), `backupAt`, `restoredAt`, the backup `kept`, `replacedUnreadable`, the counts `held`, `dropped`, `erased`, `back` and `gone`, and the user it ran as, then deletes it. So a restore undone before botd starts is audited twice, once each way. A note whose file is neither the store nor one of its backups is of a restore cut off before the rename: it is logged as nothing restored, not audited.
 - At every start, before it opens the stores, botd deletes `.restore-*` work files left by a restore that was cut off: they may hold rows that have since left the store.
 - Routines that come back run on their schedule once botd starts, so the command says so when any do.
 - botd then starts as usual: its message ids continue past the restored store's (ADR 0215), it moves rows that belong elsewhere, and its next check backs the store up and copies it off the host.
@@ -73,7 +76,9 @@ The backup is copied into a work file `.restore-<name>` in the store's folder, w
 ## Tests
 
 - Unit (`machines/chat_store_restore.rs`):
-  - a backup in the folder comes back without the chats of a Bot that moved to Frankfurt (no page of them left), refused while those chats are still waiting to move; the dry run counts what comes back and goes and changes nothing; the store it replaces is kept as a backup; a cut-off restore's work file is deleted; botd's next start audits it once and opens the store;
+  - a backup in the folder comes back without the chats of a Bot that moved to Frankfurt (no page of them left), refused while those chats are still waiting to move; the dry run counts what comes back and goes and changes nothing; the store it replaces is kept as a backup; a cut-off restore's work file is deleted; undone before botd starts, both restores are audited at the next start, oldest first, and a cut-off one's note is only logged; botd opens the store;
+  - a backup without routines, approvals or a newer column is given them before erasures run;
+  - only the owner of the folders may restore;
   - erasures made since are run on it again: an erased person's routine, their Bot's message in another Bot's chat and their approval decision, gone from every page;
   - a backup older than the audit log is refused once someone was erased since;
   - after the volume is lost, an age-encrypted copy comes back from the bucket, with its secret key from botd's saved secrets; without an identity or with a wrong one it is refused and nothing is left;

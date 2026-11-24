@@ -748,6 +748,17 @@ fn delete_in_copy(c: &Connection, op: &str, bots: &[String]) -> rusqlite::Result
     Ok(Held::of(n))
 }
 
+/// Brings a copy of a store opened on `c` (a backup from an older botd, perhaps without
+/// routines or approvals, ADR 0228) to the tables botd keeps now, from botd's own database
+/// attached as `botd`, as attaching the store does.
+pub fn upgrade_copy(c: &Connection, botd: &str) -> rusqlite::Result<()> {
+    for k in KEPT.iter() {
+        let main = columns(c, botd, k.name)?;
+        ensure_table(c, "main", k, &main)?;
+    }
+    Ok(())
+}
+
 /// The Bots whose chats, routines and approvals belong in `region`'s store: those whose
 /// owner's pin (their team's, else their own) is in it. `c` is botd's own database.
 pub fn bots_kept_in(c: &Connection, region: &str) -> rusqlite::Result<Vec<String>> {

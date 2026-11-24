@@ -52,7 +52,7 @@ A pin's chats, routines and approvals are kept in its region when that region ha
 
 ## Restoring a regional chat store
 
-When a region's chat store is lost (its volume gone, or mounted empty) or damaged, restore it from a backup in its folder or a copy in its bucket ([ADR 0256](../adr/0256-restoring-a-regional-chat-store.md)). On the server, with botd stopped, as the user botd runs as:
+When a region's chat store is lost (its volume gone, or mounted empty) or damaged, restore it from a backup in its folder or a copy in its bucket ([ADR 0256](../adr/0256-restoring-a-regional-chat-store.md)). On the server, with botd stopped, as the user botd runs as (`sudo -u superbot ...` on the installer's layout; it refuses another user, root included):
 
 ```sh
 botd chat-store list gb-lon                                   # the store, its backups and its bucket's copies
@@ -66,6 +66,7 @@ The backup must be this region's store, open with the master key (or the previou
 
 | Refused | Why | Fix |
 |---|---|---|
+| `belongs to uid ...` | Run as another user (root, say), whose files botd couldn't open | Run it as the owner of `DATA_DIR` and the folder: `sudo -u superbot botd chat-store ...` |
 | `botd must be stopped` | botd, or another restore, holds the lock | Stop botd (`sudo systemctl stop superbot`; Compose: `docker compose stop botd`) |
 | `holds ... of Bots kept elsewhere now that botd hasn't moved yet` | A move out of the store is waiting | Start botd, let it move them (the pin's report shows when), stop it, restore |
 | `audit log no longer goes back that far` | Someone was erased after the backup, and `AUDIT_RETENTION_DAYS` pruned what names their Bots | Restore a newer backup |
