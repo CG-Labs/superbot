@@ -391,7 +391,8 @@ jobs:
             cosign sign-blob --yes --key cosign.key --signing-config signing-config.json --bundle "$f.sigstore.json" "$f" >/dev/null
           done
           "$GITHUB_WORKSPACE/deploy/offline-release-check.sh" online signed --version "$OLD" --commit "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" \
-            --image signed=localhost:5000/superbot-offline-signed:1 --key cosign.pub --any-binary-arch
+            --image signed=localhost:5000/superbot-offline-signed:1 --key cosign.pub --any-binary-arch --without-harness-bundles
+          grep -qx 'harness-bundles skipped' signed/release-check.expected
           grep -qx "image signed localhost:5000/superbot-offline-signed:1 $SIGNED_INDEX" signed/release-check.expected
       # The mirror is a registry binary run inside the namespace, so nothing here has a network.
       - name: Push both arches' bundles to a mirror with no network; cosign verifies the signed index there

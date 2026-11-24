@@ -248,6 +248,65 @@ impl Bundles {
     }
 }
 
+/// `botd harness check-bundles FILE...` (ADR 0247): what this botd makes of FILEs as
+/// MACHINE_HERMES_BUNDLE and MACHINE_HARNESS_BUNDLE (by their names), with machines' plan
+/// naming every harness it pins. Each is checked in full against the `.sha256` beside it, as
+/// at start, and must hold exactly what that plan pins. One line per bundle, then the
+/// harnesses machines would install from them. Reads no settings; serves and starts nothing.
+pub fn check_files(files: &[String]) -> Result<String, String> {
+    if files.is_empty() {
+        return Err("Give the Hermes and harness bundles to check".into());
+    }
+    let (mut hermes, mut clis) = (Vec::new(), Vec::new());
+    for f in files {
+        let name = Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let list = if name.starts_with("superbot-hermes-") {
+            &mut hermes
+        } else if name.starts_with("superbot-harnesses-") {
+            &mut clis
+        } else {
+            return Err(format!("{f} isn't named as a Hermes bundle (superbot-hermes-*) or a harness bundle (superbot-harnesses-*)"));
+        };
+        let abs = std::path::absolute(f).map_err(|e| format!("{f}: {e}"))?;
+        list.push(abs.display().to_string());
+    }
+    let all = install::bins().join(",");
+    let var = |k: &str| match k {
+        "MACHINE_HARNESSES" => all.clone(),
+        "MACHINE_HERMES_BUNDLE" => hermes.join(","),
+        "MACHINE_HARNESS_BUNDLE" => clis.join(","),
+        // Only named in the plan's download URLs, which nothing here fetches.
+        "MACHINE_CONTROL_URL" => "https://botd.invalid".into(),
+        _ => String::new(),
+    };
+    let mut plan = super::upkeep::parse_harnesses(&all)?.ok_or("this botd pins no harnesses")?;
+    let mut out = String::new();
+    for kind in [BundleKind::Harnesses, BundleKind::Hermes] {
+        let Some(b) = Bundles::from_env(&var, kind)? else { continue };
+        plan = b.apply(plan)?;
+        for (arch, x) in &b.by_arch {
+            let m = &x.manifest;
+            let holds = match kind {
+                BundleKind::Hermes => format!("Hermes Agent {} ({})", m.tag, short(&m.commit)),
+                BundleKind::Harnesses => {
+                    let each: Vec<String> = m.harnesses.iter().map(|(h, v)| format!("{h} {}", v.split(' ').next().unwrap_or_default())).collect();
+                    format!("{} on Node.js {}", each.join(", "), m.node.split(' ').next().unwrap_or_default())
+                }
+            };
+            out.push_str(&format!("{arch} {} {}: {holds}, SHA-256 {}\n", what(kind), x.file.display(), x.sha256));
+        }
+    }
+    super::tools::check(&plan).map_err(|e| format!("machines couldn't install from these bundles: {e}"))?;
+    let (from, rest): (Vec<_>, Vec<_>) = plan.harnesses.iter().partition(|h| matches!(h.source, InstallSource::Bundle { .. }));
+    let names = |l: &[&super::wire::HarnessInstall]| l.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", ");
+    out.push_str(&format!("Machines would install {} from these bundles", names(&from)));
+    if !rest.is_empty() {
+        out.push_str(&format!(", and {} from the internet or the operator's mirrors", names(&rest)));
+    }
+    out.push('\n');
+    Ok(out)
+}
+
 /// Whether only an agent that says `CAN_HARNESS_BUNDLES` can install `plan`.
 pub fn bundled(plan: &HarnessPlan) -> bool {
     plan.harnesses.iter().any(|h| matches!(h.source, InstallSource::Bundle { .. }))
@@ -515,5 +574,53 @@ mod tests {
         std::fs::write(&x86, b"changed").unwrap();
         assert!(b.recheck("x86_64", &sha).await.unwrap_err().contains("restart botd"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ADR 0247: `botd harness check-bundles`, as the release check runs it on a release's
+    // Hermes and harness bundles.
+    #[test]
+    fn check_bundles_says_what_machines_would_take() {
+        let dir = temp("check-bundles");
+        let all = ["claude", "codex", "pi"];
+        let (hx, hsha) = bundle_file(&dir, "x86_64", &pinned_commit());
+        let (ha, _) = bundle_file(&dir, "aarch64", &pinned_commit());
+        let (nx, nsha) = harness_file(&dir, "x86_64", &real_pins("x86_64", &all));
+        let (na, _) = harness_file(&dir, "aarch64", &real_pins("aarch64", &all));
+        let files = |l: &[&PathBuf]| l.iter().map(|p| p.display().to_string()).collect::<Vec<_>>();
+
+        let out = check_files(&files(&[&hx, &ha, &nx, &na])).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5, "{out}");
+        let versions: Vec<String> = all.iter().map(|h| format!("{h} {}", install::install(h, None, None).unwrap().version)).collect();
+        let na_sha: String = Sha256::digest(std::fs::read(&na).unwrap()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(lines[0], format!("aarch64 harness bundle {}: {} on Node.js {}, SHA-256 {na_sha}", na.display(), versions.join(", "), install::node().version));
+        assert!(lines[1].starts_with(&format!("x86_64 harness bundle {}: ", nx.display())) && lines[1].ends_with(&format!(", SHA-256 {nsha}")), "{out}");
+        assert!(lines[2].starts_with(&format!("aarch64 Hermes bundle {}: ", ha.display())), "{out}");
+        assert_eq!(lines[3], format!("x86_64 Hermes bundle {}: Hermes Agent v0.23.3 ({}), SHA-256 {hsha}", hx.display(), &pinned_commit()[..12]));
+        assert_eq!(lines[4], format!("Machines would install {} from these bundles", install::bins().join(", ")));
+        let only = check_files(&files(&[&nx])).unwrap();
+        assert!(only.ends_with("Machines would install claude, codex, pi from these bundles, and hermes from the internet or the operator's mirrors\n"), "{only}");
+
+        let refused = |l: Vec<String>, why: &str| {
+            let err = check_files(&l).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        };
+        refused(Vec::new(), "Give the Hermes and harness bundles");
+        refused(vec![dir.join("botd").display().to_string()], "isn't named as a Hermes bundle");
+        refused(files(&[&hx, &hx]), "two bundles for x86_64");
+        let other = temp("check-bundles-other");
+        let (old, _) = bundle_file(&other, "x86_64", &"b".repeat(40));
+        refused(files(&[&old]), "holds Hermes Agent bbbbbbbbbbbb, but machines' plan pins");
+        let (few, _) = harness_file(&other, "aarch64", &real_pins("aarch64", &["claude", "pi"]));
+        refused(files(&[&few]), "doesn't hold codex, which machines' plan names");
+        std::fs::rename(&few, other.join("superbot-hermes-v0.23.3-aarch64.tar.gz")).unwrap();
+        std::fs::rename(other.join("superbot-harnesses-0.1.0-aarch64.tar.gz.sha256"), other.join("superbot-hermes-v0.23.3-aarch64.tar.gz.sha256")).unwrap();
+        refused(vec![other.join("superbot-hermes-v0.23.3-aarch64.tar.gz").display().to_string()], "isn't a Hermes bundle");
+        std::fs::remove_file(other.join("superbot-hermes-v0.23.3-aarch64.tar.gz.sha256")).unwrap();
+        refused(vec![other.join("superbot-hermes-v0.23.3-aarch64.tar.gz").display().to_string()], "there is no");
+        std::fs::write(dir.join("superbot-harnesses-0.1.0-x86_64.tar.gz.sha256"), format!("{}\n", "a".repeat(64))).unwrap();
+        refused(files(&[&nx]), &format!("has SHA-256 {nsha}, not {}", "a".repeat(64)));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(other);
     }
 }
