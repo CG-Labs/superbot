@@ -53,5 +53,8 @@
     { "id": "model-provider", "tier": "high", "since": "2026-12-01", "assessed": "2026-12-01", "approvedBy": "person-2" }
   ],
   "exceptions": [],
-  "conductConcerns": []
+  "conductConcerns": [],
+  "breachNoticeHours": 48,
+  "incidents": [],
+  "tabletops": []
 }
