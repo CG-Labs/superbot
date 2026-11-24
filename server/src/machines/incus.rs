@@ -1950,7 +1950,7 @@ impl MachineProvider for Incus {
             let v = self.call(Method::GET, &format!("/1.0/instances/{}", name(machine)?), &[], None, None).await?.metadata;
             let refused = |m: &str| api(409, m);
             if v["config"][TEAM_NIC_READY] != TEAM_NIC {
-                return Err(refused("it was made before team networks on Incus, so it wouldn't bring up a team NIC; rebuild it to join its team's network"));
+                return Err(refused("it was made before team networks on Incus, so it wouldn't bring up a team NIC; rebuild it to join its team's network (botctl machine rebuild <user>)"));
             }
             match v["devices"].get(TEAM_NIC) {
                 Some(d) if *d == self.team_nic(net) => return Ok(()),
@@ -1964,6 +1964,13 @@ impl MachineProvider for Incus {
 
     fn team_network_hotplug(&self) -> bool {
         true
+    }
+
+    fn team_nic_needs_rebuild<'a>(&'a self, id: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let v = self.call(Method::GET, &format!("/1.0/instances/{}", name(id)?), &[], None, None).await?.metadata;
+            Ok(v["config"][TEAM_NIC_READY] != TEAM_NIC)
+        })
     }
 
     fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>> {

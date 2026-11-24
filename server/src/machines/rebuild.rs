@@ -133,6 +133,13 @@ fn details(m: &Machine, extra: Value) -> Value {
     d
 }
 
+/// Whether `m`, though its agent can upgrade itself, needs a rebuild to join its team's
+/// network: a container made before ADR 0212, with team networks on.
+async fn for_team_nic(cp: &ControlPlane, m: &Machine) -> bool {
+    let (Some(p), Some(pid)) = (cp.provider.as_deref(), m.provider_id.as_deref()) else { return false };
+    cp.team_network.is_some() && p.team_nic_needs_rebuild(pid).await.unwrap_or(false)
+}
+
 /// Why botd can't rebuild machines at all, if it can't.
 fn unable(cp: &ControlPlane, e: &Enrollment) -> Option<&'static str> {
     if e.upkeep.rebuilds == Rebuilds::Off {
@@ -308,7 +315,7 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 Ok(hb) => hb,
                 Err(why) => return retry_later(app, &m, "queued", "queued", true, "offline", &format!("Its agent didn't answer: {why}")),
             };
-            if !legacy(&hb) {
+            if !legacy(&hb) && !for_team_nic(cp, &m).await {
                 cancel(app, &system(&m), &m, "not_needed");
                 return;
             }
@@ -509,7 +516,8 @@ pub async fn get(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
 
 /// `POST /api/users/{key}/machine/rebuild[?discardWork=true]`: rebuilds it with today's
 /// agent. Its agent must answer and be from before ADR 0039, unless a rebuild sent
-/// before failed (it may have none left). 202; it is tried at once,
+/// before failed (it may have none left), or it needs one to join its team's network
+/// (ADR 0212). 202; it is tried at once,
 /// then by the reconciler, and the audit log and `GET` say how it went.
 pub async fn request(
     AppS(app): AppS<AppState>,
@@ -551,7 +559,7 @@ pub async fn request(
         Err(_) if again => None,
         Err(err) => return Err(err),
     };
-    if hb.as_ref().is_some_and(|h| !legacy(h)) {
+    if hb.as_ref().is_some_and(|h| !legacy(h)) && !for_team_nic(cp, &m).await {
         return Err(conflict("Its agent can upgrade itself, so it needn't be rebuilt. Use botctl machine upgrade <user>."));
     }
     if !discard && app.db.machine_may_hold_work(&m.id) {

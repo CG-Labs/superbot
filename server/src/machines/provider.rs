@@ -364,6 +364,11 @@ pub trait MachineProvider: Send + Sync {
     fn team_network_hotplug(&self) -> bool {
         false
     }
+    /// Whether the machine can take a team network's interface only once rebuilt, as a
+    /// container made before ADR 0212 can't bring one up.
+    fn team_nic_needs_rebuild<'a>(&'a self, _id: &'a str) -> Fut<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.
 

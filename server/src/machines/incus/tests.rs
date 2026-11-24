@@ -787,6 +787,9 @@ async fn a_team_network_is_an_isolated_ovn_network_with_its_own_acl() {
     p.join_team_network("superbot-m2", &n).await.unwrap();
     assert_eq!(s.calls("PUT", "/1.0/instances/superbot-m2").len(), 1, "on it already: nothing asked");
     assert!(p.team_network_hotplug());
+    assert!(!p.team_nic_needs_rebuild("superbot-m2").await.unwrap());
+    s.w().instances.get_mut("superbot-m2").unwrap().body["config"].as_object_mut().unwrap().remove("user.superbot.team-nic");
+    assert!(p.team_nic_needs_rebuild("superbot-m2").await.unwrap(), "made before ADR 0212");
 }
 
 #[tokio::test]

@@ -57,7 +57,7 @@ Every container is now made, and rebuilt, with a `cloud-init.network-config` tha
 - Incus plugs NICs into running containers and unplugs them again. A new provider flag, `team_network_hotplug`, says so. The sweep of ADR 0189 and 0202 is otherwise unchanged:
   - **Joining.** A machine already made joins at once, once its egress rules let the subnet through and it is behind the firewall. It is audited `machine.team_network_joining` with `atOnce: true`, then `machine.team_network_joined` on the next pass. `MACHINE_TEAM_NETWORK_JOIN=when-idle` never restarts anything on Incus.
   - **Leaving.** A running machine whose owner leaves loses `eth1` at once, without a power-off. It is audited `machine.team_network_left` with `inUse: true`. Its rules lose the subnet on the next heartbeat.
-- A container made before this change lacks the marker, so its cloud-init wouldn't bring up `eth1`. Joining is refused with "rebuild it to join", audited once. A container with an `eth1` of its own isn't touched until the firewall sweep has removed that device.
+- A container made before this change lacks the marker, so its cloud-init wouldn't bring up `eth1`. Joining is refused with "rebuild it to join", audited once. Such a container may be rebuilt (`botctl machine rebuild`, ADR 0056) though its agent upgrades itself: a new provider check, `team_nic_needs_rebuild`, lets it past the rebuild's "agent can upgrade itself" refusal while team networks are on. A container with an `eth1` of its own isn't touched until the firewall sweep has removed that device.
 
 ### Several hosts
 
@@ -90,6 +90,7 @@ With several Incus hosts (ADR 0076), each host has its own team networks. botd l
   - A leaver is unplugged while running, never powered off, audited `inUse: true`.
   - The ACL is set back at the next create.
   - A container made before this change is refused once until rebuilt.
+- **Rebuilds** (`machines_rebuild_tests.rs`): with team networks on, a machine whose agent upgrades itself is refused a rebuild, unless the provider says it needs one for a team NIC; then it is rebuilt, comes back, and isn't rebuilt again.
   - The admin check fails without `network_ovn_isolated` or `backup_override_config`, or with a bridge on the same range, and then nothing is made.
 - **Baseline** (`baseline.rs`): `ovn` on Incus passes; `vpc` on Incus and `ovn` on Linode fail.
 

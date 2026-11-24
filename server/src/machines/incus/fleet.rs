@@ -654,6 +654,13 @@ impl MachineProvider for Fleet {
         true
     }
 
+    fn team_nic_needs_rebuild<'a>(&'a self, id: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let (m, n) = self.route(id)?;
+            m.incus.team_nic_needs_rebuild(n).await
+        })
+    }
+
     fn hosts(&self) -> Option<&dyn Hosts> {
         Some(self)
     }
