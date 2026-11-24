@@ -428,7 +428,7 @@ fn the_triage_page_documents_every_option_and_finding() {
     for o in options {
         assert!(page.contains(&format!("`{o}")), "triage.md doesn't explain {o}");
     }
-    let mut ids: HashSet<String> = code.split("Finding::new(\"").skip(1).map(|r| r.split('"').next().unwrap().to_string()).collect();
+    let mut ids: HashSet<String> = code.split("Finding::new(").skip(1).filter_map(|r| r.trim_start().strip_prefix('"')).map(|r| r.split('"').next().unwrap().to_string()).collect();
     assert!(ids.len() >= 20, "the findings: {ids:?}");
     let groups = code.split("fn audit_group").nth(1).unwrap().split("\n}\n").next().unwrap();
     let groups = quoted_before(groups, ", \"");

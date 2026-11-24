@@ -26,19 +26,8 @@ pub const MAX_BYTES: u64 = 64 << 20;
 pub const ONLINE_FORMAT: u64 = 2;
 pub const OFFLINE_FORMAT: u64 = 1;
 /// Every file either bundle has. Anything else in the tar is left unread.
-pub const FILES: [&str; 11] = [
-    "README.txt",
-    "version.json",
-    "config.json",
-    "health.json",
-    "health-score.json",
-    "health-score-history.json",
-    "logs.jsonl",
-    "audit-summary.json",
-    "check.json",
-    "logs.txt",
-    "manifest.json",
-];
+pub const FILES: [&str; 11] =
+    ["README.txt", "version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "logs.jsonl", "audit-summary.json", "check.json", "logs.txt", "manifest.json"];
 const ONLINE_FILES: [&str; 7] = ["version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "logs.jsonl", "audit-summary.json"];
 const OFFLINE_FILES: [&str; 4] = ["version.json", "check.json", "config.json", "logs.txt"];
 /// Longest text taken from the bundle into the triage, in characters.
@@ -144,7 +133,7 @@ pub fn read_tar(bytes: &[u8]) -> Result<Bundle, String> {
         }
         let path = entry.path().map_err(|e| format!("a damaged tar file: {e}"))?.to_string_lossy().into_owned();
         let Some((folder, file)) = place(&path) else { continue };
-        total += entry.size();
+        total = total.saturating_add(entry.size());
         if total > MAX_BYTES {
             return Err(too_big());
         }
@@ -185,7 +174,7 @@ pub fn read_dir(dir: &Path) -> Result<Bundle, String> {
         if !meta.is_file() {
             continue;
         }
-        total += meta.len();
+        total = total.saturating_add(meta.len());
         if total > MAX_BYTES {
             return Err(too_big());
         }
@@ -340,7 +329,7 @@ fn many(n: u64, one: &str, more: &str) -> String {
 }
 
 fn percent(part: u64, whole: u64) -> u64 {
-    if whole == 0 { 0 } else { part * 100 / whole }
+    part.saturating_mul(100).checked_div(whole).unwrap_or(0)
 }
 
 fn duration(secs: i64) -> String {
@@ -398,7 +387,8 @@ fn status_rules(health: &Value, out: &mut Vec<Finding>) {
         let Some((lvl, sev, book)) = component(id, level) else { continue };
         let name = str_at(c, "name").map(clean).unwrap_or_else(|| clean(id));
         let note = str_at(c, "note").map(|n| format!(": {}", clean(n))).unwrap_or_default();
-        let mut f = Finding::new(format!("status.{}", clean(id)), lvl, sev, format!("{name} is {}{note}", level.replace('_', " ")), format!("health.json status.components {}", clean(id))).runbook(book);
+        let mut f =
+            Finding::new(format!("status.{}", clean(id)), lvl, sev, format!("{name} is {}{note}", level.replace('_', " ")), format!("health.json status.components {}", clean(id))).runbook(book);
         if sev == Some(1) {
             f = f.runbook("support/runbook-major-incident.md").next("Run it as a Severity 1: post on the status page within 15 minutes.");
         }
@@ -423,22 +413,43 @@ fn health_rules(health: &Value, version: Option<&Value>, out: &mut Vec<Finding>)
     let (sent, failed) = (u64_at(last, "noticesSent"), u64_at(last, "noticesFailed"));
     if pending > 0 && failed > 0 && sent == 0 {
         out.push(
-            Finding::new("approvals.unheard", Level::Fail, Some(2), format!("{} waiting and every notification failed in the last {minutes} minutes ({failed}): Bots wait for people who never hear", many(pending, "approval", "approvals")), "health.json approvals, lastMinutes")
-                .runbook("support/runbook-approvals-stuck.md"),
+            Finding::new(
+                "approvals.unheard",
+                Level::Fail,
+                Some(2),
+                format!("{} waiting and every notification failed in the last {minutes} minutes ({failed}): Bots wait for people who never hear", many(pending, "approval", "approvals")),
+                "health.json approvals, lastMinutes",
+            )
+            .runbook("support/runbook-approvals-stuck.md"),
         );
     } else {
         if failed > 0 {
-            out.push(Finding::new("notifications.failed", Level::Warn, Some(3), format!("{failed} of {} notifications failed in the last {minutes} minutes", failed + sent), "health.json lastMinutes").runbook("support/runbook-approvals-stuck.md"));
+            out.push(
+                Finding::new(
+                    "notifications.failed",
+                    Level::Warn,
+                    Some(3),
+                    format!("{failed} of {} notifications failed in the last {minutes} minutes", failed.saturating_add(sent)),
+                    "health.json lastMinutes",
+                )
+                .runbook("support/runbook-approvals-stuck.md"),
+            );
         }
         if pending > 0 && oldest.is_some_and(|s| s >= 1800) {
             let age = duration(oldest.unwrap_or(0));
-            out.push(Finding::new("approvals.waiting", Level::Warn, Some(3), format!("{} waiting, the oldest for {age}", many(pending, "approval", "approvals")), "health.json approvals").runbook("support/runbook-approvals-stuck.md"));
+            out.push(
+                Finding::new("approvals.waiting", Level::Warn, Some(3), format!("{} waiting, the oldest for {age}", many(pending, "approval", "approvals")), "health.json approvals")
+                    .runbook("support/runbook-approvals-stuck.md"),
+            );
         }
     }
     let waiting = u64_at(&health["runs"], "waiting");
     if waiting > 0 {
         let cap = health["runs"]["capPerComputer"].as_u64().map(|c| format!(" (at most {c} at once per computer)")).unwrap_or_default();
-        out.push(Finding::new("runs.waiting", Level::Warn, Some(3), format!("{} waiting for a slot{cap}", many(waiting, "run", "runs")), "health.json runs").runbook("support/runbook-run-limits-egress.md#run-limits"));
+        out.push(
+            Finding::new("runs.waiting", Level::Warn, Some(3), format!("{} waiting for a slot{cap}", many(waiting, "run", "runs")), "health.json runs")
+                .runbook("support/runbook-run-limits-egress.md#run-limits"),
+        );
     }
     let (requests, errors) = (u64_at(last, "requests"), u64_at(last, "errors"));
     if requests >= 20 && percent(errors, requests) >= 5 {
@@ -451,23 +462,42 @@ fn health_rules(health: &Value, version: Option<&Value>, out: &mut Vec<Finding>)
         );
     }
     let (done, runs_failed) = (u64_at(last, "runsDone"), u64_at(last, "runsFailed"));
-    if done + runs_failed >= 4 && percent(runs_failed, done + runs_failed) >= 20 {
-        let p = percent(runs_failed, done + runs_failed);
+    let runs = done.saturating_add(runs_failed);
+    if runs >= 4 && percent(runs_failed, runs) >= 20 {
+        let p = percent(runs_failed, runs);
         let (lvl, sev) = if p >= 50 { (Level::Fail, Some(2)) } else { (Level::Warn, Some(3)) };
-        out.push(Finding::new("runs.failing", lvl, sev, format!("{runs_failed} of {} Bot runs ({p}%) failed in the last {minutes} minutes", done + runs_failed), "health.json lastMinutes").runbook("support/runbook-harness-outage.md"));
+        out.push(
+            Finding::new("runs.failing", lvl, sev, format!("{runs_failed} of {} Bot runs ({p}%) failed in the last {minutes} minutes", runs), "health.json lastMinutes")
+                .runbook("support/runbook-harness-outage.md"),
+        );
     }
     let machines = &health["machines"];
     let errored = u64_at(&machines["byState"], "error");
     if errored > 0 {
-        out.push(Finding::new("machines.error", Level::Warn, Some(3), format!("{} in error", many(errored, "user's machine is", "users' machines are")), "health.json machines.byState").runbook("support/runbook-machine-down.md#one-machine"));
+        out.push(
+            Finding::new("machines.error", Level::Warn, Some(3), format!("{} in error", many(errored, "user's machine is", "users' machines are")), "health.json machines.byState")
+                .runbook("support/runbook-machine-down.md#one-machine"),
+        );
     }
-    let hosts_down = u64_at(&machines["hostsByState"], "down") + u64_at(&machines["hostsByState"], "lost");
+    let hosts_down = u64_at(&machines["hostsByState"], "down").saturating_add(u64_at(&machines["hostsByState"], "lost"));
     if hosts_down > 0 {
-        out.push(Finding::new("machines.hosts", Level::Fail, Some(2), format!("{} down or lost", many(hosts_down, "Incus host", "Incus hosts")), "health.json machines.hostsByState").runbook("support/runbook-machine-down.md#a-whole-incus-host"));
+        out.push(
+            Finding::new("machines.hosts", Level::Fail, Some(2), format!("{} down or lost", many(hosts_down, "Incus host", "Incus hosts")), "health.json machines.hostsByState")
+                .runbook("support/runbook-machine-down.md#a-whole-incus-host"),
+        );
     }
     let breaches = u64_at(machines, "rpoBreachesOpen");
     if breaches > 0 {
-        out.push(Finding::new("machines.rpo", Level::Fail, Some(2), format!("{} past {} backup RPO", many(breaches, "user's machine", "users' machines"), if breaches == 1 { "its" } else { "their" }), "health.json machines.rpoBreachesOpen").runbook("support/runbook-machine-down.md#restore-one-machine"));
+        out.push(
+            Finding::new(
+                "machines.rpo",
+                Level::Fail,
+                Some(2),
+                format!("{} past {} backup RPO", many(breaches, "user's machine", "users' machines"), if breaches == 1 { "its" } else { "their" }),
+                "health.json machines.rpoBreachesOpen",
+            )
+            .runbook("support/runbook-machine-down.md#restore-one-machine"),
+        );
     }
     let none = version.and_then(|v| v["harnesses"]["installed"].as_array()).is_some_and(Vec::is_empty);
     if none && machines.is_null() {
@@ -586,7 +616,16 @@ fn history_rules(history: &Value, out: &mut Vec<Finding>) {
                 "score.falling",
                 Level::Warn,
                 None,
-                format!("Health score fell {} points, from {} ({}) on {} to {} ({}) on {}{worse}", -change, t["fromScore"], band("fromBand"), band("from"), t["toScore"], band("toBand"), band("to")),
+                format!(
+                    "Health score fell {} points, from {} ({}) on {} to {} ({}) on {}{worse}",
+                    change.saturating_neg(),
+                    t["fromScore"],
+                    band("fromBand"),
+                    band("from"),
+                    t["toScore"],
+                    band("toBand"),
+                    band("to")
+                ),
                 "health-score-history.json trend",
             )
             .runbook("support/health-score.md#history")
@@ -609,7 +648,9 @@ fn audit_group(action: &str) -> (&'static str, &'static str, Option<&'static str
         "harness" => ("harness", "harness failures", Some("support/runbook-harness-outage.md")),
         "license" => ("license", "license refusals", Some("support/health-score.md#license")),
         "machine" | "isolation" if action != "machine.run_limited" => ("machines", "machine failures", Some("support/runbook-machine-down.md")),
-        _ if matches!(action, "bot.run_refused" | "routine.run_refused" | "machine.run_limited" | "usage.token_limit_reached") => ("run_limits", "runs refused or held to limits", Some("support/runbook-run-limits-egress.md")),
+        _ if matches!(action, "bot.run_refused" | "routine.run_refused" | "machine.run_limited" | "usage.token_limit_reached") => {
+            ("run_limits", "runs refused or held to limits", Some("support/runbook-run-limits-egress.md"))
+        }
         "bot" if action.ends_with("_refused") => ("access", "access denials", Some("support/runbook-custom-roles.md#why-a-holder-is-refused")),
         _ => ("other", "other failures and denials", None),
     }
@@ -626,13 +667,14 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
     let mut groups: BTreeMap<&'static str, Group> = BTreeMap::new();
     for a in audit["byAction"].as_array().into_iter().flatten() {
         let Some(action) = str_at(a, "action") else { continue };
-        let bad: u64 = a["outcomes"].as_object().into_iter().flatten().filter(|(o, _)| o.as_str() != "success").filter_map(|(_, n)| n.as_u64()).sum();
+        let bad: u64 = a["outcomes"].as_object().into_iter().flatten().filter(|(o, _)| o.as_str() != "success").filter_map(|(_, n)| n.as_u64()).fold(0u64, u64::saturating_add);
         if bad == 0 {
             continue;
         }
         let (key, what, book) = audit_group(action);
         let g = groups.entry(key).or_insert_with(|| Group { what, book, actions: BTreeMap::new(), reasons: BTreeMap::new(), saml: false });
-        *g.actions.entry(clean(action)).or_default() += bad;
+        let n = g.actions.entry(clean(action)).or_default();
+        *n = n.saturating_add(bad);
         g.saml |= action.starts_with("sso.saml") || action.starts_with("auth.slo") || action == "auth.saml_idp_initiated";
     }
     for p in audit["recentProblems"].as_array().into_iter().flatten() {
@@ -646,7 +688,7 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
     let days = u64_at(audit, "days");
     let to = str_at(audit, "to").map(clean).unwrap_or_default();
     for (key, g) in groups {
-        let total: u64 = g.actions.values().sum();
+        let total = g.actions.values().copied().fold(0u64, u64::saturating_add);
         let mut actions: Vec<(String, u64)> = g.actions.into_iter().collect();
         actions.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let mut reasons: Vec<(String, u64)> = g.reasons.into_iter().collect();
@@ -672,7 +714,10 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
         out.push(f);
     }
     if audit["truncated"] == true {
-        out.push(Finding::new("audit.truncated", Level::Info, None, "The audit summary hit its limit: counts cover only the newest events", "audit-summary.json truncated").next("`botctl audit` on the server has the rest."));
+        out.push(
+            Finding::new("audit.truncated", Level::Info, None, "The audit summary hit its limit: counts cover only the newest events", "audit-summary.json truncated")
+                .next("`botctl audit` on the server has the rest."),
+        );
     }
 }
 
@@ -730,10 +775,11 @@ fn log_rules(file: &str, text: &str, out: &mut Vec<Finding>) {
         lines += 1;
         let panic = msg.contains("panicked");
         panics += u64::from(panic);
-        let bad = panic || match level.as_deref() {
-            Some(l) => matches!(l, "warn" | "warning" | "error" | "fatal"),
-            None => sounds_bad(&msg),
-        };
+        let bad = panic
+            || match level.as_deref() {
+                Some(l) => matches!(l, "warn" | "warning" | "error" | "fatal"),
+                None => sounds_bad(&msg),
+            };
         if bad {
             problems += 1;
             *top.entry(shape(&msg)).or_default() += 1;
@@ -741,9 +787,15 @@ fn log_rules(file: &str, text: &str, out: &mut Vec<Finding>) {
     }
     if panics > 0 {
         out.push(
-            Finding::new("logs.panic", Level::Warn, None, format!("botd panicked {} in its newest {}", if panics == 1 { "once".to_string() } else { format!("{panics} times") }, many(lines, "log line", "log lines")), file)
-                .runbook("support/escalation.md")
-                .next("A panic is a bug: send the bundle to level 3 through the issue tracker, and link the issue."),
+            Finding::new(
+                "logs.panic",
+                Level::Warn,
+                None,
+                format!("botd panicked {} in its newest {}", if panics == 1 { "once".to_string() } else { format!("{panics} times") }, many(lines, "log line", "log lines")),
+                file,
+            )
+            .runbook("support/escalation.md")
+            .next("A panic is a bug: send the bundle to level 3 through the issue tracker, and link the issue."),
         );
     }
     if problems > 0 {
@@ -783,7 +835,9 @@ fn check_rules(check: &Value, out: &mut Vec<Finding>) {
         out.push(f);
     }
     if check["beforeUpgrade"] == true {
-        out.push(Finding::new("check.before_upgrade", Level::Info, None, "Checked before an upgrade (--before-upgrade)", "check.json beforeUpgrade").runbook("support/runbook-upgrade.md#before-an-upgrade"));
+        out.push(
+            Finding::new("check.before_upgrade", Level::Info, None, "Checked before an upgrade (--before-upgrade)", "check.json beforeUpgrade").runbook("support/runbook-upgrade.md#before-an-upgrade"),
+        );
     }
 }
 
@@ -793,22 +847,40 @@ fn version_rules(v: &Value, kind: Kind, o: &Options, out: &mut Vec<Finding>) {
         Kind::Offline => OFFLINE_FORMAT,
     };
     if let Some(f) = v["bundleFormat"].as_u64().filter(|f| *f > known) {
-        out.push(Finding::new("bundle.format", Level::Info, None, format!("Made by a newer botd (bundle format {f}; this botctl reads {known}): files or fields it doesn't know are left out"), "version.json bundleFormat").next("Upgrade botctl for a complete triage."));
+        out.push(
+            Finding::new(
+                "bundle.format",
+                Level::Info,
+                None,
+                format!("Made by a newer botd (bundle format {f}; this botctl reads {known}): files or fields it doesn't know are left out"),
+                "version.json bundleFormat",
+            )
+            .next("Upgrade botctl for a complete triage."),
+        );
     }
     let botd = str_at(v, "botd").unwrap_or_default();
-    if let (Some(latest), Some(theirs)) = (o.latest, semver(botd)) {
-        if theirs < latest {
-            let (a, b, c) = latest;
-            let lvl = if (theirs.0, theirs.1) < (latest.0, latest.1) { Level::Warn } else { Level::Info };
-            out.push(
-                Finding::new("version.behind", lvl, None, format!("botd {} is behind the latest release, {a}.{b}.{c}", clean(botd)), "version.json botd")
-                    .runbook("support/runbook-upgrade.md#before-an-upgrade")
-                    .next("Check the changelog for a fix before digging: an upgrade may be the answer."),
-            );
-        }
+    if let (Some(latest), Some(theirs)) = (o.latest, semver(botd))
+        && theirs < latest
+    {
+        let (a, b, c) = latest;
+        let lvl = if (theirs.0, theirs.1) < (latest.0, latest.1) { Level::Warn } else { Level::Info };
+        out.push(
+            Finding::new("version.behind", lvl, None, format!("botd {} is behind the latest release, {a}.{b}.{c}", clean(botd)), "version.json botd")
+                .runbook("support/runbook-upgrade.md#before-an-upgrade")
+                .next("Check the changelog for a fix before digging: an upgrade may be the answer."),
+        );
     }
-    if let Some(up) = v["uptimeSeconds"].as_i64().filter(|s| *s < RESTART_SECONDS) {
-        out.push(Finding::new("botd.restarted", Level::Info, None, format!("botd started {} before the bundle was made: a restart, or a crash it came back from", duration(up)), "version.json uptimeSeconds").next("Ask whether someone restarted it; the logs from before are in journalctl or docker compose logs, not the bundle."));
+    if let Some(up) = v["uptimeSeconds"].as_i64().filter(|s| (0..RESTART_SECONDS).contains(s)) {
+        out.push(
+            Finding::new(
+                "botd.restarted",
+                Level::Info,
+                None,
+                format!("botd started {} before the bundle was made: a restart, or a crash it came back from", duration(up)),
+                "version.json uptimeSeconds",
+            )
+            .next("Ask whether someone restarted it; the logs from before are in journalctl or docker compose logs, not the bundle."),
+        );
     }
 }
 
@@ -904,7 +976,10 @@ pub fn triage(b: &Bundle, o: &Options) -> Result<Triage, String> {
     if let Some(c) = created_at {
         let hours = (o.as_of - c).num_hours();
         if hours >= STALE_HOURS {
-            findings.push(Finding::new("bundle.stale", Level::Info, None, format!("The bundle was made {} before this triage", duration(hours * 3600)), "version.json createdAt").next("If the problem is happening now, ask for a fresh one."));
+            findings.push(
+                Finding::new("bundle.stale", Level::Info, None, format!("The bundle was made {} before this triage", duration(hours * 3600)), "version.json createdAt")
+                    .next("If the problem is happening now, ask for a fresh one."),
+            );
         }
     }
     let testing = health.as_ref().is_some_and(|h| h["license"]["summary"]["testing"] == true)
@@ -1114,7 +1189,16 @@ mod tests {
     }
 
     fn online(files: Vec<(&str, Value)>) -> Bundle {
-        let mut all: BTreeMap<&str, Value> = [("version.json", version()), ("health.json", healthy()), ("health-score.json", json!({ "score": 95, "band": "healthy", "signals": [] })), ("health-score-history.json", json!({ "points": [], "trend": null })), ("audit-summary.json", json!({ "days": 7, "to": "2026-11-24T05:00:00Z", "byAction": [], "recentProblems": [], "truncated": false })), ("config.json", json!({}))].into_iter().collect();
+        let mut all: BTreeMap<&str, Value> = [
+            ("version.json", version()),
+            ("health.json", healthy()),
+            ("health-score.json", json!({ "score": 95, "band": "healthy", "signals": [] })),
+            ("health-score-history.json", json!({ "points": [], "trend": null })),
+            ("audit-summary.json", json!({ "days": 7, "to": "2026-11-24T05:00:00Z", "byAction": [], "recentProblems": [], "truncated": false })),
+            ("config.json", json!({})),
+        ]
+        .into_iter()
+        .collect();
         for (n, v) in files {
             all.insert(n, v);
         }
@@ -1417,6 +1501,24 @@ mod tests {
         assert!(triage(&nothing, &opts()).err().unwrap().contains("not a support bundle"));
     }
 
+    #[test]
+    fn extreme_numbers_from_a_crafted_bundle_dont_panic() {
+        let big = u64::MAX;
+        let mut h = healthy();
+        h["lastMinutes"] = json!({ "minutes": big, "requests": big, "errors": big, "runsDone": big, "runsFailed": big, "noticesSent": big, "noticesFailed": big });
+        h["approvals"] = json!({ "pending": big, "oldestPendingSeconds": i64::MAX });
+        h["machines"] = json!({ "byState": { "error": big }, "hostsByState": { "down": big, "lost": big }, "rpoBreachesOpen": big });
+        let audit = json!({ "byAction": [{ "action": "auth.login_failed", "outcomes": { "failure": big, "denied": big } }, { "action": "auth.slo_failed", "outcomes": { "failure": big } }] });
+        let history = json!({ "trend": { "change": i64::MIN, "fromBand": "healthy", "toBand": "at_risk" } });
+        let mut v = version();
+        v["uptimeSeconds"] = json!(i64::MIN);
+        let t = triage(&online(vec![("health.json", h), ("audit-summary.json", audit), ("health-score-history.json", history), ("version.json", v)]), &opts()).unwrap();
+        assert!(find(&t, "audit.sign_in").summary.starts_with(&format!("{big} sign-in failures")), "saturates");
+        assert!(find(&t, "score.falling").summary.starts_with(&format!("Health score fell {} points", i64::MAX)));
+        assert!(t.failed() && !ids(&t).contains(&"botd.restarted"), "a negative uptime is no restart");
+        let _ = (t.text(), t.markdown(), t.json());
+    }
+
     fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut t = tar::Builder::new(Vec::new());
         for (name, data) in entries {
@@ -1497,7 +1599,11 @@ mod tests {
             let (page, anchor) = r.split_once('#').unwrap_or((r, ""));
             let md = std::fs::read_to_string(docs.join(page)).unwrap_or_else(|e| panic!("docs/{page}: {e}"));
             if !anchor.is_empty() {
-                let slugs: Vec<String> = md.lines().filter(|l| l.starts_with('#')).map(|l| l.trim_start_matches('#').trim().to_lowercase().chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_').collect::<String>().replace(' ', "-")).collect();
+                let slugs: Vec<String> = md
+                    .lines()
+                    .filter(|l| l.starts_with('#'))
+                    .map(|l| l.trim_start_matches('#').trim().to_lowercase().chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_').collect::<String>().replace(' ', "-"))
+                    .collect();
                 assert!(slugs.iter().any(|s| s == anchor), "docs/{page} has no #{anchor}: {slugs:?}");
             }
         }
