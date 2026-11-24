@@ -13,6 +13,9 @@ use std::net::IpAddr;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+mod interfaces;
+pub use interfaces::Generation;
+
 pub const API_URL: &str = "https://api.linode.com/v4";
 const PAGE_SIZE: u32 = 500;
 /// 50,000 machines; past that something is wrong with the paging, not the fleet.
@@ -24,6 +27,8 @@ pub struct Linode {
     http: reqwest::Client,
     /// What the machines' firewall drops on the way out (ADR 0179). Empty: nothing.
     outbound: Vec<Outbound>,
+    /// Which kind of interfaces new Linodes get (MACHINE_LINODE_INTERFACES, ADR 0226).
+    generation: Generation,
 }
 
 /// Linode takes at most this many addresses in one rule.
@@ -142,6 +147,7 @@ impl Linode {
             base: base.trim_end_matches('/').to_string(),
             http,
             outbound: Vec::new(),
+            generation: Generation::default(),
         }
     }
 
@@ -149,6 +155,12 @@ impl Linode {
     /// without exactly these is set again.
     pub fn with_outbound(mut self, rules: Vec<Outbound>) -> Linode {
         self.outbound = rules;
+        self
+    }
+
+    /// New Linodes get `g`'s interfaces.
+    pub fn with_interfaces(mut self, g: Generation) -> Linode {
+        self.generation = g;
         self
     }
 
@@ -218,25 +230,55 @@ impl Linode {
         Ok(out)
     }
 
-    /// The firewall's devices that are Linodes, as (device id, Linode id).
-    /// Every device behind the firewall: `(device id, Linode id)` for Linodes, None
-    /// for anything else.
-    async fn devices(&self, id: &str) -> Result<Vec<Option<(u64, String)>>, ProviderError> {
+    /// Every device behind the firewall.
+    async fn devices(&self, id: &str) -> Result<Vec<Device>, ProviderError> {
         Ok(self
             .all(&format!("/networking/firewalls/{}/devices", path_id(id)?), None)
             .await?
             .iter()
-            .map(|d| {
-                (d["entity"]["type"] == "linode")
-                    .then(|| Some((d["id"].as_u64()?, d["entity"]["id"].as_u64()?.to_string())))
-                    .flatten()
-            })
+            .map(device)
             .collect())
     }
+}
 
-    async fn linode_devices(&self, id: &str) -> Result<Vec<(u64, String)>, ProviderError> {
-        Ok(self.devices(id).await?.into_iter().flatten().collect())
+/// One device behind a firewall: a Linode with configuration-profile interfaces, one
+/// of a Linode's own interfaces (ADR 0226), or anything else (a NodeBalancer).
+#[derive(Clone, Debug, PartialEq)]
+enum Device {
+    Linode { device: u64, linode: String },
+    Interface { device: u64, linode: String, interface: u64 },
+    Other,
+}
+
+impl Device {
+    /// The device's id and its Linode's, if it is a Linode or one of its interfaces.
+    fn of_linode(&self) -> Option<(u64, &str)> {
+        match self {
+            Device::Linode { device, linode } | Device::Interface { device, linode, .. } => Some((*device, linode)),
+            Device::Other => None,
+        }
     }
+}
+
+fn device(d: &Value) -> Device {
+    let e = &d["entity"];
+    let parsed = || -> Option<Device> {
+        let device = d["id"].as_u64()?;
+        match e["type"].as_str()? {
+            "linode" => Some(Device::Linode { device, linode: e["id"].as_u64()?.to_string() }),
+            "linode_interface" => {
+                let interface = e["id"].as_u64()?;
+                // Its Linode, from `parent_entity`, or else from the entity's URL.
+                let linode = match &e["parent_entity"] {
+                    p if p["type"] == "linode" => p["id"].as_u64()?,
+                    _ => interfaces::linode_in_url(e["url"].as_str()?, interface)?,
+                };
+                Some(Device::Interface { device, linode: linode.to_string(), interface })
+            }
+            _ => None,
+        }
+    };
+    parsed().unwrap_or(Device::Other)
 }
 
 fn addresses(cidrs: &[String]) -> Value {
@@ -468,6 +510,7 @@ impl MachineProvider for Linode {
         json!({
             "firewallEgress": if self.outbound.is_empty() { "off" } else { "on" },
             "egressRules": outbound_json(&self.outbound),
+            "interfaces": self.generation.as_str(),
         })
     }
 
@@ -495,24 +538,18 @@ impl MachineProvider for Linode {
                     "user_data": base64::engine::general_purpose::STANDARD.encode(ud)
                 });
             }
-            if let Some(fw) = &spec.firewall_id {
-                body["firewall_id"] = json!(path_id(fw)?.parse::<u64>().unwrap_or_default());
+            let number = |id: &Option<String>| -> Result<Option<u64>, ProviderError> {
+                id.as_deref().map(|i| Ok(path_id(i)?.parse::<u64>().unwrap_or_default())).transpose()
+            };
+            interfaces::create(&mut body, self.generation, number(&spec.firewall_id)?, number(&spec.subnet_id)?)?;
+            match self.call(Method::POST, "/linode/instances", None, Some(&body)).await {
+                Ok(v) => machine(&v),
+                Err(ProviderError::Api { status, message }) if message.contains("interface_generation") => Err(ProviderError::Api {
+                    status,
+                    message: format!("{message}; MACHINE_LINODE_INTERFACES={} must be a kind the account allows", self.generation.as_str()),
+                }),
+                Err(e) => Err(e),
             }
-            // Configuration-profile interfaces, so the Linode's one firewall covers the
-            // VPC interface too, inbound and outbound. The public one stays first, the
-            // primary: the internet and botd are reached through it.
-            if let Some(subnet) = &spec.subnet_id {
-                body["interface_generation"] = json!("legacy_config");
-                body["interfaces"] = json!([
-                    { "purpose": "public" },
-                    { "purpose": "vpc", "subnet_id": path_id(subnet)?.parse::<u64>().unwrap_or_default() },
-                ]);
-            }
-            machine(
-                &self
-                    .call(Method::POST, "/linode/instances", None, Some(&body))
-                    .await?,
-            )
         })
     }
 
@@ -733,11 +770,19 @@ impl MachineProvider for Linode {
                 for l in s["linodes"].as_array().into_iter().flatten() {
                     let Some(machine) = l["id"].as_u64() else { continue };
                     for i in l["interfaces"].as_array().into_iter().flatten() {
-                        if let (Some(interface), Some(config)) = (i["id"].as_u64(), i["config_id"].as_u64()) {
-                            // Unsaid is taken as active: it is left only once the machine is off.
-                            let active = i["active"].as_bool().unwrap_or(true);
-                            out.push(NetworkMember { machine: machine.to_string(), config: config.to_string(), interface: interface.to_string(), active });
-                        }
+                        let Some(interface) = i["id"].as_u64() else { continue };
+                        // Unsaid is taken as active: it is left only once the machine is off.
+                        let active = i["active"].as_bool().unwrap_or(true);
+                        // No profile: a Linode interface (ADR 0226), taken off only while
+                        // the Linode is off.
+                        let (config, needs_power_off) = match &i["config_id"] {
+                            Value::Null => (String::new(), true),
+                            c => match c.as_u64() {
+                                Some(c) => (c.to_string(), false),
+                                None => continue,
+                            },
+                        };
+                        out.push(NetworkMember { machine: machine.to_string(), config, interface: interface.to_string(), active, needs_power_off });
                     }
                 }
             }
@@ -747,12 +792,16 @@ impl MachineProvider for Linode {
 
     fn leave_team_network<'a>(&'a self, m: &'a NetworkMember) -> Fut<'a, ()> {
         Box::pin(async move {
-            let path = format!(
-                "/linode/instances/{}/configs/{}/interfaces/{}",
-                path_id(&m.machine)?,
-                path_id(&m.config)?,
-                path_id(&m.interface)?
-            );
+            let path = if m.config.is_empty() {
+                format!("/linode/instances/{}/interfaces/{}", path_id(&m.machine)?, path_id(&m.interface)?)
+            } else {
+                format!(
+                    "/linode/instances/{}/configs/{}/interfaces/{}",
+                    path_id(&m.machine)?,
+                    path_id(&m.config)?,
+                    path_id(&m.interface)?
+                )
+            };
             match self.call(Method::DELETE, &path, None, None).await {
                 Ok(_) | Err(ProviderError::NotFound) => Ok(()),
                 Err(e) => Err(e),
@@ -764,14 +813,16 @@ impl MachineProvider for Linode {
     /// Linode's one profile: its public interface first if the profile lists none (an
     /// empty list is Linode's public default, and a VPC interface alone would become
     /// the primary), then the VPC's. Linode puts them in place at the next boot.
+    /// A Linode with Linode interfaces is given a VPC interface of its own instead,
+    /// behind its public interface's firewall, while it is off (ADR 0226).
     fn join_team_network<'a>(&'a self, machine: &'a str, n: &'a TeamNetwork) -> Fut<'a, ()> {
         Box::pin(async move {
             let id = path_id(machine)?;
             let subnet: u64 = path_id(&n.subnet_id)?.parse().unwrap_or_default();
             let refused = |message: String| ProviderError::Api { status: 409, message };
             let l = self.call(Method::GET, &format!("/linode/instances/{id}"), None, None).await?;
-            if l["interface_generation"] == "linode" {
-                return Err(refused("it has Linode interfaces, each with a firewall of its own, not configuration-profile ones; rebuild or recreate it to join its team's network".into()));
+            if interfaces::has_linode_interfaces(&l) {
+                return self.join_with_linode_interfaces(id, &l, subnet).await;
             }
             let configs = self.all(&format!("/linode/instances/{id}/configs"), None).await?;
             let [c] = configs.as_slice() else {
@@ -790,6 +841,13 @@ impl MachineProvider for Linode {
             }
             self.call(Method::POST, &path, None, Some(&json!({ "purpose": "vpc", "subnet_id": subnet }))).await?;
             Ok(())
+        })
+    }
+
+    fn team_network_needs_power_off<'a>(&'a self, machine: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let l = self.call(Method::GET, &format!("/linode/instances/{}", path_id(machine)?), None, None).await?;
+            Ok(interfaces::has_linode_interfaces(&l))
         })
     }
 
@@ -862,54 +920,106 @@ impl MachineProvider for Linode {
         })
     }
 
+    /// A Linode with Linode interfaces counts as covered only once every public and
+    /// VPC interface it has is behind the firewall; one only partly behind counts among
+    /// `others`, so the sweep attaches the rest (ADR 0226).
     fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices> {
         Box::pin(async move {
             let mut out = FirewallDevices::default();
+            let mut by_linode: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> = Default::default();
             for d in self.devices(id).await? {
                 match d {
-                    Some((_, linode)) => out.machines.push(linode),
-                    None => out.others += 1,
+                    Device::Linode { linode, .. } => out.machines.push(linode),
+                    Device::Interface { linode, interface, .. } => {
+                        by_linode.entry(linode).or_default().insert(interface);
+                    }
+                    Device::Other => out.others += 1,
+                }
+            }
+            for (linode, behind) in by_linode {
+                match self.linode_interfaces(&linode).await {
+                    Ok(all) if interfaces::all_behind(&all, &behind) => out.machines.push(linode),
+                    Ok(_) | Err(ProviderError::NotFound) => out.others += 1,
+                    Err(e) => return Err(e),
                 }
             }
             Ok(out)
         })
     }
 
-    fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
+    /// From the Linode's side: its own firewalls, or each interface's.
+    fn firewall_covers<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, bool> {
         Box::pin(async move {
-            let linode: u64 = path_id(machine)?.parse().unwrap_or_default();
-            self.call(
-                Method::POST,
-                &format!("/networking/firewalls/{}/devices", path_id(id)?),
-                None,
-                Some(&json!({ "id": linode, "type": "linode" })),
-            )
-            .await
-            .map(drop)
+            let (fw, linode) = (path_id(id)?, path_id(machine)?);
+            let l = match self.call(Method::GET, &format!("/linode/instances/{linode}"), None, None).await {
+                Err(ProviderError::NotFound) => return Ok(false),
+                l => l?,
+            };
+            let has = |firewalls: &[Value]| firewalls.iter().any(|f| f["id"].as_u64().is_some_and(|f| f.to_string() == fw));
+            if !interfaces::has_linode_interfaces(&l) {
+                return Ok(has(&self.all(&format!("/linode/instances/{linode}/firewalls"), None).await?));
+            }
+            let filtered = interfaces::filtered(&self.linode_interfaces(linode).await?);
+            if filtered.is_empty() {
+                return Ok(false);
+            }
+            for i in filtered {
+                if !has(&self.interface_firewalls(linode, i).await?) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         })
     }
 
+    /// The Linode itself, or each of its public and VPC Linode interfaces not behind
+    /// the firewall yet. Linode refuses an interface behind another firewall.
+    fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let (fw, linode) = (path_id(id)?, path_id(machine)?);
+            let l = self.call(Method::GET, &format!("/linode/instances/{linode}"), None, None).await?;
+            let add = async |entity: u64, kind: &str| {
+                let body = json!({ "id": entity, "type": kind });
+                self.call(Method::POST, &format!("/networking/firewalls/{fw}/devices"), None, Some(&body)).await.map(drop)
+            };
+            if !interfaces::has_linode_interfaces(&l) {
+                return add(linode.parse().unwrap_or_default(), "linode").await;
+            }
+            let filtered = interfaces::filtered(&self.linode_interfaces(linode).await?);
+            if filtered.is_empty() {
+                return Err(ProviderError::Api { status: 409, message: "it has no public or VPC interface for a firewall to cover".into() });
+            }
+            let behind: Vec<u64> = self
+                .devices(fw)
+                .await?
+                .into_iter()
+                .filter_map(|d| match d {
+                    Device::Interface { linode: l, interface, .. } if l == linode => Some(interface),
+                    _ => None,
+                })
+                .collect();
+            for i in filtered.into_iter().filter(|i| !behind.contains(i)) {
+                add(i, "linode_interface").await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Every device of the Linode's: itself, or each of its interfaces.
     fn detach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
-            let devices = match self.linode_devices(id).await {
+            let devices = match self.devices(id).await {
                 Err(ProviderError::NotFound) => return Ok(()),
                 d => d?,
             };
-            let Some((device, _)) = devices.into_iter().find(|(_, l)| l == machine) else {
-                return Ok(());
-            };
-            match self
-                .call(
-                    Method::DELETE,
-                    &format!("/networking/firewalls/{}/devices/{device}", path_id(id)?),
-                    None,
-                    None,
-                )
-                .await
-            {
-                Ok(_) | Err(ProviderError::NotFound) => Ok(()),
-                Err(e) => Err(e),
+            for d in devices {
+                let Some((device, _)) = d.of_linode().filter(|(_, l)| *l == machine) else { continue };
+                match self.call(Method::DELETE, &format!("/networking/firewalls/{}/devices/{device}", path_id(id)?), None, None).await {
+                    Ok(_) | Err(ProviderError::NotFound) => {}
+                    Err(e) => return Err(e),
+                }
             }
+            Ok(())
         })
     }
 
@@ -1010,7 +1120,7 @@ mod tests {
                 get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
                     record(&s, "GET", format!("/linode/instances/{id}"), &h, Value::Null);
                     match id {
-                        7 => (StatusCode::OK, Json(instance(7, "superbot-m7", "running"))),
+                        7 | 8 => (StatusCode::OK, Json(instance(id, &format!("superbot-m{id}"), "running"))),
                         21..=25 => (StatusCode::OK, Json(instance(id, &format!("superbot-m{id}"), "running"))),
                         26 => {
                             let mut m = instance(26, "superbot-m26", "running");
@@ -1445,6 +1555,7 @@ mod tests {
                 ("PUT", "/networking/firewalls/77/rules"),
                 ("PUT", "/networking/firewalls/77"),
                 ("GET", "/networking/firewalls/77/devices"),
+                ("GET", "/linode/instances/8"),
                 ("POST", "/networking/firewalls/77/devices"),
                 ("GET", "/networking/firewalls/77/devices"),
                 ("DELETE", "/networking/firewalls/77/devices/9001"),
@@ -1454,7 +1565,7 @@ mod tests {
                 ("DELETE", "/networking/firewalls/78"),
                 ("POST", "/linode/instances"),
             ],
-            "detach finds the device for the Linode; one not behind it is left alone"
+            "attach asks which kind of interfaces the Linode has; detach finds the device for the Linode; one not behind it is left alone"
         );
         assert_eq!(
             seen[0].3,
@@ -1470,8 +1581,9 @@ mod tests {
         assert_eq!(seen[2].2.as_deref(), Some(r#"{"label":"superbot-fw"}"#));
         assert_eq!(seen[6].3["inbound"].as_array().unwrap().len(), 1);
         assert_eq!(seen[7].3, json!({ "status": "enabled" }));
-        assert_eq!(seen[9].3, json!({ "id": 8, "type": "linode" }));
-        assert_eq!(seen[16].3["firewall_id"], json!(77), "behind it from the first boot");
+        assert_eq!(seen[10].3, json!({ "id": 8, "type": "linode" }));
+        assert_eq!(seen[17].3["firewall_id"], json!(77), "behind it from the first boot");
+        assert_eq!(seen[17].3["interface_generation"], "legacy_config", "the kind the firewall covers");
     }
 
     #[test]
@@ -1632,7 +1744,8 @@ mod tests {
         assert_eq!(b["interfaces"], json!([{ "purpose": "public" }, { "purpose": "vpc", "subnet_id": 50 }]), "public first: the primary");
         assert_eq!(b["interface_generation"], "legacy_config", "so the Linode's firewall covers the VPC interface");
         assert_eq!(b["firewall_id"], 77);
-        assert!(seen[1].3.get("interfaces").is_none() && seen[1].3.get("interface_generation").is_none(), "no team, Linode's defaults");
+        assert!(seen[1].3.get("interfaces").is_none(), "no team: Linode's public default");
+        assert_eq!(seen[1].3["interface_generation"], "legacy_config", "never the account's default kind, which the firewall on the Linode may not cover");
     }
 
     #[tokio::test]
@@ -1695,13 +1808,15 @@ mod tests {
         assert_eq!(
             members,
             [
-                NetworkMember { machine: "7".into(), config: "70".into(), interface: "701".into(), active: true },
-                NetworkMember { machine: "30".into(), config: "300".into(), interface: "3001".into(), active: true },
-                NetworkMember { machine: "31".into(), config: "310".into(), interface: "3101".into(), active: false },
+                NetworkMember { machine: "7".into(), config: "70".into(), interface: "701".into(), active: true, needs_power_off: false },
+                NetworkMember { machine: "12".into(), config: String::new(), interface: "1201".into(), active: false, needs_power_off: true },
+                NetworkMember { machine: "30".into(), config: "300".into(), interface: "3001".into(), active: true, needs_power_off: false },
+                NetworkMember { machine: "31".into(), config: "310".into(), interface: "3101".into(), active: false, needs_power_off: false },
             ],
-            "every subnet's; an interface of another kind has no profile to take it off; one added since its boot is inactive"
+            "every subnet's; a Linode interface has no profile and goes only while its Linode is off; one added since its boot is inactive"
         );
         api.leave_team_network(&members[0]).await.unwrap();
+        api.leave_team_network(&NetworkMember { machine: "7".into(), ..members[1].clone() }).await.unwrap();
         let gone = NetworkMember { machine: "9".into(), ..members[0].clone() };
         api.leave_team_network(&gone).await.unwrap();
         let active = NetworkMember { machine: "8".into(), ..members[0].clone() };
@@ -1716,6 +1831,7 @@ mod tests {
                 "/vpcs?page=1&page_size=500",
                 "/vpcs/5/subnets",
                 "/linode/instances/7/configs/70/interfaces/701",
+                "/linode/instances/7/interfaces/1201",
                 "/linode/instances/9/configs/70/interfaces/701",
                 "/linode/instances/8/configs/70/interfaces/701",
             ]
@@ -1739,7 +1855,9 @@ mod tests {
         };
         refused(api.join_team_network("24", &n).await, "2 configuration profiles");
         refused(api.join_team_network("25", &n).await, "another VPC");
-        refused(api.join_team_network("26", &n).await, "Linode interfaces");
+        // Linode interfaces have a path of their own (`linode/interfaces.rs`); this one
+        // is running, so nothing is sent.
+        refused(api.join_team_network("26", &n).await, "only while it is powered off");
         assert!(api.join_team_network("../21", &n).await.is_err());
         assert!(api.join_team_network("21", &TeamNetwork { subnet_id: "5/0".into(), ..n.clone() }).await.is_err());
         let seen = seen.lock().unwrap();

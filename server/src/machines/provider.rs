@@ -106,6 +106,9 @@ pub struct NetworkMember {
     /// The machine booted with it. An interface added to a running machine is inactive
     /// until its next boot (ADR 0202), and can be taken off while inactive.
     pub active: bool,
+    /// It can be taken off only while its machine is powered off, active or not: a
+    /// Linode interface (ADR 0226).
+    pub needs_power_off: bool,
 }
 
 /// What to put on a machine that is wiped and reinstalled in place (ADR 0056): same
@@ -358,6 +361,12 @@ pub trait MachineProvider: Send + Sync {
     fn join_team_network<'a>(&'a self, _machine: &'a str, _network: &'a TeamNetwork) -> Fut<'a, ()> {
         Box::pin(async { Err(no_networks()) })
     }
+    /// Whether `machine` takes a team network's interface only while it is powered off,
+    /// as a Linode with Linode interfaces does (ADR 0226): `join_team_network` is then
+    /// called only once the provider says it is off.
+    fn team_network_needs_power_off<'a>(&'a self, _machine: &'a str) -> Fut<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
     /// Whether an interface on a team network goes into and comes out of a running
     /// machine at once (ADR 0212): joined members are always active, and leaving needs
     /// no power-off.
@@ -383,7 +392,16 @@ pub trait MachineProvider: Send + Sync {
     ) -> Fut<'a, ProviderFirewall>;
     fn set_firewall_rules<'a>(&'a self, id: &'a str, rules: &'a [FirewallRule]) -> Fut<'a, ()>;
     fn enable_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
+    /// What firewall `id` covers. A machine is in `machines` only if the firewall covers
+    /// all of it: on a Linode with Linode interfaces, every public and VPC interface.
     fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices>;
+    /// Whether firewall `id` covers all of `machine`, as `firewall_devices` would say,
+    /// for one machine without reading every device.
+    fn firewall_covers<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move { Ok(self.firewall_devices(id).await?.machines.iter().any(|m| m == machine)) })
+    }
+    /// Puts `machine` behind firewall `id`: on a Linode with Linode interfaces, each of
+    /// its public and VPC interfaces that isn't yet.
     fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()>;
     /// Succeeds if the machine isn't behind it, or either is gone.
     fn detach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()>;

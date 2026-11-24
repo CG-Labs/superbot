@@ -213,7 +213,7 @@ async fn a_machine_powered_off_to_leave_is_powered_on_again_whatever_happens_mea
 
     // Had he rejoined after the sweep looked, it backs off under the lock, on or off.
     let n = TeamNetwork { id: net.clone(), label: old.clone(), region: "gb-lon".into(), subnet_id: String::new(), subnet: String::new(), created: false };
-    let mem = NetworkMember { machine: pid(&env, &al), config: "c".into(), interface: "i".into(), active: true };
+    let mem = NetworkMember { machine: pid(&env, &al), config: "c".into(), interface: "i".into(), active: true, needs_power_off: false };
     let leave_now = async || team_network::leave(&env.app, &env.cp, env.fake.as_ref(), &n, Some(&acme), &machine(&env, &al), &mem).await;
     assert_eq!(leave_now().await, team_network::Leave::Waiting);
     assert_eq!(machine(&env, &al).state, State::Running);
@@ -450,4 +450,148 @@ async fn a_network_that_cant_be_made_holds_the_create_back() {
     assert_eq!(env.fake.calls("create"), 0);
     let failed = events(&env, "machine.create_failed").await;
     assert_eq!(failed[0]["details"]["step"], "network");
+}
+
+#[tokio::test]
+async fn a_machine_with_linode_interfaces_joins_its_teams_network_only_while_off() {
+    let env = serve().await;
+    let (_ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (cy, _) = user_with(env.port, &env.admin, "cy@example.com", "member").await;
+    ask(&env, &cy).await;
+    let cym = pid(&env, &cy);
+    env.fake.linode_interfaces_for(&cym);
+    let acme = team(&env, "Acme", "ada@example.com").await;
+    join(&env, &acme, &cy).await;
+    rules_say(&env, &cy, "on", Some(team_network::DEFAULT_SUBNET));
+
+    // Running: with next-boot it waits for her to power it off; botd doesn't.
+    for _ in 0..2 {
+        assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "awaitingPowerOff": 1 }));
+    }
+    assert_eq!((env.fake.calls("join_team_network"), machine(&env, &cy).state), (0, State::Running));
+
+    // Suspended, but not off at the provider yet: it waits for that too.
+    assert_eq!(json_call(&env, "POST", &format!("/api/users/{cy}/machine/suspend"), "").await.0, 200);
+    env.fake.set(&cym, |m| m.status = "shutting_down".into());
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "waiting": 1 }));
+    assert_eq!(env.fake.calls("join_team_network"), 0);
+
+    // Off: given its interface, and left off, as she left it.
+    env.fake.set(&cym, |m| m.status = "offline".into());
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "joining": 1 }));
+    let net = env.fake.joining(&cym).expect("on Acme's network from its next boot");
+    let joining = events(&env, "machine.team_network_joining").await;
+    assert_eq!((joining[0]["details"]["whileOff"].as_bool(), joining[0]["details"]["poweredOff"].as_bool()), (Some(true), Some(true)), "{joining:?}");
+    assert_eq!(machine(&env, &cy).state, State::Suspended);
+    assert!(reconcile(&env).await.get("teamNetworks").is_none(), "nothing more to do while it is off");
+    assert_eq!(json_call(&env, "POST", &format!("/api/users/{cy}/machine/resume"), "").await.0, 200);
+    assert_eq!(env.fake.network_of(&cym).as_deref(), Some(net.as_str()));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "joined": 1 }));
+
+    // She leaves: powered off, taken off, powered on again.
+    let (code, _) = json_call(&env, "DELETE", &format!("/api/teams/{acme}/members/{cy}"), "").await;
+    assert!(code == 200 || code == 204);
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "leaving": 1 }));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 1, "resumed": 1 }));
+    assert_eq!((env.fake.network_of(&cym), machine(&env, &cy).state), (None, State::Running));
+
+    // A Linode interface is taken off only while off, even one not in use yet.
+    let n = env.fake.networks().into_iter().find(|n| n.id == net).unwrap();
+    let n = TeamNetwork { id: n.id, label: n.label, region: n.region, subnet_id: n.subnet_id, subnet: n.subnet, created: false };
+    let mem = NetworkMember { machine: cym.clone(), config: String::new(), interface: format!("{cym}-vpc"), active: false, needs_power_off: true };
+    let leaves = env.fake.calls("leave_team_network");
+    assert_eq!(team_network::leave(&env.app, &env.cp, env.fake.as_ref(), &n, Some(&acme), &machine(&env, &cy), &mem).await, team_network::Leave::Leaving);
+    assert_eq!((env.fake.calls("leave_team_network"), machine(&env, &cy).state), (leaves, State::Suspended));
+}
+
+#[tokio::test]
+async fn with_when_idle_a_machine_with_linode_interfaces_is_powered_off_to_join_and_on_again_whatever_happens() {
+    use crate::machines_mtls_tests::{self as mtls, CHAT, agent_with_config, machine_for};
+    let mut env = mtls::serve_with_control(
+        |e| e,
+        |cp| {
+            cp.firewall_with(Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
+            cp.team_network = Some(team_network::Settings { kind: team_network::Kind::Vpc, subnet: team_network::DEFAULT_SUBNET.into(), join: team_network::Join::WhenIdle });
+        },
+        |_| {},
+    )
+    .await;
+    let (_ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (cy, mid, token) = machine_for(&env, "cy@example.com").await;
+    let dir = crate::db::temp_path("egress");
+    let script = stand_in_egress(&dir);
+    let _m = agent_with_config(&mut env, &mid, &token, CHAT, |mut c| {
+        c.egress_script = script.clone();
+        c
+    })
+    .await;
+    let reconcile = async |env: &mtls::Env| {
+        let (code, r) = mtls::json_call(env, "POST", "/api/machines/reconcile", "").await;
+        assert_eq!(code, 200, "{r}");
+        r["teamNetworks"].clone()
+    };
+    let rules = async |env: &mtls::Env, want: Option<&str>| {
+        for _ in 0..400 {
+            crate::machines::heartbeats(&env.app, &env.cp).await;
+            let u = env.app.db.machine(&mid).unwrap().agent_upkeep.unwrap_or_default();
+            if u["teamNetwork"]["state"] == "on" && u["teamNetwork"]["subnet"].as_str() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the rules never let {want:?} through");
+    };
+    let state = |env: &mtls::Env| env.app.db.machine(&mid).unwrap().state;
+    let pid = env.app.db.machine(&mid).unwrap().provider_id.unwrap();
+    env.fake.linode_interfaces_for(&pid);
+    rules(&env, None).await;
+    let (code, t) = mtls::json_call(&env, "POST", "/api/teams", &json!({ "name": "Acme", "owner": "ada@example.com", "machines": false }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let acme = t["id"].as_str().unwrap().to_string();
+    let member = async |env: &mtls::Env, method: &str| {
+        let (code, v) = mtls::json_call(env, method, &format!("/api/teams/{acme}/members/{cy}"), r#"{"role":"member"}"#).await;
+        assert!(matches!(code, 200 | 204), "{code} {v}");
+    };
+    member(&env, "PUT").await;
+    assert_eq!(reconcile(&env).await, json!({ "waiting": 1 }));
+    rules(&env, Some(team_network::DEFAULT_SUBNET)).await;
+
+    // Idle: powered off, given its interface once off at the provider, powered on.
+    assert_eq!(reconcile(&env).await, json!({ "restarting": 1 }));
+    assert_eq!(state(&env), State::Suspended);
+    let restarting = mtls::events(&env, "machine.team_network_restarting").await;
+    assert_eq!((restarting.len(), restarting[0]["details"]["toJoin"].as_bool()), (1, Some(true)), "{restarting:?}");
+    env.fake.set(&pid, |m| m.status = "shutting_down".into());
+    assert_eq!(reconcile(&env).await, json!({ "waiting": 1 }), "still on its way off: held off");
+    assert_eq!(state(&env), State::Suspended);
+    env.fake.set(&pid, |m| m.status = "offline".into());
+    assert_eq!(reconcile(&env).await, json!({ "joining": 1, "resumed": 1 }));
+    assert_eq!(state(&env), State::Running);
+    let net = env.fake.network_of(&pid).expect("in use from the boot that follows");
+    assert_eq!(reconcile(&env).await, json!({ "joined": 1 }));
+
+    // She leaves, and rejoins; this time the Linode refuses the interface.
+    member(&env, "DELETE").await;
+    assert_eq!(reconcile(&env).await, json!({ "leaving": 1 }));
+    assert_eq!(reconcile(&env).await, json!({ "left": 1, "resumed": 1 }));
+    assert_eq!(env.fake.network_of(&pid), None);
+    rules(&env, None).await;
+    member(&env, "PUT").await;
+    rules(&env, Some(team_network::DEFAULT_SUBNET)).await;
+    assert_eq!(reconcile(&env).await, json!({ "restarting": 1 }));
+    let no = crate::machines::provider::ProviderError::Api { status: 409, message: "it is on another VPC; it leaves that one first".into() };
+    env.fake.fail_next("join_team_network", no);
+    assert_eq!(reconcile(&env).await, json!({ "errors": 1, "resumed": 1 }), "powered on again without it");
+    assert_eq!((state(&env), env.fake.network_of(&pid)), (State::Running, None));
+
+    // Refused once, it isn't powered off again for it: it waits for her to.
+    for _ in 0..2 {
+        assert_eq!(reconcile(&env).await, json!({ "awaitingPowerOff": 1 }));
+    }
+    assert_eq!(state(&env), State::Running);
+    assert_eq!(mtls::events(&env, "machine.team_network_restarting").await.len(), 2);
+    let (code, _) = mtls::json_call(&env, "POST", &format!("/api/users/{cy}/machine/suspend"), "").await;
+    assert_eq!(code, 200);
+    assert_eq!(reconcile(&env).await, json!({ "joining": 1 }), "off by her hand: given it, and left off");
+    assert_eq!((state(&env), env.fake.joining(&pid).as_deref()), (State::Suspended, Some(net.as_str())));
 }

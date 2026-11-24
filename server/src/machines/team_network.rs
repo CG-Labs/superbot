@@ -16,6 +16,10 @@
 //! from its next boot. With MACHINE_TEAM_NETWORK_JOIN=when-idle, botd powers it off and
 //! on again once it runs nothing; with `next-boot`, the default, it waits for one.
 //!
+//! A Linode with Linode interfaces (ADR 0226) is given one only while it is off: with
+//! `next-boot` the next time it is suspended, with `when-idle` botd powers it off once it
+//! runs nothing, gives it the interface, and powers it on again.
+//!
 //! On Incus (ADR 0212) a team network is an isolated OVN network per team and region on
 //! each host, which a team member's container joins through a second NIC behind an ACL
 //! of the network's own: inbound dropped, outbound only to the subnet. Incus plugs and
@@ -236,7 +240,7 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         .filter_map(|m| Some((m.provider_id.clone()?, m)))
         .collect();
     let (mut leaving, mut left, mut resumed, mut errors) = (0, 0, 0, 0);
-    let (mut joining, mut joined, mut pending, mut restarting, mut waiting) = (0, 0, 0, 0, 0);
+    let (mut joining, mut joined, mut pending, mut restarting, mut waiting, mut awaiting_power_off) = (0, 0, 0, 0, 0, 0);
     let mut unseen = false;
     let mut still_on: HashSet<String> = HashSet::new();
     // Machines with an interface on some network, in use or not: none joins another.
@@ -286,7 +290,9 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
     // A network not looked at may still have a machine to take off: never power one on
     // until every network has been. Nor join one to a network: it may be on another.
     if !unseen {
-        let off: Vec<String> = suspended(cp).iter().filter(|id| !still_on.contains(*id)).cloned().collect();
+        // One powered off to join is powered on below, once it has its interface or can't.
+        let held: HashSet<String> = join_off(cp).keys().cloned().collect();
+        let off: Vec<String> = suspended(cp).iter().filter(|id| !still_on.contains(*id) && !held.contains(*id)).cloned().collect();
         for id in off {
             match resume(app, cp, &id).await {
                 Some(true) => resumed += 1,
@@ -294,20 +300,42 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
                 None => {}
             }
         }
+        let mut outcomes: HashMap<String, Joined> = HashMap::new();
         if s.join != Join::Off {
             let off_all: Vec<&Machine> = ours.values().filter(|m| !on_one.contains(&m.id)).collect();
             for m in off_all {
-                match join(app, cp, p, s, m).await {
+                let j = join(app, cp, p, s, m).await;
+                match j {
                     Joined::Joining => joining += 1,
-                    Joined::Waiting => waiting += 1,
+                    Joined::Waiting | Joined::GoingOff => waiting += 1,
+                    Joined::AwaitingPowerOff => awaiting_power_off += 1,
+                    Joined::Restarting => restarting += 1,
                     Joined::Failed => errors += 1,
                     Joined::Nothing => {}
                 }
+                outcomes.insert(m.id.clone(), j);
+            }
+        }
+        // Powered off to join: on again once given the interface, refused it, or no longer
+        // due one; just powered off, or still on its way off at the provider, it waits,
+        // but not for ever.
+        let at = now();
+        let held: Vec<(String, i64)> = join_off(cp).iter().map(|(id, when)| (id.clone(), *when)).collect();
+        for (id, since) in held {
+            if matches!(outcomes.get(&id), Some(Joined::GoingOff | Joined::Restarting)) && at - since < JOIN_OFF_MS {
+                continue;
+            }
+            join_off(cp).remove(&id);
+            match resume(app, cp, &id).await {
+                Some(true) => resumed += 1,
+                Some(false) => errors += 1,
+                None => {}
             }
         }
         if s.join == Join::WhenIdle {
             for (n, team, m) in &to_boot {
-                match restart(app, cp, p, n, team, m).await {
+                let d = json!({ "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet });
+                match restart(app, cp, p, team, m, d, false).await {
                     Restart::Restarting => restarting += 1,
                     Restart::Waiting => {}
                     Restart::Failed => errors += 1,
@@ -322,6 +350,7 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
         ("resumed", resumed),
         ("joining", joining),
         ("pending", pending),
+        ("awaitingPowerOff", awaiting_power_off),
         ("restarting", restarting),
         ("joined", joined),
         ("waiting", waiting),
@@ -348,9 +377,20 @@ fn joined_now(app: &App, cp: &ControlPlane, n: &TeamNetwork, team: &str, m: &Mac
 enum Joined {
     Joining,
     Waiting,
+    /// Suspended to be given its interface while off, and not off at the provider yet.
+    GoingOff,
+    /// Running, and given its interface only while off (ADR 0226): with `next-boot`,
+    /// the next time it is suspended; with `when-idle`, once it runs nothing.
+    AwaitingPowerOff,
+    /// Powered off by botd to be given its interface.
+    Restarting,
     Failed,
     Nothing,
 }
+
+/// How long a machine powered off to join may take to be off at the provider before
+/// it is powered on again without its interface.
+const JOIN_OFF_MS: i64 = 10 * 60_000;
 
 /// Why `m` can't be put on `subnet` yet, if it can't: its egress rules must let the
 /// subnet through first, or there must be none. botd knows what they let through from
@@ -369,23 +409,44 @@ pub fn rules_waiting(m: &Machine, subnet: &str) -> Option<&'static str> {
 }
 
 /// Puts `m` on its owner's team's network from its next boot, if it should be on one;
-/// at once where the provider plugs interfaces into running machines (Incus).
+/// at once where the provider plugs interfaces into running machines (Incus); and only
+/// while it is off where the provider adds them only then (Linode interfaces).
 async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Settings, m: &Machine) -> Joined {
     let active = |x: &Machine| matches!(x.state, State::Running | State::Suspended);
     let Some(team) = app.db.team_id_of(&m.user_id) else { return Joined::Nothing };
-    if !active(m) || m.provider_id.is_none() {
-        return Joined::Nothing;
-    }
+    let Some(pid) = m.provider_id.clone().filter(|_| active(m)) else { return Joined::Nothing };
     if rules_waiting(m, &s.subnet).is_some() || !behind_firewall(cp, p, m).await {
         return Joined::Waiting;
     }
+    let while_off = match p.team_network_needs_power_off(&pid).await {
+        Ok(w) => w,
+        Err(_) => return Joined::Failed,
+    };
+    if while_off {
+        if m.state == State::Running {
+            // Once refused, it waits for its owner to power it off, as with next-boot,
+            // rather than being powered off and on again every pass.
+            if s.join != Join::WhenIdle || refusals(cp).contains_key(&m.id) {
+                return Joined::AwaitingPowerOff;
+            }
+            return match restart(app, cp, p, &team, m, json!({ "team": team, "toJoin": true }), true).await {
+                Restart::Restarting => Joined::Restarting,
+                Restart::Waiting => Joined::AwaitingPowerOff,
+                Restart::Failed => Joined::Failed,
+            };
+        }
+        if !p.get(&pid).await.is_ok_and(|pm| pm.status == "offline") {
+            return Joined::GoingOff;
+        }
+    }
     let by = system(m);
-    // Under the lock team changes take: one who left the team meanwhile isn't put on.
+    // Under the lock team changes take: one who left the team meanwhile isn't put on,
+    // nor one powered on meanwhile, if its interface goes on only while it's off.
     let _g = cp.lock_ops().await;
-    let Some(m) = app.db.machine(&m.id).filter(|x| active(x) && app.db.team_id_of(&x.user_id).as_deref() == Some(team.as_str())) else {
+    let due = |x: &Machine| active(x) && (!while_off || x.state == State::Suspended) && app.db.team_id_of(&x.user_id).as_deref() == Some(team.as_str());
+    let Some(m) = app.db.machine(&m.id).filter(due) else {
         return Joined::Nothing;
     };
-    let pid = m.provider_id.clone().unwrap_or_default();
     // Where hosts have networks of their own (Incus), the machine's host's.
     let on = p.hosts().and_then(|h| h.on(&h.host_of(&pid))).unwrap_or(p);
     let tried = match ensure(app, cp, on, &m, &by).await {
@@ -399,7 +460,7 @@ async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Se
             joining_set(cp).insert(m.id.clone());
             let d = json!({
                 "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet, "join": s.join.as_str(),
-                "poweredOff": m.state == State::Suspended, "atOnce": p.team_network_hotplug(),
+                "poweredOff": m.state == State::Suspended, "atOnce": p.team_network_hotplug(), "whileOff": while_off,
             });
             app.db.record(&event(&by, "machine.team_network_joining", &m, d));
             Joined::Joining
@@ -417,11 +478,12 @@ async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Se
 }
 
 /// Whether the provider says `m` is behind the machines' firewall, whose inbound drops
-/// are what keep teammates' machines apart on the VPC. A machine whose firewall failed
-/// to attach waits until the firewall sweep puts it behind.
+/// are what keep teammates' machines apart on the VPC: all of it, every interface where
+/// each has its own (ADR 0226). A machine whose firewall failed to attach waits until
+/// the firewall sweep puts it behind.
 async fn behind_firewall(cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine) -> bool {
     let (Some(_), Some(fw), Some(pid)) = (&cp.firewall, m.firewall_id.as_deref(), m.provider_id.as_deref()) else { return false };
-    p.firewall_devices(fw).await.is_ok_and(|d| d.machines.iter().any(|x| x == pid))
+    p.firewall_covers(fw, pid).await.unwrap_or(false)
 }
 
 #[derive(Debug, PartialEq)]
@@ -431,11 +493,12 @@ enum Restart {
     Failed,
 }
 
-/// Powers off `m`, on `n`'s subnet but not using it yet, once its agent says it runs
-/// nothing, so the sweep powers it on again on the network (MACHINE_TEAM_NETWORK_JOIN=
-/// when-idle). A run that starts between that answer and the power-off ends with it, as
-/// a rebuild's would.
-async fn restart(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: &str, m: &Machine) -> Restart {
+/// Powers off `m` once its agent says it runs nothing (MACHINE_TEAM_NETWORK_JOIN=
+/// when-idle), so the sweep powers it on again on its team's network: one on the subnet
+/// but not using it yet, or, `to_join`, one whose interface goes on only while it is
+/// off (ADR 0226), given it first. A run that starts between that answer and the
+/// power-off ends with it, as a rebuild's would.
+async fn restart(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, team: &str, m: &Machine, details: Value, to_join: bool) -> Restart {
     let Some(e) = cp.enrollment.as_deref() else { return Restart::Waiting };
     if m.enrollment != "enrolled" || !behind_firewall(cp, p, m).await {
         return Restart::Waiting;
@@ -451,8 +514,10 @@ async fn restart(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: 
         return if app.db.machine(&m.id).is_some_and(|x| still(&x)) { Restart::Failed } else { Restart::Waiting };
     }
     suspended(cp).insert(m.id.clone());
-    let d = json!({ "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet });
-    app.db.record(&event(&by, "machine.team_network_restarting", m, d));
+    if to_join {
+        join_off(cp).insert(m.id.clone(), now());
+    }
+    app.db.record(&event(&by, "machine.team_network_restarting", m, details));
     Restart::Restarting
 }
 
@@ -462,6 +527,10 @@ fn joining_set(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashSet<String>> 
 
 fn refusals(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
     cp.network_join_refused.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn join_off(cp: &ControlPlane) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+    cp.network_join_off.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // The team network's subnet in machines' own egress rules (ADR 0202).
@@ -540,7 +609,8 @@ pub(crate) enum Leave {
 
 /// Takes `m` off `n`. An interface in use can only go while the machine is off, so a
 /// running machine is suspended first, and the next pass, once it is off, removes it.
-/// One added since it booted (ADR 0202) goes at once, and so does any where the
+/// One added since it booted (ADR 0202) goes at once, unless it is a Linode interface,
+/// which goes only while its machine is off (ADR 0226); and so does any where the
 /// provider unplugs interfaces from running machines (Incus, ADR 0212).
 pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: Option<&str>, m: &Machine, mem: &NetworkMember) -> Leave {
     let by = system(m);
@@ -549,7 +619,7 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
     // since the sweep looked keeps their network.
     let due = || team.is_none() || app.db.team_id_of(&m.user_id).as_deref() != team;
     match m.state {
-        State::Running if !mem.active || p.team_network_hotplug() => {
+        State::Running if (!mem.active && !mem.needs_power_off) || p.team_network_hotplug() => {
             let _g = cp.lock_ops().await;
             if !app.db.machine(&m.id).is_some_and(|x| x.state == State::Running) || !due() {
                 return Leave::Waiting;
