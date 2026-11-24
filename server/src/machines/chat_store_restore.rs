@@ -1,0 +1,1074 @@
+//! `botd chat-store` (ADR 0256): lists a regional chat store's backups (ADR 0215), in its
+//! folder and in its bucket (ADR 0246), and restores one as the store, on the server with
+//! botd stopped, as `botd database` and `botd support check` run (ADR 0187).
+//!
+//! A restore is checked before anything changes: the backup must be this store (botd's
+//! record of its id and region), open with the master key (or the previous one, mid-
+//! rotation) and pass its integrity check, and a bucket copy must match the SHA-256 in its
+//! name. It is prepared in a work file in the store's own folder, never the host's temp
+//! folder: rows of Bots that aren't kept in the region now (moved out, or deleted) are
+//! taken out, and erasures made since are run on it again, so a restore never brings back
+//! what a move or an erasure took out. The store it replaces is kept as a backup made now,
+//! so it is cleared and copied off the host like any other and the restore can be undone.
+//! Without `--yes` it only says what a restore would do. botd audits the restore at its
+//! next start (`residency.chat_store_restored`), from a note left in the folder.
+
+use super::chat_store_copies::{self, Copies, copy_name};
+use super::chat_stores;
+use crate::audit::{Who, clip};
+use crate::database_encryption::{self, DbKey, Format};
+use crate::db::{ChatStore, Db, Held};
+use crate::support_check::Settings;
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+pub const RESTORED: &str = "residency.chat_store_restored";
+/// Left in the store's folder by a restore, for botd to audit at its next start.
+const NOTE: &str = "restored.json";
+/// Work files of a restore in the store's folder; a restore that was cut off leaves them.
+const WORK: &str = ".restore-";
+const ACTOR: &str = "residency";
+const DOC: &str = "docs/support/runbook-residency.md#restoring-a-regional-chat-store";
+
+const USAGE: &str = "Usage: botd chat-store list <region> [--home <dir> | --env-file <file>]
+       botd chat-store restore <region> <backup | newest> [--identity <file>] [--replace-unreadable] [--yes]
+                               [--home <dir> | --env-file <file>]
+
+Run on the server with botd stopped, as the user botd runs as (or root).
+  <backup>              a backup in the region's folder (chats-<time>.sqlite) or a copy in its
+                        bucket (chats-<time>-<sha256>.sqlite[.age]), as `list` shows them;
+                        newest: the folder's newest backup, else the bucket's newest copy
+  --identity <file>     the age identity that opens the bucket's encrypted copies
+  --replace-unreadable  delete a store that doesn't open, rather than refuse
+  --yes                 restore; without it, say what a restore would do and change nothing
+  --home <dir>          the installer's layout: settings from <dir>/superbot/.env
+  --env-file <file>     settings from this file, over botd's environment
+Docs: docs/support/runbook-residency.md#restoring-a-regional-chat-store";
+
+/// One region's store, as botd's settings and database say.
+pub struct Place {
+    region: String,
+    store: ChatStore,
+    db_path: PathBuf,
+    /// The master keys' database keys: the current one, then the previous one.
+    keys: Vec<DbKey>,
+    /// Whether botd's own database is encrypted, which its stores must match.
+    encrypted: bool,
+    db_key: Option<DbKey>,
+    /// The region's bucket. Err: its settings are wrong, said only when it is needed.
+    copies: Result<Option<Copies>, String>,
+}
+
+fn io(p: &Path) -> impl Fn(std::io::Error) -> String + '_ {
+    move |e| format!("{}: {e}", p.display())
+}
+
+/// REGION_DATA_DIRS's entries, as `<region>=<folder>`.
+fn region_dirs(raw: &str) -> Vec<(String, PathBuf)> {
+    raw.split(',').filter_map(|e| e.split_once('=')).map(|(r, d)| (r.trim().to_string(), PathBuf::from(d.trim()))).filter(|(r, _)| !r.is_empty()).collect()
+}
+
+impl Place {
+    /// `region`'s store, from botd's settings `s`: its folder (REGION_DATA_DIRS), botd's
+    /// database and its record of the store, the master keys, and the region's bucket.
+    pub fn locate(s: &Settings, region: &str) -> Result<Place, String> {
+        let dirs = region_dirs(&s.get(chat_stores::SETTING));
+        let Some((_, folder)) = dirs.iter().find(|(r, _)| r == region) else {
+            let named: Vec<&str> = dirs.iter().map(|(r, _)| r.as_str()).collect();
+            return Err(format!("{} doesn't name {region} (it names {})", chat_stores::SETTING, if named.is_empty() { "none".to_string() } else { named.join(", ") }));
+        };
+        if !folder.is_dir() {
+            return Err(format!("{region}'s folder {} isn't there. Mount the region's volume first: botd keeps the store on storage in the region (ADR 0215)", folder.display()));
+        }
+        let data_dir = s.data_dir();
+        let db_path = data_dir.join("app.sqlite");
+        let masters = crate::support_check::master_keys(s, &data_dir)?;
+        let keys: Vec<DbKey> = masters.iter().map(DbKey::derive).collect();
+        let (encrypted, db_key) = match database_encryption::format(&db_path)? {
+            Format::Missing => {
+                return Err(format!("no botd database at {}. Restore botd's own server backup first (docs/support/runbook-server-restore.md)", db_path.display()));
+            }
+            Format::Plain => (false, None),
+            Format::Encrypted => match keys.iter().find(|k| database_encryption::opens(&db_path, k)) {
+                Some(k) => (true, Some(k.clone())),
+                None if keys.is_empty() => return Err(format!("{} is encrypted and no master key was found (SUPERBOT_MASTER_KEY or SUPERBOT_MASTER_KEY_FILE)", db_path.display())),
+                None => return Err(format!("{}: the master key doesn't open it (wrong key)", db_path.display())),
+            },
+        };
+        let c = database_encryption::open_read_only(&db_path, db_key.as_ref()).map_err(|e| format!("{}: {e}", db_path.display()))?;
+        let id: Option<String> = c.query_row("SELECT store_id FROM chat_stores WHERE region = ?1", [region], |r| r.get(0)).optional().unwrap_or(None);
+        let Some(id) = id else {
+            return Err(format!("botd has no chat store recorded for {region}, so there is no store to restore (ADR 0215)"));
+        };
+        let store = ChatStore { region: region.to_string(), schema: String::new(), path: folder.join("chats.sqlite"), id };
+        let copies = bucket(s, &dirs, c, masters.first());
+        Ok(Place { region: region.to_string(), store, db_path, keys, encrypted, db_key, copies })
+    }
+
+    fn db(&self) -> Result<Connection, String> {
+        database_encryption::open_read_only(&self.db_path, self.db_key.as_ref()).map_err(|e| format!("{}: {e}", self.db_path.display()))
+    }
+
+    fn folder(&self) -> &Path {
+        self.store.path.parent().unwrap_or(Path::new("/"))
+    }
+
+    fn copies(&self) -> Result<Option<&Copies>, String> {
+        self.copies.as_ref().map(Option::as_ref).map_err(|e| format!("{}'s bucket: {e}", self.region))
+    }
+}
+
+/// The region buckets botd would copy to (ADR 0246), with their keys from the settings, or
+/// else from botd's saved server secrets (sealed with `master` in botd's database `db`).
+fn bucket(s: &Settings, dirs: &[(String, PathBuf)], db: Connection, master: Option<&crate::secrets::key::MasterKey>) -> Result<Option<Copies>, String> {
+    use crate::secrets::sealed::{Cipher, SealedStore};
+    let vars: HashMap<String, String> = s.vars().into_iter().collect();
+    let env = crate::secrets::env::EnvStore::vars(vars.clone());
+    let sealed = master.map(|k| SealedStore::new(db, std::sync::Arc::new(Cipher::new(k))));
+    let mut layers: Vec<&dyn crate::secrets::SecretStore> = vec![&env];
+    if let Some(sealed) = &sealed {
+        layers.push(sealed);
+    }
+    let store = crate::secrets::external::Layered(layers);
+    let var = |k: &str| vars.get(k).cloned().unwrap_or_default();
+    let named = chat_store_copies::named(vars.keys().cloned());
+    let dirs = chat_stores::Settings { dirs: dirs.to_vec(), ..chat_stores::Settings::default() };
+    chat_store_copies::Settings::from_env(&store, &var, &dirs, &named)?.map(Copies::new).transpose()
+}
+
+/// Holds botd's data lock and the store's, as botd does while it runs, so nothing changes
+/// either while a restore reads and writes them.
+struct Locks(#[allow(dead_code)] std::fs::File, #[allow(dead_code)] std::fs::File);
+
+fn lock(place: &Place) -> Result<Locks, String> {
+    let stopped = |e: String| format!("{e}. botd must be stopped for a restore (sudo systemctl stop superbot; Compose: docker compose stop botd)");
+    let data = database_encryption::lock_data_dir(&place.db_path).map_err(stopped)?;
+    let store = database_encryption::lock_data_dir(&place.store.path).map_err(stopped)?;
+    Ok(Locks(data, store))
+}
+
+/// Deletes the work files a restore that was cut off left in a store's `folder`: they may
+/// hold rows of Bots that have since left the store. At botd's start, before it opens the
+/// store; one that can't be deleted stops botd.
+pub fn drop_leftovers(folder: &Path) -> Result<(), String> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(folder)(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io(folder))?;
+        if entry.file_name().to_string_lossy().starts_with(WORK) {
+            let p = entry.path();
+            std::fs::remove_file(&p).map_err(|e| format!("{}: {e}; a restore that was cut off left it, and it may hold chats that left the store (ADR 0256)", p.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// At botd's start: audits each restore made while it was stopped, from the note it left
+/// in the store's folder, as `residency.chat_store_restored` by botd itself, then deletes
+/// the note. Lines for the startup log.
+pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (region, dir) in dirs {
+        let path = dir.join(NOTE);
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let note: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let mut details = json!({ "region": region });
+        for k in ["storeId", "backup", "from", "backupAt", "restoredAt", "kept", "replacedUnreadable", "held", "dropped", "erased", "back", "gone", "uid"] {
+            match &note[k] {
+                Value::String(v) => details[k] = json!(clip(v, 200)),
+                Value::Null => {}
+                v => details[k] = v.clone(),
+            }
+        }
+        db.record(&Who::system(ACTOR).event(RESTORED).target("chat_store", region).details(details));
+        let backup = note["backup"].as_str().map_or("a backup".to_string(), |b| clip(b, 200));
+        lines.push(format!("Regional chat stores: {region}'s store was restored from {backup} while botd was stopped; audited as {RESTORED} (ADR 0256)."));
+        if let Err(e) = std::fs::remove_file(&path) {
+            lines.push(format!("Regional chat stores: {} couldn't be deleted ({e}), so the restore will be audited again at the next start; delete it (ADR 0256).", path.display()));
+        }
+    }
+    lines
+}
+
+// Listing
+
+/// What `botd chat-store list` prints: the store, its backups and its bucket's copies.
+pub async fn list(place: &Place) -> Result<String, String> {
+    let mut out = String::new();
+    let p = &place.store.path;
+    let file = match std::fs::metadata(p) {
+        Ok(m) => format!("{} ({})", p.display(), size(m.len())),
+        Err(_) => format!("{}: missing", p.display()),
+    };
+    out.push_str(&format!("{}'s chat store {}: {file}\n", place.region, place.store.id));
+    let copies = match place.copies() {
+        Ok(Some(c)) => Some(c.list_copies(&place.store).await.unwrap_or_else(|| Ok(Vec::new()))),
+        Ok(None) => None,
+        Err(e) => Some(Err(e)),
+    };
+    let copied: Vec<String> = copies.iter().flatten().flatten().filter_map(|n| copy_name(n).map(|c| c.backup)).collect();
+    let local = chat_stores::backups_strictly(&place.store)?;
+    out.push_str(&format!("Backups in {} (newest first): {}\n", chat_stores::backups_dir(&place.store).display(), local.len()));
+    for (_, path) in &local {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let off = if copied.iter().any(|c| *c == name) { "  copy in the bucket" } else { "" };
+        out.push_str(&format!("  {name}  {}{off}\n", size(bytes)));
+    }
+    match copies {
+        None => out.push_str(&format!("No bucket for {} ({}_BUCKET): its backups are only on the store's volume (ADR 0246).\n", place.region, chat_store_copies::store_name(&place.region))),
+        Some(Err(e)) => out.push_str(&format!("Its bucket couldn't be listed: {e}\n")),
+        Some(Ok(names)) => {
+            let dest = place.copies().ok().flatten().and_then(|c| c.destination(&place.store)).unwrap_or_default();
+            out.push_str(&format!("Copies in {dest} (newest first): {}\n", names.len()));
+            for n in names.iter().rev() {
+                out.push_str(&format!("  {n}\n"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
+        b => format!("{} KB", b.div_ceil(1024)),
+    }
+}
+
+fn date(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map_or_else(String::new, |t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+}
+
+// Restoring
+
+/// Where a backup is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Source {
+    /// In the store's folder's `backups/`.
+    Folder(PathBuf),
+    /// A copy in the region's bucket, by name.
+    Bucket(String),
+}
+
+/// The backup a restore puts back.
+#[derive(Clone, Debug)]
+struct Chosen {
+    /// `chats-<time>.sqlite`.
+    name: String,
+    at: i64,
+    source: Source,
+}
+
+/// The backup `wanted` names (or the newest), in the folder or the bucket.
+async fn choose(place: &Place, wanted: &str) -> Result<Chosen, String> {
+    let local = chat_stores::backups_strictly(&place.store)?;
+    let folder = |at: i64, path: &PathBuf| Chosen { name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), at, source: Source::Folder(path.clone()) };
+    let from_bucket = |name: &str| copy_name(name).and_then(|c| chat_stores::backup_time(&c.backup).map(|at| Chosen { name: c.backup, at, source: Source::Bucket(name.to_string()) }));
+    let listed = || async {
+        match place.copies()? {
+            Some(c) => c.list_copies(&place.store).await.unwrap_or_else(|| Ok(Vec::new())),
+            None => Err(format!("{} has no bucket ({}_BUCKET)", place.region, chat_store_copies::store_name(&place.region))),
+        }
+    };
+    if wanted == "newest" {
+        if let Some((at, path)) = local.first() {
+            return Ok(folder(*at, path));
+        }
+        let names = listed().await.map_err(|e| format!("{}'s folder has no backups, and {e}", place.region))?;
+        return names.iter().filter_map(|n| from_bucket(n)).max_by_key(|c| c.at).ok_or_else(|| format!("{}'s folder has no backups and its bucket has no copies", place.region));
+    }
+    if chat_stores::backup_time(wanted).is_some() {
+        return local.iter().find(|(_, p)| p.file_name().is_some_and(|n| n == wanted)).map(|(at, p)| folder(*at, p)).ok_or_else(|| format!("{wanted} isn't in {}", chat_stores::backups_dir(&place.store).display()));
+    }
+    if copy_name(wanted).is_some() {
+        let names = listed().await?;
+        return names.iter().find(|n| *n == wanted).and_then(|n| from_bucket(n)).ok_or_else(|| format!("{wanted} isn't in {}'s bucket", place.region));
+    }
+    Err(format!("\"{}\" isn't a backup's name (chats-<time>.sqlite) or a copy's (chats-<time>-<sha256>.sqlite[.age]); `botd chat-store list {}` shows them", clip(wanted, 80), place.region))
+}
+
+/// Puts the backup in a work file in the store's folder, decrypted and checked against the
+/// SHA-256 in its name when it comes from the bucket.
+async fn fetch(place: &Place, chosen: &Chosen, identities: &[age::x25519::Identity]) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let work = place.folder().join(format!("{WORK}{}", chosen.name));
+    let _ = std::fs::remove_file(&work);
+    match &chosen.source {
+        Source::Folder(path) => {
+            std::fs::copy(path, &work).map_err(io(&work))?;
+            std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o600)).map_err(io(&work))?;
+        }
+        Source::Bucket(name) => {
+            let c = place.copies()?.ok_or_else(|| format!("{} has no bucket", place.region))?;
+            let parsed = copy_name(name).ok_or_else(|| format!("{name} isn't a copy's name"))?;
+            let download = place.folder().join(format!("{WORK}{name}.download"));
+            let _ = std::fs::remove_file(&download);
+            let r = async {
+                c.download(&place.store, name, &download).await?;
+                if parsed.encrypted {
+                    decrypt(&download, &work, identities)?;
+                    std::fs::remove_file(&download).map_err(io(&download))?;
+                } else {
+                    std::fs::rename(&download, &work).map_err(io(&work))?;
+                }
+                let sha = sha256(&work)?;
+                if sha != parsed.sha {
+                    return Err(format!("{name} doesn't match its SHA-256 once downloaded{}; nothing was changed", if parsed.encrypted { " and decrypted" } else { "" }));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = r {
+                let _ = std::fs::remove_file(&download);
+                let _ = std::fs::remove_file(&work);
+                return Err(e);
+            }
+        }
+    }
+    Ok(work)
+}
+
+fn decrypt(from: &Path, to: &Path, identities: &[age::x25519::Identity]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if identities.is_empty() {
+        return Err("the copy is age-encrypted: give the identity that opens it with --identity <file>".into());
+    }
+    let f = std::fs::File::open(from).map_err(io(from))?;
+    let d = age::Decryptor::new(std::io::BufReader::new(f)).map_err(|e| format!("{}: not an age file: {e}", from.display()))?;
+    let mut r = d.decrypt(identities.iter().map(|i| i as &dyn age::Identity)).map_err(|_| "the identity given doesn't open this copy (REGION_DATA_AGE_RECIPIENTS names others)".to_string())?;
+    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(to).map_err(io(to))?;
+    std::io::copy(&mut r, &mut out).map_err(|e| format!("decrypting {}: {e}", from.display()))?;
+    out.sync_all().map_err(io(to))
+}
+
+fn sha256(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(io(path))?;
+    let mut ctx = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf).map_err(io(path))?;
+        if n == 0 {
+            return Ok(crate::sigv4::hex(ctx.finish().as_ref()));
+        }
+        ctx.update(&buf[..n]);
+    }
+}
+
+/// The store as it is now.
+#[derive(Debug)]
+enum Current {
+    Missing,
+    /// It opens, with this key, and passes its integrity check.
+    Readable(Option<DbKey>),
+    Unreadable(String),
+}
+
+/// The key of `keys` that opens the database at `path`. None: it is plain.
+fn key_for(path: &Path, keys: &[DbKey]) -> Result<Option<DbKey>, String> {
+    match database_encryption::format(path)? {
+        Format::Missing => Err(format!("{} is empty", path.display())),
+        Format::Plain => Ok(None),
+        Format::Encrypted => keys.iter().find(|k| database_encryption::opens(path, k)).cloned().map(Some).ok_or_else(|| {
+            format!("{} doesn't open with the master key or the previous one: it was made under a master key botd no longer has, or isn't a database", path.display())
+        }),
+    }
+}
+
+fn current(place: &Place) -> Current {
+    let p = &place.store.path;
+    match database_encryption::format(p) {
+        Ok(Format::Missing) => return Current::Missing,
+        Err(e) => return Current::Unreadable(e),
+        Ok(_) => {}
+    }
+    let key = match key_for(p, &place.keys) {
+        Ok(k) => k,
+        Err(e) => return Current::Unreadable(e),
+    };
+    let check = database_encryption::open_read_only(p, key.as_ref()).and_then(|c| c.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)));
+    match check {
+        Ok(ok) if ok == "ok" => Current::Readable(key),
+        Ok(bad) => Current::Unreadable(format!("{} fails its integrity check ({})", p.display(), clip(&bad, 200))),
+        Err(e) => Current::Unreadable(format!("{}: {e}", p.display())),
+    }
+}
+
+/// What a restore does, worked out on the work file before anything else changes.
+#[derive(Debug, Default)]
+pub struct Plan {
+    /// What the restored store holds.
+    held: Held,
+    /// Rows of Bots kept elsewhere now, or deleted, taken out of it.
+    dropped: Held,
+    /// What erasures made since rewrote or deleted in it.
+    erased: Held,
+    /// Against the store now (None: it is missing or unreadable): what comes back, what goes.
+    back: Option<Held>,
+    gone: Option<Held>,
+    /// The store now doesn't open, and is deleted rather than kept.
+    unreadable: Option<String>,
+}
+
+/// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
+/// erasures deleted, from botd's database. Refused when the audit log no longer reaches
+/// back to the backup and someone was erased since, as their Bots can't all be found.
+fn erasures(c: &Connection, backup_at: i64) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let db = |e: rusqlite::Error| format!("botd's database: {e}");
+    let people: Vec<(String, String, i64)> = {
+        let mut s = c.prepare("SELECT id, COALESCE(erased_as, ''), erased_at FROM users WHERE erased_at IS NOT NULL ORDER BY erased_at").map_err(db)?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
+    };
+    let bots: Vec<String> = {
+        let mut s = c
+            .prepare("SELECT DISTINCT target_id FROM audit_events WHERE action = 'bot.deleted' AND target_id IS NOT NULL AND json_valid(details) AND json_extract(details, '$.reason') = 'user_erased'")
+            .map_err(db)?;
+        s.query_map([], |r| r.get(0)).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
+    };
+    let oldest: Option<i64> = c.query_row("SELECT MIN(at) FROM audit_events", [], |r| r.get(0)).map_err(db)?;
+    if people.iter().any(|(_, _, at)| *at >= backup_at) && oldest.is_none_or(|o| o > backup_at) {
+        return Err(format!(
+            "someone was erased after this backup was made ({}), and botd's audit log no longer goes back that far, so the Bots their erasure deleted can't all be found. Restore a newer backup (ADR 0256)",
+            date(backup_at)
+        ));
+    }
+    Ok((people.into_iter().map(|(id, p, _)| (id, p)).collect(), bots))
+}
+
+/// Prepares the work file to be the store: checks it is this store, takes out the rows of
+/// Bots that aren't kept in the region now, runs erasures again, rebuilds it so nothing
+/// taken out is left in its pages, and compares it with the store now.
+fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Plan, String> {
+    let shown = work.display().to_string();
+    let key = key_for(work, &place.keys)?;
+    if key.is_some() && !place.encrypted {
+        return Err(format!("{shown} is encrypted but botd's database isn't; a chat store is kept like botd's own database (ADR 0215)"));
+    }
+    let err = |e: rusqlite::Error| format!("{shown}: {e}");
+    let c = database_encryption::open_with(work, key.as_ref()).map_err(err)?;
+    // Nothing of it may be written outside the region's folder (VACUUM's copy, a journal).
+    c.execute_batch("PRAGMA temp_store = MEMORY").map_err(err)?;
+    c.query_row("PRAGMA journal_mode = MEMORY", [], |_| Ok(())).map_err(err)?;
+    let check = |c: &Connection| -> Result<(), String> {
+        let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(err)?;
+        if ok != "ok" {
+            return Err(format!("{shown} fails its integrity check ({}); restore another backup", clip(&ok, 200)));
+        }
+        Ok(())
+    };
+    check(&c)?;
+    let own: Option<(String, String)> = c.query_row("SELECT id, region FROM chat_store LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap_or(None);
+    match own {
+        None => return Err(format!("{shown} isn't a SuperBot chat store")),
+        Some((_, r)) if r != place.region => return Err(format!("that backup is {r}'s chat store, not {}'s", place.region)),
+        Some((id, _)) if id != place.store.id => {
+            return Err(format!("that backup is of chat store {id}, but botd keeps {}'s chats in store {} (ADR 0215)", place.region, place.store.id));
+        }
+        Some(_) => {}
+    }
+    let db = place.db()?;
+    let kept = crate::db::bots_kept_in(&db, &place.region).map_err(|e| format!("botd's database: {e}"))?;
+    let (people, bots) = erasures(&db, at)?;
+    drop(db);
+    c.execute_batch("PRAGMA secure_delete = ON").map_err(err)?;
+    let mut plan = Plan::default();
+    for (i, (user, pseudonym)) in people.iter().enumerate() {
+        let theirs: &[String] = if i == 0 { &bots } else { &[] };
+        plan.erased.add(crate::db::erase_in_copy(&c, user, pseudonym, theirs).map_err(err)?);
+    }
+    plan.dropped = crate::db::keep_only_in_copy(&c, &kept).map_err(err)?;
+    c.execute_batch("VACUUM").map_err(err)?;
+    check(&c)?;
+    plan.held = crate::db::held_in_copy(&c, &kept).map_err(err)?;
+    match current {
+        Current::Readable(k) => {
+            let p = place.store.path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", place.store.path.display()))?;
+            c.execute("ATTACH DATABASE ?1 AS now_store KEY ?2", rusqlite::params![p, k.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
+            let waiting = elsewhere(&c, "now_store", &kept).map_err(err)?;
+            if waiting.total() > 0 {
+                return Err(format!(
+                    "the store now holds {} of Bots kept elsewhere now that botd hasn't moved yet, which a restore would leave behind in a backup. Start botd, let it move them, stop it, then restore",
+                    waiting.describe()
+                ));
+            }
+            let (back, gone) = crate::db::compare_copy(&c, "now_store").map_err(err)?;
+            c.execute("DETACH DATABASE now_store", []).map_err(err)?;
+            (plan.back, plan.gone) = (Some(back), Some(gone));
+        }
+        Current::Unreadable(e) => plan.unreadable = Some(e.clone()),
+        Current::Missing => {}
+    }
+    drop(c);
+    std::fs::File::open(work).and_then(|f| f.sync_all()).map_err(io(work))?;
+    Ok(plan)
+}
+
+/// The rows of Bots other than `kept` in the store attached as `schema`.
+fn elsewhere(c: &Connection, schema: &str, kept: &[String]) -> rusqlite::Result<Held> {
+    let list = serde_json::to_string(kept).unwrap_or_else(|_| "[]".into());
+    let n = |t: &str| c.query_row(&format!("SELECT COUNT(*) FROM {schema}.{t} WHERE bot_id NOT IN (SELECT value FROM json_each(?1))"), [&list], |r| r.get(0));
+    Ok(Held { messages: n("messages")?, routines: n("routines")?, approvals: n("approvals")? })
+}
+
+/// Keeps the store now as a backup made at `at` in its folder's `backups/`, as one file,
+/// so it is cleared and copied off the host like any other. Its name.
+fn keep_current(place: &Place, key: Option<&DbKey>, at: i64) -> Result<String, String> {
+    let p = &place.store.path;
+    let err = |e: rusqlite::Error| format!("{}: {e}", p.display());
+    let c = database_encryption::open_with(p, key).map_err(err)?;
+    c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).map_err(err)?;
+    let mode: String = c.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0)).map_err(err)?;
+    if mode != "delete" {
+        return Err(format!("{} stayed in {mode} mode; is botd running?", p.display()));
+    }
+    drop(c);
+    let dir = chat_stores::backups_dir(&place.store);
+    std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+    let mut t = at;
+    loop {
+        let stamp = chrono::DateTime::from_timestamp_millis(t).unwrap_or_default().format("%Y%m%d-%H%M%S");
+        let name = format!("chats-{stamp}.sqlite");
+        let dest = dir.join(&name);
+        if std::fs::symlink_metadata(&dest).is_err() {
+            std::fs::rename(p, &dest).map_err(io(&dest))?;
+            sync_dir(&dir);
+            return Ok(name);
+        }
+        t += 1000;
+    }
+}
+
+fn sync_dir(dir: &Path) {
+    let _ = std::fs::File::open(dir).and_then(|f| f.sync_all());
+}
+
+fn remove_sidecars(path: &Path) -> Result<(), String> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(suffix);
+        let p = PathBuf::from(s);
+        match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(&p)(e)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// What `restore` was asked to do.
+#[derive(Default)]
+pub struct Options<'a> {
+    pub backup: &'a str,
+    pub identities: Vec<age::x25519::Identity>,
+    pub replace_unreadable: bool,
+    pub yes: bool,
+}
+
+/// What a restore did, or would do.
+#[derive(Debug)]
+pub struct Restore {
+    chosen: Chosen,
+    plan: Plan,
+    /// The store now, kept as this backup. None: it was missing or unreadable.
+    kept: Option<String>,
+    done: bool,
+}
+
+/// Restores `place`'s store from the backup `o.backup` (only says what it would do
+/// without `o.yes`), holding botd's locks, so botd must be stopped. Nothing changes unless
+/// every check passes; the work file is deleted when one fails.
+pub async fn restore(place: &Place, o: &Options<'_>, at: i64) -> Result<Restore, String> {
+    let _locks = lock(place)?;
+    drop_leftovers(place.folder())?;
+    let chosen = choose(place, o.backup).await?;
+    let now = current(place);
+    if let (Current::Unreadable(e), false) = (&now, o.replace_unreadable) {
+        return Err(format!("the store now doesn't open: {e}. To replace it anyway, add --replace-unreadable; it is deleted, not kept"));
+    }
+    let work = fetch(place, &chosen, &o.identities).await?;
+    let r = (|| {
+        let plan = prepare(place, &work, chosen.at, &now)?;
+        if !o.yes {
+            std::fs::remove_file(&work).map_err(io(&work))?;
+            return Ok(Restore { chosen: chosen.clone(), plan, kept: None, done: false });
+        }
+        let kept = match &now {
+            Current::Readable(k) => Some(keep_current(place, k.as_ref(), at)?),
+            Current::Unreadable(_) => {
+                match std::fs::remove_file(&place.store.path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(&place.store.path)(e)),
+                    _ => {}
+                }
+                None
+            }
+            Current::Missing => None,
+        };
+        remove_sidecars(&place.store.path)?;
+        std::fs::rename(&work, &place.store.path).map_err(io(&place.store.path))?;
+        sync_dir(place.folder());
+        let r = Restore { chosen: chosen.clone(), plan, kept, done: true };
+        write_note(place, &r, at)?;
+        Ok(r)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&work);
+    }
+    r
+}
+
+fn write_note(place: &Place, r: &Restore, at: i64) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let note = json!({
+        "storeId": place.store.id,
+        "backup": r.chosen.name,
+        "from": match &r.chosen.source { Source::Folder(_) => "folder", Source::Bucket(_) => "bucket" },
+        "backupAt": r.chosen.at,
+        "restoredAt": at,
+        "kept": r.kept,
+        "replacedUnreadable": r.plan.unreadable.is_some(),
+        "held": r.plan.held,
+        "dropped": r.plan.dropped,
+        "erased": r.plan.erased,
+        "back": r.plan.back,
+        "gone": r.plan.gone,
+        "uid": own_uid(),
+    });
+    let path = place.folder().join(NOTE);
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path).map_err(io(&path))?;
+    f.write_all(note.to_string().as_bytes()).and_then(|_| f.sync_all()).map_err(io(&path))
+}
+
+/// The user this command runs as, for the audit: the owner of `/proc/self`.
+fn own_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+impl Restore {
+    /// For the terminal.
+    pub fn text(&self, region: &str) -> String {
+        let p = &self.plan;
+        let from = match &self.chosen.source {
+            Source::Folder(_) => "in its folder".to_string(),
+            Source::Bucket(n) => format!("in its bucket ({n})"),
+        };
+        let mut out = format!("{} {region}'s chat store from {} {from}, made {}:\n", if self.done { "Restored" } else { "Would restore" }, self.chosen.name, date(self.chosen.at));
+        out.push_str(&format!("  It holds {} of the Bots kept in {region} now.\n", p.held.describe()));
+        if p.dropped.total() > 0 {
+            out.push_str(&format!("  Taken out of it: {} of Bots kept elsewhere now, or deleted since.\n", p.dropped.describe()));
+        }
+        if p.erased.total() > 0 {
+            out.push_str(&format!("  Erased in it again: {} of people erased since.\n", p.erased.describe()));
+        }
+        match (&p.back, &p.gone, &p.unreadable) {
+            (Some(back), Some(gone), _) => {
+                out.push_str(&format!("  Against the store now: {} come back, and {} made since the backup go.\n", back.describe(), gone.describe()));
+                if back.routines > 0 {
+                    out.push_str("  Routines that come back run on their schedule again once botd starts; check them.\n");
+                }
+            }
+            (_, _, Some(e)) => out.push_str(&format!("  The store now doesn't open ({e}); it {} deleted, not kept.\n", if self.done { "was" } else { "is" })),
+            _ => out.push_str("  The store is missing, so nothing in it is lost.\n"),
+        }
+        match (&self.kept, self.done) {
+            (Some(k), _) => out.push_str(&format!("  The store as it was is kept as backups/{k}, so this can be undone.\n")),
+            (None, false) if p.back.is_some() => out.push_str("  The store as it is would be kept as a backup made now, so this can be undone.\n"),
+            _ => {}
+        }
+        if self.done {
+            out.push_str(&format!(
+                "Start botd: it audits this as {RESTORED}, moves anything else to where it belongs, and backs the store up and copies it off the host on its first check. Docs: {DOC}\n"
+            ));
+        } else {
+            out.push_str("Nothing was changed. Run it again with --yes to restore.\n");
+        }
+        out
+    }
+}
+
+// The command line
+
+#[derive(Debug, Default, PartialEq)]
+struct Args<'a> {
+    cmd: &'a str,
+    region: &'a str,
+    backup: &'a str,
+    identity: Option<&'a str>,
+    replace_unreadable: bool,
+    yes: bool,
+    home: Option<&'a str>,
+    env_file: Option<&'a str>,
+}
+
+fn parse<'a>(args: &[&'a str]) -> Result<Args<'a>, String> {
+    let mut a = Args::default();
+    let mut positional = Vec::new();
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        let mut value = || it.next().copied().ok_or_else(|| format!("{arg} needs a value\n{USAGE}"));
+        match arg {
+            "--identity" => a.identity = Some(value()?),
+            "--replace-unreadable" => a.replace_unreadable = true,
+            "--yes" => a.yes = true,
+            "--home" => a.home = Some(value()?),
+            "--env-file" => a.env_file = Some(value()?),
+            o if o.starts_with('-') => return Err(format!("Unknown option {o}\n{USAGE}")),
+            p => positional.push(p),
+        }
+    }
+    match positional.as_slice() {
+        ["list", region] => (a.cmd, a.region) = ("list", region),
+        ["restore", region, backup] => (a.cmd, a.region, a.backup) = ("restore", region, backup),
+        _ => return Err(USAGE.to_string()),
+    }
+    if a.cmd == "list" && (a.identity.is_some() || a.replace_unreadable || a.yes) {
+        return Err(format!("list takes only --home or --env-file\n{USAGE}"));
+    }
+    if a.home.is_some() && a.env_file.is_some() {
+        return Err(format!("Use --home or --env-file, not both\n{USAGE}"));
+    }
+    Ok(a)
+}
+
+/// `botd chat-store <list|restore> ...`: prints the result and returns the exit code: 0,
+/// 1 when it failed, 2 for a usage error.
+pub async fn cli(args: &[String]) -> i32 {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let a = match parse(&args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    match run(&a).await {
+        Ok(text) => {
+            print!("{text}");
+            0
+        }
+        Err(e) => {
+            eprintln!("botd chat-store: {e}");
+            1
+        }
+    }
+}
+
+async fn run(a: &Args<'_>) -> Result<String, String> {
+    let s = Settings::load(a.home, a.env_file)?;
+    let place = Place::locate(&s, a.region)?;
+    if a.cmd == "list" {
+        return list(&place).await;
+    }
+    let identities = match a.identity {
+        Some(f) => super::backup::identities(&std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?)?,
+        None => Vec::new(),
+    };
+    let o = Options { backup: a.backup, identities, replace_unreadable: a.replace_unreadable, yes: a.yes };
+    restore(&place, &o, crate::db::now()).await.map(|r| r.text(&place.region))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{PinOn, Scratch, now};
+    use crate::machines::chat_stores::backup_pass;
+    use crate::machines::s3_standin::{self, StandIn};
+    use crate::secrets::SecretStore;
+    use std::collections::BTreeMap;
+
+    const DAY: i64 = 86_400_000;
+
+    struct World {
+        t: Scratch,
+        lon: PathBuf,
+        fra: PathBuf,
+        app: PathBuf,
+    }
+
+    impl World {
+        fn new() -> (World, Db) {
+            let t = Scratch::new();
+            let (lon, fra, data) = (t.path().join("lon"), t.path().join("fra"), t.path().join("data"));
+            for d in [&lon, &fra, &data] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let app = data.join("app.sqlite");
+            let db = Db::open(&app).unwrap();
+            let w = World { t, lon, fra, app };
+            db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+            (w, db)
+        }
+
+        fn dirs(&self) -> Vec<(String, PathBuf)> {
+            vec![("gb-lon".into(), self.lon.clone()), ("de-fra-2".into(), self.fra.clone())]
+        }
+
+        fn settings(&self, extra: &[(&str, &str)]) -> Settings {
+            let mut p: BTreeMap<String, String> = BTreeMap::new();
+            p.insert("DATA_DIR".into(), self.app.parent().unwrap().display().to_string());
+            p.insert("REGION_DATA_DIRS".into(), format!("gb-lon={},de-fra-2={}", self.lon.display(), self.fra.display()));
+            for (k, v) in extra {
+                p.insert(k.to_string(), v.to_string());
+            }
+            Settings::new(None, Some(self.t.path().join("home")), p)
+        }
+
+        fn place(&self) -> Place {
+            Place::locate(&self.settings(&[]), "gb-lon").unwrap()
+        }
+
+        fn store(&self) -> PathBuf {
+            self.lon.join("chats.sqlite")
+        }
+    }
+
+    fn pinned_bot(db: &Db, name: &str, region: &str) -> (String, String) {
+        let u = db.create_user(None, Some(&format!("{name}@example.com")), name, crate::rbac::Role::Member).unwrap().id;
+        db.pin_residency(PinOn::User, &u, region, "DPA-1", None).unwrap();
+        let bot = db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &u, crate::acl::Visibility::Private).id;
+        (u, bot)
+    }
+
+    fn holds(p: &Path, w: &str) -> bool {
+        let b = std::fs::read(p).unwrap();
+        b.windows(w.len()).any(|x| x == w.as_bytes())
+    }
+
+    fn texts(store: &Path) -> Vec<String> {
+        let c = Connection::open(store).unwrap();
+        let mut s = c.prepare("SELECT text FROM messages ORDER BY id").unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    fn opts(backup: &str, yes: bool) -> Options<'_> {
+        Options { backup, yes, ..Options::default() }
+    }
+
+    fn work_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(WORK)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_backup_in_the_folder_comes_back_without_the_chats_of_bots_that_moved_and_the_store_it_replaces_is_kept() {
+        let (w, db) = World::new();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, bobs) = pinned_bot(&db, "bob", "gb-lon");
+        db.add_message(&ada, "user", "chat-1a-from-the-backup", None, false, None);
+        db.add_message(&bobs, "user", "chat-2b-moved-to-frankfurt", None, false, None);
+        let at = now() - DAY;
+        backup_pass(&db, 7, at);
+        db.add_message(&ada, "user", "chat-3c-after-the-backup", None, false, None);
+        db.pin_residency(PinOn::User, &bob, "de-fra-2", "DPA-2", None).unwrap();
+
+        // Bob's chats are still in London: a restore would strand them in a backup.
+        let place = w.place();
+        let e = restore(&place, &opts("newest", false), now()).await.unwrap_err();
+        assert!(e.contains("hasn't moved yet") && e.contains("1 chat message"), "{e}");
+        assert!(work_files(&w.lon).is_empty());
+        db.place_chats().unwrap();
+        drop(db);
+
+        let before = std::fs::read(w.store()).unwrap();
+        let r = restore(&place, &opts("newest", false), now()).await.unwrap();
+        let text = r.text("gb-lon");
+        assert!(!r.done && text.starts_with("Would restore gb-lon's chat store from chats-") && text.contains("Nothing was changed"), "{text}");
+        assert_eq!((r.plan.held.messages, r.plan.dropped.messages, r.plan.erased.total()), (1, 1, 0), "{r:?}");
+        assert_eq!((r.plan.back.unwrap().total(), r.plan.gone.unwrap().messages), (0, 1), "{r:?}");
+        assert!(text.contains("1 chat message made since the backup go"), "{text}");
+        assert_eq!(std::fs::read(w.store()).unwrap(), before, "a dry run changes nothing");
+        assert!(work_files(&w.lon).is_empty() && !w.lon.join(NOTE).exists());
+
+        std::fs::write(w.lon.join(format!("{WORK}cut-off.sqlite")), "chat-2b-moved-to-frankfurt").unwrap();
+        let restored_at = now();
+        let r = restore(&place, &opts("newest", true), restored_at).await.unwrap();
+        assert!(r.done && r.text("gb-lon").starts_with("Restored"), "{}", r.text("gb-lon"));
+        assert_eq!(texts(&w.store()), ["chat-1a-from-the-backup"]);
+        assert!(!holds(&w.store(), "chat-2b-moved") && !holds(&w.store(), "chat-3c"), "no page of the moved Bot's chat is left in it");
+        assert!(work_files(&w.lon).is_empty(), "a cut-off restore's work file is gone");
+        let kept = chat_stores::backups_dir(&place.store).join(r.kept.as_deref().unwrap());
+        assert!(texts(&kept).contains(&"chat-3c-after-the-backup".to_string()), "the store it replaced is a backup, so this can be undone");
+        assert_eq!(chat_stores::backups_strictly(&place.store).unwrap().len(), 2);
+        let note: Value = serde_json::from_str(&std::fs::read_to_string(w.lon.join(NOTE)).unwrap()).unwrap();
+        assert_eq!((note["from"].as_str(), note["restoredAt"].as_i64(), note["dropped"]["messages"].as_i64()), (Some("folder"), Some(restored_at), Some(1)), "{note}");
+
+        // botd's next start audits it once.
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        let lines = audit_restores(&db, &w.dirs());
+        assert!(lines.len() == 1 && lines[0].contains("gb-lon's store was restored"), "{lines:?}");
+        assert!(!w.lon.join(NOTE).exists() && audit_restores(&db, &w.dirs()).is_empty());
+        let f = crate::audit::Filter { actions: vec![RESTORED.into()], ..Default::default() };
+        let events: Vec<Value> = db.audit_events(&f, 10, false).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+        assert_eq!(events.len(), 1);
+        let d = &events[0]["details"];
+        assert_eq!((d["region"].as_str(), d["storeId"].as_str(), d["held"]["messages"].as_i64(), events[0]["actorId"].as_str()), (Some("gb-lon"), Some(place.store.id.as_str()), Some(1), Some(ACTOR)), "{events:?}");
+        assert_eq!(db.chat_store_counts().iter().find(|(s, _)| s.region == "gb-lon").unwrap().1.messages, 1, "botd opens the restored store");
+    }
+
+    #[tokio::test]
+    async fn erasures_made_since_the_backup_are_run_on_it_again() {
+        let (w, db) = World::new();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, bobs) = pinned_bot(&db, "bob", "gb-lon");
+        db.add_routine_by(&ada, "bobs-routine", "0 9 * * *", "chat-4d-bobs-routine", true, Some(&bob));
+        db.add_message_from(&ada, "user", "chat-5e-from-bobs-bot", None, false, None, Some(&bobs));
+        db.add_message(&ada, "user", "chat-6f-adas-own", None, false, None);
+        let approval = db.add_approval(&ada, "claude", "Bash", "tool", "ls", &json!({}), "read", "why", now() + DAY);
+        let at = now() + 2000;
+        backup_pass(&db, 7, at);
+        let backup = chat_stores::backups_strictly(&w.place().store).unwrap()[0].1.clone();
+        Connection::open(&backup).unwrap().execute("UPDATE approvals SET decided_by = ?1, note = 'chat-7g-bobs-note' WHERE id = ?2", rusqlite::params![bob, approval.id]).unwrap();
+
+        assert!(db.delete_bot_unless_held(&bobs));
+        db.record(&Who::system("t").event("bot.deleted").target("bot", &bobs).details(json!({ "reason": "user_erased" })));
+        db.erase_user(&bob, "erased-7f3a", None, std::slice::from_ref(&bobs)).unwrap();
+        drop(db);
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!(r.plan.erased, Held { messages: 1, routines: 1, approvals: 1 }, "{r:?}");
+        assert!(r.text("gb-lon").contains("Erased in it again: 1 chat message, 1 routine and 1 approval"), "{}", r.text("gb-lon"));
+        assert_eq!(texts(&w.store()), ["[erased]", "chat-6f-adas-own"]);
+        let c = Connection::open(w.store()).unwrap();
+        let (routines, decided): (i64, String) =
+            c.query_row("SELECT (SELECT COUNT(*) FROM routines), (SELECT decided_by FROM approvals)", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((routines, decided.as_str()), (0, "erased-7f3a"));
+        for w_ in ["chat-4d", "chat-5e", "chat-7g", &bob] {
+            assert!(!holds(&w.store(), w_), "{w_} is gone from every page");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backup_from_before_the_audit_log_is_refused_once_someone_was_erased_since() {
+        let (w, db) = World::new();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
+        db.add_message(&ada, "user", "chat-8h", None, false, None);
+        backup_pass(&db, 7, now() - 30 * DAY);
+        db.erase_user(&bob, "erased-91b0", None, &[]).unwrap();
+        drop(db);
+        let before = std::fs::read(w.store()).unwrap();
+        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("audit log no longer goes back that far") && e.contains("Restore a newer backup"), "{e}");
+        assert_eq!(std::fs::read(w.store()).unwrap(), before);
+        assert!(work_files(&w.lon).is_empty() && !w.lon.join(NOTE).exists());
+    }
+
+    #[tokio::test]
+    async fn an_age_encrypted_copy_in_the_bucket_comes_back_after_the_volume_is_lost() {
+        let (w, db) = World::new();
+        let s3 = StandIn::start().await;
+        let master = crate::secrets::key::MasterKey::generate();
+        let sealed = crate::secrets::sealed::SealedStore::new(crate::secrets::sealed::connect(&w.app).unwrap(), std::sync::Arc::new(crate::secrets::sealed::Cipher::new(&master)));
+        sealed.put("REGION_DATA_S3_GB_LON_SECRET_ACCESS_KEY", s3_standin::SECRET).unwrap();
+        drop(sealed);
+        let id = age::x25519::Identity::generate();
+        let (public, key) = (id.to_public().to_string(), master.base64());
+        let s = w.settings(&[
+            ("SUPERBOT_MASTER_KEY", key.as_str()),
+            ("REGION_DATA_S3_GB_LON_BUCKET", s3_standin::BUCKET),
+            ("REGION_DATA_S3_GB_LON_ENDPOINT", s3.url.as_str()),
+            ("REGION_DATA_S3_GB_LON_ACCESS_KEY_ID", s3_standin::ACCESS_KEY),
+            ("REGION_DATA_AGE_RECIPIENTS", public.as_str()),
+        ]);
+        let place = Place::locate(&s, "gb-lon").unwrap();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        db.add_message(&ada, "user", "chat-9i-off-the-host", None, false, None);
+        backup_pass(&db, 7, now() - DAY);
+        let copies = place.copies().unwrap().expect("the bucket, its secret key from botd's saved secrets");
+        assert_eq!(copies.pass(&db, now()).await["gb-lon"].as_ref().map(|c| c.uploaded), Ok(1));
+        drop(db);
+
+        // The volume is lost: a new, empty one is mounted at the folder.
+        std::fs::remove_dir_all(&w.lon).unwrap();
+        std::fs::create_dir_all(&w.lon).unwrap();
+        let listed = list(&place).await.unwrap();
+        assert!(listed.contains("chats.sqlite: missing") && listed.contains("Copies in") && listed.contains(".sqlite.age"), "{listed}");
+        assert!(!listed.contains(s3_standin::SECRET));
+
+        let e = restore(&place, &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("--identity"), "{e}");
+        let wrong = Options { identities: vec![age::x25519::Identity::generate()], ..opts("newest", true) };
+        let e = restore(&place, &wrong, now()).await.unwrap_err();
+        assert!(e.contains("doesn't open this copy"), "{e}");
+        assert!(!w.store().exists() && work_files(&w.lon).is_empty(), "nothing changed, nothing left");
+
+        let right = Options { identities: vec![id], ..opts("newest", true) };
+        let r = restore(&place, &right, now()).await.unwrap();
+        assert!(matches!(r.chosen.source, Source::Bucket(_)) && r.kept.is_none(), "{r:?}");
+        assert!(r.text("gb-lon").contains("The store is missing, so nothing in it is lost"), "{}", r.text("gb-lon"));
+        assert_eq!(texts(&w.store()), ["chat-9i-off-the-host"]);
+        assert!(work_files(&w.lon).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_restore_is_refused_while_botd_runs_or_when_the_backup_isnt_this_store() {
+        let (w, db) = World::new();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        let (_, fritz) = pinned_bot(&db, "fritz", "de-fra-2");
+        db.add_message(&ada, "user", "chat-10j", None, false, None);
+        db.add_message(&fritz, "user", "chat-11k", None, false, None);
+        backup_pass(&db, 7, now() - DAY);
+        drop(db);
+        let place = w.place();
+
+        let lock = database_encryption::lock_data_dir(&w.store()).unwrap();
+        let e = restore(&place, &opts("newest", false), now()).await.unwrap_err();
+        assert!(e.contains("botd must be stopped"), "{e}");
+        drop(lock);
+
+        // Frankfurt's backup, put among London's.
+        let fra = chat_stores::backups_strictly(&Place::locate(&w.settings(&[]), "de-fra-2").unwrap().store).unwrap()[0].1.clone();
+        let name = "chats-20200101-000000.sqlite";
+        std::fs::copy(&fra, chat_stores::backups_dir(&place.store).join(name)).unwrap();
+        let e = restore(&place, &opts(name, true), now()).await.unwrap_err();
+        assert!(e.contains("de-fra-2's chat store, not gb-lon's"), "{e}");
+        std::fs::write(chat_stores::backups_dir(&place.store).join(name), b"not a database at all, just some bytes").unwrap();
+        assert!(restore(&place, &opts(name, true), now()).await.is_err());
+        assert!(restore(&place, &opts("chats-20200102-000000.sqlite", true), now()).await.unwrap_err().contains("isn't in"));
+        assert!(restore(&place, &opts("../app.sqlite", true), now()).await.unwrap_err().contains("isn't a backup's name"));
+        assert!(work_files(&w.lon).is_empty());
+
+        // A store that doesn't open is replaced only when asked.
+        std::fs::write(w.store(), vec![7u8; 8192]).unwrap();
+        let e = restore(&place, &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("--replace-unreadable"), "{e}");
+        let o = Options { replace_unreadable: true, ..opts("newest", true) };
+        let r = restore(&place, &o, now()).await.unwrap();
+        assert!(r.plan.unreadable.is_some() && r.kept.is_none() && r.text("gb-lon").contains("was deleted, not kept"), "{r:?}");
+        assert_eq!(texts(&w.store()), ["chat-10j"]);
+
+        let e = Place::locate(&w.settings(&[]), "us-east").err().unwrap();
+        assert!(e.contains("doesn't name us-east (it names gb-lon, de-fra-2)"), "{e}");
+        std::fs::remove_dir_all(&w.fra).unwrap();
+        assert!(Place::locate(&w.settings(&[]), "de-fra-2").err().unwrap().contains("Mount the region's volume"));
+        let unrecorded = Scratch::new();
+        let mut s = w.settings(&[("REGION_DATA_DIRS", &format!("gb-lon={}", unrecorded.path().display()))]);
+        s = Settings::new(None, None, s.vars().into_iter().map(|(k, v)| if k == "DATA_DIR" { (k, unrecorded.path().join("data").display().to_string()) } else { (k, v) }).collect());
+        assert!(Place::locate(&s, "gb-lon").err().unwrap().contains("no botd database"));
+    }
+
+    #[test]
+    fn the_command_line_is_parsed_strictly() {
+        let p = parse;
+        assert_eq!(p(&["list", "gb-lon"]).unwrap(), Args { cmd: "list", region: "gb-lon", ..Args::default() });
+        let a = p(&["restore", "gb-lon", "newest", "--identity", "/k", "--yes", "--home", "/h"]).unwrap();
+        assert_eq!((a.backup, a.identity, a.yes, a.home, a.replace_unreadable), ("newest", Some("/k"), true, Some("/h"), false));
+        for bad in [&["restore", "gb-lon"][..], &["list"], &["list", "gb-lon", "--yes"], &["restore", "a", "b", "--home", "x", "--env-file", "y"], &["restore", "a", "b", "--force"], &["restore", "a", "b", "--identity"]] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
+        assert!(p(&[]).unwrap_err().starts_with("Usage: botd chat-store"));
+        let sha = "a".repeat(64);
+        assert_eq!(copy_name(&format!("chats-20261101-030000-{sha}.sqlite")).map(|c| (c.backup, c.encrypted)), Some(("chats-20261101-030000.sqlite".into(), false)));
+        assert!(copy_name(&format!("chats-20261101-030000-{sha}.0123456789abcdef.sqlite.age")).is_some_and(|c| c.encrypted && c.sha == sha));
+        for bad in ["chats-20261101-030000.sqlite".to_string(), format!("chats-20261101-030000-{}.sqlite", "A".repeat(64)), format!("../chats-20261101-030000-{sha}.sqlite"), format!("chats-20261101-030000-{sha}.short.sqlite.age")] {
+            assert!(copy_name(&bad).is_none(), "{bad}");
+        }
+    }
+}

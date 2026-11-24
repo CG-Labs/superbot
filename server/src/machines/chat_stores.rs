@@ -176,12 +176,16 @@ pub fn open(db: &Db, s: &Settings, previous: Option<&DbKey>, keys: Keys) -> Resu
             log_info!("Regional chat stores: {} brought under botd's database key (ADR 0215).", path.display());
         }
     }
+    for (_, dir) in &s.dirs {
+        super::chat_store_restore::drop_leftovers(dir)?;
+    }
     let attached = db.attach_chat_stores(&s.dirs, &s.forget, key.map(DbKey::raw))?;
     for (region, path) in &attached.forgotten {
         db.record(&Who::system(ACTOR).event(FORGOTTEN).details(json!({ "region": region, "path": path, "named": s.forget.contains(region) })));
     }
     let approvals = db.seal_store_approvals(keys.current, keys.previous, keys.forget)?;
     let mut lines = vec![format!("Regional chat stores: {} (ADR 0215).", s.describe())];
+    lines.extend(super::chat_store_restore::audit_restores(db, &s.dirs));
     lines.extend(attached.created.iter().map(|r| format!("Regional chat stores: made {r}'s store.")));
     lines.extend(attached.forgotten.iter().map(|(r, p)| {
         let why = if s.forget.contains(r) { format!("is named in {FORGET}") } else { "held no chats".into() };
@@ -235,12 +239,12 @@ pub fn place(db: &Db) -> Vec<ChatMove> {
 
 // Backups
 
-fn backups_dir(store: &ChatStore) -> PathBuf {
+pub(super) fn backups_dir(store: &ChatStore) -> PathBuf {
     store.path.parent().unwrap_or(Path::new("/")).join("backups")
 }
 
 /// When a backup named `chats-<YYYYMMDD-HHMMSS>.sqlite` was made (UTC, ms).
-fn backup_time(name: &str) -> Option<i64> {
+pub(super) fn backup_time(name: &str) -> Option<i64> {
     let stamp = name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
     chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok().map(|t| t.and_utc().timestamp_millis())
 }

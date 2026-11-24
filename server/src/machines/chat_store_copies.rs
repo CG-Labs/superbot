@@ -290,6 +290,33 @@ impl Copies {
         Ok(())
     }
 
+    /// The names of `store`'s copies in its bucket (keys without its prefix), oldest first,
+    /// for a restore (ADR 0256). None: its region has no bucket.
+    pub async fn list_copies(&self, store: &ChatStore) -> Option<Result<Vec<String>, String>> {
+        let s3 = self.client(&store.region)?;
+        let prefix = self.store_prefix(store);
+        Some(s3.list(&prefix).await.map(|keys| {
+            let mut names: Vec<String> = keys.iter().filter_map(|k| k.strip_prefix(&prefix)).filter(|n| copy_name(n).is_some()).map(str::to_string).collect();
+            names.sort();
+            names
+        }))
+    }
+
+    /// Downloads `store`'s copy named `name` (from `list_copies`) to `dest`, a new file,
+    /// as it is in the bucket (age-encrypted when it ends in `.age`).
+    pub async fn download(&self, store: &ChatStore, name: &str, dest: &Path) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let s3 = self.client(&store.region).ok_or_else(|| format!("{} has no bucket ({}_BUCKET)", store.region, store_name(&store.region)))?;
+        let mut res = s3.get(&format!("{}{name}", self.store_prefix(store))).await?;
+        let io = |e: std::io::Error| format!("{}: {e}", dest.display());
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dest).map_err(io)?;
+        while let Some(chunk) = res.chunk().await.map_err(|e| format!("downloading {name}: {e}"))? {
+            f.write_all(&chunk).map_err(io)?;
+        }
+        f.sync_all().map_err(io)
+    }
+
     /// Copies each store whose region has a bucket, each pass audited as
     /// `residency.chat_store_backups_copied` when it changed the bucket or failed. By region.
     pub async fn pass(&self, db: &Db, at: i64) -> HashMap<String, Result<Copied, String>> {
@@ -362,6 +389,31 @@ fn recipients_id(recipients: &[age::x25519::Recipient]) -> Option<String> {
     let mut each: Vec<String> = recipients.iter().map(|r| r.to_string()).collect();
     each.sort();
     Some(crate::sigv4::hex(digest::digest(&digest::SHA256, each.join(",").as_bytes()).as_ref())[..16].to_string())
+}
+
+/// A copy's name, as `Copies::key` makes it, taken apart.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CopyName {
+    /// The backup it is a copy of: `chats-<UTC time>.sqlite`.
+    pub backup: String,
+    /// The backup file's SHA-256, in hex.
+    pub sha: String,
+    pub encrypted: bool,
+}
+
+/// `chats-<time>-<sha>.sqlite`, or `chats-<time>-<sha>.<recipients>.sqlite.age`.
+pub fn copy_name(name: &str) -> Option<CopyName> {
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    let (rest, encrypted) = match name.strip_suffix(".sqlite.age") {
+        Some(r) => {
+            let (r, id) = r.rsplit_once('.')?;
+            (hex(id, 16).then_some(r)?, true)
+        }
+        None => (name.strip_suffix(".sqlite")?, false),
+    };
+    let (stem, sha) = rest.rsplit_once('-')?;
+    let backup = format!("{stem}.sqlite");
+    (hex(sha, 64) && chat_stores::backup_time(&backup).is_some()).then(|| CopyName { backup, sha: sha.to_string(), encrypted })
 }
 
 fn recorded(store: &ChatStore) -> String {

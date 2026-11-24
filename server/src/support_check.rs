@@ -373,6 +373,17 @@ impl Keys {
     }
 }
 
+/// The master keys botd would start with, as `s` sets them: the current one, then the
+/// previous one mid-rotation. For other offline commands (`botd chat-store`, ADR 0256).
+pub(crate) fn master_keys(s: &Settings, data_dir: &Path) -> Result<Vec<MasterKey>, String> {
+    let keys = Keys::find(s, data_dir);
+    let mut out = Vec::new();
+    for k in [keys.current, keys.previous] {
+        out.extend(k?.map(|(k, _)| k));
+    }
+    Ok(out)
+}
+
 fn check_master_key(keys: &Keys, format: Option<Format>) -> Finding {
     let previous = match &keys.previous {
         Ok(Some((_, from))) => format!("; the previous key from {from} too (a rotation in progress)"),

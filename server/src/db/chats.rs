@@ -353,7 +353,7 @@ impl Db {
             if let (true, Some((_, id, was))) = (missing, rec) {
                 return Err(format!(
                     "{region}'s chat store (store {id}, last at {was}) isn't at {shown}. Is its volume mounted? botd won't start an empty store in its place: \
-                     restore it from its folder's backups/ (ADR 0215)."
+                     restore it from its folder's backups/ or its bucket with `botd chat-store restore {region} newest` (ADR 0215, ADR 0256)."
                 ));
             }
             let path_str = path.to_str().ok_or_else(|| format!("{shown}: path is not UTF-8"))?;
@@ -721,6 +721,19 @@ pub fn held_in_copy(c: &Connection, bots: &[String]) -> rusqlite::Result<Held> {
 /// (`secure_delete`), and rebuilds the file so no page of theirs is left in it (ADR 0238).
 /// What was deleted.
 pub fn drop_from_copy(c: &Connection, bots: &[String]) -> rusqlite::Result<Held> {
+    let held = delete_in_copy(c, "IN", bots)?;
+    c.execute_batch("VACUUM")?;
+    Ok(held)
+}
+
+/// Deletes the rows of every Bot but `keep` from a copy of a store opened on `c`, zeroing
+/// them (`secure_delete`), for a backup about to be restored (ADR 0256): rows of Bots kept
+/// elsewhere now, or deleted, would otherwise come back. The caller VACUUMs. What was deleted.
+pub fn keep_only_in_copy(c: &Connection, keep: &[String]) -> rusqlite::Result<Held> {
+    delete_in_copy(c, "NOT IN", keep)
+}
+
+fn delete_in_copy(c: &Connection, op: &str, bots: &[String]) -> rusqlite::Result<Held> {
     let list = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
     c.execute_batch("PRAGMA secure_delete = ON")?;
     let tx = c.unchecked_transaction()?;
@@ -728,12 +741,31 @@ pub fn drop_from_copy(c: &Connection, bots: &[String]) -> rusqlite::Result<Held>
     for (i, k) in KEPT.iter().enumerate() {
         let exists: bool = tx.query_row("SELECT COUNT(*) > 0 FROM main.sqlite_master WHERE type = 'table' AND name = ?1", [k.name], |r| r.get(0))?;
         if exists {
-            n[i] = tx.execute(&format!("DELETE FROM main.{} WHERE bot_id IN (SELECT value FROM json_each(?1))", k.name), [&list])? as i64;
+            n[i] = tx.execute(&format!("DELETE FROM main.{} WHERE bot_id {op} (SELECT value FROM json_each(?1))", k.name), [&list])? as i64;
         }
     }
     tx.commit()?;
-    c.execute_batch("VACUUM")?;
     Ok(Held::of(n))
+}
+
+/// The Bots whose chats, routines and approvals belong in `region`'s store: those whose
+/// owner's pin (their team's, else their own) is in it. `c` is botd's own database.
+pub fn bots_kept_in(c: &Connection, region: &str) -> rusqlite::Result<Vec<String>> {
+    let mut s = c.prepare(&format!("SELECT b.id FROM main.bots b WHERE ({}) = ?1 ORDER BY b.id", pinned_region("b.id")))?;
+    s.query_map([region], |r| r.get(0))?.collect()
+}
+
+/// What a copy of a store opened on `c` holds that the store attached as `schema` doesn't
+/// (it would come back), and what that store holds that the copy doesn't (it would go),
+/// by id.
+pub fn compare_copy(c: &Connection, schema: &str) -> rusqlite::Result<(Held, Held)> {
+    let (mut back, mut gone) = ([0; 3], [0; 3]);
+    for (i, k) in KEPT.iter().enumerate() {
+        let t = k.name;
+        back[i] = c.query_row(&format!("SELECT COUNT(*) FROM main.{t} WHERE id NOT IN (SELECT id FROM {schema}.{t})"), [], |r| r.get(0))?;
+        gone[i] = c.query_row(&format!("SELECT COUNT(*) FROM {schema}.{t} WHERE id NOT IN (SELECT id FROM main.{t})"), [], |r| r.get(0))?;
+    }
+    Ok((Held::of(back), Held::of(gone)))
 }
 
 /// A temporary folder for tests, removed when dropped.
