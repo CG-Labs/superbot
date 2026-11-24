@@ -133,6 +133,16 @@ fn details(m: &Machine, extra: Value) -> Value {
     d
 }
 
+/// Whether `m`, though its agent can upgrade itself, needs a rebuild to join its team's
+/// network: a container made before ADR 0212, with team networks on. An error is no
+/// answer either way.
+async fn for_team_nic(cp: &ControlPlane, m: &Machine) -> Result<bool, ProviderError> {
+    match (cp.provider.as_deref(), m.provider_id.as_deref()) {
+        (Some(p), Some(pid)) if cp.team_network.is_some() => p.team_nic_needs_rebuild(pid).await,
+        _ => Ok(false),
+    }
+}
+
 /// Why botd can't rebuild machines at all, if it can't.
 fn unable(cp: &ControlPlane, e: &Enrollment) -> Option<&'static str> {
     if e.upkeep.rebuilds == Rebuilds::Off {
@@ -309,8 +319,17 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 Err(why) => return retry_later(app, &m, "queued", "queued", true, "offline", &format!("Its agent didn't answer: {why}")),
             };
             if !legacy(&hb) {
-                cancel(app, &system(&m), &m, "not_needed");
-                return;
+                match for_team_nic(cp, &m).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        cancel(app, &system(&m), &m, "not_needed");
+                        return;
+                    }
+                    Err(err) => {
+                        let why = format!("The provider couldn't say whether it still needs one: {err}");
+                        return retry_later(app, &m, "queued", "queued", true, "provider", &why);
+                    }
+                }
             }
             if hb.jobs > 0 {
                 let id = m.rebuild_id.as_deref().unwrap_or_default();
@@ -509,7 +528,8 @@ pub async fn get(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
 
 /// `POST /api/users/{key}/machine/rebuild[?discardWork=true]`: rebuilds it with today's
 /// agent. Its agent must answer and be from before ADR 0039, unless a rebuild sent
-/// before failed (it may have none left). 202; it is tried at once,
+/// before failed (it may have none left), or it needs one to join its team's network
+/// (ADR 0212). 202; it is tried at once,
 /// then by the reconciler, and the audit log and `GET` say how it went.
 pub async fn request(
     AppS(app): AppS<AppState>,
@@ -551,7 +571,9 @@ pub async fn request(
         Err(_) if again => None,
         Err(err) => return Err(err),
     };
-    if hb.as_ref().is_some_and(|h| !legacy(h)) {
+    if hb.as_ref().is_some_and(|h| !legacy(h))
+        && !for_team_nic(cp, &m).await.map_err(|err| ApiError(StatusCode::BAD_GATEWAY, format!("The provider couldn't say whether it needs one: {err}")))?
+    {
         return Err(conflict("Its agent can upgrade itself, so it needn't be rebuilt. Use botctl machine upgrade <user>."));
     }
     if !discard && app.db.machine_may_hold_work(&m.id) {

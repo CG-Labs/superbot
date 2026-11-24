@@ -66,6 +66,8 @@ struct State {
     /// What `firewall_egress` reports, as Linode's outbound rules would be.
     egress: Option<serde_json::Value>,
     networks: BTreeMap<String, FakeNetwork>,
+    /// Machines that take a team network's interface only once rebuilt (ADR 0212).
+    team_nic_rebuild: BTreeSet<String>,
 }
 
 /// Linode's disks for the default tiers' plans, in GiB.
@@ -240,6 +242,11 @@ impl Fake {
     /// someone's, or a team's own service.
     pub fn join_network(&self, id: &str, member: &str) {
         self.state.lock().unwrap().networks.get_mut(id).unwrap().members.insert(member.into());
+    }
+
+    /// As if machine `id` were an Incus container made before ADR 0212.
+    pub fn team_nic_needs_rebuild_for(&self, id: &str) {
+        self.state.lock().unwrap().team_nic_rebuild.insert(id.into());
     }
 
     /// As if network `id` was made under another label, e.g. another MACHINE_LABEL_PREFIX.
@@ -438,9 +445,14 @@ impl MachineProvider for Fake {
                 m.status = "rebuilding".into();
                 let label = m.label.clone();
                 s.user_data.insert(label, spec.user_data.clone());
+                s.team_nic_rebuild.remove(id);
                 Ok(())
             })
         })
+    }
+
+    fn team_nic_needs_rebuild<'a>(&'a self, id: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move { self.with("team_nic_needs_rebuild", |s| Ok(s.team_nic_rebuild.contains(id))) })
     }
 
     fn ensure_team_network<'a>(&'a self, label: &'a str, region: &'a str, subnet: &'a str) -> Fut<'a, TeamNetwork> {

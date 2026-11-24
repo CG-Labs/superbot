@@ -18,8 +18,8 @@
 //!   containers, nesting, and host paths there.
 
 use super::provider::{
-    ByteStream, CreateSpec, DiskUse, FirewallDevices, FirewallRule, Fut, HostUse, MachineProvider, ProviderError,
-    ProviderFirewall, ProviderMachine, RebuildSpec, RestoreFile, RestoreSpec,
+    ByteStream, CreateSpec, DiskUse, FirewallDevices, FirewallRule, Fut, HostUse, MachineProvider, NetworkMember,
+    ProviderError, ProviderFirewall, ProviderMachine, RebuildSpec, RestoreFile, RestoreSpec, TeamNetwork,
 };
 use super::pki;
 use crate::secrets::SecretStore;
@@ -79,6 +79,21 @@ const BACKUP_EXPIRY_HOURS: i64 = 24;
 /// NoCloud seed when the container is first started after a create or rebuild, so
 /// removing it later changes nothing inside a container that has started.
 const USER_DATA: &str = "cloud-init.user-data";
+/// Rendered into the seed the same way. Every container is made with [`NETWORK_CONFIG`].
+const NETWORK_KEY: &str = "cloud-init.network-config";
+/// eth0 as the image's default has it, and the team NIC (ADR 0212) whenever it is
+/// plugged in, by DHCP with neither routes nor DNS from it, so the container's default
+/// route and resolver stay eth0's. `optional`: a container with no team NIC boots as
+/// before.
+const NETWORK_CONFIG: &str = "version: 2\nethernets:\n  eth0:\n    dhcp4: true\n  eth1:\n    optional: true\n    dhcp4: true\n    dhcp4-overrides:\n      use-dns: false\n      use-routes: false\n";
+/// The NIC a team member's container is on its team's network through (ADR 0212).
+pub const TEAM_NIC: &str = "eth1";
+/// Set on containers made or rebuilt with [`NETWORK_CONFIG`], whose cloud-init brings up
+/// a team NIC plugged in later. One made before can't join without a rebuild.
+const TEAM_NIC_READY: &str = "user.superbot.team-nic";
+/// Marks the OVN networks botd made for teams; no other network is ever listed as one.
+const TEAM_NETWORK_MARK: &str = "user.superbot.team-network";
+const TEAM_NETWORK_REGION: &str = "user.superbot.region";
 
 /// What a plan gives a container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +347,39 @@ pub fn egress(deny: &[String], open: &[(IpAddr, u16)]) -> Vec<Rule> {
     out
 }
 
+/// The outbound rule of a team network's ACL (ADR 0212): only to the team's subnet. The
+/// NIC drops everything else both ways but for replies and what Incus always lets
+/// through to the network's router (DHCP, DNS, neighbour discovery), so a container
+/// reaches the team's services, never a teammate's container or past the network.
+fn team_egress(subnet: &str) -> Vec<Rule> {
+    vec![Rule {
+        action: "allow".into(),
+        destination: subnet.into(),
+        description: "superbot: only the team's own network".into(),
+        enabled: true,
+        ..Rule::default()
+    }]
+}
+
+/// An OVN network's `ipv4.address` (the router's, as `10.248.0.1/22`) as its subnet.
+fn subnet_of(addr: &str) -> Option<String> {
+    let (v6, lo, _) = span(addr)?;
+    let len = addr.split_once('/')?.1;
+    (!v6).then(|| format!("{}/{len}", address(false, lo)))
+}
+
+/// A team network's router: the subnet's first address, as OVN's `ipv4.address` has it.
+fn router_of(subnet: &str) -> Option<String> {
+    let (v6, lo, hi) = span(subnet)?;
+    let len = subnet.split_once('/')?.1;
+    (!v6 && lo < hi).then(|| format!("{}/{len}", address(false, lo + 1)))
+}
+
+/// Whether two canonical CIDRs share an address.
+fn overlap(a: &str, b: &str) -> bool {
+    matches!((span(a), span(b)), (Some((a6, alo, ahi)), Some((b6, blo, bhi))) if a6 == b6 && alo <= bhi && blo <= ahi)
+}
+
 /// The firewall's rules as an ACL's inbound rules.
 fn ingress(rules: &[FirewallRule]) -> Vec<Rule> {
     rules
@@ -448,6 +496,9 @@ pub struct Settings {
     pub image_server: Option<String>,
     /// What containers never reach, canonical CIDRs.
     pub deny: Vec<String>,
+    /// The part of `deny` named for this host: INCUS_EGRESS_DENY and the Incus hosts,
+    /// kept even where an entry repeats one of PRIVATE's ranges.
+    pub kept: Vec<String>,
     /// botd's machine address and port, when it is an IP.
     pub control: Option<(IpAddr, u16)>,
     /// INCUS_EGRESS_ALLOW: TCP addresses and ports containers reach though `deny`
@@ -511,11 +562,14 @@ impl Settings {
                 Some(s.trim_end_matches('/').to_string())
             }
         };
-        let mut deny: Vec<String> = PRIVATE.iter().map(|s| s.to_string()).collect();
+        let mut kept = Vec::new();
         for c in var("INCUS_EGRESS_DENY").split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            deny.push(super::firewall::cidr(c).map_err(|e| format!("INCUS_EGRESS_DENY: {e}"))?);
+            kept.push(super::firewall::cidr(c).map_err(|e| format!("INCUS_EGRESS_DENY: {e}"))?);
         }
-        deny.push(super::firewall::cidr(&host_ip.to_string())?);
+        kept.push(super::firewall::cidr(&host_ip.to_string())?);
+        kept.sort();
+        kept.dedup();
+        let mut deny: Vec<String> = PRIVATE.iter().map(|s| s.to_string()).chain(kept.iter().cloned()).collect();
         deny.sort();
         deny.dedup();
         let control = url::Url::parse(var("MACHINE_CONTROL_URL").trim())
@@ -523,7 +577,7 @@ impl Settings {
             .and_then(|u| Some((ip_of(&u.host()?.to_owned())?, u.port_or_known_default()?)));
         let allow = egress_allow(&var("INCUS_EGRESS_ALLOW"))?;
         let [project, network, pool] = <[String; 3]>::try_from(names).unwrap();
-        Ok(Settings { url, project, network, pool, image_server, deny, control, allow })
+        Ok(Settings { url, project, network, pool, image_server, deny, kept, control, allow })
     }
 }
 
@@ -567,6 +621,9 @@ impl Credentials {
 pub struct Incus {
     s: Settings,
     egress: Vec<Rule>,
+    /// MACHINE_TEAM_NETWORK_SUBNET with MACHINE_TEAM_NETWORK=ovn (ADR 0212), for the
+    /// preflight check and admins; team networks are made with the subnet asked for.
+    team_subnet: Option<String>,
     pin: String,
     http: reqwest::Client,
     /// For backups' bytes (ADR 0071): no overall timeout, but not silent for long.
@@ -758,7 +815,25 @@ impl Incus {
             .build()
             .map_err(|e| format!("Incus client: {e}"))?;
         let egress = egress(&s.deny, &s.open());
-        Ok(Incus { s, egress, pin, http, stream })
+        Ok(Incus { s, egress, team_subnet: None, pin, http, stream })
+    }
+
+    /// With team networks on (ADR 0212): refused if `subnet` meets anything containers
+    /// reach through eth0 or are kept off: botd's machine address, INCUS_EGRESS_ALLOW,
+    /// INCUS_EGRESS_DENY or an Incus host. Through the team NIC's route the first would
+    /// be unreachable and the last let through.
+    pub fn with_team_subnet(mut self, subnet: &str) -> Result<Incus, String> {
+        let why = |what: &str| format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} meets {what}; pick a range apart from it");
+        for (ip, _) in self.s.open() {
+            if drops(&[subnet.to_string()], &[], ip, 0) {
+                return Err(why(&format!("{ip}, which containers reach botd or an INCUS_EGRESS_ALLOW address at")));
+            }
+        }
+        if let Some(c) = self.s.kept.iter().find(|c| overlap(subnet, c)) {
+            return Err(why(&format!("{c}, which containers are kept off (INCUS_EGRESS_DENY or an Incus host)")));
+        }
+        self.team_subnet = Some(subnet.to_string());
+        Ok(self)
     }
 
     pub(crate) fn base(&self) -> &Settings {
@@ -1057,6 +1132,102 @@ impl Incus {
         Ok(())
     }
 
+    /// That team networks can be made here with `subnet` (ADR 0212): Incus makes isolated
+    /// OVN networks (`network_ovn_isolated`) and overrides a backup's devices on import
+    /// (`backup_override_config`), and `subnet` is apart from the bridge containers' eth0
+    /// is on, whose route the team NIC's would otherwise take over.
+    async fn check_team(&self, subnet: &str) -> Result<String, ProviderError> {
+        let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
+        for (x, why) in [
+            ("network_ovn_isolated", "team networks (isolated OVN networks) need"),
+            ("backup_override_config", "restoring a team's machine onto another host needs"),
+        ] {
+            if !v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == x)) {
+                return Err(api(400, format!("Incus lacks the {x} API extension, which {why}")));
+            }
+        }
+        let bridge = &self.s.network;
+        let b = self.call(Method::GET, &format!("/1.0/networks/{bridge}"), &[], None, None).await?.metadata;
+        if let Some(theirs) = b["config"]["ipv4.address"].as_str().and_then(subnet_of)
+            && overlap(subnet, &theirs)
+        {
+            return Err(api(409, format!("MACHINE_TEAM_NETWORK_SUBNET {subnet} meets {bridge}'s {theirs}, which containers' eth0 is on; pick another range")));
+        }
+        Ok(format!("isolated OVN networks with {subnet}, apart from {bridge}"))
+    }
+
+    /// A restricted project without networks of its own (`features.networks`) lets its
+    /// containers use only the default project's networks named in
+    /// `restricted.networks.access`, when that is set: a team network is added to it.
+    /// That loosens nothing: it names one more network, made by botd for one team.
+    async fn allow_network(&self, n: &str) -> Result<(), ProviderError> {
+        let path = format!("/1.0/projects/{}", self.s.project);
+        for _ in 0..3 {
+            let r = self.call(Method::GET, &path, &[], None, None).await?;
+            let c = &r.metadata["config"];
+            let access = c["restricted.networks.access"].as_str().unwrap_or_default().trim().to_string();
+            if c["restricted"] != "true" || c["features.networks"] == "true" || access.is_empty() || access.split(',').any(|a| a.trim() == n) {
+                return Ok(());
+            }
+            let mut put = json!({ "config": r.metadata["config"], "description": r.metadata["description"] });
+            put["config"]["restricted.networks.access"] = json!(format!("{access},{n}"));
+            match self.call(Method::PUT, &path, &[], Some(&put), r.etag.as_deref()).await {
+                Err(ProviderError::Api { status: 412, .. }) => continue,
+                res => return res.map(drop),
+            }
+        }
+        Err(ProviderError::Transport("the project kept changing at Incus".into()))
+    }
+
+    /// The ACL on team network `n`'s NICs, named after it: nothing inbound, so teammates'
+    /// machines stay apart as the firewall keeps them on Linode, and only `subnet`
+    /// outbound. Replies come back: OVN's ACLs are stateful. Made if missing, and set
+    /// again if anything else is in it.
+    async fn ensure_team_acl(&self, n: &str, subnet: &str) -> Result<(), ProviderError> {
+        let want: Vec<Value> = team_egress(subnet).iter().map(Rule::json).collect();
+        let description = json!("SuperBot: one team's network; nothing in, out only to its subnet (ADR 0212)");
+        for _ in 0..3 {
+            let r = match self.acl(n).await {
+                Ok(r) => r,
+                Err(ProviderError::NotFound) => {
+                    let body = json!({ "name": n, "description": description, "config": {}, "ingress": [], "egress": want });
+                    return match self.call(Method::POST, "/1.0/network-acls", &[], Some(&body), None).await {
+                        Ok(_) | Err(ProviderError::LabelTaken) => Ok(()),
+                        Err(e) => Err(e),
+                    };
+                }
+                Err(e) => return Err(e),
+            };
+            let rules = |k: &str| -> Option<Vec<Rule>> { r.metadata[k].as_array().map(|a| a.iter().filter_map(Rule::read).collect()) };
+            let only = |k: &str, want: Vec<Rule>| {
+                r.metadata[k].as_array().map(Vec::len) == Some(want.len()) && rules(k).is_some_and(|got| got == want)
+            };
+            if only("ingress", Vec::new()) && only("egress", team_egress(subnet)) {
+                return Ok(());
+            }
+            let body = json!({ "description": description, "config": r.metadata["config"], "ingress": [], "egress": want });
+            match self.call(Method::PUT, &format!("/1.0/network-acls/{n}"), &[], Some(&body), r.etag.as_deref()).await {
+                Err(ProviderError::Api { status: 412, .. }) => continue,
+                res => return res.map(drop),
+            }
+        }
+        Err(ProviderError::Transport("the team network's ACL kept changing at Incus".into()))
+    }
+
+    /// An OVN network botd made for a team, as a team network. Its subnet is empty if
+    /// it has lost its IPv4 address.
+    fn team_network(v: &Value, created: bool) -> Option<TeamNetwork> {
+        let n = v["name"].as_str().filter(|n| slug(n))?;
+        (v["type"] == "ovn" && v["config"][TEAM_NETWORK_MARK] == "true").then(|| TeamNetwork {
+            id: n.into(),
+            label: n.into(),
+            region: v["config"][TEAM_NETWORK_REGION].as_str().unwrap_or_default().into(),
+            subnet_id: n.into(),
+            subnet: v["config"]["ipv4.address"].as_str().and_then(subnet_of).unwrap_or_default(),
+            created,
+        })
+    }
+
     fn source(&self, image: &str) -> Value {
         match &self.s.image_server {
             Some(server) => json!({ "type": "image", "alias": image, "server": server, "protocol": "simplestreams" }),
@@ -1081,8 +1252,42 @@ impl Incus {
         })
     }
 
+    /// The NIC on team network `network` (ADR 0212): behind the network's own ACL,
+    /// dropping what it doesn't let through both ways, and unable to claim another
+    /// address.
+    fn team_nic(&self, network: &str) -> Value {
+        json!({
+            "type": "nic",
+            "network": network,
+            "name": TEAM_NIC,
+            "security.mac_filtering": "true",
+            "security.ipv4_filtering": "true",
+            "security.ipv6_filtering": "true",
+            "security.acls": network,
+            "security.acls.default.ingress.action": "drop",
+            "security.acls.default.egress.action": "drop",
+        })
+    }
+
+    /// `X-Incus-devices` for a backup import: the team NIC, whether the backup had one
+    /// or not, on the bridge every container may use, with no ACL to look up. An empty
+    /// value unsets a key.
+    fn team_nic_on_import(&self) -> String {
+        let keys = ["security.acls", "security.acls.default.ingress.action", "security.acls.default.egress.action"];
+        [format!("{TEAM_NIC},type=nic"), format!("{TEAM_NIC},name={TEAM_NIC}"), format!("{TEAM_NIC},network={}", self.s.network)]
+            .into_iter()
+            .chain(keys.iter().map(|k| format!("{TEAM_NIC},{k}=")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Whether `dev`, as device `key`, is exactly a team NIC.
+    fn is_team_nic(&self, key: &str, dev: &Value) -> bool {
+        key == TEAM_NIC && dev["network"].as_str().is_some_and(|n| slug(n) && *dev == self.team_nic(n))
+    }
+
     /// Whether the container's network is what `attach_firewall` sets: no profiles,
-    /// eth0 exactly `nic(acl)`, and no other NIC.
+    /// eth0 exactly `nic(acl)`, and no other NIC but a team NIC.
     fn covered(&self, v: &Value, acl: &str) -> bool {
         let devices = match v.get("expanded_devices") {
             Some(d) if d.is_object() => d,
@@ -1090,7 +1295,8 @@ impl Incus {
         };
         v["profiles"].as_array().is_none_or(Vec::is_empty)
             && devices.as_object().is_some_and(|d| {
-                d.get("eth0") == Some(&self.nic(acl)) && d.iter().all(|(k, dev)| k == "eth0" || dev["type"] != "nic")
+                d.get("eth0") == Some(&self.nic(acl))
+                    && d.iter().all(|(k, dev)| k == "eth0" || dev["type"] != "nic" || self.is_team_nic(k, dev))
             })
     }
     fn root(&self, size: &Size) -> Value {
@@ -1271,6 +1477,12 @@ impl MachineProvider for Incus {
                 "the machines' network ACL: inbound only the firewall's rules; outbound no TCP/UDP to egressDenied",
                 "a restricted project, checked before every create",
             ],
+            "teamNetwork": self.team_subnet.as_ref().map(|subnet| json!({
+                "kind": "ovn",
+                "subnet": subnet,
+                "nic": format!("{TEAM_NIC}, MAC/IPv4/IPv6 filtering, its network's ACL: nothing in, out only to the team's subnet"),
+                "network": "isolated OVN (no uplink, no NAT, DHCP without a gateway)",
+            })),
         })
     }
 
@@ -1313,6 +1525,9 @@ impl MachineProvider for Incus {
                 })
                 .await,
             );
+            if let Some(subnet) = &self.team_subnet {
+                out.push(self.check("team network", self.check_team(subnet)).await);
+            }
             Ok(out)
         })
     }
@@ -1349,6 +1564,12 @@ impl MachineProvider for Incus {
             if !spec.authorized_keys.is_empty() {
                 config.insert("cloud-init.vendor-data".into(), json!(vendor_data(&spec.authorized_keys)));
             }
+            config.insert(NETWORK_KEY.into(), json!(NETWORK_CONFIG));
+            config.insert(TEAM_NIC_READY.into(), json!(TEAM_NIC));
+            let mut devices = json!({ "root": self.root(&size), "eth0": self.nic(acl) });
+            if let Some(net) = &spec.subnet_id {
+                devices[TEAM_NIC] = self.team_nic(name(net)?);
+            }
             let body = json!({
                 "name": n,
                 "type": "container",
@@ -1357,7 +1578,7 @@ impl MachineProvider for Incus {
                 "description": "SuperBot machine",
                 "source": self.source(&spec.image),
                 "config": config,
-                "devices": { "root": self.root(&size), "eth0": self.nic(acl) },
+                "devices": devices,
             });
             let target: Vec<(&str, &str)> = if spec.region == LOCAL {
                 Vec::new()
@@ -1461,6 +1682,8 @@ impl MachineProvider for Incus {
             self.stop(id, true).await?;
             self.edit(id, |put| {
                 put["config"][USER_DATA] = json!(spec.user_data);
+                put["config"][NETWORK_KEY] = json!(NETWORK_CONFIG);
+                put["config"][TEAM_NIC_READY] = json!(TEAM_NIC);
                 if spec.authorized_keys.is_empty() {
                     if let Some(c) = put["config"].as_object_mut() {
                         c.remove("cloud-init.vendor-data");
@@ -1570,18 +1793,27 @@ impl MachineProvider for Incus {
         })
     }
 
-    /// Into the project and pool botd uses, whatever the backup says.
+    /// Into the project and pool botd uses, whatever the backup says. A saved team NIC
+    /// names its network and ACL on the host it was made on, which a host that never
+    /// served the team lacks, and Incus refuses a backup whose devices it can't load:
+    /// where it can override them, the copy comes in with that NIC on this host's
+    /// bridge behind no ACL, stopped, until `prepare` replaces every device.
     fn import_backup<'a>(&'a self, n: &'a str, data: ByteStream) -> Fut<'a, ()> {
         Box::pin(async move {
             self.check_server().await?;
             self.check_project().await?;
-            let req = self
+            let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
+            let overrides = v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == "backup_override_config"));
+            let mut req = self
                 .stream
                 .post(self.url("/1.0/instances", &[]))
                 .header("Content-Type", "application/octet-stream")
                 .header("X-Incus-name", name(n)?)
-                .header("X-Incus-pool", &self.s.pool)
-                .body(reqwest::Body::wrap_stream(data));
+                .header("X-Incus-pool", &self.s.pool);
+            if overrides {
+                req = req.header("X-Incus-devices", self.team_nic_on_import());
+            }
+            let req = req.body(reqwest::Body::wrap_stream(data));
             let r = self.reply(req).await?;
             self.finish_long(r, BACKUP_WAIT, "importing the backup").await
         })
@@ -1593,6 +1825,151 @@ impl MachineProvider for Incus {
             self.delete(id).await?;
             self.rename(staging, id).await?;
             self.get(id).await
+        })
+    }
+
+    /// An isolated OVN network (no uplink) with `subnet`, its router on the first
+    /// address, handing out addresses with no gateway, and its ACL (ADR 0212). The
+    /// project's network access list names it first, where there is one.
+    fn ensure_team_network<'a>(&'a self, label: &'a str, region: &'a str, subnet: &'a str) -> Fut<'a, TeamNetwork> {
+        Box::pin(async move {
+            let n = name(label)?;
+            let router = router_of(subnet).ok_or_else(|| api(400, format!("{subnet} isn't an IPv4 range a team network can have")))?;
+            self.check_team(subnet).await?;
+            // A restricted project sees only the networks its access list names, so it
+            // comes before looking; the ACL waits until the network is known to match.
+            self.allow_network(n).await?;
+            let path = format!("/1.0/networks/{n}");
+            let mut created = false;
+            let v = match self.call(Method::GET, &path, &[], None, None).await {
+                Ok(r) => r.metadata,
+                Err(ProviderError::NotFound) => {
+                    let body = json!({
+                        "name": n,
+                        "type": "ovn",
+                        "description": "SuperBot: one team's machines (ADR 0212)",
+                        "config": {
+                            "network": "none",
+                            "ipv4.address": router,
+                            "ipv4.nat": "false",
+                            "ipv4.dhcp": "true",
+                            "ipv4.dhcp.gateway": "none",
+                            "ipv6.address": "none",
+                            TEAM_NETWORK_MARK: "true",
+                            TEAM_NETWORK_REGION: region,
+                        },
+                    });
+                    match self.call(Method::POST, "/1.0/networks", &[], Some(&body), None).await {
+                        Ok(_) => created = true,
+                        Err(ProviderError::LabelTaken) => {}
+                        Err(e) => return Err(e),
+                    }
+                    self.call(Method::GET, &path, &[], None, None).await?.metadata
+                }
+                Err(e) => return Err(e),
+            };
+            let refused = |m: String| api(409, m);
+            let t = Self::team_network(&v, created).ok_or_else(|| refused(format!("network {n} is there already, and isn't an OVN network botd made for a team")))?;
+            if t.region != region {
+                return Err(refused(format!("team network {n} is for {}, not {region}", t.region)));
+            }
+            if t.subnet != subnet {
+                return Err(refused(format!("team network {n}'s subnet is {}, not MACHINE_TEAM_NETWORK_SUBNET's {subnet}", t.subnet)));
+            }
+            self.ensure_team_acl(n, subnet).await?;
+            Ok(t)
+        })
+    }
+
+    /// Every OVN network botd made for a team whose name starts with `prefix`.
+    fn team_networks<'a>(&'a self, prefix: &'a str) -> Fut<'a, Vec<TeamNetwork>> {
+        Box::pin(async move {
+            let r = self.call(Method::GET, "/1.0/networks", &[("recursion", "1")], None, None).await?;
+            Ok(r.metadata
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| Self::team_network(v, false))
+                .filter(|t| t.label.starts_with(prefix))
+                .collect())
+        })
+    }
+
+    /// This project's containers with a NIC on network `id`. Plugged in, a NIC is in use
+    /// whenever the container runs.
+    fn team_network_members<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<NetworkMember>> {
+        Box::pin(async move {
+            let id = name(id)?;
+            let list = self.call(Method::GET, "/1.0/instances", &[("recursion", "1")], None, None).await?.metadata;
+            let mut out = Vec::new();
+            for v in list.as_array().into_iter().flatten() {
+                let Some(machine) = v["name"].as_str() else { continue };
+                let devices = match v.get("expanded_devices") {
+                    Some(d) if d.is_object() => d,
+                    _ => &v["devices"],
+                };
+                for (k, dev) in devices.as_object().into_iter().flatten() {
+                    if dev["type"] == "nic" && dev["network"] == id {
+                        out.push(NetworkMember { machine: machine.into(), config: String::new(), interface: k.clone(), active: true });
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Unplugs the NIC, from a running container too. Never eth0, the machine's own.
+    fn leave_team_network<'a>(&'a self, m: &'a NetworkMember) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let nic = name(&m.interface)?;
+            if nic == "eth0" {
+                return Err(api(400, "eth0 is the machine's own NIC, never a team network's"));
+            }
+            let res = self
+                .edit(&m.machine, |put| {
+                    if let Some(d) = put["devices"].as_object_mut()
+                        && d.get(nic).is_some_and(|dev| dev["type"] == "nic")
+                    {
+                        d.remove(nic);
+                    }
+                })
+                .await;
+            match res {
+                Ok(()) | Err(ProviderError::NotFound) => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// Plugs the team NIC into the container, running or not. Refused for one whose
+    /// cloud-init wouldn't bring it up (made before ADR 0212), or whose eth1 is
+    /// something else.
+    fn join_team_network<'a>(&'a self, machine: &'a str, n: &'a TeamNetwork) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let net = name(&n.subnet_id)?;
+            let v = self.call(Method::GET, &format!("/1.0/instances/{}", name(machine)?), &[], None, None).await?.metadata;
+            let refused = |m: &str| api(409, m);
+            if v["config"][TEAM_NIC_READY] != TEAM_NIC {
+                return Err(refused("it was made before team networks on Incus, so it wouldn't bring up a team NIC; rebuild it to join its team's network (botctl machine rebuild <user>)"));
+            }
+            match v["devices"].get(TEAM_NIC) {
+                Some(d) if *d == self.team_nic(net) => return Ok(()),
+                Some(d) if d["type"] == "nic" => return Err(refused("it is on another network through eth1; it leaves that one first")),
+                Some(_) => return Err(refused("its device eth1 isn't a NIC botd put there")),
+                None => {}
+            }
+            self.edit(machine, |put| put["devices"][TEAM_NIC] = self.team_nic(net)).await
+        })
+    }
+
+    fn team_network_hotplug(&self) -> bool {
+        true
+    }
+
+    fn team_nic_needs_rebuild<'a>(&'a self, id: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let v = self.call(Method::GET, &format!("/1.0/instances/{}", name(id)?), &[], None, None).await?.metadata;
+            Ok(v["config"][TEAM_NIC_READY] != TEAM_NIC)
         })
     }
 
@@ -1680,13 +2057,14 @@ impl MachineProvider for Incus {
         })
     }
 
-    /// Puts the whole isolated NIC back as eth0, and drops profiles and other NICs.
+    /// Puts the whole isolated NIC back as eth0, and drops profiles and other NICs but
+    /// a team NIC (ADR 0212).
     fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
             let acl = name(id)?;
             self.edit(machine, |put| {
                 if let Some(d) = put["devices"].as_object_mut() {
-                    d.retain(|k, dev| k == "eth0" || dev["type"] != "nic");
+                    d.retain(|k, dev| k == "eth0" || dev["type"] != "nic" || self.is_team_nic(k, dev));
                 }
                 put["devices"]["eth0"] = self.nic(acl);
                 put["profiles"] = json!([]);

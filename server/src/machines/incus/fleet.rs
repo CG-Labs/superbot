@@ -20,7 +20,8 @@
 use super::{Credentials, DEFAULT_IMAGE, DEFAULT_TIERS, Incus, Settings, Size, host_cidr};
 use crate::machines::provider::{
     ByteStream, CreateSpec, FirewallDevices, FirewallRule, Fut, HostInfo, HostStatus, HostUse, Hosts, MachineProvider,
-    Policy, ProviderError, ProviderFirewall, ProviderMachine, RebuildSpec, Resources, RestoreSpec,
+    NetworkMember, Policy, ProviderError, ProviderFirewall, ProviderMachine, RebuildSpec, Resources, RestoreSpec,
+    TeamNetwork,
 };
 use crate::secrets::SecretStore;
 use serde_json::{Value, json};
@@ -129,6 +130,18 @@ impl Fleet {
         self
     }
 
+    /// Team networks on every host with `subnet` (ADR 0212); refused if it meets
+    /// anything a host's containers reach or are kept off through eth0.
+    pub fn with_team_subnet(mut self, subnet: &str) -> Result<Fleet, String> {
+        let mut members = Vec::new();
+        for m in self.members {
+            let incus = m.incus.with_team_subnet(subnet).map_err(|e| format!("{e} (Incus host {})", m.name))?;
+            members.push(Member { incus, ..m });
+        }
+        self.members = members;
+        Ok(self)
+    }
+
     /// INCUS_URL and the INCUS_* settings for the first host, INCUS_HOSTS for the rest,
     /// INCUS_HOST_DOWN_MINUTES, and placement (ADR 0081): INCUS_PLACEMENT, and each
     /// host's INCUS_CAPACITY and INCUS_MAX_MACHINES (shared, unless `_<NAME>` sets
@@ -186,9 +199,11 @@ impl Fleet {
         let every: Vec<String> = built.iter().filter_map(|(_, s, _)| host_cidr(&s.url)).collect();
         let mut members = Vec::new();
         for (name, mut s, c) in built {
-            s.deny.extend(every.iter().cloned());
-            s.deny.sort();
-            s.deny.dedup();
+            for d in [&mut s.deny, &mut s.kept] {
+                d.extend(every.iter().cloned());
+                d.sort();
+                d.dedup();
+            }
             let (key, raw) = own("INCUS_CAPACITY", &name);
             let cap = Some(raw.trim()).filter(|r| !r.is_empty()).map(capacity).transpose().map_err(|e| format!("{key}: {e}"))?;
             let (key, raw) = own("INCUS_MAX_MACHINES", &name);
@@ -578,6 +593,74 @@ impl MachineProvider for Fleet {
         })
     }
 
+    /// Each host has its own team networks (ADR 0212): one is made on the host a
+    /// machine goes on, through `on`.
+    fn ensure_team_network<'a>(&'a self, _: &'a str, _: &'a str, _: &'a str) -> Fut<'a, TeamNetwork> {
+        Box::pin(async { Err(ProviderError::Api { status: 400, message: "team networks are made on a machine's own Incus host".into() }) })
+    }
+
+    /// From the hosts that are up, as `host/name`.
+    fn team_networks<'a>(&'a self, prefix: &'a str) -> Fut<'a, Vec<TeamNetwork>> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for m in self.up() {
+                out.extend(m.incus.team_networks(prefix).await?.into_iter().map(|mut n| {
+                    n.id = format!("{}/{}", m.name, n.id);
+                    n.subnet_id = format!("{}/{}", m.name, n.subnet_id);
+                    n
+                }));
+            }
+            Ok(out)
+        })
+    }
+
+    fn team_network_members<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<NetworkMember>> {
+        Box::pin(async move {
+            let (m, n) = self.route(id)?;
+            Ok(m.incus
+                .team_network_members(n)
+                .await?
+                .into_iter()
+                .map(|mut x| {
+                    x.machine = format!("{}/{}", m.name, x.machine);
+                    x
+                })
+                .collect())
+        })
+    }
+
+    fn leave_team_network<'a>(&'a self, mem: &'a NetworkMember) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let (m, n) = self.route(&mem.machine)?;
+            m.incus.leave_team_network(&NetworkMember { machine: n.into(), ..mem.clone() }).await
+        })
+    }
+
+    /// Only onto a network on the machine's own host.
+    fn join_team_network<'a>(&'a self, machine: &'a str, net: &'a TeamNetwork) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let (m, n) = self.route(machine)?;
+            let local = match split(&net.subnet_id) {
+                (Some(h), local) if h != m.name => {
+                    return Err(ProviderError::Api { status: 409, message: format!("team network {local} is on Incus host {h}, not {}", m.name) });
+                }
+                (_, local) => local,
+            };
+            m.incus.join_team_network(n, &TeamNetwork { subnet_id: local.into(), ..net.clone() }).await
+        })
+    }
+
+    fn team_network_hotplug(&self) -> bool {
+        true
+    }
+
+    fn team_nic_needs_rebuild<'a>(&'a self, id: &'a str) -> Fut<'a, bool> {
+        Box::pin(async move {
+            let (m, n) = self.route(id)?;
+            m.incus.team_nic_needs_rebuild(n).await
+        })
+    }
+
     fn hosts(&self) -> Option<&dyn Hosts> {
         Some(self)
     }
@@ -850,6 +933,46 @@ mod tests {
         }
         f.set_status("b", HostStatus::Lost);
         assert!(f.preflight().await.unwrap().is_empty(), "a lost host isn't checked");
+    }
+
+    #[tokio::test]
+    async fn each_host_has_its_own_team_networks() {
+        use crate::machines::incus_standin::StandIn;
+        let (a, b) = (StandIn::start().await, StandIn::start().await);
+        let incus = |s: &StandIn| Incus::new(s.settings(None), s.credentials()).unwrap();
+        let subnet = "10.248.0.0/22";
+        let f = Fleet::new(vec![Member::new("main", incus(&a)), Member::new("b", incus(&b))], 60_000).with_team_subnet(subnet).unwrap();
+        let label = "superbot-team-0123456789ab-local";
+        assert!(f.ensure_team_network(label, "local", subnet).await.is_err(), "made on a machine's own host");
+        let made = f.on("b").unwrap().ensure_team_network(label, "local", subnet).await.unwrap();
+        assert_eq!(made.id, label, "the host's own name for it");
+        f.create_firewall("superbot-fw", &[], &[]).await.unwrap();
+        let spec = |label: &str, net: Option<String>| CreateSpec {
+            label: label.into(),
+            plan: "c1-m2-d20".into(),
+            region: "local".into(),
+            image: DEFAULT_IMAGE.into(),
+            tags: vec![],
+            authorized_keys: vec![],
+            user_data: None,
+            firewall_id: Some("superbot-fw".into()),
+            subnet_id: net,
+        };
+        assert_eq!(f.create_on("b", &spec("superbot-m1", Some(made.subnet_id.clone()))).await.unwrap().id, "b/superbot-m1");
+        assert_eq!(f.create_on("main", &spec("superbot-m2", None)).await.unwrap().id, "main/superbot-m2");
+
+        // Listed as `host/name`, members too; joined only on the machine's own host.
+        let nets = f.team_networks("").await.unwrap();
+        assert_eq!(nets, [TeamNetwork { id: format!("b/{label}"), subnet_id: format!("b/{label}"), created: false, ..made.clone() }]);
+        let members = f.team_network_members(&nets[0].id).await.unwrap();
+        assert_eq!(members.iter().map(|m| m.machine.as_str()).collect::<Vec<_>>(), ["b/superbot-m1"]);
+        let e = f.join_team_network("main/superbot-m2", &nets[0]).await.unwrap_err();
+        assert!(e.to_string().contains("is on Incus host b, not main"), "{e}");
+        assert!(a.w().networks.values().all(|v| v["type"] != "ovn"), "nothing made on main");
+        f.leave_team_network(&members[0]).await.unwrap();
+        assert!(b.instance("superbot-m1").unwrap().body["devices"].get("eth1").is_none());
+        f.join_team_network("b/superbot-m1", &made).await.unwrap();
+        assert_eq!(b.instance("superbot-m1").unwrap().body["devices"]["eth1"]["network"], label, "a host's own id does too");
     }
 
     #[test]

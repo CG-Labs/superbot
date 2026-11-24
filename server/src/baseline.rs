@@ -50,7 +50,7 @@ pub const SETTINGS: [(&str, &str); 26] = [
     ("MACHINE_TEAMMATE_USERS", "on"),
     ("MACHINE_FIREWALL", "on for Linode machines"),
     ("MACHINE_FIREWALL_EGRESS", "on with the firewall"),
-    ("MACHINE_TEAM_NETWORK", "vpc on Linode when teams need private services of their own"),
+    ("MACHINE_TEAM_NETWORK", "vpc on Linode, ovn on Incus, when teams need private services of their own"),
     ("MACHINE_ON_DISABLE", "suspend"),
     ("SUPERBOT_CHROMIUM_SANDBOX", "unset or on"),
     ("METRICS_LISTEN", "off, loopback, or with METRICS_TOKEN"),
@@ -211,15 +211,18 @@ fn judge(setting: &str, o: &Observed) -> (Status, String, &'static str) {
             Err(_) => invalid(),
         },
         "MACHINE_TEAM_NETWORK" => {
-            let r = match crate::machines::team_network::Settings::from_env(var) {
-                Ok(Some(_)) => (Pass, "vpc".into(), "a team's machines reach its own VPC and no other team's"),
+            use crate::machines::team_network::{Kind, Settings};
+            let incus = match var("MACHINE_PROVIDER").trim().to_ascii_lowercase().as_str() {
+                "" | "linode" => false,
+                "incus" => true,
+                _ => return (NotApplicable, var("MACHINE_TEAM_NETWORK").trim().to_ascii_lowercase(), "team networks are on Linode and Incus machines only"),
+            };
+            machines(match Settings::from_env(var) {
+                Ok(Some(s)) if (s.kind == Kind::Ovn) == incus => (Pass, s.kind.as_str().into(), "a team's machines reach its own network and no other team's"),
+                Ok(Some(s)) => (Fail, s.kind.as_str().into(), "the wrong kind for the provider: vpc on Linode, ovn on Incus"),
                 Ok(None) => (Manual, "off".into(), "needed when teams' machines must reach private services of their own, which botd can't tell"),
                 Err(_) => invalid(),
-            };
-            match var("MACHINE_PROVIDER").trim().to_ascii_lowercase().as_str() {
-                "" | "linode" => machines(r),
-                _ => (NotApplicable, r.1, "team networks are on Linode machines only"),
-            }
+            })
         }
         "MACHINE_ON_DISABLE" => machines(match var("MACHINE_ON_DISABLE").trim().to_ascii_lowercase().as_str() {
             "" | "suspend" => (Pass, "suspend".into(), "a disabled user's machine is powered off"),
@@ -479,7 +482,7 @@ mod tests {
     #[test]
     fn each_rule_reads_the_value_as_botd_does() {
         type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Status, &'a str);
-        let cases: [Case; 20] = [
+        let cases: [Case; 22] = [
             (&[("AUTH_BREAK_GLASS", "off")], "AUTH_BREAK_GLASS", Status::Pass, "0"),
             (&[("SIGNIN_ALERTS", "no")], "SIGNIN_ALERTS", Status::Fail, "off"),
             (&[("TESTING_MODE", "yes")], "TESTING_MODE", Status::Fail, "on"),
@@ -495,7 +498,9 @@ mod tests {
             (&[("MACHINE_FIREWALL", "on"), ("MACHINE_CONTROL_URL", "https://192.0.2.1:8443"), ("MACHINE_FIREWALL_EGRESS", "off")], "MACHINE_FIREWALL_EGRESS", Status::Fail, "off"),
             (&[], "MACHINE_FIREWALL_EGRESS", Status::NotApplicable, "off"),
             (&[("MACHINE_TEAM_NETWORK", "VPC")], "MACHINE_TEAM_NETWORK", Status::Pass, "vpc"),
-            (&[("MACHINE_TEAM_NETWORK", "vpc"), ("MACHINE_PROVIDER", "incus")], "MACHINE_TEAM_NETWORK", Status::NotApplicable, "vpc"),
+            (&[("MACHINE_TEAM_NETWORK", "vpc"), ("MACHINE_PROVIDER", "incus")], "MACHINE_TEAM_NETWORK", Status::Fail, "vpc"),
+            (&[("MACHINE_TEAM_NETWORK", "ovn"), ("MACHINE_PROVIDER", "incus")], "MACHINE_TEAM_NETWORK", Status::Pass, "ovn"),
+            (&[("MACHINE_TEAM_NETWORK", "ovn")], "MACHINE_TEAM_NETWORK", Status::Fail, "ovn"),
             (&[("MACHINE_TEAM_NETWORK", "yes")], "MACHINE_TEAM_NETWORK", Status::Fail, "invalid"),
             (&[("MACHINE_ON_DISABLE", "keep")], "MACHINE_ON_DISABLE", Status::Fail, "keep"),
             (&[("SUPERBOT_CHROMIUM_SANDBOX", "off")], "SUPERBOT_CHROMIUM_SANDBOX", Status::Fail, "off"),

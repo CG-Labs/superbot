@@ -336,6 +336,44 @@ async fn a_refused_rebuild_fails_and_auto_never_wipes_a_machine_that_may_hold_wo
 }
 
 #[tokio::test]
+async fn a_container_made_before_team_networks_is_rebuilt_though_its_agent_upgrades_itself() {
+    use crate::machines::team_network::{DEFAULT_SUBNET, Join, Kind, Settings};
+    let ovn = |cp: &mut crate::machines::ControlPlane| {
+        cp.team_network = Some(Settings { kind: Kind::Ovn, subnet: DEFAULT_SUBNET.into(), join: Join::NextBoot })
+    };
+    let mut env = crate::machines_mtls_tests::serve_with_control(|e| e, ovn, |_| {}).await;
+    let (uid, mid, token) = machine_for(&env, "ed@example.com").await;
+    let listen = env.agent_listener.take().unwrap().local_addr().unwrap();
+    let first = new_agent(&env, listen, &mid, &token).await;
+    assert_eq!(heartbeats(&env.app, &env.cp).await, Some(1));
+    let path = format!("/api/users/{uid}/machine/rebuild?discardWork=true");
+    let (code, v) = json_call(&env, "POST", &path, "").await;
+    assert_eq!(code, 409);
+    assert!(v["error"].as_str().unwrap().contains("botctl machine upgrade"), "{v}");
+
+    // A container that can't bring a team NIC up until rebuilt may be rebuilt.
+    let pid = env.app.db.machine(&mid).unwrap().provider_id.unwrap();
+    env.fake.team_nic_needs_rebuild_for(&pid);
+    env.fake.fail_next("team_nic_needs_rebuild", ProviderError::Transport("timed out".into()));
+    let (code, v) = json_call(&env, "POST", &path, "").await;
+    assert_eq!(code, 502, "no answer is no answer either way: {v}");
+    assert!(rebuild_view(&env, &uid).await["rebuild"].is_null(), "nothing queued");
+    let (code, v) = json_call(&env, "POST", &path, "").await;
+    assert_eq!(code, 202, "{v}");
+    assert_eq!(v["rebuild"]["state"], "rebuilding", "sent at once, not cancelled as not needed: {v}");
+    assert_eq!(env.fake.calls("rebuild"), 1);
+
+    first.abort();
+    let _ = first.await;
+    let fresh = token_in(&env.fake.user_data(&label(&env, &mid)).unwrap());
+    let _new = new_agent(&env, listen, &mid, &fresh).await;
+    assert_eq!(heartbeats(&env.app, &env.cp).await, Some(1));
+    assert_eq!(rebuild_view(&env, &uid).await["rebuild"]["state"], "done");
+    let (code, _) = json_call(&env, "POST", &path, "").await;
+    assert_eq!(code, 409, "rebuilt, it needn't be again");
+}
+
+#[tokio::test]
 async fn rebuilds_can_be_turned_off() {
     let mut env = serve_with(|mut e| {
         e.upkeep.rebuilds = Rebuilds::Off;

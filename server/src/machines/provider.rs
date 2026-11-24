@@ -83,7 +83,7 @@ impl fmt::Debug for CreateSpec {
 }
 
 /// A team's own network at the provider (ADR 0189): a Linode VPC, and the subnet its
-/// machines join.
+/// machines join; or an Incus OVN network, whose id and subnet id are its name (ADR 0212).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeamNetwork {
     pub id: String,
@@ -97,7 +97,7 @@ pub struct TeamNetwork {
 }
 
 /// One interface on a team network: the machine, and the interface's own ids, which
-/// taking it off needs.
+/// taking it off needs (on Incus, no configuration profile and the NIC's device name).
 #[derive(Clone, Debug, PartialEq)]
 pub struct NetworkMember {
     pub machine: String,
@@ -357,6 +357,17 @@ pub trait MachineProvider: Send + Sync {
     /// Succeeds if it is on that subnet already, or will be at its next boot.
     fn join_team_network<'a>(&'a self, _machine: &'a str, _network: &'a TeamNetwork) -> Fut<'a, ()> {
         Box::pin(async { Err(no_networks()) })
+    }
+    /// Whether an interface on a team network goes into and comes out of a running
+    /// machine at once (ADR 0212): joined members are always active, and leaving needs
+    /// no power-off.
+    fn team_network_hotplug(&self) -> bool {
+        false
+    }
+    /// Whether the machine can take a team network's interface only once rebuilt, as a
+    /// container made before ADR 0212 can't bring one up.
+    fn team_nic_needs_rebuild<'a>(&'a self, _id: &'a str) -> Fut<'a, bool> {
+        Box::pin(async { Ok(false) })
     }
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.

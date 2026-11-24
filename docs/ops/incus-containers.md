@@ -212,6 +212,35 @@ Dedicating a host is refused while anyone else's machine is on it, sent there or
 
 A dedicated host costs the same as any other host, and the team fills it alone. Price it per host, not per machine. On Linode, every machine already has its own VM; Linode's dedicated CPU plans are a `MACHINE_TIERS` choice, not this setting.
 
+### A network of its own per team
+
+A team can have a private network for its own services, such as a database, that its members' machines reach and nobody else's do ([ADR 0212](../adr/0212-an-ovn-network-per-team-on-incus.md)). Each team gets an isolated OVN network per region on each host: no uplink, no NAT, and DHCP that hands out no gateway. Its members' containers get a second NIC, `eth1`, on it.
+
+The host needs OVN. Install `ovn-host` and `ovn-central` (or point at an existing OVN), then tell Incus where the northbound database is:
+
+```bash
+incus config set network.ovn.northbound_connection unix:/run/ovn/ovnnb_db.sock
+```
+
+No uplink network is needed. In botd's `.env`:
+
+```bash
+MACHINE_TEAM_NETWORK=ovn
+MACHINE_TEAM_NETWORK_SUBNET=10.248.0.0/22     # any RFC 1918 range, /29 or larger
+MACHINE_TEAM_NETWORK_JOIN=next-boot           # or off: only new and rebuilt machines join
+```
+
+The subnet must stay apart from the bridge (`superbot0`), botd's address, `INCUS_EGRESS_ALLOW` and `INCUS_EGRESS_DENY`. botd refuses to start, or the `team network` check fails, if it isn't. `botctl machine substrate check` also confirms Incus has `network_ovn_isolated` and `backup_override_config` (Incus 6.17 or later), which lets a team machine's backup be restored onto a host without the team's network.
+
+What botd does:
+
+- Makes `<prefix>-team-<digest>-<region>` the first time a team member's machine needs it, and adds its name to the project's `restricted.networks.access`. It never removes names.
+- Puts an ACL of the same name on `eth1`. It lets nothing in and lets out only to the team's subnet, so teammates' machines can't reach each other, as on Linode. `eth1` has MAC and IP filtering.
+- Plugs `eth1` into a running container when its owner joins the team, and unplugs it when they leave, without restarting it.
+- Refuses containers made before this version, which can't bring `eth1` up, until they are rebuilt. `botctl machine rebuild <user>` does it.
+
+To put a team service on the network, attach it to the network yourself, for example `incus config device add acme-db eth0 nic network=<team-network>` in the default project. Find the team's network with `incus network list | grep team-`, or from `machine.team_network_created` in the audit log. With several hosts, each host has its own copy of the network, so a service reaches only the team's machines on its host.
+
 ## Testing against a real host
 
 An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
@@ -236,7 +265,8 @@ It cleans up containers and ACLs left by an earlier run. It needs nftables' brid
 ## Limits to know
 
 - Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel. A server with `MACHINE_OWN_KERNEL_TIERS` set won't start with `MACHINE_PROVIDER=incus`, so unset it here. After moving such users to Linode with it set, their old containers are refused every run until they have new machines. [ADR 0120](../adr/0120-managed-substrate.md) recommends containers only on hosts that serve one organisation until the boundary has been red-teamed; [dedicate hosts to a team](#hosts-dedicated-to-a-team) to hold botd to that per customer.
-- Containers can't reach each other at all, ping included. They can ping the gateway. The host itself reaches only their agent port.
+- Containers can't reach each other at all, ping included, team members' too. They can ping the gateway. The host itself reaches only their agent port.
+- A restore or a move to another host brings a container back without its team NIC. The next reconcile puts it back, unless `MACHINE_TEAM_NETWORK_JOIN=off`.
 - Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host; off-host backups (step 7) do.
 - A backup restores only to the same machine, on its host or another. Exports are full each time, so storage grows with disk size times retention.
 - A container's config holds its live enrollment token from its create (or rebuild) until it enrolls or misses its deadline. Anyone who can read the Incus project can read it during that window. A container that never starts keeps it in its config, but the token expires an hour after it was issued.

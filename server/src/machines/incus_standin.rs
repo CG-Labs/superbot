@@ -61,6 +61,8 @@ pub struct World {
     pub instances: BTreeMap<String, Instance>,
     pub acls: BTreeMap<String, Value>,
     pub projects: BTreeMap<String, Value>,
+    /// Managed networks by name: `incusbr0`, the bridge, and any made (ADR 0212).
+    pub networks: BTreeMap<String, Value>,
     pub calls: Vec<Call>,
     /// Creates stay running until `release`.
     pub hold_creates: bool,
@@ -179,6 +181,7 @@ impl StandIn {
         };
         w.projects.insert("superbot".into(), json!({ "restricted": "true" }));
         w.projects.insert("default".into(), json!({}));
+        w.networks.insert("incusbr0".into(), json!({ "type": "bridge", "managed": true, "config": { "ipv4.address": "10.20.0.1/24" } }));
         let world = Arc::new(Mutex::new(w));
         let provider = pki::provider();
         let config = Arc::new(
@@ -226,6 +229,7 @@ impl StandIn {
             pool: "default".into(),
             image_server: Some(super::incus::DEFAULT_IMAGE_SERVER.into()),
             deny,
+            kept: vec!["127.0.0.1/32".into()],
             control,
             allow: Vec::new(),
         }
@@ -279,7 +283,15 @@ fn reply(status: StatusCode, v: Value, etag: Option<String>) -> Response {
 }
 
 fn extensions(missing: &[String]) -> Vec<&'static str> {
-    ["network_acl", "network_bridge_acl_devices", "instances_rebuild", "instance_create_start", "instance_get_full"]
+    [
+        "network_acl",
+        "network_bridge_acl_devices",
+        "instances_rebuild",
+        "instance_create_start",
+        "instance_get_full",
+        "network_ovn_isolated",
+        "backup_override_config",
+    ]
         .into_iter()
         .filter(|x| !missing.iter().any(|m| m == x))
         .collect()
@@ -453,8 +465,26 @@ impl World {
             if d["type"] == "nic" && d["network"].as_str().is_none_or(|n| n.is_empty()) {
                 return Some("Only managed network devices are allowed".into());
             }
+            // Without networks of its own, the default project's that the access list
+            // names, if it names any.
+            let access = p["restricted.networks.access"].as_str().unwrap_or_default();
+            if let Some(n) = d["network"].as_str().filter(|_| d["type"] == "nic" && !access.is_empty() && p["features.networks"] != "true")
+                && !access.split(',').any(|a| a.trim() == n)
+            {
+                return Some(format!("Network \"{n}\" is not allowed in project"));
+            }
         }
         None
+    }
+
+    fn networks_exist(&self, body: &Value) -> Option<String> {
+        let devices = body["devices"].as_object().cloned().unwrap_or_default();
+        devices
+            .values()
+            .filter(|d| d["type"] == "nic")
+            .filter_map(|d| d["network"].as_str())
+            .find(|n| !self.networks.contains_key(*n))
+            .map(|n| format!("Failed loading network \"{n}\": Network not found"))
     }
 
     fn acls_exist(&self, body: &Value) -> Option<String> {
@@ -538,7 +568,27 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
             if let Some(pool) = header("x-incus-pool") {
                 kept["devices"]["root"]["pool"] = json!(pool);
             }
-            if let Some(why) = w.refused(&project, &kept).or_else(|| w.acls_exist(&kept)) {
+            // As Incus: `device,key=value` entries, space-separated; an empty value unsets.
+            if let Some(over) = header("x-incus-devices") {
+                if w.missing_extensions.iter().any(|m| m == "backup_override_config") {
+                    return err(400, "backup_override_config isn't supported");
+                }
+                for entry in over.split(' ') {
+                    let Some((dev, (k, v))) = entry.split_once(',').and_then(|(d, kv)| Some((d, kv.split_once('=')?))) else {
+                        return err(400, &format!("Failed to parse device, =: {entry:?}"));
+                    };
+                    if !kept["devices"][dev].is_object() {
+                        kept["devices"][dev] = json!({});
+                    }
+                    let d = kept["devices"][dev].as_object_mut().unwrap();
+                    if v.is_empty() {
+                        d.remove(k);
+                    } else {
+                        d.insert(k.into(), json!(v));
+                    }
+                }
+            }
+            if let Some(why) = w.refused(&project, &kept).or_else(|| w.acls_exist(&kept)).or_else(|| w.networks_exist(&kept)) {
                 return err(400, &why);
             }
             let files = saved["files"]
@@ -572,11 +622,62 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
             "environment": { "server_version": w.version.clone().unwrap_or("standin".into()) },
         })),
         ("GET", ["1.0", "projects", p]) => match w.projects.get(*p) {
-            Some(c) => sync(json!({ "name": p, "config": c })),
+            Some(c) => reply(
+                StatusCode::OK,
+                json!({ "type": "sync", "status": "Success", "status_code": 200, "metadata": { "name": p, "config": c, "description": "" } }),
+                Some(etag(c)),
+            ),
             None => err(404, "Project not found"),
         },
-        ("GET", ["1.0", "networks", n]) if *n == "incusbr0" => {
-            sync(json!({ "name": n, "type": "bridge", "managed": true }))
+        ("PUT", ["1.0", "projects", p]) => {
+            let Some(c) = w.projects.get(*p) else { return err(404, "Project not found") };
+            if if_match.as_ref().is_some_and(|e| *e != etag(c)) {
+                return err(412, "ETag doesn't match");
+            }
+            w.projects.insert(p.to_string(), body["config"].clone());
+            sync(json!({}))
+        }
+        ("GET", ["1.0", "networks"]) => {
+            let list: Vec<Value> = w
+                .networks
+                .iter()
+                .map(|(n, v)| {
+                    if recursion.is_empty() {
+                        json!(format!("/1.0/networks/{n}"))
+                    } else {
+                        let mut v = v.clone();
+                        v["name"] = json!(n);
+                        v
+                    }
+                })
+                .collect();
+            sync(json!(list))
+        }
+        ("POST", ["1.0", "networks"]) => {
+            let Some(n) = body["name"].as_str().map(String::from) else {
+                return err(400, "No name provided");
+            };
+            let pc = w.projects.get(&project).cloned().unwrap_or_default();
+            let access = pc["restricted.networks.access"].as_str().unwrap_or_default();
+            if pc["restricted"] == "true" && pc["features.networks"] != "true" && !access.is_empty() && !access.split(',').any(|a| a.trim() == n) {
+                return err(403, "Network not allowed in project");
+            }
+            if w.networks.contains_key(&n) {
+                return err(409, "The network already exists");
+            }
+            if body["type"] != "ovn" {
+                return err(400, "The stand-in makes only OVN networks");
+            }
+            let mut v = body.clone();
+            v.as_object_mut().unwrap().remove("name");
+            v["managed"] = json!(true);
+            w.networks.insert(n, v);
+            sync(json!({}))
+        }
+        ("GET", ["1.0", "networks", n]) if w.networks.contains_key(*n) => {
+            let mut v = w.networks[*n].clone();
+            v["name"] = json!(n);
+            sync(v)
         }
         ("GET", ["1.0", "resources"]) => sync(w.resources.clone()),
         ("GET", ["1.0", "storage-pools", "default", "resources"]) if !w.pool_resources.is_null() => sync(w.pool_resources.clone()),
@@ -609,7 +710,7 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
             if w.instances.contains_key(&n) || w.ops.values().any(|o| o.pending.as_ref().is_some_and(|(p, _)| *p == n)) {
                 return err(500, &format!("Instance {n:?} already exists"));
             }
-            if let Some(why) = w.refused(&project, &body).or_else(|| w.acls_exist(&body)) {
+            if let Some(why) = w.refused(&project, &body).or_else(|| w.acls_exist(&body)).or_else(|| w.networks_exist(&body)) {
                 return err(400, &why);
             }
             w.next_ip += 1;
@@ -661,7 +762,7 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
                     if if_match.as_ref().is_some_and(|e| *e != tag) {
                         return err(412, "ETag doesn't match");
                     }
-                    if let Some(why) = w.refused(&project, &body).or_else(|| w.acls_exist(&body)) {
+                    if let Some(why) = w.refused(&project, &body).or_else(|| w.acls_exist(&body)).or_else(|| w.networks_exist(&body)) {
                         return err(400, &why);
                     }
                     let (r, done) = w.op(vec![instance_url(&n, &project)], None);
@@ -675,7 +776,7 @@ fn respond(world: &Mutex<World>, peer: pki::Peer, method: Method, uri: Uri, head
                         return err(412, "ETag doesn't match");
                     }
                     let next = patched(&i.body, &body);
-                    if let Some(why) = w.refused(&project, &next).or_else(|| w.acls_exist(&next)) {
+                    if let Some(why) = w.refused(&project, &next).or_else(|| w.acls_exist(&next)).or_else(|| w.networks_exist(&next)) {
                         return err(400, &why);
                     }
                     w.instances.get_mut(&n).unwrap().body = next;

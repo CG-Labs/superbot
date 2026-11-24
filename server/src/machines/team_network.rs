@@ -15,6 +15,11 @@
 //! egress rules first, then the machine is given an interface on the subnet, in use
 //! from its next boot. With MACHINE_TEAM_NETWORK_JOIN=when-idle, botd powers it off and
 //! on again once it runs nothing; with `next-boot`, the default, it waits for one.
+//!
+//! On Incus (ADR 0212) a team network is an isolated OVN network per team and region on
+//! each host, which a team member's container joins through a second NIC behind an ACL
+//! of the network's own: inbound dropped, outbound only to the subnet. Incus plugs and
+//! unplugs NICs in running containers, so joining and leaving need no power-off.
 
 use super::enroll::Enrollment;
 use super::provider::{MachineProvider, NetworkMember, ProviderError, TeamNetwork};
@@ -32,11 +37,38 @@ use std::sync::Mutex;
 pub const DEFAULT_SUBNET: &str = "10.248.0.0/22";
 /// Where Linode lets a VPC subnet be: RFC 1918, but for 192.168.128.0/17, which its
 /// private network uses.
-const ALLOWED: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/17"];
-/// Linode's longest subnet prefix.
+const ALLOWED_VPC: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/17"];
+/// Where an OVN network's subnet may be: RFC 1918.
+const ALLOWED_OVN: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+/// The longest subnet prefix: Linode's, and room on OVN for its router and a few machines.
 const LONGEST: u32 = 29;
-/// A VPC label's longest.
+/// A VPC label's longest, and an Incus network's.
 const MAX_LABEL: usize = 64;
+
+/// What a team network is at the provider (MACHINE_TEAM_NETWORK).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A Linode VPC per team and region (ADR 0189).
+    Vpc,
+    /// An isolated OVN network per team and region on each Incus host (ADR 0212).
+    Ovn,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Vpc => "vpc",
+            Kind::Ovn => "ovn",
+        }
+    }
+
+    fn allowed(self) -> (&'static [&'static str], &'static str) {
+        match self {
+            Kind::Vpc => (&ALLOWED_VPC, "where Linode's VPC subnets go"),
+            Kind::Ovn => (&ALLOWED_OVN, "RFC 1918's private ranges"),
+        }
+    }
+}
 
 /// How a machine already made joins its team's network (MACHINE_TEAM_NETWORK_JOIN,
 /// ADR 0202).
@@ -71,58 +103,64 @@ impl Join {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
+    pub kind: Kind,
     /// The range of every team network's subnet, canonical. Every team's is the same:
-    /// VPCs are apart, so the same range on two never meets.
+    /// team networks never route to each other, so the same range on two never meets.
     pub subnet: String,
     pub join: Join,
 }
 
+/// Whether `subnet` meets one of the comma-separated CIDRs in `deny`: the one it meets.
+pub fn meets(subnet: &str, deny: &str) -> Option<String> {
+    let (_, lo, hi) = super::incus::span(subnet)?;
+    deny.split(',').map(str::trim).filter(|s| !s.is_empty()).find_map(|c| {
+        let (v6, a, b) = super::firewall::cidr(c).ok().and_then(|c| super::incus::span(&c))?;
+        (!v6 && a <= hi && lo <= b).then(|| c.to_string())
+    })
+}
+
 impl Settings {
-    /// MACHINE_TEAM_NETWORK (`off`, the default, or `vpc`),
+    /// MACHINE_TEAM_NETWORK (`off`, the default, `vpc` or `ovn`),
     /// MACHINE_TEAM_NETWORK_SUBNET and MACHINE_TEAM_NETWORK_JOIN. Whether the provider
     /// and the firewall allow it is the control plane's to check.
     pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Option<Settings>, String> {
         let raw = var("MACHINE_TEAM_NETWORK_SUBNET");
-        match var("MACHINE_TEAM_NETWORK").trim().to_ascii_lowercase().as_str() {
+        let kind = match var("MACHINE_TEAM_NETWORK").trim().to_ascii_lowercase().as_str() {
             "" | "off" => {
                 if !raw.trim().is_empty() {
-                    return Err("MACHINE_TEAM_NETWORK_SUBNET needs MACHINE_TEAM_NETWORK=vpc".into());
+                    return Err("MACHINE_TEAM_NETWORK_SUBNET needs MACHINE_TEAM_NETWORK=vpc or ovn".into());
                 }
                 if !var("MACHINE_TEAM_NETWORK_JOIN").trim().is_empty() {
-                    return Err("MACHINE_TEAM_NETWORK_JOIN needs MACHINE_TEAM_NETWORK=vpc".into());
+                    return Err("MACHINE_TEAM_NETWORK_JOIN needs MACHINE_TEAM_NETWORK=vpc or ovn".into());
                 }
                 return Ok(None);
             }
-            "vpc" => {}
-            v => return Err(format!("MACHINE_TEAM_NETWORK must be off or vpc, not \"{}\"", crate::audit::clip(v, 20))),
-        }
+            "vpc" => Kind::Vpc,
+            "ovn" => Kind::Ovn,
+            v => return Err(format!("MACHINE_TEAM_NETWORK must be off, vpc or ovn, not \"{}\"", crate::audit::clip(v, 20))),
+        };
         let subnet = match raw.trim() {
             "" => DEFAULT_SUBNET.to_string(),
             r => super::firewall::cidr(r).map_err(|e| format!("MACHINE_TEAM_NETWORK_SUBNET: {e}"))?,
         };
         let span = super::incus::span(&subnet).filter(|(v6, _, _)| !v6).ok_or("MACHINE_TEAM_NETWORK_SUBNET must be an IPv4 range")?;
-        if !ALLOWED.iter().filter_map(|a| super::incus::span(a)).any(|(_, lo, hi)| lo <= span.1 && span.2 <= hi) {
-            return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} isn't inside {}, where Linode's VPC subnets go", ALLOWED.join(", ")));
+        let (allowed, where_) = kind.allowed();
+        if !allowed.iter().filter_map(|a| super::incus::span(a)).any(|(_, lo, hi)| lo <= span.1 && span.2 <= hi) {
+            return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} isn't inside {}, {where_}", allowed.join(", ")));
         }
         if subnet.rsplit('/').next().and_then(|l| l.parse::<u32>().ok()).is_none_or(|l| l > LONGEST) {
-            return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} is smaller than Linode's smallest subnet, a /{LONGEST}"));
+            return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} is smaller than the smallest team subnet, a /{LONGEST}"));
         }
         // An operator's own deny list wins: the team network would let it through.
-        for c in var("MACHINE_EGRESS_DENY").split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            if let Some((v6, lo, hi)) = super::firewall::cidr(c).ok().and_then(|c| super::incus::span(&c))
-                && !v6
-                && lo <= span.2
-                && span.1 <= hi
-            {
-                return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} meets MACHINE_EGRESS_DENY's {c}; pick a range the deny list doesn't name"));
-            }
+        if let Some(c) = meets(&subnet, &var("MACHINE_EGRESS_DENY")) {
+            return Err(format!("MACHINE_TEAM_NETWORK_SUBNET: {subnet} meets MACHINE_EGRESS_DENY's {c}; pick a range the deny list doesn't name"));
         }
         let join = Join::parse(&var("MACHINE_TEAM_NETWORK_JOIN"))?;
-        Ok(Some(Settings { subnet, join }))
+        Ok(Some(Settings { kind, subnet, join }))
     }
 
     pub fn view(&self) -> Value {
-        json!({ "kind": "vpc", "subnet": self.subnet, "join": self.join.as_str() })
+        json!({ "kind": self.kind.as_str(), "subnet": self.subnet, "join": self.join.as_str() })
     }
 }
 
@@ -330,7 +368,8 @@ pub fn rules_waiting(m: &Machine, subnet: &str) -> Option<&'static str> {
     }
 }
 
-/// Puts `m` on its owner's team's network from its next boot, if it should be on one.
+/// Puts `m` on its owner's team's network from its next boot, if it should be on one;
+/// at once where the provider plugs interfaces into running machines (Incus).
 async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Settings, m: &Machine) -> Joined {
     let active = |x: &Machine| matches!(x.state, State::Running | State::Suspended);
     let Some(team) = app.db.team_id_of(&m.user_id) else { return Joined::Nothing };
@@ -347,7 +386,9 @@ async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Se
         return Joined::Nothing;
     };
     let pid = m.provider_id.clone().unwrap_or_default();
-    let tried = match ensure(app, cp, p, &m, &by).await {
+    // Where hosts have networks of their own (Incus), the machine's host's.
+    let on = p.hosts().and_then(|h| h.on(&h.host_of(&pid))).unwrap_or(p);
+    let tried = match ensure(app, cp, on, &m, &by).await {
         Ok(Some(n)) => p.join_team_network(&pid, &n).await.map(|()| n),
         Ok(None) => return Joined::Nothing,
         Err(e) => Err(e),
@@ -358,7 +399,7 @@ async fn join(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, s: &Se
             joining_set(cp).insert(m.id.clone());
             let d = json!({
                 "team": team, "networkId": n.id, "label": n.label, "subnet": n.subnet, "join": s.join.as_str(),
-                "poweredOff": m.state == State::Suspended,
+                "poweredOff": m.state == State::Suspended, "atOnce": p.team_network_hotplug(),
             });
             app.db.record(&event(&by, "machine.team_network_joining", &m, d));
             Joined::Joining
@@ -499,7 +540,8 @@ pub(crate) enum Leave {
 
 /// Takes `m` off `n`. An interface in use can only go while the machine is off, so a
 /// running machine is suspended first, and the next pass, once it is off, removes it.
-/// One added since it booted (ADR 0202) goes at once.
+/// One added since it booted (ADR 0202) goes at once, and so does any where the
+/// provider unplugs interfaces from running machines (Incus, ADR 0212).
 pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, n: &TeamNetwork, team: Option<&str>, m: &Machine, mem: &NetworkMember) -> Leave {
     let by = system(m);
     let details = || json!({ "team": team, "networkId": n.id, "label": n.label, "ownersTeam": app.db.team_id_of(&m.user_id) });
@@ -507,7 +549,7 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
     // since the sweep looked keeps their network.
     let due = || team.is_none() || app.db.team_id_of(&m.user_id).as_deref() != team;
     match m.state {
-        State::Running if !mem.active => {
+        State::Running if !mem.active || p.team_network_hotplug() => {
             let _g = cp.lock_ops().await;
             if !app.db.machine(&m.id).is_some_and(|x| x.state == State::Running) || !due() {
                 return Leave::Waiting;
@@ -520,7 +562,7 @@ pub(crate) async fn leave(app: &AppState, cp: &ControlPlane, p: &dyn MachineProv
             }
             joining_set(cp).remove(&m.id);
             d["resuming"] = json!(false);
-            d["inUse"] = json!(false);
+            d["inUse"] = json!(mem.active);
             app.db.record(&event(&by, "machine.team_network_left", m, d));
             Leave::Left
         }
@@ -614,9 +656,9 @@ mod tests {
         assert_eq!(Settings::from_env(&vars(&[])).unwrap(), None);
         assert_eq!(Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "off")])).unwrap(), None);
         let e = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK_SUBNET", "10.9.0.0/24")])).unwrap_err();
-        assert!(e.contains("needs MACHINE_TEAM_NETWORK=vpc"), "{e}");
-        let e = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "ovn")])).unwrap_err();
-        assert!(e.contains("off or vpc"), "{e}");
+        assert!(e.contains("needs MACHINE_TEAM_NETWORK=vpc or ovn"), "{e}");
+        let e = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "mesh")])).unwrap_err();
+        assert!(e.contains("off, vpc or ovn"), "{e}");
         let on = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "VPC")])).unwrap().unwrap();
         assert_eq!(on.subnet, DEFAULT_SUBNET);
         assert_eq!(on.view(), json!({ "kind": "vpc", "subnet": DEFAULT_SUBNET, "join": "next-boot" }));
@@ -629,11 +671,24 @@ mod tests {
             ("fd00::/64", "IPv4"),
             ("203.0.113.0/24", "isn't inside"),
             ("192.168.200.0/24", "isn't inside"),
-            ("10.248.0.8/30", "smallest subnet"),
-            ("10.248.0.4/32", "smallest subnet"),
+            ("10.248.0.8/30", "smallest team subnet"),
+            ("10.248.0.4/32", "smallest team subnet"),
         ] {
             let e = with(bad).unwrap_err();
             assert!(e.starts_with("MACHINE_TEAM_NETWORK_SUBNET") && e.contains(why), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn ovn_takes_any_private_range() {
+        let with = |s: &str| Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "ovn"), ("MACHINE_TEAM_NETWORK_SUBNET", s)]));
+        let on = Settings::from_env(&vars(&[("MACHINE_TEAM_NETWORK", "OVN")])).unwrap().unwrap();
+        assert_eq!(on.view(), json!({ "kind": "ovn", "subnet": DEFAULT_SUBNET, "join": "next-boot" }));
+        assert_eq!(with("192.168.200.0/24").unwrap().unwrap().subnet, "192.168.200.0/24", "outside Linode's VPC ranges, but private");
+        assert_eq!(with("10.0.0.0/8").unwrap().unwrap().subnet, "10.0.0.0/8");
+        for (bad, why) in [("203.0.113.0/24", "isn't inside"), ("100.64.0.0/24", "isn't inside"), ("10.1.0.8/30", "smallest")] {
+            let e = with(bad).unwrap_err();
+            assert!(e.contains(why) && (why != "isn't inside" || e.contains("RFC 1918")), "{bad}: {e}");
         }
     }
 
