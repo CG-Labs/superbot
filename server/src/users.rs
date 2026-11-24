@@ -521,8 +521,9 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
 
 /// Ends the current session. Always clears the cookie.
 /// Ends the caller's session. One a native SAML IdP vouched for, in the browser, also gets
-/// `logoutUrl`: the signed LogoutRequest that ends the IdP's session (ADR 0137). Without a
-/// browser, botd sends it to the IdP over SOAP itself, when the IdP takes that (ADR 0208).
+/// `logoutUrl`: the signed LogoutRequest that ends the IdP's session (ADR 0137), or botd's page
+/// that posts it, for an IdP that takes only HTTP-POST (ADR 0248). Without a browser, botd
+/// sends it to the IdP over SOAP itself, when the IdP takes that (ADR 0208).
 pub async fn logout(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Response {
     let mut logout_url = None;
     if let Some(s) = &c.session
@@ -535,10 +536,7 @@ pub async fn logout(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             e = e.details(d);
         }
         app.db.record(&e);
-        logout_url = slo.and_then(|l| match l {
-            crate::sso::IdpLogout::Redirect { url, .. } => Some(url),
-            crate::sso::IdpLogout::BackChannel { .. } => None,
-        });
+        logout_url = slo.and_then(crate::sso::IdpLogout::url);
     }
     let mut body = json!({ "ok": true });
     if let Some(u) = logout_url {

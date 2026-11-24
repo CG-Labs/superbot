@@ -152,6 +152,15 @@ struct PendingLogout {
     expires: i64,
 }
 
+/// Our signed LogoutRequest for an IdP that takes logout over HTTP-POST (ADR 0248), until the
+/// browser that signed out opens the page that posts it, once.
+struct LogoutPage {
+    provider: String,
+    url: String,
+    xml: String,
+    expires: i64,
+}
+
 pub struct Sso {
     pub providers: Vec<Arc<Provider>>,
     /// SSO_PUBLIC_URL: where the IdP sends people back to.
@@ -166,6 +175,8 @@ pub struct Sso {
     seen: Mutex<HashMap<String, i64>>,
     /// Native SAML: our LogoutRequests not answered yet, by ID.
     logouts: Mutex<HashMap<String, PendingLogout>>,
+    /// Native SAML: logout pages not opened yet, by their one-time handle (ADR 0248).
+    logout_pages: Mutex<HashMap<String, LogoutPage>>,
     http: OnceLock<reqwest::Client>,
     /// Least time between JWKS fetches for a key id we don't know.
     pub refresh_gap: Duration,
@@ -185,6 +196,7 @@ impl Default for Sso {
             handoffs: Mutex::default(),
             seen: Mutex::default(),
             logouts: Mutex::default(),
+            logout_pages: Mutex::default(),
             http: OnceLock::new(),
             refresh_gap: Duration::from_secs(60),
             role_writes: tokio::sync::Mutex::new(()),
@@ -361,6 +373,12 @@ impl Sso {
     /// Native SAML: where the IdP sends logout messages over SOAP, server to server (ADR 0208).
     pub fn slo_soap_url(&self, id: &str) -> String {
         format!("{}/api/auth/sso/{id}/slo/soap", self.public_url)
+    }
+
+    /// Native SAML: the page that posts our LogoutRequest to an IdP that takes logout only over
+    /// HTTP-POST, once (ADR 0248). The client opens it as it would the IdP's redirect URL.
+    fn logout_page_url(&self, id: &str, handle: &str) -> String {
+        format!("{}/api/auth/sso/{id}/logout?h={handle}", self.public_url)
     }
 
     /// Loads IdP metadata imported with botctl, at startup.
@@ -1050,9 +1068,7 @@ fn send_authn_request(a: &Auth, p: &Provider, request_id: &str, state: &str, ret
                     return no_store(ret.fail("sso_failed"));
                 }
             };
-            let page = saml_sp::post_form(endpoint, "SAMLRequest", &request, Some(state));
-            let csp = HeaderValue::from_str(&saml_sp::post_csp(endpoint)).expect("ASCII");
-            ([(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")), (header::CONTENT_SECURITY_POLICY, csp)], page).into_response()
+            post_page(endpoint, "SAMLRequest", &request, Some(state), saml_sp::TO_SIGN_IN)
         }
     };
     if let Some(b) = binder {
@@ -1544,6 +1560,9 @@ fn decrypt_keys(app: &AppState, p: &Provider) -> Result<(Vec<(Option<saml_keys::
 pub enum IdpLogout {
     /// The browser follows `url`, a signed LogoutRequest over HTTP-Redirect (ADR 0137).
     Redirect { url: String, id: String },
+    /// The browser follows `url`, botd's one-time page that posts the signed LogoutRequest to
+    /// the IdP over HTTP-POST (ADR 0248).
+    Post { url: String, id: String },
     /// botd sent the LogoutRequest itself, over SOAP (ADR 0208); the answer is audited when it comes.
     BackChannel { id: String },
 }
@@ -1551,21 +1570,31 @@ pub enum IdpLogout {
 impl IdpLogout {
     pub fn id(&self) -> &str {
         match self {
-            IdpLogout::Redirect { id, .. } | IdpLogout::BackChannel { id } => id,
+            IdpLogout::Redirect { id, .. } | IdpLogout::Post { id, .. } | IdpLogout::BackChannel { id } => id,
         }
     }
 
     pub fn binding(&self) -> &'static str {
         match self {
             IdpLogout::Redirect { .. } => "redirect",
+            IdpLogout::Post { .. } => "post",
             IdpLogout::BackChannel { .. } => "soap",
+        }
+    }
+
+    /// Where the browser goes next, if anywhere.
+    pub fn url(self) -> Option<String> {
+        match self {
+            IdpLogout::Redirect { url, .. } | IdpLogout::Post { url, .. } => Some(url),
+            IdpLogout::BackChannel { .. } => None,
         }
     }
 }
 
 /// Signing out of a session a native SAML IdP vouched for. The session is revoked already;
 /// this ends the person's IdP session too. A browser session goes to the IdP's SLO URL with a
-/// signed LogoutRequest. Without a browser to send (the phone app, `botctl`), or an IdP with
+/// signed LogoutRequest, in the query, or posted by a page of botd's when the IdP takes only
+/// HTTP-POST (ADR 0248). Without a browser to send (the phone app, `botctl`), or an IdP with
 /// only a SOAP SLO URL, botd sends it over SOAP itself, in the background (ADR 0208). None when
 /// the IdP has neither, or we can't sign.
 pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> Option<IdpLogout> {
@@ -1593,6 +1622,11 @@ pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> O
     };
     let key = sp_key(app, p).map_err(|e| crate::obs::log::log_warn!("SSO {}: no single logout: {e}", p.id)).ok()?;
     let (id, at) = (saml_sp::request_id(), db::now());
+    let xml = saml_slo::logout_request(sp_entity_id, &id, &slo.location, &login, at);
+    let signed = match slo.binding {
+        Binding::Redirect => None,
+        Binding::Post => Some(key.sign_enveloped(&xml, &id).map_err(|e| crate::obs::log::log_warn!("SSO {}: no single logout: {e}", p.id)).ok()?),
+    };
     {
         let mut m = a.sso.logouts.lock().unwrap_or_else(|e| e.into_inner());
         m.retain(|_, l| l.expires > at);
@@ -1601,9 +1635,40 @@ pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> O
         }
         m.insert(id.clone(), PendingLogout { provider: p.id.clone(), session: s.id.clone(), expires: at + PENDING_TTL_MS });
     }
-    let xml = saml_slo::logout_request(sp_entity_id, &id, &slo.location, &login, at);
-    let url = saml_sp::with_redirect_query(&slo.location, &saml_sp::redirect_query("SAMLRequest", &xml, None, Some(&key)));
-    Some(IdpLogout::Redirect { url, id })
+    let Some(signed) = signed else {
+        let url = saml_sp::with_redirect_query(&slo.location, &saml_sp::redirect_query("SAMLRequest", &xml, None, Some(&key)));
+        return Some(IdpLogout::Redirect { url, id });
+    };
+    // The page lives as long as the request inside it (its NotOnOrAfter).
+    let handle = crate::random_hex(16);
+    {
+        let mut m = a.sso.logout_pages.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, l| l.expires > at);
+        if m.len() >= MAX_PENDING {
+            return None;
+        }
+        m.insert(handle.clone(), LogoutPage { provider: p.id.clone(), url: slo.location.clone(), xml: signed, expires: at + saml_slo::MAX_AGE_MS });
+    }
+    Some(IdpLogout::Post { url: a.sso.logout_page_url(&p.id, &handle), id })
+}
+
+/// `GET /api/auth/sso/{id}/logout?h=`: the page that posts our signed LogoutRequest to an IdP
+/// that takes logout only over HTTP-POST (ADR 0248), as the AuthnRequest page does (ADR 0235).
+/// Each handle opens it once, within the request's lifetime; otherwise, or for another
+/// provider, the browser just goes to the sign-in page: the SuperBot session is gone already.
+pub async fn logout_page(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let at = db::now();
+    let page = q.get("h").and_then(|h| a.sso.logout_pages.lock().unwrap_or_else(|e| e.into_inner()).remove(h));
+    let Some(page) = page.filter(|l| l.expires > at && l.provider == id) else { return no_store(see("/login")) };
+    no_store(post_page(&page.url, "SAMLRequest", &page.xml, None, saml_sp::TO_SIGN_OUT))
+}
+
+/// An HTTP-POST binding page to the IdP's `url`, with its own Content-Security-Policy. The
+/// caller adds `no_store`.
+fn post_page(url: &str, param: &str, xml: &str, relay: Option<&str>, to: &str) -> Response {
+    let page = saml_sp::post_form(url, param, xml, relay, to);
+    let csp = HeaderValue::from_str(&saml_sp::post_csp(url)).expect("ASCII");
+    ([(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")), (header::CONTENT_SECURITY_POLICY, csp)], page).into_response()
 }
 
 /// Posts our signed LogoutRequest `signed` (ID `request`) to the IdP's SOAP SLO URL and audits
@@ -1719,17 +1784,28 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
         Ok(r) => r,
         Err(Refused(reason, detail)) => return slo_failed(a, source, id, reason, json!({ "detail": detail })),
     };
+    let binding = if matches!(incoming, saml_slo::Incoming::Redirect(_)) { "redirect" } else { "post" };
     match received {
         saml_slo::Received::Request { id: request_id, name_id, session_indexes, relay, issued_ms, until_ms } => {
             if let Err(reason) = a.sso.first_use(&format!("slo|{}|{request_id}", idp.entity_id), until_ms, at) {
                 return slo_failed(a, source, id, reason, json!({ "requestId": request_id }));
             }
-            let binding = if matches!(incoming, saml_slo::Incoming::Redirect(_)) { "redirect" } else { "post" };
             idp_signed_out(a, app, source, id, &idp, &request_id, &name_id, &session_indexes, issued_ms, binding);
-            let answer = saml_slo::logout_response(sp_entity_id, &saml_sp::request_id(), Some(&idp_slo.response), &request_id, at);
-            let query = saml_sp::redirect_query("SAMLResponse", &answer, relay.as_deref(), Some(&key));
-            // The browser's own cookie is left alone: its session may not be one the IdP named.
-            no_store(see(&saml_sp::with_redirect_query(&idp_slo.response, &query)))
+            let answer_id = saml_sp::request_id();
+            let answer = saml_slo::logout_response(sp_entity_id, &answer_id, Some(&idp_slo.response), &request_id, at);
+            // Over the IdP's own binding, whichever this request came by. The browser's own
+            // cookie is left alone: its session may not be one the IdP named.
+            match idp_slo.binding {
+                Binding::Redirect => no_store(see(&saml_sp::with_redirect_query(&idp_slo.response, &saml_sp::redirect_query("SAMLResponse", &answer, relay.as_deref(), Some(&key))))),
+                Binding::Post => match key.sign_enveloped(&answer, &answer_id) {
+                    Ok(signed) => no_store(post_page(&idp_slo.response, "SAMLResponse", &signed, relay.as_deref(), saml_sp::TO_SIGN_OUT)),
+                    Err(e) => {
+                        // The sessions are revoked: only the answer is missing.
+                        crate::obs::log::log_warn!("SSO {id}: can't answer a logout: {e}");
+                        no_store(see("/login"))
+                    }
+                },
+            }
         }
         saml_slo::Received::Response { id: response_id, in_response_to, status, until_ms } => {
             if let Err(reason) = a.sso.first_use(&format!("slo|{}|{response_id}", idp.entity_id), until_ms, at) {
@@ -1740,7 +1816,7 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
                 return slo_failed(a, source, id, "unknown_request", json!({ "inResponseTo": in_response_to }));
             };
             let outcome = if status.is_none() { Outcome::Success } else { Outcome::Failure };
-            let details = json!({ "provider": id, "idp": "saml", "requestId": in_response_to, "status": status.as_deref().unwrap_or("Success"), "binding": "redirect" });
+            let details = json!({ "provider": id, "idp": "saml", "requestId": in_response_to, "status": status.as_deref().unwrap_or("Success"), "binding": binding });
             a.record(Who { actor: slo_actor(id, None), source: source.clone() }.event("auth.slo_response").target("session", &pending.session).outcome(outcome).details(details));
             no_store(see("/login"))
         }
@@ -1875,7 +1951,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     };
     let idp = p.idp_loaded().map(|m| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
-        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloSoapUrl": m.slo_soap, "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
+        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
     });
     let key = a.app.as_ref().map(|app| sp_key(app, p));
     // botd's own keys show their rollover too (ADR 0181).
@@ -1973,7 +2049,7 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
         }
     };
     let certs: Vec<&str> = m.certs.iter().map(|c| c.sha256.as_str()).collect();
-    let details = json!({ "provider": p.id, "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "certificates": certs });
+    let details = json!({ "provider": p.id, "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "certificates": certs });
     app.db.set_setting(&format!("{SAML_METADATA_SETTING}{id}"), xml);
     p.set_idp(m);
     app.db.record(&by.event("sso.saml_metadata_imported").target("sso_provider", &p.id).details(details));
