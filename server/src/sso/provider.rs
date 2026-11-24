@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::saml_sp::{self, AesCbc, Attributes, AuthnContext, Encryption, Freshness, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, SpKey};
+use super::saml_sp::{self, AesCbc, Attributes, AuthnContext, Encryption, Freshness, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, RequestBinding, SpKey};
 use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -42,7 +42,8 @@ pub enum Kind {
     Saml { issuer: String, entity_id: String, alias: String, map: ClaimMap, allowed_domains: Vec<String> },
     /// A SAML 2.0 IdP botd is the service provider for itself (ADR 0127), see `saml_sp`.
     /// Identities are stored like the bridge's: under `entity_id`, the NameID lowercased.
-    /// `sign_requests` signs AuthnRequests with the SP key (ADR 0137), which is
+    /// AuthnRequests go over the binding `request_binding` picks from the IdP's metadata (ADR
+    /// 0235). `sign_requests` signs them with the SP key (ADR 0137), which is
     /// `SSO_<ID>_PRIVATE_KEY` with `sp_cert` (base64 DER) when that is set, else generated.
     /// `encryption` takes encrypted assertions (ADR 0150) with a key of their own, likewise
     /// `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` with `enc_cert`, else generated, and AES-CBC ones only
@@ -62,6 +63,7 @@ pub enum Kind {
         required_groups: Vec<String>,
         allowed_domains: Vec<String>,
         sign_requests: bool,
+        request_binding: RequestBinding,
         sp_cert: Option<String>,
         encryption: Encryption,
         aes_cbc: AesCbc,
@@ -577,7 +579,7 @@ impl Provider {
     /// Native SAML: the IdP metadata. From a URL it's fetched again after a day, and after a
     /// failure at most once per `gap`, keeping what we had meanwhile, as for OIDC discovery.
     pub async fn idp_metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<IdpMetadata>, Invalid> {
-        let Kind::SamlSp { source, entity_id, sign_requests, metadata_trust, .. } = &self.kind else {
+        let Kind::SamlSp { source, entity_id, sign_requests, request_binding, metadata_trust, .. } = &self.kind else {
             return Err(Invalid("not_configured"));
         };
         let (stale, fresh) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -603,7 +605,7 @@ impl Provider {
             return stale.ok_or(e);
         }
         let got = get_text(http, url).await.and_then(|xml| {
-            saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, metadata_trust.as_ref(), crate::db::now()).map_err(|e| {
+            saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, metadata_trust.as_ref(), crate::db::now()).map_err(|e| {
                 crate::obs::log::log_warn!("SSO {}: IdP metadata from {url}: {e}", self.id);
                 if e.untrusted() {
                     *self.metadata_refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
