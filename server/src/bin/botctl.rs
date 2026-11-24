@@ -1297,9 +1297,17 @@ fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>
     })
 }
 
-/// `--scopes users:read,users:write`: the list botd checks, or null for its default.
-fn scope_list(rest: &[&str]) -> Option<Vec<String>> {
-    flag(rest, "--scopes").map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+/// `--scopes users:read,users:write`: the list botd checks, or null for its default. A
+/// `--scopes` with nothing after it is an error, not the default: that would be every scope.
+fn scope_list(rest: &[&str]) -> Result<Option<Vec<String>>, String> {
+    if !rest.contains(&"--scopes") {
+        return Ok(None);
+    }
+    let list: Vec<String> = flag(rest, "--scopes").filter(|s| !s.starts_with("--")).unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    if list.is_empty() {
+        return Err("--scopes takes a comma-separated list, e.g. --scopes users:write,groups:read".into());
+    }
+    Ok(Some(list))
 }
 
 /// `botctl scim ...`: SCIM provisioning tokens (ADR 0023, scoped ADR 0224), links from
@@ -1337,11 +1345,11 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         ["role-group", "set-role", id, role] => ("PATCH", format!("/api/scim/role-groups/{}", encode(id)), Some(json!({ "role": role }).to_string())),
         ["role-group", "remove", id] => ("DELETE", format!("/api/scim/role-groups/{}", encode(id)), None),
         ["token", "create", tenant, rest @ ..] if !tenant.starts_with("--") => {
-            let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label"), "expiresInDays": number(rest, "--days")?, "scopes": scope_list(rest) });
+            let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label"), "expiresInDays": number(rest, "--days")?, "scopes": scope_list(rest)? });
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "rotate", id, rest @ ..] if !id.starts_with("--") && rest.chunks(2).all(|p| matches!(p, ["--days" | "--keep-old-hours" | "--scopes", _])) => {
-            let body = json!({ "expiresInDays": number(rest, "--days")?, "keepOldHours": number(rest, "--keep-old-hours")?, "scopes": scope_list(rest) });
+            let body = json!({ "expiresInDays": number(rest, "--days")?, "keepOldHours": number(rest, "--keep-old-hours")?, "scopes": scope_list(rest)? });
             ("POST", format!("/api/scim/tokens/{}/rotate", encode(id)), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
@@ -4047,6 +4055,10 @@ mod tests {
             Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "okta", "sso": null, "label": null, "expiresInDays": null, "scopes": ["users:write", "groups:read"] }))))
         );
         assert!(req(&["token", "create", "okta", "--days", "soon"]).is_err());
+        assert!(req(&["token", "create", "okta", "--scopes"]).is_err());
+        assert!(req(&["token", "create", "okta", "--scopes", " , "]).is_err());
+        assert!(req(&["token", "create", "okta", "--scopes", "--days", "30"]).is_err());
+        assert!(req(&["token", "rotate", "st1", "--scopes", ","]).is_err());
         assert_eq!(
             req(&["token", "rotate", "st1"]),
             Ok(("POST", "/api/scim/tokens/st1/rotate".into(), Some(json!({ "expiresInDays": null, "keepOldHours": null, "scopes": null }))))
