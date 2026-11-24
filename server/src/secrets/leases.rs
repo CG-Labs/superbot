@@ -2113,21 +2113,21 @@ pub(crate) mod tests {
             assert!(e.contains(err), "{raw}: {e}");
         }
 
-        let secret = "secret-in-a-bad-apps-file-3c2d";
+        let marker = "marker-in-a-bad-apps-file-3c2d";
         for (text, err) in [
-            (format!("{{\"uaz1\": \"{secret}"), "isn't JSON"),
+            (format!("{{\"uaz1\": \"{marker}"), "isn't JSON"),
             (json!([ENTRA_APP]).to_string(), "must be a JSON object of user ids"),
             (json!({ "Uaz1": ENTRA_APP }).to_string(), "has a key that isn't a user id"),
-            (json!({ "uaz1": secret }).to_string(), "uaz1's app must be an Entra app's client id"),
+            (json!({ "uaz1": marker }).to_string(), "uaz1's app must be an Entra app's client id"),
             (json!({ "uaz1": 7 }).to_string(), "uaz1 must have an app's client id"),
-            (json!({ "uaz1": { "app": ENTRA_APP, "role": secret } }).to_string(), "uaz1 must have an app's client id, or {\"app\": ..., \"tenant\": ...} and nothing else"),
+            (json!({ "uaz1": { "app": ENTRA_APP, "role": marker } }).to_string(), "uaz1 must have an app's client id, or {\"app\": ..., \"tenant\": ...} and nothing else"),
             (json!({ "uaz1": { "tenant": "fabrikam.onmicrosoft.com" } }).to_string(), "uaz1's app must be"),
             (json!({ "uaz1": { "app": ENTRA_APP, "tenant": "common" } }).to_string(), "uaz1's tenant must be a tenant id"),
         ] {
             let file = policy_file("azure-apps-bad", &text);
             let e = parse_as(&AZURE, &format!("{{owner}} apps={file}")).unwrap_err();
-            assert!(e.starts_with(&format!("AZURE_RUN_CREDENTIALS: {{owner}}: apps={file}: ")) && e.contains(err), "{text}: {e}");
-            assert!(!e.contains(secret), "an apps file is never quoted: {e}");
+            assert!(e.starts_with(&format!("AZURE_RUN_CREDENTIALS: {{owner}}: apps={file}: ")) && e.contains(err), "expected {err:?}: {e}");
+            assert!(!e.contains(marker), "an apps file is never quoted: {e}");
         }
         let e = parse_as(&AZURE, "{owner} apps=/nonexistent/superbot/apps.json").unwrap_err();
         assert!(e.contains("apps=/nonexistent/superbot/apps.json: can't be read"), "{e}");
