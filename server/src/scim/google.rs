@@ -375,10 +375,20 @@ struct OrgUnit {
 
 impl OrgUnit {
     /// The team's name: its path without the leading `/`, unique in the customer, or
-    /// the unit's own name for the top level.
+    /// the unit's own name for the top level. A path too long for a group's name is cut
+    /// and ends with the unit's id, so two long paths never share one.
     fn team_name(&self) -> String {
+        const MAX: usize = 256;
         let p = self.path.trim_start_matches('/');
-        if p.is_empty() { self.name.clone().unwrap_or_else(|| "Everyone".into()) } else { p.chars().take(256).collect() }
+        if p.is_empty() {
+            return self.name.clone().unwrap_or_else(|| "Everyone".into());
+        }
+        if p.chars().count() <= MAX {
+            return p.to_string();
+        }
+        let suffix = format!(" ({})", self.id);
+        let kept: String = p.chars().take(MAX - suffix.chars().count()).collect();
+        format!("{kept}{suffix}")
     }
 }
 
@@ -1083,18 +1093,19 @@ async fn apply(a: &Arc<Auth>, app: &AppState, d: &Directory, c: &Caller, snap: S
 /// Each unit named, with its path now (it may have been renamed or moved since it was
 /// named by id) and how many people in scope it holds.
 fn unit_summary(s: &Settings, snap: &Snapshot, people: &[&Person]) -> Vec<Value> {
+    let team_ids: HashSet<&str> = s.team_org_units.iter().filter_map(|k| snap.org_units.get(k)).map(|u| u.id.as_str()).collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for key in s.org_units.iter().chain(&s.team_org_units) {
         if !seen.insert(key.to_lowercase()) {
             continue;
         }
-        let (path, lower) = match snap.org_units.get(key) {
-            Some(u) => (u.path.as_str(), u.lower.as_str()),
-            None => (ROOT, ROOT),
-        };
+        let unit = snap.org_units.get(key);
+        let (path, lower) = unit.map_or((ROOT, ROOT), |u| (u.path.as_str(), u.lower.as_str()));
         let n = people.iter().filter(|p| p.org_unit.as_deref().is_some_and(|o| holds(lower, o))).count();
-        out.push(json!({ "orgUnit": key, "path": path, "people": n, "team": s.team_org_units.contains(key) }));
+        // By id, so a unit named one way for accounts and another for teams shows as a team.
+        let team = unit.is_some_and(|u| team_ids.contains(u.id.as_str()));
+        out.push(json!({ "orgUnit": key, "path": path, "people": n, "team": team }));
     }
     out
 }
@@ -1455,6 +1466,13 @@ mod tests {
         assert_eq!(org_unit(&json!({ "orgUnitId": "id:03ab", "orgUnitPath": "/Eng", "name": "Eng" })).map(|u| u.team_name()), Some("Eng".into()));
         assert_eq!(org_unit(&json!({ "orgUnitId": "id:03ab", "orgUnitPath": "/", "name": "Example Ltd" })).map(|u| u.team_name()), Some("Example Ltd".into()));
         assert!(org_unit(&json!({ "orgUnitId": "03ab", "orgUnitPath": "/Eng" })).is_none());
+
+        let long = format!("/{}", "x".repeat(256));
+        let (parent, child) = (org_unit(&json!({ "orgUnitId": "id:03p", "orgUnitPath": long })).unwrap(), org_unit(&json!({ "orgUnitId": "id:03c", "orgUnitPath": format!("{long}/y") })).unwrap());
+        assert_eq!(parent.team_name(), "x".repeat(256), "a path that fits is kept whole");
+        let (a, b) = (org_unit(&json!({ "orgUnitId": "id:03a", "orgUnitPath": format!("{long}/a") })).unwrap().team_name(), child.team_name());
+        assert!(a != b && a.ends_with(" (id:03a)") && b.ends_with(" (id:03c)"), "{a} / {b}");
+        assert_eq!((a.chars().count(), b.chars().count()), (256, 256));
     }
 
     #[test]
@@ -1470,6 +1488,16 @@ mod tests {
         let teams = org_unit_teams(&s, &snap, &[&ada, &bob, &cy, &dee]);
         let got: Vec<(&str, &str, Vec<&str>)> = teams.iter().map(|g| (g.id.as_str(), g.name.as_str(), g.users.iter().map(String::as_str).collect())).collect();
         assert_eq!(got, vec![("id:e", "Eng", vec!["2", "4"]), ("id:p", "Eng/Platform", vec!["1"])], "a path and an id of one unit are one team");
+
+        // Named for accounts one way and for teams another, a unit shows once, as a team.
+        snap.org_units.insert("/eng".into(), unit("id:e", "/Eng"));
+        snap.org_units.insert("/Sales".into(), unit("id:s", "/Sales"));
+        let s = Settings { org_units: vec!["/Eng".into(), "/Sales".into()], team_org_units: vec!["/eng".into()], ..s };
+        let summary = unit_summary(&s, &snap, &[&ada, &bob, &cy, &dee]);
+        assert_eq!(
+            summary,
+            vec![json!({ "orgUnit": "/Eng", "path": "/Eng", "people": 3, "team": true }), json!({ "orgUnit": "/Sales", "path": "/Sales", "people": 1, "team": false })]
+        );
     }
 
     #[test]

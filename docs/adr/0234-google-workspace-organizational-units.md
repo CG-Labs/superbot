@@ -25,7 +25,7 @@ An **id** keeps naming the OU after it's renamed or moved, and lets an admin nam
 
 ### Teams from OUs
 
-A team OU's team is keyed by the OU's id (`externalId`, like a group's Directory id), so renaming or moving the OU renames its team rather than replacing it. Its name is the OU's path without the leading `/` (`Engineering/Platform`): paths are unique in a customer and names aren't (`/Sales/EMEA` and `/Support/EMEA`). A path and an id of the same OU are one team.
+A team OU's team is keyed by the OU's id (`externalId`, like a group's Directory id), so renaming or moving the OU renames its team rather than replacing it. Its name is the OU's path without the leading `/` (`Engineering/Platform`): paths are unique in a customer and names aren't (`/Sales/EMEA` and `/Support/EMEA`). A path longer than a group's name (256 characters) is cut and ends with the OU's id, so two long paths still get different names. A path and an id of the same OU are one team.
 
 Because every person is in one OU, each is on the team of the **deepest** team OU that holds them: with `/Engineering` and `/Engineering/Platform` both teams, someone in `/Engineering/Platform/Infra` is on Platform, and someone in `/Engineering` on Engineering. Team groups come before team OUs in ADR 0162's "first one wins", so someone on a team group stays there. Everything else is the team groups' code: people join and leave as their OU changes, someone who moves between two team OUs moves team in the same pass, a team OU taken off the list is deleted like a team group, and teams the sync doesn't manage are left alone.
 
