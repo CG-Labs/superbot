@@ -17,7 +17,7 @@ use super::chat_store_copies::{self, Copies, copy_name};
 use super::chat_stores;
 use crate::audit::{Who, clip};
 use crate::database_encryption::{self, DbKey, Format};
-use crate::db::{ChatStore, Db, Held};
+use crate::db::{ChatStore, Db, ERASED_BOTS, Held};
 use crate::support_check::Settings;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
@@ -481,12 +481,11 @@ pub struct Plan {
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
-/// erasures deleted, from botd's database. A person erased after the backup was made must
-/// have their Bots named by their erasure's `user.erased` event (`botIds`), which is newer
-/// than the backup, so audit retention never prunes it before older events: an erasure
-/// deletes their Bots before it erases what those Bots wrote in others' chats, so a backup
-/// made in between holds that, and `bot.deleted` events from before it may be pruned.
-/// Refused when that event is gone, or is from a botd that didn't name the Bots.
+/// erasures deleted, from botd's database. An erasure deletes a person's Bots before it
+/// erases what those Bots wrote in others' chats, so a backup made in between holds that,
+/// and the `bot.deleted` events from before it may be pruned. So for a person erased after
+/// the backup, their Bots come from what the erasure kept (`erased_bots:<user>`). Refused
+/// for an erasure from an earlier botd that kept nothing, unless it deleted no Bots.
 fn erasures(c: &Connection, backup_at: i64) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let db = |e: rusqlite::Error| format!("botd's database: {e}");
     let people: Vec<(String, String, i64)> = {
@@ -499,18 +498,23 @@ fn erasures(c: &Connection, backup_at: i64) -> Result<(Vec<(String, String)>, Ve
             .map_err(db)?;
         s.query_map([], |r| r.get(0)).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
     };
-    for (_, pseudonym, at) in people.iter().filter(|(_, _, at)| *at >= backup_at) {
-        let refuse = |why: &str| format!("{pseudonym} was erased {}, after this backup was made ({}), and {why}, so what their Bots wrote can't all be found. Restore a backup made after their erasure (ADR 0256)", date(*at), date(backup_at));
-        let details: Option<String> = c
+    for (id, pseudonym, at) in people.iter().filter(|(_, _, at)| *at >= backup_at) {
+        let kept: Option<String> = c.query_row("SELECT value FROM settings WHERE key = ?1", [format!("{ERASED_BOTS}{id}")], |r| r.get(0)).optional().map_err(db)?;
+        if let Some(kept) = kept {
+            let ids: Vec<String> = serde_json::from_str(&kept).map_err(|e| format!("botd's database: {ERASED_BOTS}{id}: {e}"))?;
+            bots.extend(ids);
+            continue;
+        }
+        let counted: Option<String> = c
             .query_row("SELECT details FROM audit_events WHERE action = 'user.erased' AND target_id = ?1 ORDER BY at DESC LIMIT 1", [pseudonym], |r| r.get(0))
             .optional()
             .map_err(db)?;
-        let Some(details) = details else { return Err(refuse("botd's audit log no longer records their erasure")) };
-        let d: Value = serde_json::from_str(&details).unwrap_or(Value::Null);
-        match d["botIds"].as_array() {
-            Some(ids) => bots.extend(ids.iter().filter_map(|b| b.as_str().map(str::to_string))),
-            None if d["bots"].as_u64() == Some(0) => {}
-            None => return Err(refuse("their erasure was made by an earlier botd that didn't record which Bots it deleted")),
+        if counted.and_then(|d| serde_json::from_str::<Value>(&d).ok()).and_then(|d| d["bots"].as_u64()) != Some(0) {
+            return Err(format!(
+                "{pseudonym} was erased {}, after this backup was made ({}), by an earlier botd that didn't keep which Bots it deleted, so what those Bots wrote can't all be found. Restore a backup made after their erasure (ADR 0256)",
+                date(*at),
+                date(backup_at)
+            ));
         }
     }
     bots.sort();
@@ -1085,29 +1089,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bots_erased_after_the_backup_come_from_the_erasure_event_not_pruned_bot_events() {
+    async fn bots_erased_after_the_backup_come_from_what_the_erasure_kept_not_pruned_events() {
         let (w, db) = World::new();
         let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
         let (bob, bobs) = pinned_bot(&db, "bob", "gb-lon");
+        let many: Vec<String> = (0..150).map(|i| format!("bot-{i:03}")).chain([bobs.clone()]).collect();
         db.add_message_from(&ada, "user", "chat-8h-from-bobs-bot", None, false, None, Some(&bobs));
         db.add_message(&ada, "user", "chat-9i-adas-own", None, false, None);
         backup_pass(&db, 7, now() - 30 * DAY);
-        db.erase_user(&bob, "erased-91b0", None, &[]).unwrap();
+        db.erase_user(&bob, "erased-91b0", None, &many).unwrap();
+        db.record(&Who::system("t").event("user.erased").target("user", "erased-91b0").details(json!({ "bots": many.len() })));
         drop(db);
         let before = std::fs::read(w.store()).unwrap();
-        let erased = |details: Value| Db::open(&w.app).unwrap().record(&Who::system("t").event("user.erased").target("user", "erased-91b0").details(details));
+        let app = Connection::open(&w.app).unwrap();
+        let key = format!("{ERASED_BOTS}{bob}");
+        let kept: String = app.query_row("SELECT value FROM settings WHERE key = ?1", [&key], |r| r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<String>>(&kept).unwrap(), many);
 
+        app.execute("DELETE FROM settings WHERE key = ?1", [&key]).unwrap();
         let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
-        assert!(e.contains("erased-91b0 was erased") && e.contains("no longer records their erasure") && e.contains("Restore a backup made after"), "{e}");
-        erased(json!({ "bots": 1 }));
-        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
-        assert!(e.contains("earlier botd that didn't record which Bots"), "{e}");
+        assert!(e.contains("erased-91b0 was erased") && e.contains("earlier botd that didn't keep which Bots") && e.contains("Restore a backup made after"), "{e}");
         assert_eq!(std::fs::read(w.store()).unwrap(), before);
         assert!(work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
 
-        erased(json!({ "bots": 1, "botIds": [bobs] }));
+        app.execute("INSERT INTO settings (key, value) VALUES (?1, ?2)", [&key, &kept]).unwrap();
+        drop(app);
         restore(&w.place(), &opts("newest", true), now()).await.unwrap();
-        assert_eq!(texts(&w.store()), ["[erased]", "chat-9i-adas-own"]);
+        assert_eq!(texts(&w.store()), ["[erased]", "chat-9i-adas-own"], "the Bot after the first 100 still counts");
     }
 
     #[tokio::test]

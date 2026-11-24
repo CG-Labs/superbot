@@ -3072,6 +3072,9 @@ fn migrate_server_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
 const AUDIT_ERASING: &str = "audit_erasing";
 /// Settings key prefix for the Bots an unfinished erasure took on, by user id.
 const ERASING_BOTS: &str = "erasing_bots:";
+/// The Bots an erasure deleted, kept for good: restoring a regional chat store backup made
+/// mid-erasure needs all of them, and audit events may be pruned or clip the list (ADR 0256).
+pub(crate) const ERASED_BOTS: &str = "erased_bots:";
 
 /// Erasing a user (ADR 0102): the user row stays as a tombstone, with when, by whom and
 /// as which pseudonym. The audit log stays append-only except that, inside an erasure's
@@ -7244,6 +7247,7 @@ impl Db {
         let run = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.execute(sql, p).map_err(db_err);
         let mut out = Erased::default();
         run("DELETE FROM settings WHERE key = ?", &[&format!("{ERASING_BOTS}{user_id}")])?;
+        run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", &[&format!("{ERASED_BOTS}{user_id}"), &bots_json])?;
         run("DELETE FROM push_devices WHERE user_id = ?", &[&user_id])?;
         out.sessions = run("DELETE FROM sessions WHERE user_id = ?", &[&user_id])?;
         out.login_codes = run("DELETE FROM login_codes WHERE user_id = ?", &[&user_id])?;

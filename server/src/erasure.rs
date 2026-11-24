@@ -308,8 +308,6 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     let mut details = serde_json::to_value(&erased).unwrap_or_default();
     details["pseudonym"] = json!(p);
     details["bots"] = json!(bot_ids.len());
-    // Restoring a regional chat store backup made mid-erasure needs them (ADR 0256).
-    details["botIds"] = json!(bot_ids);
     details["grants"] = json!(erased.grants + grants);
     details["secrets"] = json!(secrets);
     details["files"] = json!(files);

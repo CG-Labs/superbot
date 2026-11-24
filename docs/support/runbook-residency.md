@@ -69,7 +69,7 @@ The backup must be this region's store, open with the master key (or the previou
 | `belongs to uid ...` | Run as another user (root, say), whose files botd couldn't open | Run it as the owner of `DATA_DIR` and the folder: `sudo -u superbot botd chat-store ...` |
 | `botd must be stopped` | botd, or another restore, holds the lock | Stop botd (`sudo systemctl stop superbot`; Compose: `docker compose stop botd`) |
 | `holds ... of Bots kept elsewhere now that botd hasn't moved yet` | A move out of the store is waiting | Start botd, let it move them (the pin's report shows when), stop it, restore |
-| `no longer records their erasure` or `didn't record which Bots it deleted` | Someone was erased after the backup, and botd can't tell which Bots their erasure deleted | Restore a backup made after that erasure |
+| `didn't keep which Bots it deleted` | Someone was erased after the backup by an earlier botd, so botd can't tell which Bots their erasure deleted | Restore a backup made after that erasure |
 | `is <region>'s chat store, not ...` or `is of chat store <id>` | The backup is another region's, or an earlier store's in the folder | Pick this store's backup (`list` shows them) |
 | `doesn't open with the master key or the previous one` | Made under a master key botd no longer has | Restore a newer backup, or set `SUPERBOT_MASTER_KEY_PREVIOUS` to that key |
 | `give the identity ... --identity` or `doesn't open this copy` | The copy is age-encrypted to other recipients | Give the identity matching `REGION_DATA_AGE_RECIPIENTS` when it was made |
