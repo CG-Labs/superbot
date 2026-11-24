@@ -236,7 +236,7 @@ impl Google {
 
     /// The email of the service account botd signs in as: the key's, or the metadata
     /// server's default account's.
-    pub async fn email(&self) -> Result<String, String> {
+    pub async fn principal(&self) -> Result<String, String> {
         let host = match &self.auth {
             Auth::Key(sa) => return Ok(sa.email.clone()),
             Auth::Metadata { host } => host,
@@ -245,14 +245,14 @@ impl Google {
         let res = self.local.get(format!("http://{host}/computeMetadata/v1/instance/service-accounts/default/email")).header("Metadata-Flavor", "Google").send().await.map_err(|e| format!("{what}: {e}"))?;
         let status = res.status();
         let text = res.text().await.map_err(|e| format!("{what}: {e}"))?;
-        let email = text.trim();
+        let name = text.trim();
         if !status.is_success() {
             return Err(format!("{what} answered {status}"));
         }
-        if email.is_empty() || email.len() > 254 || !email.contains('@') || !email.bytes().all(|b| b.is_ascii_alphanumeric() || b"@.-_".contains(&b)) {
+        if name.is_empty() || name.len() > 254 || !name.contains('@') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"@.-_".contains(&b)) {
             return Err(format!("{what} isn't an email"));
         }
-        Ok(email.to_string())
+        Ok(name.to_string())
     }
 
     /// Signs in at `base` instead: a stand-in for the metadata server.

@@ -69,7 +69,7 @@ pub enum Auth {
     Aws { mount: String, role: Option<String>, region: String, sts_url: url::Url, server_id: Option<String>, creds: Box<aws::Credentials> },
     /// Vault's `gcp` method (`iam` type): a short JWT for `vault/<role>`, signed by IAM
     /// Credentials' `signJwt` as `account` (botd's own service account unless set).
-    Gcp { mount: String, role: String, account: Option<String>, iam: String, google: Box<gcp::Google> },
+    Gcp { mount: String, role: String, signer: Option<String>, iam: String, google: Box<gcp::Google> },
     /// Vault's `azure` method: botd's Entra ID token for the mount's `resource`, with the
     /// VM's subscription, resource group and name from instance metadata if `instance`.
     Azure { mount: String, role: String, instance: bool, entra: Box<azure::Entra> },
@@ -116,7 +116,7 @@ fn required_role(var: &dyn Fn(&str) -> String, method: &str, key: &str) -> Resul
 }
 
 /// A service account's email, as `signJwt` names it.
-fn account_setting(raw: &str) -> Result<String, String> {
+fn signer_setting(raw: &str) -> Result<String, String> {
     let ok = raw.len() <= 254 && raw.split_once('@').is_some_and(|(n, d)| !n.is_empty() && d.contains('.')) && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b"@.-_".contains(&b));
     if !ok {
         return Err(format!("VAULT_GCP_SERVICE_ACCOUNT must be a service account's email like botd@my-project.iam.gserviceaccount.com, not {raw:?}"));
@@ -294,9 +294,9 @@ impl Config {
             "gcp" => Auth::Gcp {
                 mount: path_setting("VAULT_GCP_MOUNT", &var("VAULT_GCP_MOUNT"), "gcp")?,
                 role: required_role(var, "gcp", "VAULT_GCP_ROLE")?,
-                account: match var("VAULT_GCP_SERVICE_ACCOUNT").trim() {
+                signer: match var("VAULT_GCP_SERVICE_ACCOUNT").trim() {
                     "" => None,
-                    a => Some(account_setting(a)?),
+                    a => Some(signer_setting(a)?),
                 },
                 iam: match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
                     "" => gcp::IAM_CREDENTIALS.to_string(),
@@ -537,7 +537,7 @@ impl Inner {
                 };
                 self.login(mount, role.as_deref(), body).await?
             }
-            Auth::Gcp { mount, role, account, iam, google } => self.login(mount, Some(role), self.gcp_jwt(role, account.as_deref(), iam, google, fresh)).await?,
+            Auth::Gcp { mount, role, signer, iam, google } => self.login(mount, Some(role), self.gcp_jwt(role, signer.as_deref(), iam, google, fresh)).await?,
             Auth::Azure { mount, role, instance, entra } => {
                 let body = async {
                     let token = Zeroizing::new(entra.token(fresh).await.map_err(Error::Unavailable)?.to_string());
@@ -562,18 +562,18 @@ impl Inner {
         Ok(value)
     }
 
-    /// A JWT for `vault/<role>`, signed by Google's IAM Credentials as `account` (botd's
+    /// A JWT for `vault/<role>`, signed by Google's IAM Credentials as `signer` (botd's
     /// own service account unless set) with botd's own token, for Vault's `gcp` method;
     /// the login body. A token IAM Credentials refuses is replaced once.
-    async fn gcp_jwt(&self, role: &str, account: Option<&str>, iam: &str, google: &gcp::Google, fresh: bool) -> Result<Zeroizing<String>, Error> {
-        let account = match account {
+    async fn gcp_jwt(&self, role: &str, signer: Option<&str>, iam: &str, google: &gcp::Google, fresh: bool) -> Result<Zeroizing<String>, Error> {
+        let signer = match signer {
             Some(a) => a.to_string(),
-            None => google.email().await.map_err(Error::Unavailable)?,
+            None => google.principal().await.map_err(Error::Unavailable)?,
         };
         let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) + GCP_JWT_SECONDS;
-        let payload = json!({ "aud": format!("vault/{role}"), "sub": account, "exp": exp }).to_string();
-        let url = format!("{iam}/v1/projects/-/serviceAccounts/{account}:signJwt");
-        let what = format!("signJwt as {account}");
+        let payload = json!({ "aud": format!("vault/{role}"), "sub": signer, "exp": exp }).to_string();
+        let url = format!("{iam}/v1/projects/-/serviceAccounts/{signer}:signJwt");
+        let what = format!("signJwt as {signer}");
         let mut fresh = fresh;
         loop {
             let token = google.token(fresh).await.map_err(Error::Unavailable)?;
@@ -898,9 +898,9 @@ impl Provider for Vault {
                 let header = if server_id.is_some() { ", with the server id header" } else { "" };
                 format!("AWS login as {role} at auth/{mount}, an STS request signed for {region}{header} with {}", creds.describe())
             }
-            Auth::Gcp { mount, role, account, google, .. } => {
-                let account = account.as_deref().map_or_else(|| "its own service account".to_string(), |a| format!("service account {a}"));
-                format!("GCP login as role {role} at auth/{mount}, a JWT signed as {account} with {}", google.describe())
+            Auth::Gcp { mount, role, signer, google, .. } => {
+                let who = signer.as_deref().map_or_else(|| "its own service account".to_string(), |a| format!("service account {a}"));
+                format!("GCP login as role {role} at auth/{mount}, a JWT signed as {who} with {}", google.describe())
             }
             Auth::Azure { mount, role, instance, entra } => {
                 let vm = if *instance { ", with the VM's details" } else { "" };
@@ -2006,7 +2006,7 @@ pub(crate) mod tests {
         let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_REGION", "cn-north-1")]), &none).unwrap();
         assert!(matches!(&c.auth, Auth::Aws { sts_url, .. } if sts_url.as_str() == "https://sts.cn-north-1.amazonaws.com.cn/"));
         let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "superbot")]), &none).unwrap();
-        assert!(matches!(&c.auth, Auth::Gcp { mount, account: None, iam, .. } if mount == "gcp" && iam == gcp::IAM_CREDENTIALS));
+        assert!(matches!(&c.auth, Auth::Gcp { mount, signer: None, iam, .. } if mount == "gcp" && iam == gcp::IAM_CREDENTIALS));
         let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "superbot"), ("VAULT_AUTH_NAMESPACE", "admin")]), &none).unwrap();
         assert!(matches!(&c.auth, Auth::Azure { mount, instance: false, entra, .. } if mount == "azure" && entra.resource() == AZURE_RESOURCE));
     }
