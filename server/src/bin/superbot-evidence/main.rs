@@ -12,11 +12,14 @@
 //! `register` (ADR 0204): checks the security owner's private policy register (role
 //! holders, policy approvals, acknowledgements and training, risks, management reviews,
 //! vendors, exceptions, conduct concerns, security incidents and tabletop exercises)
-//! against the policies' cadences, as a bundle naming people by id.
+//! against the policies' cadences, as a bundle naming people by id. `uptime` (ADR 0249):
+//! the availability SLO measured from the outside probe's checks, from Prometheus or the
+//! probe's exported files, month by month against the objectives.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
-//! `coverage` and `register` read local files only, and so does `drills --no-ci`.
+//! `coverage` and `register` read local files only, and so do `drills --no-ci` and
+//! `uptime --checks`; `uptime --prometheus` reads only the operator's Prometheus.
 
 mod changes;
 mod coverage;
@@ -24,7 +27,9 @@ mod drills;
 mod github;
 #[path = "../../evidence_period.rs"]
 mod period;
+mod prometheus;
 mod register;
+mod uptime;
 #[path = "../../ustar.rs"]
 mod ustar;
 mod vulns;
@@ -32,7 +37,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), and its coverage (ADR 0169).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), and its coverage (ADR 0169).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
@@ -44,6 +49,9 @@ const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, AD
   superbot-evidence coverage <evidence store> [--from <YYYY-MM-DD> --to <YYYY-MM-DD>]
                     [--checklist <soc2-readiness-checklist.md>] [--json] [-o <file>]
   superbot-evidence register <register.json> [--policies <folder>] [--baseline <file>]...
+                    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
+  superbot-evidence uptime (--prometheus <url> [--query <selector>] | --checks <file>...)
+                    [--objective <percent>] [--maintenance <from>/<to>]...
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
 
 Writes one bundle for the period (whole UTC days, --to not included; neither: last month):
@@ -109,7 +117,21 @@ evidence bundle access-review.json), each review of that server matched to an ac
 digest that day. Refuses a register that
 doesn't hold together (unknown people, roles or policies, ids that aren't plain), listing
 every problem. People are named by register id; names, titles and notes stay out. No
-token and no network.";
+token and no network.
+
+uptime writes one bundle for the period of the availability SLO (docs/slo.md) measured
+from the outside probe's checks of /status.json: a minute is down when it had checks and
+every one failed, unmeasured when it had none; each calendar month and the period against
+--objective (default 99.9, the strictest plan on the server) and every plan's, the error
+budget spent, every outage and those that spent more than a quarter of the 30-day budget
+(a written review is due), and the gaps in the probe's record. --prometheus reads the
+blackbox exporter's raw samples of --query (default probe_success{job=\"superbot-status\"})
+a day at a time, with a token from PROMETHEUS_TOKEN if it needs one (https, or http to
+this computer). --checks reads any other probe's export instead: one check a line,
+<time>,<result>[,<location>], the time as RFC 3339 or Unix seconds and the result 1/0,
+true/false or up/down. Each --maintenance window was announced maintenance and doesn't
+count, up to 4 hours a month. It maps to A1.1-3 only while the probe's gaps fit in the
+error budget.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -344,10 +366,18 @@ fn drills(a: &Args, p: period::Period, gh: Option<(&mut github::GitHub, &str)>, 
     ))
 }
 
+/// A command that parses its own options and prints what it saved.
+type Command = fn(&[String], chrono::DateTime<chrono::Utc>) -> Result<String, String>;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "register") {
-        return match register::run(&args[1..], chrono::Utc::now()) {
+    let own: Option<Command> = match args.first().map(String::as_str) {
+        Some("register") => Some(register::run),
+        Some("uptime") => Some(uptime::run),
+        _ => None,
+    };
+    if let Some(run) = own {
+        return match run(&args[1..], chrono::Utc::now()) {
             Ok(out) => {
                 println!("{out}");
                 ExitCode::SUCCESS
