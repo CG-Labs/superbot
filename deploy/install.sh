@@ -2107,7 +2107,7 @@ prepare_harness_bundle() {
 harness_wanted_version() {
   local key=harness_$1
   [[ "$1" != node ]] || key=node
-  sed -n "s/^$key=\([^ ]*\) .*/\1/p" <<<"$HARNESS_WANTED" | head -n 1
+  sed -n "s/^$key=\([^ ]*\) .*/\1/p;T;q" <<<"$HARNESS_WANTED"
 }
 
 # Whether Node.js and each of NAMES run from HARNESSES_DIR as an account with no access to

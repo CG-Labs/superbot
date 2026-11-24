@@ -335,7 +335,8 @@ jobs:
           grep -Fq "Harness bundle: claude codex pi on Node.js" /tmp/offline-harnesses.log
           grep -Fq "Installing claude codex pi system-wide in /opt/superbot-harnesses from the harness bundle" /tmp/offline-harnesses.log
           [[ $(sudo stat -c '%U %a' /opt/superbot-harnesses) == 'root 755' ]]
-          if sudo find /opt/superbot-harnesses -perm /022 ! -type l | grep -q .; then echo "the harness CLIs are writable by other accounts" >&2; exit 1; fi
+          writable=$(sudo find /opt/superbot-harnesses -perm /022 ! -type l -print -quit)
+          if [[ -n "$writable" ]]; then echo "the harness CLIs are writable by other accounts: $writable" >&2; exit 1; fi
           if ls -d /opt/.superbot-harnesses.* 2>/dev/null; then echo "the harness bundle's staging was left behind" >&2; exit 1; fi
           probe=$(mktemp -d) && chmod 0777 "$probe"
           for b in claude codex pi; do
