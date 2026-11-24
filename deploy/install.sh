@@ -2004,7 +2004,7 @@ harness_pins() {
   local out
   out=$("$1" harness pins 2>/dev/null) || return 1
   awk '
-    $1 == "node" && NF == 4 && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /^(x86_64|aarch64)$/ && $4 ~ /^[0-9a-f]{64}$/ { n++; next }
+    $1 == "node" && NF == 4 && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /^(x86_64|aarch64)$/ && length($4) == 64 && $4 ~ /^[0-9a-f]+$/ { n++; next }
     $1 == "npm" && NF == 5 && $2 ~ /^[a-z][a-z0-9-]*$/ && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$/ \
       && $4 ~ /^(@[a-z0-9._-]+\/)?[a-z0-9._-]+$/ && $5 ~ /^sha512-[A-Za-z0-9+\/]+=*$/ { m++; next }
     $1 == "hermes" && NF == 5 { next }
@@ -2147,27 +2147,29 @@ harness_link() {
 
 # Undoes install_harnesses: its links (and what they replaced), its tree, and the tree it moved
 # aside, back in HARNESSES_DIR. If that last fails, HARNESS_PREVIOUS stays set, so
-# cleanup_offline keeps it for the operator.
+# cleanup_offline keeps it for the operator; so does anything left in replaced/.
 harness_put_back() {
-  local link f
+  local link f stuck=false
   for link in "${HARNESS_LINKED[@]}"; do rm -f -- "$link"; done
   HARNESS_LINKED=()
   for f in "$HARNESS_STAGE"/replaced/*; do
     [[ -e "$f" || -L "$f" ]] || continue
-    mv -- "$f" "$BIN_DIR/$(basename "$f")" || warn "Couldn't put $BIN_DIR/$(basename "$f") back: it is in $f"
+    mv -- "$f" "$BIN_DIR/$(basename "$f")" || { warn "Couldn't put $BIN_DIR/$(basename "$f") back: it is in $f"; stuck=true; }
   done
   if [[ "$HARNESS_MOVED_IN" == true ]]; then
     rm -rf -- "$HARNESSES_DIR" || { warn "Couldn't remove the new harness CLIs from $HARNESSES_DIR"; return 1; }
     HARNESS_MOVED_IN=false
   fi
-  [[ -n "$HARNESS_PREVIOUS" && -e "$HARNESS_PREVIOUS" ]] || return 0
-  warn "Putting back the harness CLIs $HARNESSES_DIR had"
-  if mv -- "$HARNESS_PREVIOUS" "$HARNESSES_DIR"; then
-    HARNESS_PREVIOUS=""
-  else
-    warn "Couldn't put them back: they are in $HARNESS_PREVIOUS; move them to $HARNESSES_DIR by hand"
-    return 1
+  if [[ -n "$HARNESS_PREVIOUS" && -e "$HARNESS_PREVIOUS" ]]; then
+    warn "Putting back the harness CLIs $HARNESSES_DIR had"
+    if mv -- "$HARNESS_PREVIOUS" "$HARNESSES_DIR"; then
+      HARNESS_PREVIOUS=""
+    else
+      warn "Couldn't put them back: they are in $HARNESS_PREVIOUS; move them to $HARNESSES_DIR by hand"
+      return 1
+    fi
   fi
+  [[ "$stuck" == false ]]
 }
 
 harness_failed() {
@@ -2198,6 +2200,7 @@ install_harnesses() {
   if [[ -z "$(harness_mismatch "$HARNESSES_DIR/superbot/MANIFEST" "$HARNESS_WANTED")" ]] \
     && harness_link "$names" && harness_works "$names"; then
     HARNESS_LINKED=()
+    rm -rf -- "$HARNESS_STAGE/replaced"
     log "The harness CLIs this release pins are already installed in $HARNESSES_DIR ($names)"
     return
   fi
@@ -2271,6 +2274,8 @@ cleanup_offline() {
       harness_put_back || hstuck=true
       [[ "$BOTD_STOPPED" != true ]] || systemctl start superbot.service || true
     fi
+    # harness_failed has already tried to put these back; what it couldn't is the operator's.
+    [[ -z "$(ls -A -- "$HARNESS_STAGE/replaced" 2>/dev/null)" ]] || hstuck=true
     if [[ "$hstuck" == true ]]; then
       rm -rf -- "$HARNESS_STAGE/bundle" "$HARNESS_STAGE/tree"
     else

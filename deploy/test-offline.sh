@@ -454,7 +454,7 @@ out=$(nprep "$(HMANIFEST=1 nremake nless sed -i '/^harness_pi=/d' MANIFEST)") &&
 grep -Fq "(pi is missing, not 1.0.0" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the missing-harness refusal didn't say why"; }
 nprep "$NB" "$(cut -c1-64 "$B.sha256")" >/dev/null && fail "a harness bundle was checked against another bundle's SHA-256"
 nprep "$NB" "$(cut -c1-64 "$NB.sha256")" >/dev/null || fail "a harness bundle wasn't checked against its own --harness-bundle-sha256"
-for bad in "node 22.0 x86_64 $nsha" "npm Claude 2.1.0 @a/b sha512-x" "npm claude latest @a/b sha512-x" "npm claude 2.1.0 @a/b md5-x" "npm claude 2.1.0 '@a/b;id' sha512-x" "npm claude 2.1.0 @a/b"; do
+for bad in "node 22.0 x86_64 $nsha" "node 22.0.1 x86_64 ${nsha:1}" "node 22.0.1 x86_64 ${nsha}0" "node 22.0.1 x86_64 ${nsha^^}" "npm Claude 2.1.0 @a/b sha512-x" "npm claude latest @a/b sha512-x" "npm claude 2.1.0 @a/b md5-x" "npm claude 2.1.0 '@a/b;id' sha512-x" "npm claude 2.1.0 @a/b"; do
   printf '#!/bin/sh\nprintf "%%s\\n" "node 22.0.1 x86_64 %s" "npm codex 0.1.0 @openai/codex sha512-Y29kZXg=" "%s"\n' "$nsha" "$bad" >"$T/noff/bin/botd"
   if harness_pins "$T/noff/bin/botd" >/dev/null; then fail "harness pins with \"$bad\" were taken"; fi
 done
@@ -486,6 +486,22 @@ grep -q "systemctl start superbot.service" <<<"$out" || fail "botd wasn't starte
 [[ "$(cat "$T/nswap/opt/superbot-harnesses/marker")" == old && ! -e "$T/nswap/stage" ]] || fail "the old harness CLIs weren't put back, or the staging was left"
 [[ "$(cat "$T/nswap/bin/claude")" == "operator's own claude" && ! -L "$T/nswap/bin/claude" && ! -e "$T/nswap/bin/codex" ]] || fail "the new links weren't undone, or what they replaced wasn't put back"
 ok "an exit mid-swap puts the old harness CLIs and the operator's own links back, and starts botd again"
+
+# A file the operator had in BIN_DIR that can't be moved back stays in the staging folder, also
+# after harness_failed has already tried once.
+rm -rf "$T/nswap" && mkdir -p "$T/nswap/stage/previous" "$T/nswap/stage/replaced" "$T/nswap/stage/bundle" "$T/nswap/opt/superbot-harnesses" "$T/nswap/bin"
+echo old >"$T/nswap/stage/previous/marker"
+echo "operator's own claude" >"$T/nswap/stage/replaced/claude"
+ln -s "$T/nswap/opt/superbot-harnesses/superbot/claude" "$T/nswap/bin/claude"
+out=$( (HARNESSES_DIR=$T/nswap/opt/superbot-harnesses BIN_DIR=$T/nswap/bin HARNESS_STAGE=$T/nswap/stage HARNESS_PREVIOUS=$T/nswap/stage/previous
+  HARNESS_MOVED_IN=true HARNESS_LINKED=("$T/nswap/bin/claude") BOTD_STOPPED=false OFFLINE_TMP=""
+  mv() { [[ "${*: -1}" != "$BIN_DIR/claude" ]] || return 1; command mv "$@"; }
+  ! harness_put_back || exit 9
+  cleanup_offline) 2>&1) || fail "harness_put_back said it put back a file it couldn't: $out"
+grep -Fq "Couldn't put $T/nswap/bin/claude back: it is in $T/nswap/stage/replaced/claude" <<<"$out" || fail "no warning for a file that couldn't be put back: $out"
+[[ "$(cat "$T/nswap/stage/replaced/claude")" == "operator's own claude" && ! -e "$T/nswap/stage/bundle" ]] || fail "the staging folder was removed with the operator's own file in it"
+[[ "$(cat "$T/nswap/opt/superbot-harnesses/marker")" == old && ! -e "$T/nswap/bin/claude" ]] || fail "the old harness CLIs weren't put back, or the new link was left"
+ok "a file the operator had that can't be put back is kept in the staging folder"
 
 # An offline upgrade without --harness-bundle keeps the harness CLIs it has, and says when
 # they aren't the release's.
