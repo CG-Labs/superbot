@@ -4,7 +4,9 @@
 //! a saved secret of that name; a lease that can't be made refuses the run, audited as
 //! `secrets_unavailable`, and the Bot says so. A plan's model provider key may come only
 //! from a lease; if that lease gives it empty, the run is refused. A run whose lease
-//! can't be revoked (an STS session, ADR 0194) stops when it expires.
+//! can't be revoked (an STS session, ADR 0194) stops when it expires. A run that outlasts
+//! its lease's TTL keeps it by renewing it, until the backend won't renew it further
+//! (ADR 0221); then the run stops when the lease ends.
 
 use crate::acl::Visibility;
 use crate::secrets::leases::tests::{fake, set_for_owner, wait_for};
@@ -62,7 +64,7 @@ async fn run(port: u16, app: &AppState, who: &str, bot: &str) -> String {
     let before = app.db.last_id();
     let (code, body) = call(port, "POST", &format!("/api/bots/{bot}/messages"), who, r#"{"text":"deploy"}"#).await;
     assert_eq!(code, 202, "{body}");
-    for _ in 0..300 {
+    for _ in 0..600 {
         if let Some(m) = app.db.replies_after(bot, before).into_iter().next() {
             return m.text;
         }
@@ -158,7 +160,41 @@ async fn a_run_stops_when_its_sts_session_expires() {
 
     let started = std::time::Instant::now();
     let reply = run(port, &app, &ada, &bot.id).await;
-    assert!(reply.contains("short-lived cloud credentials for this task expired"), "{reply}");
+    assert!(reply.contains("short-lived credentials for this task expired"), "{reply}");
     assert!(started.elapsed() < Duration::from_secs(10), "stopped with its session, not at the run timeout");
     assert!(f.revoked.lock().unwrap().is_empty(), "an STS session is never revoked");
+}
+
+#[tokio::test]
+async fn a_run_outlives_its_leases_ttl_by_renewing_them_until_the_max_ttl_stops_it() {
+    let (port, app, admin, _) = serve_app().await;
+    slow_claude(&app);
+    let (ada_id, ada) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("Deployer", "#fff", "waddle", "claude", None, false, &ada_id, Visibility::Private);
+    let path = format!("renewtest/creds/{ada_id}");
+    let f = fake(&[(path.as_str(), &[("password", Some("renew-http-pass-2f3a"))])]);
+    f.ttl.store(2, Ordering::SeqCst);
+    set_for_owner(&ada_id, RunCredentials::new(f.clone(), parse("renewtest/creds/{owner} RENEW_HTTP_PASSWORD=password").unwrap()));
+
+    // Renewed by its 2 s TTL twice, then the role's max TTL gives 1 s: the run stops then.
+    let started = std::time::Instant::now();
+    let msg = tokio::spawn({
+        let ada = ada.clone();
+        let bot = bot.id.clone();
+        let app = app.clone();
+        async move { run(port, &app, &ada, &bot).await }
+    });
+    {
+        let f = f.clone();
+        tokio::task::spawn_blocking(move || wait_for(|| f.renewals.lock().unwrap().len() >= 2)).await.unwrap();
+    }
+    f.renew_cap.store(1, Ordering::SeqCst);
+    let reply = msg.await.unwrap();
+    assert!(reply.contains("short-lived credentials for this task expired"), "{reply}");
+    let took = started.elapsed();
+    assert!(took > Duration::from_secs(3) && took < Duration::from_secs(12), "past its first TTL, stopped with its last renewal: {took:?}");
+    wait_for(|| f.revoked.lock().unwrap().len() == 1);
+    assert_eq!(*f.revoked.lock().unwrap(), [format!("{path}/lease0")], "revoked as the run ended");
+    let renewals = f.renewals.lock().unwrap().clone();
+    assert!(renewals.len() >= 3 && renewals.iter().all(|(id, n)| *id == format!("{path}/lease0") && *n == 2), "{renewals:?}");
 }
