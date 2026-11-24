@@ -909,6 +909,7 @@ mod tests {
             owner_id: "u1".into(),
             visibility: crate::acl::Visibility::Private,
             prompts: None,
+            service_account_id: None,
         };
         let a = Actor::for_bot(&owner).method("bot_token");
         assert_eq!((a.kind, a.id.as_deref(), a.name.as_deref()), (ActorKind::Bot, Some("b1"), Some("Scout")));

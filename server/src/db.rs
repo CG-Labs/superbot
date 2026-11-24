@@ -38,6 +38,20 @@ pub struct Bot {
     pub visibility: Visibility,
     /// Suggested prompts in its details. None: the client's defaults; empty: none.
     pub prompts: Option<Vec<String>>,
+    /// The owner's service account that made it and keeps it (ADR 0222), if any.
+    #[serde(skip)]
+    pub service_account_id: Option<String>,
+}
+
+/// Why a service account's new Bot wasn't made (ADR 0222).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptBotRefusal {
+    /// Its owner's plan has no Bot left.
+    PlanLimit,
+    /// It keeps as many Bots as a service account may.
+    AccountLimit,
+    /// It was deleted, or given another owner, meanwhile.
+    Account,
 }
 
 /// One user's grant on one Bot (ADR 0017).
@@ -282,6 +296,7 @@ fn bot_row(r: &Row) -> rusqlite::Result<Bot> {
         // The column's CHECK allows only the two; anything else would fail closed.
         visibility: Visibility::parse(&r.get::<_, String>("visibility")?).unwrap_or(Visibility::Private),
         prompts: r.get::<_, Option<String>>("prompts")?.and_then(|j| serde_json::from_str(&j).ok()),
+        service_account_id: r.get("service_account_id")?,
     })
 }
 
@@ -2299,7 +2314,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 67] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 68] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2367,7 +2382,45 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 67] = [
     migrate_time_bound_roles,
     migrate_scim_team_role_groups,
     migrate_role_requests,
+    migrate_service_account_bots,
 ];
+
+/// Service accounts' own Bots (ADR 0222): a Bot a service account made names it. The Bot
+/// is still its owner's (machine, plan, keys, memory); the account keeps it only while it's
+/// live and owned by that same person. Triggers hold that whatever writes: a link is only
+/// written to such an account, and goes when the Bot changes owner, or the account changes
+/// owner or is deleted.
+fn migrate_service_account_bots(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('bots') WHERE name = 'service_account_id'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE bots ADD COLUMN service_account_id TEXT REFERENCES users(id) ON DELETE SET NULL;")?;
+    }
+    c.execute_batch(
+        "CREATE INDEX IF NOT EXISTS bots_service_account ON bots(service_account_id) WHERE service_account_id IS NOT NULL;
+        CREATE TRIGGER IF NOT EXISTS bots_service_account_insert BEFORE INSERT ON bots
+        WHEN NEW.service_account_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM service_accounts WHERE user_id = NEW.service_account_id AND owner_id = NEW.owner_id AND deleted_at IS NULL)
+        BEGIN
+          SELECT RAISE(ABORT, 'a Bot can only be kept by a live service account of its owner');
+        END;
+        CREATE TRIGGER IF NOT EXISTS bots_service_account_update BEFORE UPDATE OF service_account_id ON bots
+        WHEN NEW.service_account_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM service_accounts WHERE user_id = NEW.service_account_id AND owner_id = NEW.owner_id AND deleted_at IS NULL)
+        BEGIN
+          SELECT RAISE(ABORT, 'a Bot can only be kept by a live service account of its owner');
+        END;
+        CREATE TRIGGER IF NOT EXISTS bots_service_account_owner AFTER UPDATE OF owner_id ON bots
+        WHEN NEW.service_account_id IS NOT NULL AND NEW.owner_id IS NOT OLD.owner_id
+        BEGIN
+          UPDATE bots SET service_account_id = NULL WHERE id = NEW.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS service_accounts_release_bots AFTER UPDATE OF owner_id, deleted_at ON service_accounts
+        WHEN NEW.deleted_at IS NOT NULL OR NEW.owner_id IS NOT OLD.owner_id
+        BEGIN
+          UPDATE bots SET service_account_id = NULL WHERE service_account_id = NEW.user_id AND (NEW.deleted_at IS NOT NULL OR owner_id IS NOT NEW.owner_id);
+        END;",
+    )
+}
 
 /// Requests for a role (ADR 0209): a person asks for a requestable, time-bound role for
 /// some hours, across the server or in their team, and an admin approves or denies it.
@@ -4744,6 +4797,42 @@ impl Db {
             )
             .unwrap();
         if n == 0 { None } else { self.bot(&id) }
+    }
+
+    /// A private Bot of `owner` that their service account `account` made and keeps (ADR
+    /// 0222). Counted against the owner's `max_bots` and the account's `max_kept`, and only
+    /// while the account is live and still `owner`'s, all in one statement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_service_account_bot(&self, name: &str, color: &str, shape: &str, harness: &str, model: Option<&str>, owner: &str, account: &str, max_bots: Option<u32>, max_kept: u32) -> Result<Bot, KeptBotRefusal> {
+        let id = crate::short_id();
+        let n = self
+            .c()
+            .execute(
+                "INSERT INTO bots (id, name, color, shape, harness, model, primary_bot, created_at, owner_id, visibility, service_account_id)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, 'private', ?9
+                 WHERE EXISTS (SELECT 1 FROM service_accounts WHERE user_id = ?9 AND owner_id = ?8 AND deleted_at IS NULL)
+                   AND (SELECT COUNT(*) FROM bots WHERE service_account_id = ?9) < ?11
+                   AND (?10 IS NULL OR (SELECT COUNT(*) FROM bots WHERE owner_id = ?8) < ?10)",
+                params![id, name, color, shape, harness, model, now(), owner, account, max_bots, max_kept],
+            )
+            .unwrap();
+        if n > 0 {
+            return self.bot(&id).ok_or(KeptBotRefusal::Account);
+        }
+        if self.service_account(account).is_none_or(|s| s.deleted_at.is_some() || s.owner_id != owner) {
+            Err(KeptBotRefusal::Account)
+        } else if self.kept_bots(account).len() >= max_kept as usize {
+            Err(KeptBotRefusal::AccountLimit)
+        } else {
+            Err(KeptBotRefusal::PlanLimit)
+        }
+    }
+
+    /// The ids of the Bots service account `account` keeps (ADR 0222), oldest first.
+    pub fn kept_bots(&self, account: &str) -> Vec<String> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT id FROM bots WHERE service_account_id = ? ORDER BY created_at, id").unwrap();
+        s.query_map([account], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
     }
 
     // Bot ACLs (ADR 0017)
@@ -11686,6 +11775,43 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_is_kept_only_by_a_live_service_account_of_its_owner() {
+        let db = Db::open(&temp_path("kept-bots").join("app.sqlite")).unwrap();
+        let ana = db.create_user(None, Some("ana@example.com"), "Ana", Role::Member).unwrap();
+        let bea = db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let sa = db.create_service_account("CI", "", Role::Member, None, None, &ana.id, None).unwrap().user.id;
+        let beas = db.create_service_account("Bea's CI", "", Role::Member, None, None, &bea.id, None).unwrap().user.id;
+        let make = |owner: &str, max_bots: Option<u32>, max_kept: u32| db.create_service_account_bot("CI", "#fff", "waddle", "claude", None, owner, &sa, max_bots, max_kept);
+
+        // Private, its owner's, and counted against both limits in the same statement.
+        let one = make(&ana.id, None, 2).unwrap();
+        assert_eq!((one.owner_id.as_str(), one.service_account_id.as_deref(), one.visibility, one.primary), (ana.id.as_str(), Some(sa.as_str()), Visibility::Private, false));
+        assert_eq!(make(&ana.id, Some(1), 2).err(), Some(KeptBotRefusal::PlanLimit));
+        let two = make(&ana.id, Some(2), 2).unwrap();
+        assert_eq!(make(&ana.id, None, 2).err(), Some(KeptBotRefusal::AccountLimit));
+        assert_eq!(make(&bea.id, None, 9).err(), Some(KeptBotRefusal::Account), "only for its own owner");
+        assert_eq!(db.kept_bots(&sa), [one.id.clone(), two.id.clone()]);
+
+        // Nothing writes a link to another owner's account, whatever writes it.
+        assert!(db.c().execute("UPDATE bots SET service_account_id = ?1 WHERE id = ?2", [&beas, &one.id]).is_err());
+        let other = db.create_bot_owned("Ana's", "#fff", "waddle", "claude", None, false, &ana.id, Visibility::Private);
+        assert!(db.c().execute("UPDATE bots SET service_account_id = ?1 WHERE id = ?2", [&beas, &other.id]).is_err());
+        assert!(db.c().execute("UPDATE bots SET service_account_id = ?1 WHERE id = ?2", [&sa, &other.id]).is_ok(), "its owner's Bot");
+
+        // A Bot that changes owner leaves it; so do all of them when it changes owner or is deleted.
+        assert!(db.set_bot_owner_capped(&one.id, &bea.id, None));
+        assert_eq!(db.bot(&one.id).unwrap().service_account_id, None);
+        db.update_service_account(&sa, &ServiceAccountPatch { owner: Some(bea.id.clone()), ..Default::default() }).unwrap();
+        assert!(db.kept_bots(&sa).is_empty());
+        assert_eq!(db.bot(&two.id).unwrap().owner_id, ana.id, "they stay Ana's");
+        assert_eq!(make(&ana.id, None, 9).err(), Some(KeptBotRefusal::Account), "nor makes more for Ana");
+        let three = make(&bea.id, None, 9).unwrap();
+        assert_eq!(db.delete_service_account(&sa, None), Some(0));
+        assert!(db.kept_bots(&sa).is_empty() && db.bot(&three.id).is_some());
+        assert!(db.c().execute("UPDATE bots SET service_account_id = ?1 WHERE id = ?2", [&sa, &three.id]).is_err(), "a deleted account keeps nothing");
+    }
+
+    #[test]
     fn a_residency_pin_and_its_region_are_saved_together_or_not_at_all() {
         let db = Db::open(&temp_path("pin-atomic").join("app.sqlite")).unwrap();
         let u = db.create_user(None, Some("pin@example.com"), "P", Role::Member).unwrap();
@@ -12321,7 +12447,9 @@ mod tests {
 
     /// Rewinds a database to before bot ACLs, so a test can set `user_version` lower.
     const UNDO_BOT_ACLS: &str =
-        concat!(undo_last_login!(), undo_audit_actors!(), " DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;");
+        concat!(undo_last_login!(), undo_audit_actors!(), " DROP TRIGGER bots_service_account_insert; DROP TRIGGER bots_service_account_update;
+        DROP TRIGGER bots_service_account_owner; DROP TRIGGER service_accounts_release_bots; DROP INDEX bots_service_account; ALTER TABLE bots DROP COLUMN service_account_id;
+        DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;");
 
     #[test]
     fn upgrade_keeps_old_audit_rows_and_records_new_actors() {

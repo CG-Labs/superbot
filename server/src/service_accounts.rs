@@ -8,7 +8,8 @@
 //! and only in the team they're on; a team's account acts there only while its owner is
 //! (ADR 0182).
 //! A Bot's manager can grant one viewer or operator on the Bot, never beyond what its
-//! owner can do with that Bot (ADR 0170).
+//! owner can do with that Bot (ADR 0170). One can make Bots of its own: private Bots of
+//! its owner that it keeps and manages, run as its owner's would (ADR 0222).
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
 use crate::db::{CustomRole, NewServiceToken, ServiceAccount, ServiceAccountPatch, ServiceRefusal, ServiceToken, TeamMember, User};
@@ -94,8 +95,9 @@ pub fn actor(u: &User, s: Option<&ServiceCaller>) -> Actor {
 }
 
 /// What a service account may not do whatever its role: the routes about a person's own
-/// sign-in, account, machine and plan, managing service accounts, owning Bots, screens,
-/// and deciding approvals, which need a person.
+/// sign-in, account, machine and plan, managing service accounts, a Bot's owner, sharing
+/// and grants (even on a Bot it keeps, ADR 0222), screens, and deciding approvals, which
+/// need a person.
 pub fn person_only(method: &Method, path: &str) -> Option<&'static str> {
     let s: Vec<&str> = path.strip_prefix("/api/")?.split('/').collect();
     let m = if method == Method::HEAD { "GET" } else { method.as_str() };
@@ -104,7 +106,7 @@ pub fn person_only(method: &Method, path: &str) -> Option<&'static str> {
         (_, ["auth", ..]) => "A service account has no sign-in, session or second factor.",
         (_, ["me", ..] | ["machine", ..] | ["billing", ..] | ["team", "leave"] | ["team", "billing", ..]) => "This is about a person's own account, which a service account doesn't have.",
         (_, ["service-accounts", ..]) => "A service account can't manage service accounts.",
-        ("POST", ["bots"]) => "A service account can't own Bots.",
+        ("PATCH", ["bots", _, "access"]) | (_, ["bots", _, "grants", ..]) => "Who owns a Bot and who can use it is for a person to decide.",
         (_, ["bots", _, "screen"]) => "Screens are for people.",
         (_, ["approvals", _, "approve" | "deny"]) => "Deciding an approval needs a person.",
         _ => return None,
@@ -506,11 +508,33 @@ fn refusals_view(id: &str, rows: &[ServiceRefusal]) -> Value {
 }
 
 /// The Bots it reaches while enabled (ADR 0170): by its role, team and grants, within its
-/// owner's access now.
+/// owner's access now. `kept`: one it made and keeps (ADR 0222).
 fn bots_view(app: &AppState, sa: &ServiceAccount) -> Value {
     let grants = app.db.user_grants(&sa.user.id);
     let bots = crate::acl::Viewer::service(&app.db, &sa.user.id, sa.user.role).bots(&app.db);
-    json!(bots.iter().map(|(b, access)| json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "access": access, "grant": grants.get(&b.id) })).collect::<Vec<_>>())
+    json!(bots
+        .iter()
+        .map(|(b, access)| json!({
+            "id": b.id, "name": b.name, "owner": b.owner_id, "access": access, "grant": grants.get(&b.id),
+            "kept": crate::acl::kept_by(&app.db, b, &sa.user.id),
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// Most Bots one service account may keep (ADR 0222), on top of its owner's plan limit,
+/// so a leaked token can't fill its owner's machine.
+pub const MAX_KEPT_BOTS: u32 = 20;
+
+/// Records each Bot in `ids` that `id` no longer keeps as `bot.service_account_released`
+/// with `reason`. The triggers of ADR 0222 already let them go. Returns how many.
+pub fn note_released(app: &AppState, by: &Who, id: &str, ids: &[String], reason: &str) -> usize {
+    let still = app.db.kept_bots(id);
+    let gone: Vec<&String> = ids.iter().filter(|b| !still.contains(b)).collect();
+    for bot in &gone {
+        let d = json!({ "serviceAccount": id, "reason": reason, "owner": app.db.bot(bot).map(|b| b.owner_id) });
+        app.db.record(&by.event("bot.service_account_released").target("bot", bot).bot(bot).details(d));
+    }
+    gone.len()
 }
 
 fn view(app: &AppState, sa: &ServiceAccount, refused: &[ServiceRefusal]) -> Value {
@@ -528,6 +552,7 @@ fn view(app: &AppState, sa: &ServiceAccount, refused: &[ServiceRefusal]) -> Valu
         "tokens": tokens.iter().filter(|t| token_state(t, at) == "active").count(),
         "lastUsedAt": tokens.iter().filter_map(|t| t.last_used_at).max(),
         "refusals": refusals_view(&sa.user.id, refused),
+        "keptBots": app.db.kept_bots(&sa.user.id).len(),
         "createdAt": sa.user.created_at, "createdBy": sa.created_by, "updatedAt": sa.user.updated_at,
     })
 }
@@ -556,6 +581,7 @@ pub async fn list(State(app): State<AppState>, Extension(c): Extension<Caller>) 
         "serviceAccounts": list, "view": if c.admin() { "all" } else { "own" },
         "choices": caller_person(&c).ok().map(|u| choices(&app, &u)),
         "scopes": scope_names(), "defaultDays": DEFAULT_DAYS, "maxDays": MAX_DAYS, "refusalDays": REFUSAL_DAYS,
+        "maxKeptBots": MAX_KEPT_BOTS,
     }))
 }
 
@@ -650,8 +676,11 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
         p.role = Some((role_now, org_now));
         p.team = Some(team_now.map(|t| (t, team_role_now)));
     }
+    let kept = app.db.kept_bots(&id);
     app.db.update_service_account(&id, &p).map_err(|e| if e == "not found" { not_found("Service account") } else { write_error(e) })?;
     let after = app.db.service_account(&id).ok_or_else(|| not_found("Service account"))?;
+    // Its Bots stay with the person who owns them; a new owner doesn't get them (ADR 0222).
+    let released = note_released(&app, &by, &id, &kept, "owner_changed");
     let mut changes = Map::new();
     let mut change = |k: &str, from: Value, to: Value| {
         if from != to {
@@ -671,7 +700,11 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
         app.send(json!({ "type": "resync" }));
     }
     if !changes.is_empty() {
-        app.db.record(&by.event("service_account.updated").target("service_account", &id).details(json!({ "name": after.user.name, "changes": changes })));
+        let mut d = json!({ "name": after.user.name, "changes": changes });
+        if released > 0 {
+            d["keptBotsReleased"] = json!(released);
+        }
+        app.db.record(&by.event("service_account.updated").target("service_account", &id).details(d));
     }
     // In another team, its grants on the old team's Bots reach nothing: they go, as a
     // person's do when they leave (ADR 0170).
@@ -689,7 +722,7 @@ pub async fn update(State(app): State<AppState>, Extension(c): Extension<Caller>
             }
         }
     }
-    if dropped > 0 {
+    if dropped > 0 || released > 0 {
         app.send(json!({ "type": "resync" }));
     }
     if before.user.status != after.user.status {
@@ -724,17 +757,20 @@ fn drop_grants(app: &AppState, by: &Who, id: &str, reason: &str, which: impl Fn(
 /// taken away, it's disabled and the work it asked for stops; the audit log keeps naming it.
 pub async fn delete(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let sa = need_account(&app, &c, &by, &key)?;
+    let kept = app.db.kept_bots(&sa.user.id);
     let revoked = app.db.delete_service_account(&sa.user.id, by.actor.id.as_deref()).ok_or_else(|| not_found("Service account"))?;
     let grants = drop_grants(&app, &by, &sa.user.id, "service_account_deleted", |_| true);
-    if grants > 0 {
+    // The Bots it kept stay its owner's, with their chats (ADR 0222).
+    let released = note_released(&app, &by, &sa.user.id, &kept, "service_account_deleted");
+    if grants > 0 || released > 0 {
         app.send(json!({ "type": "resync" }));
     }
     let paused = crate::handover::user_disabled(&app, &by, &sa.user.id);
     let stopped = app.stop_for_user(&sa.user.id);
     app.db.record(&by.event("service_account.deleted").target("service_account", &sa.user.id).details(json!({
-        "name": sa.user.name, "tokensRevoked": revoked, "grantsRemoved": grants, "routinesPaused": paused, "runsStopped": stopped,
+        "name": sa.user.name, "tokensRevoked": revoked, "grantsRemoved": grants, "keptBotsReleased": released, "routinesPaused": paused, "runsStopped": stopped,
     })));
-    Ok(Json(json!({ "ok": true, "tokensRevoked": revoked, "grantsRemoved": grants })))
+    Ok(Json(json!({ "ok": true, "tokensRevoked": revoked, "grantsRemoved": grants, "keptBotsReleased": released })))
 }
 
 /// The service account a Bot grant names (ADR 0170): a live one, by id. People are found
@@ -850,7 +886,9 @@ mod tests {
             ("POST", "/api/team/billing/portal"),
             ("GET", "/api/service-accounts"),
             ("POST", "/api/service-accounts/sa1/tokens"),
-            ("POST", "/api/bots"),
+            ("PATCH", "/api/bots/b1/access"),
+            ("PUT", "/api/bots/b1/grants/u2"),
+            ("DELETE", "/api/bots/b1/grants/u2"),
             ("GET", "/api/bots/b1/screen"),
             ("POST", "/api/approvals/a1/approve"),
             ("POST", "/api/approvals/a1/deny"),
@@ -864,6 +902,10 @@ mod tests {
             ("GET", "/api/audit"),
             ("GET", "/api/users"),
             ("POST", "/api/bots/b1/messages"),
+            ("POST", "/api/bots"),
+            ("PATCH", "/api/bots/b1"),
+            ("DELETE", "/api/bots/b1"),
+            ("GET", "/api/bots/b1/access"),
             ("GET", "/api/team"),
             ("POST", "/api/team/invites"),
             ("GET", "/api/machines"),

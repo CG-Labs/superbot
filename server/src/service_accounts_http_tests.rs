@@ -267,7 +267,7 @@ async fn service_accounts_cannot_sign_in_or_do_a_persons_things() {
         ("POST", "/api/team/leave"),
         ("GET", "/api/service-accounts"),
         ("POST", "/api/service-accounts"),
-        ("POST", "/api/bots"),
+        ("PUT", "/api/bots/b1/grants/u1"),
     ] {
         assert_eq!(call(port, method, path, &t, "{}").await.0, 403, "{method} {path}");
     }
@@ -751,7 +751,7 @@ async fn bot_owners_grant_service_accounts_never_beyond_their_owner() {
 
     // Its views and the access review show what it reaches, with its grants.
     let (_, v) = json_call(port, "GET", &format!("/api/service-accounts/{sa}"), &admin, "").await;
-    assert_eq!(v["bots"], json!([{ "id": ledger, "name": "Ledger", "owner": ana, "access": "operate", "grant": "operator" }]), "{v}");
+    assert_eq!(v["bots"], json!([{ "id": ledger, "name": "Ledger", "owner": ana, "access": "operate", "grant": "operator", "kept": false }]), "{v}");
     let (_, review) = json_call(port, "GET", "/api/access-review", &admin, "").await;
     let row = review["serviceAccounts"].as_array().unwrap().iter().find(|s| s["id"] == json!(sa)).cloned().unwrap();
     let reached: Vec<&str> = row["botAccess"]["bots"].as_array().unwrap().iter().filter_map(|b| b["id"].as_str()).collect();
@@ -866,7 +866,7 @@ async fn refusals_are_counted_per_service_account() {
         assert_eq!(call(port, "GET", "/api/users", &read, "").await.0, 403, "its role has no users.manage");
     }
     assert_eq!(call(port, "POST", "/api/bots/b1/read", &read, "").await.0, 403, "its token has no write");
-    assert_eq!(call(port, "POST", "/api/bots", &read, "{}").await.0, 403);
+    assert_eq!(call(port, "GET", "/api/machine", &read, "").await.0, 403);
     assert_eq!(call(port, "DELETE", &format!("/api/service-accounts/{sa}/tokens/{old_id}"), &admin, "").await.0, 200);
     assert_eq!(call(port, "GET", "/api/bots", &old, "").await.0, 401);
     // A token no one has counts against no one.

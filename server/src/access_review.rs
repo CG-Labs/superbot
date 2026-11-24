@@ -128,7 +128,18 @@ fn service(app: &App, sa: &ServiceAccount, at: i64, names: &HashMap<&str, &str>,
     let u = &sa.user;
     let grants = app.db.user_grants(&u.id);
     // Within its owner's access, as its tokens get it (ADR 0170).
-    let bots: Vec<Value> = Viewer::service(&app.db, &u.id, u.role).bots(&app.db).into_iter().map(|(b, access)| bot_view(&b, access, &u.id, grants.get(&b.id), names)).collect();
+    // `kept`: one it made and manages, its owner's Bot (ADR 0222).
+    let bots: Vec<Value> = Viewer::service(&app.db, &u.id, u.role)
+        .bots(&app.db)
+        .into_iter()
+        .map(|(b, access)| {
+            let mut v = bot_view(&b, access, &u.id, grants.get(&b.id), names);
+            if crate::acl::kept_by(&app.db, &b, &u.id) {
+                v["kept"] = json!(true);
+            }
+            v
+        })
+        .collect();
     let tokens = app.db.service_tokens(&u.id);
     let live: Vec<&db::ServiceToken> = tokens.iter().filter(|t| crate::service_accounts::token_state(t, at) == "active").collect();
     let role_view = |r: &crate::db::CustomRole, perms: crate::rbac::Perms| json!({ "id": r.id, "name": r.name, "permissions": perms.names() });
@@ -328,7 +339,16 @@ impl Report {
             } else {
                 p["botAccess"]["bots"]
                     .as_array()
-                    .map(|b| b.iter().map(|b| format!("{} ({}){}", b["name"].as_str().unwrap_or(""), b["access"].as_str().unwrap_or(""), b["grant"].as_str().map(|g| format!(" grant:{g}")).unwrap_or_default())).collect::<Vec<_>>().join("; "))
+                    .map(|b| {
+                        b.iter()
+                            .map(|b| {
+                                let grant = b["grant"].as_str().map(|g| format!(" grant:{g}")).unwrap_or_default();
+                                let kept = if b["kept"] == true { " kept" } else { "" };
+                                format!("{} ({}){grant}{kept}", b["name"].as_str().unwrap_or(""), b["access"].as_str().unwrap_or(""))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
                     .unwrap_or_default()
             }
         };
