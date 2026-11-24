@@ -1929,7 +1929,11 @@ fn saml_summary(v: &Value) -> String {
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
         yes(v["signRequests"].as_bool().unwrap_or(false)),
-        if v["singleLogout"].as_bool().unwrap_or(false) { "yes" } else { "no (the IdP's metadata has no HTTP-Redirect SingleLogoutService)" }
+        match (v["singleLogout"].as_bool().unwrap_or(false), v["idp"]["sloBinding"].as_str()) {
+            (true, Some("post")) => "yes, over HTTP-POST",
+            (true, _) => "yes",
+            (false, _) => "no (the IdP's metadata has no HTTP-Redirect or HTTP-POST SingleLogoutService)",
+        }
     );
     out += &format!(
         "  Back-channel logout:      {}\n    SOAP SLO URL:            {}\n",
@@ -1980,7 +1984,8 @@ fn saml_summary(v: &Value) -> String {
     }
     out += &format!(":\n    Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
     if let Some(slo) = idp["sloUrl"].as_str() {
-        out += &format!("    Logout URL:  {slo}\n");
+        let post = if idp["sloBinding"] == "post" { " (HTTP-POST)" } else { "" };
+        out += &format!("    Logout URL:  {slo}{post}\n");
     }
     if let Some(slo) = idp["sloSoapUrl"].as_str() {
         out += &format!("    SOAP logout URL:  {slo}\n");
@@ -4276,6 +4281,10 @@ mod tests {
         assert!(out.contains("Signs AuthnRequests:      yes") && out.contains("Single logout:            yes\n"), "{out}");
         assert!(out.contains("Back-channel logout:      from the IdP, and to it\n    SOAP SLO URL:            https://bots.example/api/auth/sso/corp/slo/soap\n"), "{out}");
         assert!(out.contains("    SOAP logout URL:  https://idp.example/soap\n"), "{out}");
+        let mut post = v.clone();
+        post["idp"]["sloBinding"] = json!("post");
+        let out_post = saml_summary(&post);
+        assert!(out_post.contains("Single logout:            yes, over HTTP-POST\n") && out_post.contains("    Logout URL:  https://idp.example/slo (HTTP-POST)\n"), "{out_post}");
         assert!(out.contains("Encrypted assertions:     off") && !out.contains("SP encryption"), "{out}");
         v["encryptedAssertions"] = json!("require");
         v["spEncryptionKey"] = json!({ "from": "secret", "certificate": { "sha256": "56:78", "subject": "CN=enc", "notAfter": 1_900_000_000_000_i64 } });

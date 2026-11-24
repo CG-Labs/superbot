@@ -536,12 +536,23 @@ async fn main() {
     control_plane.chat_stores =
         machines::chat_stores::Settings::from_env(&|k| env(k, ""), control_plane.enabled(), &control_plane.regions, &control_plane.server_data, &data_dir)
             .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
+    let chat_buckets = machines::chat_store_copies::named(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
+    control_plane.chat_copies = machines::chat_store_copies::Settings::from_env(&startup_store, &|k| env(k, ""), &control_plane.chat_stores, &chat_buckets)
+        .and_then(|s| s.map(machines::chat_store_copies::Copies::new).transpose())
+        .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")))
+        .map(Arc::new);
+    if let Some(c) = control_plane.chat_copies.as_deref() {
+        log_info!("Regional chat stores: backups copied off the host, {} (ADR 0246).", c.describe());
+    }
     let current_cipher = secrets::sealed::cipher();
     let store_keys = machines::chat_stores::Keys { current: &current_cipher, previous: previous_cipher.as_ref(), forget: secrets::forget_sealed() };
     let opened = machines::chat_stores::open(&db, &control_plane.chat_stores, previous_db_key.as_ref(), store_keys)
         .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
     for line in &opened.lines {
         log_info!("{line}");
+    }
+    for w in machines::chat_store_copies::check_destinations(&db, control_plane.chat_copies.as_deref(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Regional chat stores: {e}"))) {
+        log_warn!("WARNING: {w}");
     }
     // Only once every regional chat store opens under the new key, and its approvals are
     // sealed under it, can the previous one go.
@@ -853,8 +864,9 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     let machine_backups = control_plane.offsite.as_ref().map(|o| &o.s);
-    backup_encryption::check(&server_backups, machine_backups).unwrap_or_else(|e| exit(format!("Backup encryption: {e}")));
-    let backup_targets = backup_encryption::targets(&server_backups, machine_backups);
+    let chat_copies = control_plane.chat_copies.as_deref().map(|c| c.settings());
+    backup_encryption::check(&server_backups, machine_backups, chat_copies).unwrap_or_else(|e| exit(format!("Backup encryption: {e}")));
+    let backup_targets = backup_encryption::targets(&server_backups, machine_backups, chat_copies);
     let (encryption_line, encryption_warnings) = backup_encryption::startup_lines(server_backups.encryption, &backup_targets);
     log_info!("Backup encryption: {encryption_line} (ADR 0114).");
     for w in encryption_warnings {
@@ -1124,6 +1136,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso/{id}/metadata", get(sso::saml_metadata))
         .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/auth/sso/{id}/slo/soap", post(sso::slo_soap))
+        .route("/auth/sso/{id}/logout", get(sso::logout_page))
         .route("/sso/{id}/saml", get(sso::saml_status))
         .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
         .route("/sso/{id}/saml/keys/{use}/next", post(sso::saml_key_next).delete(sso::saml_key_cancel))
@@ -1747,11 +1760,11 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
 }
 
 /// `/api/auth/sso` (the list), `/api/auth/sso/{id}/start`, `/api/auth/sso/{id}/callback`, and native
-/// SAML's `/api/auth/sso/{id}/acs`, `/metadata`, `/slo` and `/slo/soap`: which one.
+/// SAML's `/api/auth/sso/{id}/acs`, `/metadata`, `/slo`, `/slo/soap` and `/logout`: which one.
 fn sso_path(path: &str) -> Option<&str> {
     match path.strip_prefix("/api/auth/sso")? {
         "" => Some("list"),
-        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata" | "slo" | "slo/soap")).map(|(_, step)| step),
+        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata" | "slo" | "slo/soap" | "logout")).map(|(_, step)| step),
     }
 }
 

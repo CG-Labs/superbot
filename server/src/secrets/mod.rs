@@ -173,9 +173,11 @@ pub fn server_secret(name: &str) -> bool {
     let bot_webhook = name.strip_prefix(BOT_WEBHOOK_PREFIX).is_some_and(|id| !id.is_empty());
     // A data region's own machine backup store (ADR 0117): MACHINE_BACKUP_S3_<REGION>_SECRET_ACCESS_KEY.
     let region_store = name.strip_prefix("MACHINE_BACKUP_S3_").and_then(|n| n.strip_suffix("_SECRET_ACCESS_KEY")).is_some_and(|r| !r.is_empty());
+    // A data region's bucket for its chat store's backups (ADR 0246): REGION_DATA_S3_<REGION>_SECRET_ACCESS_KEY.
+    let chat_bucket = name.strip_prefix("REGION_DATA_S3_").and_then(|n| n.strip_suffix("_SECRET_ACCESS_KEY")).is_some_and(|r| !r.is_empty());
     // A named audit export sink's own headers (ADR 0191): AUDIT_EXPORT_HEADERS_<NAME>.
     let audit_sink = name.strip_prefix("AUDIT_EXPORT_HEADERS_").is_some_and(|n| !n.is_empty() && n != "FILE" && n.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()));
-    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook || region_store || audit_sink)
+    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook || region_store || chat_bucket || audit_sink)
 }
 
 /// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
