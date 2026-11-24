@@ -355,12 +355,13 @@ async fn machines_sign_in_to_the_operators_registry_with_botds_login() {
     .await;
     assert_eq!(v["agent"]["plan"].as_str(), Some(plan.id().as_str()), "{v}");
 
-    // npm was handed a userconfig only root reads, outside the tools Bots read, naming
-    // only the plan's registry.
+    // npm was handed a userconfig only root reads, in the agent's state folder, not the
+    // tools Bots read, naming only the plan's registry.
     let saw = std::fs::read_to_string(m.cfg.tools.join("node-0.0.1/npm-saw")).unwrap();
     let dart = crate::machines::tools::nerf_dart(&mirror.registry()).unwrap();
+    let login = m.cfg.state_dir.join(crate::machines::agent::NPM_LOGIN_DIR);
     assert!(saw.contains(&format!("userconfig 600 in 700\n{dart}:_authToken={token}\n")), "{saw}");
-    assert!(!std::path::PathBuf::from(format!("{}.login", m.cfg.tools.display())).exists(), "the login goes when the install ends");
+    assert!(!login.exists(), "the login goes when the install ends");
     let state = std::fs::read_to_string(m.cfg.tools.join("state.json")).unwrap_or_default();
     assert!(!state.contains(token), "and the agent never saves it");
 
@@ -680,7 +681,7 @@ async fn real_npm_installs_from_a_mirror_with_no_network() {
     let plan = mirror.plan(&node, vec![("pi", "@corp/mirror-probe", "1.0.0", Some(pin)), ("codex", "other-probe", "1.0.0", Some(wrong))]);
     crate::machines::tools::check(&plan).unwrap();
 
-    let tools = Tools::new(dir.join("tools"), None).unwrap();
+    let tools = Tools::new(dir.join("tools"), None, dir.join("login")).unwrap();
     tools.set_plan(plan).unwrap();
     let r = real_install(&tools, &["pi", "codex"]).await;
     assert_eq!(r["pi"].state, "installed", "{:?}", r["pi"]);
@@ -728,7 +729,7 @@ async fn real_npm_signs_in_to_a_registry_that_wants_a_login() {
     for (n, (what, login, wants, ok)) in tries.into_iter().enumerate() {
         mirror.require(&wants);
         mirror.serve_login(&login);
-        let tools = Tools::new(dir.join(format!("tools-{n}")), None).unwrap();
+        let tools = Tools::new(dir.join(format!("tools-{n}")), None, dir.join(format!("login-{n}"))).unwrap();
         let ca = mirror.ca_pem();
         tools.set_control(&mirror.other, Box::new(move || download_client(None, Some(&ca))));
         tools.set_plan(plan.clone()).unwrap();
