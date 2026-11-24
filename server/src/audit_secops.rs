@@ -187,6 +187,16 @@ fn status_of(body: &[u8]) -> Option<String> {
     (!s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')).then(|| s.to_string())
 }
 
+/// `Retry-After` as seconds or as an HTTP date; a date already past is no wait.
+fn retry_after(v: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let v = v.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    Some((at.with_timezone(&chrono::Utc) - now).to_std().unwrap_or_default())
+}
+
 fn hint(status: u16) -> &'static str {
     match status {
         400 => ": is the log type one the instance has (make SUPERBOT_AUDIT a custom log type)? See docs/ops/audit-export.md",
@@ -231,7 +241,7 @@ impl Client {
                     continue;
                 }
                 let wait = (status == reqwest::StatusCode::TOO_MANY_REQUESTS).then(|| {
-                    let asked = r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok()).map(Duration::from_secs);
+                    let asked = r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| retry_after(v, chrono::Utc::now()));
                     asked.unwrap_or_default().clamp(MIN_THROTTLE, MAX_RETRY_AFTER)
                 });
                 let answer = r.bytes().await.unwrap_or_default();
@@ -373,6 +383,12 @@ mod tests {
         assert!(bodies(&[]).is_empty());
         assert_eq!(status_of(br#"{"error":{"code":403,"message":"Permission denied on quoting-the-request","status":"PERMISSION_DENIED"}}"#).as_deref(), Some("PERMISSION_DENIED"));
         assert_eq!(status_of(br#"{"error":{"status":"has spaces"}}"#), None);
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-24T12:30:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(retry_after(" 45 ", now), Some(Duration::from_secs(45)));
+        assert_eq!(retry_after("Tue, 24 Nov 2026 12:32:00 GMT", now), Some(Duration::from_secs(120)), "an HTTP date, as RFC 9110 allows");
+        assert_eq!(retry_after("Tue, 24 Nov 2026 12:29:00 GMT", now), Some(Duration::ZERO), "already past");
+        assert_eq!(retry_after("soon", now), None);
     }
 
     /// A stand-in for the metadata server and the Chronicle API's `logs:import`.
