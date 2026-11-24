@@ -561,6 +561,10 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
     if let (Some(s), Some(app)) = (&c.service, &a.app) {
         v["serviceAccount"] = crate::service_accounts::whoami(app, &c, s);
     }
+    // So the app offers "Your service accounts" to every owner, not only delegates (ADR 0239).
+    if let (Some(u), Some(app)) = (c.user.as_ref().filter(|u| !u.service), &a.app) {
+        v["ownedServiceAccounts"] = json!(app.db.owned_service_accounts(&u.id));
+    }
     Json(v)
 }
 

@@ -6868,6 +6868,11 @@ impl Db {
         self.c().query_row(&format!("{} WHERE u.id = ?", Self::SERVICE_ACCOUNT), [id], service_account_row).optional().ok().flatten()
     }
 
+    /// How many live service accounts `owner` owns.
+    pub fn owned_service_accounts(&self, owner: &str) -> i64 {
+        self.c().query_row("SELECT COUNT(*) FROM service_accounts WHERE owner_id = ? AND deleted_at IS NULL", [owner], |r| r.get(0)).unwrap_or(0)
+    }
+
     /// Every service account, deleted ones too, oldest first.
     pub fn service_accounts(&self) -> Vec<ServiceAccount> {
         let c = self.c();

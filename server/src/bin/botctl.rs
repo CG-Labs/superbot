@@ -96,8 +96,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Give the role for the time asked, or less (--for)
   botctl role deny <request> [--note "<text>"]     Turn it down
   botctl service-accounts                          Service accounts (ADR 0143): non-human callers for scripts
-                                                   and integrations. Admins see all; others with users.manage
-                                                   the ones they own
+                                                   and integrations. Admins see all; anyone else the ones they
+                                                   own (show, disable and token list|revoke too, ADR 0239)
   botctl service-account show <sa>                 One, its permissions, its tokens (never their secrets), the
                                                    Bots it reaches, and its refusals in the last 30 days
   botctl service-account add "<name>" [--role member|readonly|<custom role>] [--team <team>] [--description "<text>"]

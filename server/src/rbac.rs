@@ -276,10 +276,12 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("POST", ["users", _, "login-codes"]) | ("DELETE", ["users", _, "sessions"]) => ManageUsers,
         ("GET", ["sessions"]) | ("DELETE", ["sessions", _]) => ManageUsers,
         // Service accounts (ADR 0143). Handlers keep a delegate to the ones they own, and
-        // to no more than they hold themselves.
-        ("GET" | "POST", ["service-accounts"]) | ("GET" | "PATCH" | "DELETE", ["service-accounts", _]) => ManageUsers,
-        ("GET" | "POST", ["service-accounts", _, "tokens"]) | ("DELETE", ["service-accounts", _, "tokens", _]) => ManageUsers,
-        ("POST", ["service-accounts", _, "tokens", _, "rotate"]) => ManageUsers,
+        // to no more than they hold themselves. Anyone may see the ones they own, revoke
+        // their tokens and disable them (ADR 0239): handlers refuse Bots and everything else.
+        ("GET", ["service-accounts"] | ["service-accounts", _] | ["service-accounts", _, "tokens"]) => Account,
+        ("PATCH", ["service-accounts", _]) | ("DELETE", ["service-accounts", _, "tokens", _]) => Account,
+        ("POST", ["service-accounts"]) | ("DELETE", ["service-accounts", _]) => ManageUsers,
+        ("POST", ["service-accounts", _, "tokens"] | ["service-accounts", _, "tokens", _, "rotate"]) => ManageUsers,
         ("GET", ["users", _, "bots" | "routines"]) | ("POST", ["users", _, "routines", "resume"]) => ManageBots,
         ("POST", ["tiers", _, "move-bots"]) => ManageBots,
         ("GET", ["audit"] | ["audit", "export.csv"] | ["access-review"] | ["access-review", "export.csv"]) => ViewAudit,
@@ -758,16 +760,17 @@ mod tests {
             ("GET", "/api/role-requests", Perm::Admin),
             ("POST", "/api/role-requests/rq1/approve", Perm::Admin),
             ("POST", "/api/role-requests/rq1/deny", Perm::Admin),
-            // Service accounts (ADR 0143).
-            ("GET", "/api/service-accounts", Perm::ManageUsers),
+            // Service accounts (ADR 0143): their owners see, revoke and disable (ADR 0239).
+            ("GET", "/api/service-accounts", Perm::Account),
             ("POST", "/api/service-accounts", Perm::ManageUsers),
-            ("GET", "/api/service-accounts/sa1", Perm::ManageUsers),
-            ("PATCH", "/api/service-accounts/sa1", Perm::ManageUsers),
+            ("GET", "/api/service-accounts/sa1", Perm::Account),
+            ("PATCH", "/api/service-accounts/sa1", Perm::Account),
             ("DELETE", "/api/service-accounts/sa1", Perm::ManageUsers),
-            ("GET", "/api/service-accounts/sa1/tokens", Perm::ManageUsers),
+            ("GET", "/api/service-accounts/sa1/tokens", Perm::Account),
             ("POST", "/api/service-accounts/sa1/tokens", Perm::ManageUsers),
-            ("DELETE", "/api/service-accounts/sa1/tokens/st1", Perm::ManageUsers),
+            ("DELETE", "/api/service-accounts/sa1/tokens/st1", Perm::Account),
             ("POST", "/api/service-accounts/sa1/tokens/st1/rotate", Perm::ManageUsers),
+            ("HEAD", "/api/service-accounts/sa1", Perm::Account),
             ("PUT", "/api/service-accounts/sa1", Perm::Admin),
             ("GET", "/api/service-accounts/sa1/tokens/st1", Perm::Admin),
             ("PATCH", "/api/service-accounts/sa1/tokens/st1", Perm::Admin),
