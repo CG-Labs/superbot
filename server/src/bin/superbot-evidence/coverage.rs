@@ -31,14 +31,19 @@ pub struct Expected {
 
 /// botd's evidence bundle (ADR 0142). botd's `evidence::SECTIONS` isn't reachable from
 /// this binary; a test checks this against the evidence plan's table, as botd's does.
-pub const EVIDENCE: [Expected; 6] = [
+pub const EVIDENCE: [Expected; 7] = [
     Expected { file: "access-review.json", criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2"] },
     Expected { file: "changes.json", criteria: &["CC5.1", "CC5.2", "CC8.1"], rows: &["CC5.1-1", "CC8.1-2"] },
     Expected { file: "backups.json", criteria: &["A1.2", "A1.3", "CC6.7", "CC7.5", "CC9.1"], rows: &["A1.2-1", "A1.2-2", "CC6.7-2"] },
     Expected { file: "retention.json", criteria: &["C1.2", "CC6.5"], rows: &["C1.2-1", "CC6.5-1", "CC6.5-2"] },
     Expected { file: "sign-ins-and-alerts.json", criteria: &["CC6.1", "CC6.6", "CC7.2"], rows: &["CC6.1-1", "CC7.2-1"] },
     Expected { file: "audit-summary.json", criteria: &["CC2.1", "CC4.1", "CC7.2"], rows: &[] },
+    Expected { file: AUDIT_INTEGRITY, criteria: &["CC2.1", "CC7.2"], rows: &["CC2.1-2", "CC7.2-2"] },
 ];
+
+/// botd's `audit-integrity.json` (ADR 0261): in every bundle from format 3. Its manifest
+/// names each row only while the period shows it held, so a row's days come from there.
+pub const AUDIT_INTEGRITY: &str = "audit-integrity.json";
 
 /// Files of botd's bundle that bundles made before them lack (ADR 0195): checked like
 /// the rest when listed, never required, so only the test against the evidence plan
@@ -60,7 +65,7 @@ pub struct Kind {
 }
 
 pub const KINDS: [Kind; 6] = [
-    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 2, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
+    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 3, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
     Kind {
         id: "change-management",
         prefix: changes::PREFIX,
@@ -120,12 +125,13 @@ pub fn expected(kind: &str) -> Vec<(&'static str, &'static [&'static str], &'sta
 fn since_format(kind: &str, file: &str) -> u64 {
     match kind {
         "policy-register" => register::SINCE_FORMAT.iter().find(|(f, _)| *f == file).map_or(1, |(_, n)| *n),
+        "evidence" if file == AUDIT_INTEGRITY => 3,
         _ => 1,
     }
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 17] = [
+const EXCEPTION_FILES: [&str; 18] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -143,6 +149,7 @@ const EXCEPTION_FILES: [&str; 17] = [
     "access.json",
     "vulnerabilities.json",
     "uptime.json",
+    AUDIT_INTEGRITY,
 ];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
@@ -896,6 +903,36 @@ mod tests {
         assert!(!check(format!("{name}.tar"), &name, &files).verified(), "changed after it was made");
     }
 
+    /// botd's bundles have `audit-integrity.json` from format 3 (ADR 0261): one of format
+    /// 2 without it still checks, one of format 3 must have it, its exceptions count, and
+    /// a row it doesn't name for the month isn't covered by it.
+    #[test]
+    fn botds_audit_integrity_file_is_required_from_format_3() {
+        let with = |n: u64, body: Option<(&[u8], &[&str], &[&str])>| {
+            let (name, mut fs) = bundle(&KINDS[0], p("2027-01-01", "2027-02-01"), "2027-02-01T00:05:00Z");
+            let mut m: Value = serde_json::from_slice(&fs["manifest.json"]).unwrap();
+            m["format"] = json!(n);
+            m["files"].as_array_mut().unwrap().retain(|f| f["name"] != AUDIT_INTEGRITY);
+            fs.remove(AUDIT_INTEGRITY);
+            if let Some((body, criteria, rows)) = body {
+                m["files"].as_array_mut().unwrap().push(json!({ "name": AUDIT_INTEGRITY, "sha256": sha256(body), "criteria": criteria, "checklist": rows }));
+                fs.insert(AUDIT_INTEGRITY.into(), body.to_vec());
+            }
+            fs.insert("manifest.json".into(), json_file(&m));
+            seal(&mut fs);
+            check(format!("{name}.tar"), &name, &fs)
+        };
+        let old = with(2, None);
+        assert!(old.verified(), "made before it: {:?}", old.problems);
+        let missing = with(3, None);
+        assert!(!missing.verified() && missing.problems.iter().any(|x| x.contains("it has no audit-integrity.json")), "{:?}", missing.problems);
+        let body = json_file(&json!({ "exceptions": { "off": [], "checkGaps": [{ "from": "2027-01-03T00:00:00Z" }], "failedChecks": [], "exportBehind": [{ "kind": "webhook" }, { "kind": "s3" }] } }));
+        let f = with(3, Some((&body, &["CC2.1"], &[])));
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!((f.exceptions[AUDIT_INTEGRITY]["checkGaps"], f.exceptions[AUDIT_INTEGRITY]["exportBehind"]), (1, 2));
+        assert!(f.files.iter().any(|(n, _, rows)| n == AUDIT_INTEGRITY && rows.is_empty()), "names no row while neither held");
+    }
+
     /// A register bundle of manifest format `n` with `file` taken out, then put back with
     /// `body` mapped to `rows` when given, consistently sealed, and checked.
     fn register_bundle_with(n: u64, file: &str, body: Option<(&[u8], &[&str], &[&str])>) -> Found {
@@ -1318,6 +1355,8 @@ mod tests {
         }
         let botd = include_str!("../../evidence.rs");
         assert!(botd.contains("pub const BASELINE_FILE: &str = \"baseline.json\";") && botd.contains("BASELINE_CRITERIA: [&str; 1] = [\"CC5.1\"]") && botd.contains("BASELINE_ROWS: [&str; 1] = [\"CC5.1-1\"]"));
+        let integrity = include_str!("../../evidence_integrity.rs");
+        assert!(integrity.contains(&format!("pub const FILE: &str = \"{AUDIT_INTEGRITY}\";")) && integrity.contains("CRITERIA: [&str; 2] = [\"CC2.1\", \"CC7.2\"]") && integrity.contains("ROWS: [&str; 2] = [\"CC2.1-2\", \"CC7.2-2\"]"));
         assert!(botd.contains(&format!("pub const FORMAT: u32 = {};", KINDS[0].format)));
         assert!(botd.contains(&format!("const PREFIX: &str = \"{}\";", KINDS[0].prefix)));
     }
