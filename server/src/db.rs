@@ -2411,7 +2411,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 70] = [
     migrate_deleted_teams,
 ];
 
-/// Teams this server deleted (ADR 0249), kept outside the audit log so audit retention
+/// Teams this server deleted (ADR 0251), kept outside the audit log so audit retention
 /// never makes a gone team's network look like another server's. A trigger writes one
 /// whatever deletes the team. Only the id and when: no name, nothing about anyone.
 /// Teams deleted before this are read once from the audit log, as far back as it goes.
@@ -11291,7 +11291,7 @@ impl Db {
     }
 
     /// Teams this server deleted and that aren't here now, with when each was (ADR 0236).
-    /// From its own record of them (ADR 0249), which audit retention doesn't prune.
+    /// From its own record of them (ADR 0251), which audit retention doesn't prune.
     pub fn deleted_teams(&self) -> Vec<(String, i64)> {
         let c = self.c();
         let mut s = c.prepare("SELECT id, deleted_at FROM deleted_teams WHERE id NOT IN (SELECT id FROM teams) ORDER BY id").unwrap();
