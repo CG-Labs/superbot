@@ -27,7 +27,7 @@ const MAX_LINE: usize = if cfg!(test) { 1_000 } else { 32_000 };
 const PART: usize = if cfg!(test) { 500 } else { 16_000 };
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest `Retry-After` botd waits for before trying again.
-const MAX_RETRY_AFTER: u64 = 300;
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 const LABEL: &str = "Azure Monitor";
 
 /// The typed columns, beside `TimeGenerated` and `Line`, and the line field each is from.
@@ -248,12 +248,10 @@ impl Client {
                     fresh = true;
                     continue;
                 }
-                let wait = (status == reqwest::StatusCode::TOO_MANY_REQUESTS)
-                    .then(|| r.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok()))
-                    .flatten();
+                let wait = (status == reqwest::StatusCode::TOO_MANY_REQUESTS).then(|| crate::audit_export::asked_to_wait(&r)).flatten();
                 let answer = r.bytes().await.unwrap_or_default();
-                if let Some(secs) = wait {
-                    tokio::time::sleep(Duration::from_secs(secs.min(MAX_RETRY_AFTER))).await;
+                if let Some(wait) = wait {
+                    tokio::time::sleep(wait.min(MAX_RETRY_AFTER)).await;
                 }
                 return Err(("delivery_failed", format!("{shown} answered HTTP {}{}{}", status.as_u16(), code(&answer), hint(status.as_u16()))));
             }
@@ -478,6 +476,8 @@ mod tests {
         /// Gzipped uploads, and their bytes as sent.
         gzipped: AtomicUsize,
         sent: AtomicUsize,
+        /// `Retry-After` on a 429, when set.
+        retry_after: Mutex<Option<String>>,
     }
 
     type A = Arc<Azure>;
@@ -493,9 +493,18 @@ mod tests {
         (StatusCode::OK, axum::Json(json!({ "access_token": token, "expires_in": "86399", "token_type": "Bearer" })))
     }
 
-    async fn upload(State(a): State<A>, Path((dcr, stream)): Path<(String, String)>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, raw: axum::body::Bytes) -> (StatusCode, axum::Json<Value>) {
+    async fn upload(State(a): State<A>, Path((dcr, stream)): Path<(String, String)>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, raw: axum::body::Bytes) -> (StatusCode, HeaderMap, axum::Json<Value>) {
+        let (status, body) = take(&a, &dcr, &stream, &q, &h, &raw);
+        let mut headers = HeaderMap::new();
+        if status == StatusCode::TOO_MANY_REQUESTS && let Some(v) = a.retry_after.lock().unwrap().clone() {
+            headers.insert("retry-after", v.parse().unwrap());
+        }
+        (status, headers, body)
+    }
+
+    fn take(a: &Azure, dcr: &str, stream: &str, q: &HashMap<String, String>, h: &HeaderMap, raw: &[u8]) -> (StatusCode, axum::Json<Value>) {
         a.requests.fetch_add(1, Ordering::SeqCst);
-        assert_eq!((dcr.as_str(), stream.as_str(), q.get("api-version").map(String::as_str)), (DCR, "Custom-SuperBotAudit", Some(API_VERSION)));
+        assert_eq!((dcr, stream, q.get("api-version").map(String::as_str)), (DCR, "Custom-SuperBotAudit", Some(API_VERSION)));
         assert_eq!(h.get("content-type").and_then(|v| v.to_str().ok()), Some("application/json"));
         let size: usize = h.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).expect("a request's size");
         assert!(size <= MAX_BODY, "{size}");
@@ -503,7 +512,7 @@ mod tests {
             Some("gzip") => {
                 a.gzipped.fetch_add(1, Ordering::SeqCst);
                 a.sent.fetch_add(size, Ordering::SeqCst);
-                crate::audit_line::gunzip(&raw, MAX_BODY as u64).expect("gzip within Azure's 1 MB, uncompressed too")
+                crate::audit_line::gunzip(raw, MAX_BODY as u64).expect("gzip within Azure's 1 MB, uncompressed too")
             }
             None => raw.to_vec(),
             Some(other) => panic!("Content-Encoding {other}"),
@@ -628,6 +637,28 @@ mod tests {
         let ids: std::collections::BTreeSet<i64> = records.iter().filter_map(|r| r["EventId"].as_i64()).collect();
         assert!(report.ok && report.hosts[0].events == ids.len() as u64 && ids.first() == Some(&1), "{report:?}");
         assert_eq!(xs.view(app.db.audit_head())["compress"], "gzip");
+    }
+
+    #[tokio::test]
+    async fn a_429_waits_for_a_retry_after_given_as_an_http_date() {
+        let (base, azure) = stand_in().await;
+        let mut m = monitor(&[("AUDIT_EXPORT", &format!("azure-monitor://{HOST}/{DCR}/Custom-SuperBotAudit"))]).unwrap();
+        m.point_at(&base);
+        azure.refuse.store(429, Ordering::SeqCst);
+        // An HTTP date has whole seconds, so this asks for a wait of more than one second.
+        let at = chrono::Utc::now() + chrono::Duration::seconds(2);
+        *azure.retry_after.lock().unwrap() = Some(at.format("%a, %d %b %Y %H:%M:%S GMT").to_string());
+        let started = std::time::Instant::now();
+        let (reason, error) = Client::new(&m).send(&m, &[json!({ "Line": "x" })], false).await.unwrap_err();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_secs(1) && waited < Duration::from_secs(10), "waited {waited:?}");
+        assert_eq!(reason, "delivery_failed");
+        assert!(error.contains("answered HTTP 429 (OperationFailed): throttled"), "{error}");
+
+        *azure.retry_after.lock().unwrap() = Some("Tue, 24 Nov 2020 12:00:00 GMT".into());
+        let started = std::time::Instant::now();
+        Client::new(&m).send(&m, &[json!({ "Line": "x" })], false).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1), "a date already past is no wait");
     }
 
     #[tokio::test]
