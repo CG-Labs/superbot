@@ -132,6 +132,203 @@ fn resource_of(url: &url::Url) -> String {
     }
 }
 
+/// How botd signs in to Entra ID as itself: the method `method_var` names (with `method`
+/// its value) and the shared `AZURE_*` settings. Key Vault reads `AZURE_KEYVAULT_AUTH`;
+/// the audit export's Azure Monitor sink, `AUDIT_EXPORT_AZURE_AUTH` (ADR 0217).
+fn sign_in_settings(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, method_var: &str, method: &str) -> Result<(Auth, String, Identity), String> {
+    let client_id = || id_setting("AZURE_CLIENT_ID", &var("AZURE_CLIENT_ID"));
+    let tenant = || id_setting("AZURE_TENANT_ID", &var("AZURE_TENANT_ID"));
+    let auth = match method.trim() {
+        "" | "managed-identity" => Auth::ManagedIdentity { client_id: (!var("AZURE_CLIENT_ID").trim().is_empty()).then(client_id).transpose()? },
+        "client-secret" => {
+            let secret = store.get("AZURE_CLIENT_SECRET").map_err(|e| format!("AZURE_CLIENT_SECRET: {e}"))?;
+            let secret = secret.ok_or(format!("{method_var}=client-secret needs AZURE_CLIENT_SECRET (or AZURE_CLIENT_SECRET_FILE)"))?;
+            super::redact::register(secret.expose());
+            Auth::ClientSecret { tenant: tenant()?, client_id: client_id()?, secret: Zeroizing::new(secret.expose().to_string()) }
+        }
+        "workload-identity" => {
+            let file = var("AZURE_FEDERATED_TOKEN_FILE");
+            if file.trim().is_empty() {
+                return Err(format!("{method_var}=workload-identity needs AZURE_FEDERATED_TOKEN_FILE (AKS sets it)"));
+            }
+            Auth::WorkloadIdentity { tenant: tenant()?, client_id: client_id()?, token_file: PathBuf::from(file.trim()) }
+        }
+        other => return Err(format!("{method_var} must be managed-identity, client-secret or workload-identity, not {other:?}")),
+    };
+    let authority = match var("AZURE_AUTHORITY_HOST").trim() {
+        "" => AUTHORITY.to_string(),
+        a => http::base_url("AZURE_AUTHORITY_HOST", a, AUTHORITY)?,
+    };
+    let identity = match (var("IDENTITY_ENDPOINT").trim(), var("IDENTITY_HEADER")) {
+        ("", _) => Identity::Imds(IMDS.into()),
+        (endpoint, header) if !header.trim().is_empty() => {
+            let u = url::Url::parse(endpoint).map_err(|e| format!("IDENTITY_ENDPOINT {endpoint:?}: {e}"))?;
+            if !crate::tiers::encrypted_or_loopback(&u) && !matches!(u.host(), Some(url::Host::Ipv4(ip)) if ip.is_link_local()) {
+                return Err(format!("IDENTITY_ENDPOINT must be the platform's local identity endpoint, not {endpoint:?}"));
+            }
+            Identity::Endpoint { url: endpoint.to_string(), header: Zeroizing::new(header.trim().to_string()) }
+        }
+        _ => return Err("IDENTITY_ENDPOINT is set without IDENTITY_HEADER".into()),
+    };
+    Ok((auth, authority, identity))
+}
+
+fn method_of(auth: &Auth) -> &'static str {
+    match auth {
+        Auth::ManagedIdentity { .. } => "managed-identity",
+        Auth::ClientSecret { .. } => "client-secret",
+        Auth::WorkloadIdentity { .. } => "workload-identity",
+    }
+}
+
+/// Who botd signs in as, for startup lines: never a credential.
+fn signs_in_as(auth: &Auth) -> String {
+    match auth {
+        Auth::ManagedIdentity { client_id: Some(id) } => format!("user-assigned managed identity {id}"),
+        Auth::ManagedIdentity { client_id: None } => "managed identity".to_string(),
+        Auth::ClientSecret { tenant, client_id, .. } => format!("service principal {client_id} in tenant {tenant}"),
+        Auth::WorkloadIdentity { tenant, client_id, .. } => format!("workload identity {client_id} in tenant {tenant}"),
+    }
+}
+
+fn token_url(authority: &str, tenant: &str) -> String {
+    format!("{authority}/{tenant}/oauth2/v2.0/token")
+}
+
+/// A request for the managed identity's token for `resource`, from the VM's instance
+/// metadata service or the platform's identity endpoint.
+fn managed_identity(local: &reqwest::Client, identity: &Identity, resource: &str, client_id: Option<&str>) -> Result<reqwest::RequestBuilder, Error> {
+    let mut q = vec![("resource", resource)];
+    if let Some(id) = client_id {
+        q.push(("client_id", id));
+    }
+    Ok(match identity {
+        Identity::Imds(base) => {
+            q.push(("api-version", "2018-02-01"));
+            local.get(http::with_query(&format!("{base}/metadata/identity/oauth2/token"), &q)?).header("Metadata", "true")
+        }
+        Identity::Endpoint { url, header } => {
+            q.push(("api-version", "2019-08-01"));
+            local.get(http::with_query(url, &q)?).header("X-IDENTITY-HEADER", header.as_str())
+        }
+    })
+}
+
+/// The federated token the platform keeps in `AZURE_FEDERATED_TOKEN_FILE`, read afresh.
+fn federated_token(label: &str, token_file: &std::path::Path) -> Result<Zeroizing<String>, Error> {
+    let text = Zeroizing::new(std::fs::read_to_string(token_file).map_err(|e| Error::Unavailable(format!("{label}: AZURE_FEDERATED_TOKEN_FILE: {e}")))?);
+    let assertion = text.trim();
+    if assertion.is_empty() {
+        return Err(Error::Unavailable(format!("{label}: AZURE_FEDERATED_TOKEN_FILE is empty")));
+    }
+    Ok(Zeroizing::new(assertion.to_string()))
+}
+
+/// Sends a token request and reads the token and its lifetime from the answer.
+async fn bearer(label: &str, req: reqwest::RequestBuilder, what: &str) -> Result<Bearer, Error> {
+    let failed = |e: reqwest::Error| Error::Unavailable(format!("{label}: {what}: {e}"));
+    let res = req.send().await.map_err(failed)?;
+    let status = res.status();
+    let body = Zeroizing::new(res.bytes().await.map_err(failed)?.to_vec());
+    if !status.is_success() {
+        return Err(Error::Unavailable(format!("{label}: {what} answered {status}{}", http::error_code(&body))));
+    }
+    let v: Value = serde_json::from_slice(&body).map_err(|e| Error::Unavailable(format!("{label}: {what}: {e}")))?;
+    let token = v["access_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable(format!("{label}: {what} gave no token")))?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let lifetime = http::seconds(&v["expires_in"]).or_else(|| http::seconds(&v["expires_on"]).map(|at| at.saturating_sub(now)));
+    Ok(Bearer::new(token, lifetime))
+}
+
+/// botd's own token for `resource`, however it signs in.
+async fn sign_in(label: &str, http: &reqwest::Client, local: &reqwest::Client, auth: &Auth, authority: &str, identity: &Identity, resource: &str) -> Result<Bearer, Error> {
+    let scope = format!("{resource}/.default");
+    let req = match auth {
+        Auth::ManagedIdentity { client_id } => managed_identity(local, identity, resource, client_id.as_deref())?,
+        Auth::ClientSecret { tenant, client_id, secret } => {
+            let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_secret", secret), ("scope", &scope)];
+            http.post(token_url(authority, tenant)).form(&form)
+        }
+        Auth::WorkloadIdentity { tenant, client_id, token_file } => {
+            let assertion = federated_token(label, token_file)?;
+            let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_assertion_type", ASSERTION_TYPE), ("client_assertion", &assertion), ("scope", &scope)];
+            http.post(token_url(authority, tenant)).form(&form)
+        }
+    };
+    bearer(label, req, &format!("{} sign-in", method_of(auth))).await
+}
+
+/// botd signed in to Entra ID as itself for one resource other than Key Vault, the token
+/// kept while it lasts: the audit export's Azure Monitor sink (ADR 0217). It reads the
+/// same `AZURE_*` settings as Key Vault, so it is the same identity.
+pub struct Entra {
+    label: &'static str,
+    auth: Auth,
+    authority: String,
+    identity: Identity,
+    resource: String,
+    http: reqwest::Client,
+    local: reqwest::Client,
+    token: Mutex<Option<Bearer>>,
+}
+
+impl Entra {
+    /// `label` names the service in errors; `resource` is what tokens are for, such as
+    /// `https://monitor.azure.com`.
+    pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, method_var: &str, method: &str, label: &'static str, resource: &str) -> Result<Entra, String> {
+        let (auth, authority, identity) = sign_in_settings(var, store, method_var, method)?;
+        let http = http::client(label, None, false)?;
+        let local = http::client(label, None, true)?;
+        Ok(Entra { label, auth, authority, identity, resource: resource.to_string(), http, local, token: Mutex::new(None) })
+    }
+
+    pub fn method(&self) -> &'static str {
+        method_of(&self.auth)
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    /// Who botd signs in as, never a credential.
+    pub fn describe(&self) -> String {
+        signs_in_as(&self.auth)
+    }
+
+    /// The token to send; a new one if `fresh` (the service refused the last) or it is due.
+    pub async fn token(&self, fresh: bool) -> Result<Zeroizing<String>, String> {
+        if !fresh && let Some(t) = self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|t| t.fresh()) {
+            return Ok(t.value.clone());
+        }
+        let t = sign_in(self.label, &self.http, &self.local, &self.auth, &self.authority, &self.identity, &self.resource).await.map_err(|e| e.to_string())?;
+        // Masked wherever an error might quote it, while this or another holder uses it:
+        // Entra and the instance metadata service can hand out the same token again.
+        super::redact::hold(&t.value);
+        let value = t.value.clone();
+        if let Some(old) = self.token.lock().unwrap_or_else(|e| e.into_inner()).replace(t) {
+            super::redact::release(&old.value);
+        }
+        Ok(value)
+    }
+
+    /// Signs in at `base` instead: a stand-in for Entra ID and the instance metadata service.
+    #[cfg(test)]
+    pub fn point_at(&mut self, base: &str) {
+        self.authority = base.to_string();
+        if let Identity::Imds(_) = self.identity {
+            self.identity = Identity::Imds(base.to_string());
+        }
+    }
+}
+
+impl Drop for Entra {
+    fn drop(&mut self) {
+        if let Some(t) = self.token.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            super::redact::release(&t.value);
+        }
+    }
+}
+
 impl Config {
     /// `AZURE_*` settings; secrets come from `store` (the environment), so `_FILE` works.
     pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Config, String> {
@@ -141,39 +338,7 @@ impl Config {
         }
         let url = http::base_url("AZURE_KEYVAULT_URL", &raw, "https://my-vault.vault.azure.net")?;
         let resource = resource_of(&url::Url::parse(&url).map_err(|e| e.to_string())?);
-        let client_id = || id_setting("AZURE_CLIENT_ID", &var("AZURE_CLIENT_ID"));
-        let tenant = || id_setting("AZURE_TENANT_ID", &var("AZURE_TENANT_ID"));
-        let auth = match var("AZURE_KEYVAULT_AUTH").trim() {
-            "" | "managed-identity" => Auth::ManagedIdentity { client_id: (!var("AZURE_CLIENT_ID").trim().is_empty()).then(client_id).transpose()? },
-            "client-secret" => {
-                let secret = store.get("AZURE_CLIENT_SECRET").map_err(|e| format!("AZURE_CLIENT_SECRET: {e}"))?;
-                let secret = secret.ok_or("AZURE_KEYVAULT_AUTH=client-secret needs AZURE_CLIENT_SECRET (or AZURE_CLIENT_SECRET_FILE)")?;
-                Auth::ClientSecret { tenant: tenant()?, client_id: client_id()?, secret: Zeroizing::new(secret.expose().to_string()) }
-            }
-            "workload-identity" => {
-                let file = var("AZURE_FEDERATED_TOKEN_FILE");
-                if file.trim().is_empty() {
-                    return Err("AZURE_KEYVAULT_AUTH=workload-identity needs AZURE_FEDERATED_TOKEN_FILE (AKS sets it)".into());
-                }
-                Auth::WorkloadIdentity { tenant: tenant()?, client_id: client_id()?, token_file: PathBuf::from(file.trim()) }
-            }
-            other => return Err(format!("AZURE_KEYVAULT_AUTH must be managed-identity, client-secret or workload-identity, not {other:?}")),
-        };
-        let authority = match var("AZURE_AUTHORITY_HOST").trim() {
-            "" => AUTHORITY.to_string(),
-            a => http::base_url("AZURE_AUTHORITY_HOST", a, AUTHORITY)?,
-        };
-        let identity = match (var("IDENTITY_ENDPOINT").trim(), var("IDENTITY_HEADER")) {
-            ("", _) => Identity::Imds(IMDS.into()),
-            (endpoint, header) if !header.trim().is_empty() => {
-                let u = url::Url::parse(endpoint).map_err(|e| format!("IDENTITY_ENDPOINT {endpoint:?}: {e}"))?;
-                if !crate::tiers::encrypted_or_loopback(&u) && !matches!(u.host(), Some(url::Host::Ipv4(ip)) if ip.is_link_local()) {
-                    return Err(format!("IDENTITY_ENDPOINT must be the platform's local identity endpoint, not {endpoint:?}"));
-                }
-                Identity::Endpoint { url: endpoint.to_string(), header: Zeroizing::new(header.trim().to_string()) }
-            }
-            _ => return Err("IDENTITY_ENDPOINT is set without IDENTITY_HEADER".into()),
-        };
+        let (auth, authority, identity) = sign_in_settings(var, store, "AZURE_KEYVAULT_AUTH", &var("AZURE_KEYVAULT_AUTH"))?;
         let tenant = Some(var("AZURE_TENANT_ID").trim().to_string()).filter(|t| !t.is_empty());
         Ok(Config { url, resource, prefix: prefix_setting(&var("AZURE_KEYVAULT_PREFIX"))?, auth, authority, identity, tenant })
     }
@@ -221,8 +386,10 @@ pub struct KeyVault {
     worker: Arc<Worker>,
 }
 
+const KEY_VAULT: &str = "Azure Key Vault";
+
 fn unavailable(what: &str, e: impl std::fmt::Display) -> Error {
-    Error::Unavailable(format!("Azure Key Vault: {what}: {e}"))
+    Error::Unavailable(format!("{KEY_VAULT}: {what}: {e}"))
 }
 
 fn entra_unavailable(what: &str, e: impl std::fmt::Display) -> Error {
@@ -253,11 +420,7 @@ impl Inner {
     }
 
     fn method(&self) -> &'static str {
-        match self.cfg.auth {
-            Auth::ManagedIdentity { .. } => "managed-identity",
-            Auth::ClientSecret { .. } => "client-secret",
-            Auth::WorkloadIdentity { .. } => "workload-identity",
-        }
+        method_of(&self.cfg.auth)
     }
 
     /// The token to send; a new one if `fresh` (Key Vault refused the last) or it is due.
@@ -273,71 +436,9 @@ impl Inner {
         Ok(value)
     }
 
-    /// A request for the managed identity's token for `resource`, from the VM's instance
-    /// metadata service or the platform's identity endpoint.
-    fn managed_identity(&self, resource: &str, client_id: Option<&str>) -> Result<reqwest::RequestBuilder, Error> {
-        let mut q = vec![("resource", resource)];
-        if let Some(id) = client_id {
-            q.push(("client_id", id));
-        }
-        Ok(match &self.cfg.identity {
-            Identity::Imds(base) => {
-                q.push(("api-version", "2018-02-01"));
-                self.local.get(http::with_query(&format!("{base}/metadata/identity/oauth2/token"), &q)?).header("Metadata", "true")
-            }
-            Identity::Endpoint { url, header } => {
-                q.push(("api-version", "2019-08-01"));
-                self.local.get(http::with_query(url, &q)?).header("X-IDENTITY-HEADER", header.as_str())
-            }
-        })
-    }
-
-    /// The federated token the platform keeps in `AZURE_FEDERATED_TOKEN_FILE`, read afresh.
-    fn federated_token(token_file: &std::path::Path) -> Result<Zeroizing<String>, Error> {
-        let text = Zeroizing::new(std::fs::read_to_string(token_file).map_err(|e| unavailable("AZURE_FEDERATED_TOKEN_FILE", e))?);
-        let assertion = text.trim();
-        if assertion.is_empty() {
-            return Err(Error::Unavailable("Azure Key Vault: AZURE_FEDERATED_TOKEN_FILE is empty".into()));
-        }
-        Ok(Zeroizing::new(assertion.to_string()))
-    }
-
-    fn token_url(&self, tenant: &str) -> String {
-        format!("{}/{tenant}/oauth2/v2.0/token", self.cfg.authority)
-    }
-
     async fn sign_in(&self) -> Result<Bearer, Error> {
         let c = &self.cfg;
-        let scope = format!("{}/.default", c.resource);
-        let req = match &c.auth {
-            Auth::ManagedIdentity { client_id } => self.managed_identity(&c.resource, client_id.as_deref())?,
-            Auth::ClientSecret { tenant, client_id, secret } => {
-                let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_secret", secret), ("scope", &scope)];
-                self.http.post(self.token_url(tenant)).form(&form)
-            }
-            Auth::WorkloadIdentity { tenant, client_id, token_file } => {
-                let assertion = Self::federated_token(token_file)?;
-                let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_assertion_type", ASSERTION_TYPE), ("client_assertion", &assertion), ("scope", &scope)];
-                self.http.post(self.token_url(tenant)).form(&form)
-            }
-        };
-        let what = format!("{} sign-in", self.method());
-        self.bearer(req, &what).await
-    }
-
-    /// Sends a token request and reads the token and its lifetime from the answer.
-    async fn bearer(&self, req: reqwest::RequestBuilder, what: &str) -> Result<Bearer, Error> {
-        let res = req.send().await.map_err(|e| unavailable(what, e))?;
-        let status = res.status();
-        let body = Zeroizing::new(res.bytes().await.map_err(|e| unavailable(what, e))?.to_vec());
-        if !status.is_success() {
-            return Err(Error::Unavailable(format!("Azure Key Vault: {what} answered {status}{}", http::error_code(&body))));
-        }
-        let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(what, e))?;
-        let token = v["access_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable(format!("Azure Key Vault: {what} gave no token")))?;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let lifetime = http::seconds(&v["expires_in"]).or_else(|| http::seconds(&v["expires_on"]).map(|at| at.saturating_sub(now)));
-        Ok(Bearer::new(token, lifetime))
+        sign_in(KEY_VAULT, &self.http, &self.local, &c.auth, &c.authority, &c.identity, &c.resource).await
     }
 
     /// GETs `url`; when Key Vault refuses the token, gets a new one and asks once more.
@@ -418,7 +519,7 @@ impl Inner {
     /// workload identity, the platform's federated token, read afresh.
     async fn assertion(&self, fresh: bool) -> Result<Zeroizing<String>, Error> {
         let client_id = match &self.cfg.auth {
-            Auth::WorkloadIdentity { token_file, .. } => return Self::federated_token(token_file),
+            Auth::WorkloadIdentity { token_file, .. } => return federated_token(KEY_VAULT, token_file),
             Auth::ManagedIdentity { client_id: Some(id) } => id,
             _ => return Err(Error::Unavailable("Azure Entra ID: AZURE_RUN_CREDENTIALS needs a user-assigned managed identity or workload identity".into())),
         };
@@ -426,8 +527,8 @@ impl Inner {
             return Ok(t.value.clone());
         }
         let audience = exchange_audience(&self.cfg.authority);
-        let result = match self.managed_identity(audience, Some(client_id)) {
-            Ok(req) => self.bearer(req, &format!("managed-identity sign-in for {audience}")).await,
+        let result = match managed_identity(&self.local, &self.cfg.identity, audience, Some(client_id)) {
+            Ok(req) => bearer(KEY_VAULT, req, &format!("managed-identity sign-in for {audience}")).await,
             Err(e) => Err(e),
         };
         let e = Event::new(external::actor(), "secret.backend_login").target("secrets_backend", "azure-keyvault");
@@ -454,7 +555,7 @@ impl Inner {
         for fresh in [false, true] {
             let assertion = self.assertion(fresh).await?;
             let form = [("grant_type", "client_credentials"), ("client_id", app), ("client_assertion_type", ASSERTION_TYPE), ("client_assertion", &assertion), ("scope", &scope)];
-            let res = self.http.post(self.token_url(tenant)).form(&form).send().await.map_err(|e| entra_unavailable(&what, e))?;
+            let res = self.http.post(token_url(&self.cfg.authority, tenant)).form(&form).send().await.map_err(|e| entra_unavailable(&what, e))?;
             let status = res.status();
             let reply = Zeroizing::new(res.bytes().await.map_err(|e| entra_unavailable(&what, e))?.to_vec());
             if status.is_success() {
@@ -525,12 +626,7 @@ impl Provider for KeyVault {
 
     fn describe(&self) -> String {
         let c = &self.inner.cfg;
-        let auth = match &c.auth {
-            Auth::ManagedIdentity { client_id: Some(id) } => format!("user-assigned managed identity {id}"),
-            Auth::ManagedIdentity { client_id: None } => "managed identity".to_string(),
-            Auth::ClientSecret { tenant, client_id, .. } => format!("service principal {client_id} in tenant {tenant}"),
-            Auth::WorkloadIdentity { tenant, client_id, .. } => format!("workload identity {client_id} in tenant {tenant}"),
-        };
+        let auth = signs_in_as(&c.auth);
         format!("Azure Key Vault at {}, secrets {}-{{bots,server}}-<NAME>, {auth}", c.url, c.prefix)
     }
 
@@ -1020,6 +1116,30 @@ mod tests {
         let var = settings(&[run]);
         assert_eq!(external::unused_settings(&var, "gcp-secret-manager"), ["AZURE_RUN_CREDENTIALS"], "only SECRETS_BACKEND=azure-keyvault reads it");
         assert!(external::unused_settings(&var, "azure-keyvault").is_empty());
+    }
+
+    #[test]
+    fn another_resources_token_is_kept_until_it_is_refused() {
+        let (url, f) = stand_in();
+        let pairs = [("AZURE_AUTHORITY_HOST", url.as_str()), ("AZURE_TENANT_ID", "tenant-1"), ("AZURE_CLIENT_ID", "client-1"), ("AZURE_CLIENT_SECRET", "sp-secret-1")];
+        let mut e = Entra::from_env(&settings(&pairs), &EnvStore::fixed(&pairs), "AUDIT_EXPORT_AZURE_AUTH", "client-secret", "Azure Monitor", "https://monitor.azure.com").unwrap();
+        e.point_at(&url);
+        assert_eq!((e.method(), e.describe().as_str()), ("client-secret", "service principal client-1 in tenant tenant-1"));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let first = rt.block_on(e.token(false)).unwrap();
+        assert_eq!(f.asked.lock().unwrap()[0]["scope"], "https://monitor.azure.com/.default");
+        assert_eq!(*rt.block_on(e.token(false)).unwrap(), *first, "kept while it lasts");
+        let second = rt.block_on(e.token(true)).unwrap();
+        assert_ne!(*second, *first);
+        assert_eq!(f.sign_ins.load(Ordering::SeqCst), 2);
+        assert!(redact::text(&format!("x {} y", *second)).contains(redact::MARK), "the token in use is masked");
+        assert!(!redact::text(&format!("x {} y", *first)).contains(redact::MARK), "and only that one");
+
+        let wrong = [("AZURE_AUTHORITY_HOST", url.as_str()), ("AZURE_TENANT_ID", "tenant-1"), ("AZURE_CLIENT_ID", "client-1"), ("AZURE_CLIENT_SECRET", "not-the-secret")];
+        let mut e = Entra::from_env(&settings(&wrong), &EnvStore::fixed(&wrong), "AUDIT_EXPORT_AZURE_AUTH", "client-secret", "Azure Monitor", "https://monitor.azure.com").unwrap();
+        e.point_at(&url);
+        let err = rt.block_on(e.token(false)).unwrap_err();
+        assert!(err.contains("Azure Monitor: client-secret sign-in answered 401") && err.contains("invalid_client") && !err.contains("not-the-secret"), "{err}");
     }
 
     #[test]

@@ -199,9 +199,27 @@ pub fn insert_system(c: &Connection, part: &str, action: &str, target: (&str, &s
 /// hold nobody's data, so no erasure clears their salt.
 pub const ERASED: &str = "audit.erased";
 
-/// Records which rows an erasure cleared the salt of, as `[first, last]` id ranges.
+/// Ranges one `audit.erased` event names: under 43 KB even with 19-digit ids, so a line
+/// fits SIEM field limits (Azure Monitor cuts at 64 KB) however scattered the rows are.
+const MAX_RANGES: usize = 1_000;
+
+/// Records which rows an erasure cleared the salt of, as `[first, last]` id ranges, in as
+/// many events as that takes, all or none. Returns the last one's id.
 pub fn insert_erased(c: &Connection, pseudonym: &str, ids: &[i64]) -> rusqlite::Result<i64> {
-    insert_system(c, "erasure", ERASED, ("user", pseudonym), &json!({ "rows": ranges(ids) }))
+    let ranges = ranges(ids);
+    let mut parts: Vec<&[[i64; 2]]> = ranges.chunks(MAX_RANGES).collect();
+    if parts.is_empty() {
+        parts.push(&[]);
+    }
+    let tx = if c.is_autocommit() { Some(rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?) } else { None };
+    let mut last = 0;
+    for rows in parts {
+        last = insert_system(c, "erasure", ERASED, ("user", pseudonym), &json!({ "rows": rows }))?;
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(last)
 }
 
 fn ranges(ids: &[i64]) -> Vec<[i64; 2]> {
@@ -969,6 +987,33 @@ mod tests {
     fn erasures_are_recorded_as_ranges() {
         assert_eq!(ranges(&[9, 3, 4, 5, 7, 4]), vec![[3, 5], [7, 7], [9, 9]]);
         assert!(ranges(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_scattered_erasure_is_named_in_events_a_siem_can_hold_whole() {
+        let widest: Vec<i64> = (0..MAX_RANGES as i64).map(|i| i64::MAX - 2 * i).collect();
+        assert!(json!({ "rows": ranges(&widest) }).to_string().len() < 43_000);
+
+        let app = crate::runner::test_app();
+        let event = || crate::audit::Event::new(crate::audit::Actor::system("test"), "test.thing");
+        let ids: Vec<i64> = (0..2 * MAX_RANGES + 2).map(|_| app.db.try_record(&event()).unwrap()).collect();
+        let every_other: Vec<i64> = ids.iter().step_by(2).copied().collect();
+        let list = every_other.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        app.db.execute_raw("DROP TRIGGER audit_events_no_update").unwrap();
+        app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = NULL WHERE id IN ({list})")).unwrap();
+        let last = app.db.with_conn(|c| insert_erased(c, "p", &every_other)).unwrap();
+        let named: Vec<(i64, usize)> = app.db.with_conn(|c| {
+            let mut q = c.prepare("SELECT id, details FROM audit_events WHERE action = ?1 ORDER BY id").unwrap();
+            q.query_map([ERASED], |r| Ok((r.get(0)?, named_ranges(&r.get::<_, String>(1)?)))).unwrap().map(Result::unwrap).collect()
+        });
+        assert_eq!(named.iter().map(|n| n.1).collect::<Vec<_>>(), vec![MAX_RANGES, 1], "split, every range named once");
+        assert_eq!(named.last().map(|n| n.0), Some(last));
+        let r = verify(&app.db, vec![]);
+        assert_eq!((r.ok, r.erased), (true, every_other.len() as u64), "{r:?}");
+
+        fn named_ranges(details: &str) -> usize {
+            serde_json::from_str::<Value>(details).unwrap()["rows"].as_array().unwrap().len()
+        }
     }
 
     #[test]

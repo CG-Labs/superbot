@@ -11,6 +11,9 @@
 //! - Plain `http://` and `syslog+tcp://` to loopback, or with `AUDIT_EXPORT_INSECURE=on`.
 //! - `s3://<bucket>[/<prefix>]`: batches as JSON-lines objects in an S3-compatible
 //!   store, each locked with S3 Object Lock ([`crate::audit_archive`], ADR 0154).
+//! - `azure-monitor://<host>/<dcr>/<stream>`: records in a Log Analytics workspace, for
+//!   Microsoft Sentinel, through Azure Monitor's Logs Ingestion API, signed in with
+//!   Entra ID ([`crate::audit_azure`], ADR 0217).
 //!
 //! Off unless `AUDIT_EXPORT` is set. Delivery is at least once, in id order: a cursor
 //! in the database (per sink) moves only when a batch is accepted, a failed batch is
@@ -44,12 +47,14 @@ const FACILITY: u8 = 13;
 /// retention back while it is behind.
 pub const MAX_SIEMS: usize = 4;
 const MAX_NAME: usize = 24;
+const MONITOR_SIGNS_IN: &str = "Azure Monitor signs in with Entra ID (AUDIT_EXPORT_AZURE_AUTH)";
 
 enum Kind {
     /// `headers_from` names the setting the headers came from, for the startup line.
     Webhook { url: String, plain: bool, headers: Vec<(String, secrets::Secret)>, headers_from: String },
     Syslog { host: String, port: u16, tls: bool },
     Archive(Box<crate::audit_archive::Archive>),
+    Monitor(Box<crate::audit_azure::Monitor>),
 }
 
 pub struct Sink {
@@ -107,6 +112,15 @@ impl Sink {
             Kind::Webhook { .. } => "webhook",
             Kind::Syslog { .. } => "syslog",
             Kind::Archive(_) => "s3",
+            Kind::Monitor(_) => "azure-monitor",
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn monitor_mut(&mut self) -> Option<&mut crate::audit_azure::Monitor> {
+        match &mut self.kind {
+            Kind::Monitor(m) => Some(m),
+            _ => None,
         }
     }
 
@@ -147,8 +161,12 @@ impl Sink {
         Sink { shown: a.shown(), id: a.id(), kind: Kind::Archive(Box::new(a)), name: None, start: None }
     }
 
+    fn from_monitor(m: crate::audit_azure::Monitor) -> Sink {
+        Sink { shown: m.shown(), id: m.id(), kind: Kind::Monitor(Box::new(m)), name: None, start: None }
+    }
+
     pub fn parse(raw: &str, insecure: bool) -> Result<Sink, String> {
-        let bad = |why: &str| format!("AUDIT_EXPORT must be https://<host>/<path>, syslog+tls://<host>[:<port>] or s3://<bucket>[/<prefix>]: {why}");
+        let bad = |why: &str| format!("AUDIT_EXPORT must be https://<host>/<path>, syslog+tls://<host>[:<port>], azure-monitor://<host>/<dcr>/<stream> or s3://<bucket>[/<prefix>]: {why}");
         let u = url::Url::parse(raw.trim()).map_err(|_| bad("it isn't a URL"))?;
         let host = u.host_str().filter(|h| !h.is_empty()).ok_or_else(|| bad("no host"))?.to_string();
         let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]");
@@ -176,13 +194,13 @@ impl Sink {
                 let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
                 (Kind::Syslog { host, port, tls }, Some(port))
             }
-            _ => return Err(bad("use https, syslog+tls, syslog+tcp or s3")),
+            _ => return Err(bad("use https, syslog+tls, syslog+tcp, azure-monitor or s3")),
         };
         let port = port.map(|p| format!(":{p}")).unwrap_or_default();
         let (shown, id) = match &kind {
             Kind::Webhook { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}{}", u.scheme(), u.path())),
             Kind::Syslog { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}", u.scheme())),
-            Kind::Archive(_) => unreachable!("s3:// sinks are read with their settings"),
+            Kind::Archive(_) | Kind::Monitor(_) => unreachable!("s3:// and azure-monitor:// sinks are read with their settings"),
         };
         Ok(Sink { kind, shown, id, name: None, start: None })
     }
@@ -224,9 +242,13 @@ impl Settings {
         let mut sinks: Vec<Sink> = Vec::new();
         for entry in listed {
             let (name, v) = named(entry)?;
-            let mut sink = match v.to_ascii_lowercase().starts_with("s3://") {
-                true => Sink::from_archive(crate::audit_archive::Archive::from_env(v, get, store)?),
-                false => Sink::parse(v, insecure)?,
+            let lower = v.to_ascii_lowercase();
+            let mut sink = if lower.starts_with("s3://") {
+                Sink::from_archive(crate::audit_archive::Archive::from_env(v, get, store)?)
+            } else if lower.starts_with("azure-monitor://") {
+                Sink::from_monitor(crate::audit_azure::Monitor::from_env(v, get, store)?)
+            } else {
+                Sink::parse(v, insecure)?
             };
             if let Some(n) = &name {
                 if sinks.iter().any(|s| s.name.as_ref() == Some(n)) {
@@ -245,7 +267,7 @@ impl Settings {
         let archives = sinks.iter().filter(|s| s.archive().is_some()).count();
         let siems = sinks.len() - archives;
         if archives > 1 || siems > MAX_SIEMS {
-            return Err(format!("AUDIT_EXPORT takes up to {MAX_SIEMS} SIEMs (https:// or syslog+tls://) and one archive (s3://) at most, split by commas"));
+            return Err(format!("AUDIT_EXPORT takes up to {MAX_SIEMS} SIEMs (https://, syslog+tls:// or azure-monitor://) and one archive (s3://) at most, split by commas"));
         }
         if siems > 1 && let Some(s) = sinks.iter().find(|s| s.siem() && s.name.is_none()) {
             return Err(format!(
@@ -268,6 +290,7 @@ impl Settings {
                 }
                 Kind::Syslog { .. } => return Err(format!("{var} is for an https sink; syslog over TLS has no headers")),
                 Kind::Archive(_) => return Err(format!("{var} is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY")),
+                Kind::Monitor(_) => return Err(format!("{var} is for an https sink; {MONITOR_SIGNS_IN}")),
             }
         }
         if let Some(h) = store.get("AUDIT_EXPORT_HEADERS").map_err(|e| e.to_string())? {
@@ -282,6 +305,7 @@ impl Settings {
                     *headers = crate::obs::trace::headers("AUDIT_EXPORT_HEADERS", h.expose())?;
                     *headers_from = "AUDIT_EXPORT_HEADERS".into();
                 }
+                Some((_, Kind::Monitor(_))) => return Err(format!("AUDIT_EXPORT_HEADERS is for an https sink; {MONITOR_SIGNS_IN}")),
                 Some(_) => return Err("AUDIT_EXPORT_HEADERS is for an https sink; syslog over TLS has no headers".into()),
                 None => return Err("AUDIT_EXPORT_HEADERS is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY".into()),
             }
@@ -305,6 +329,7 @@ impl Settings {
                     Kind::Syslog { tls: true, .. } => "as RFC 5424 syslog over TLS".into(),
                     Kind::Syslog { .. } => "as RFC 5424 syslog over plain TCP".into(),
                     Kind::Archive(a) => a.describe(),
+                    Kind::Monitor(m) => m.describe(),
                 };
                 let from = match (s.start, &s.name) {
                     (Some(Start::All), Some(n)) => format!(", starting with the history kept ({})", own("AUDIT_EXPORT_START", n)),
@@ -393,8 +418,10 @@ impl Exporter {
             "failedTries": s.failures,
             "lastError": s.last_error,
         });
-        if let Some(a) = self.sink.archive() {
-            v["archive"] = a.view(s.archived.as_ref());
+        match &self.sink.kind {
+            Kind::Archive(a) => v["archive"] = a.view(s.archived.as_ref()),
+            Kind::Monitor(m) => v["azureMonitor"] = m.view(),
+            _ => {}
         }
         v
     }
@@ -631,6 +658,11 @@ pub fn line(e: &AuditEvent, host: &str) -> String {
 /// not once an erasure has cleared the salt, nor when the export redacted a secret
 /// recorded in clear before botd knew it, a guess at which the salt would let anyone test.
 pub fn line_with(e: &AuditEvent, host: &str, checkpoint: Option<&Value>, sealed: bool) -> String {
+    line_value(e, host, checkpoint, sealed).to_string()
+}
+
+/// [`line_with`], before it is written out.
+pub fn line_value(e: &AuditEvent, host: &str, checkpoint: Option<&Value>, sealed: bool) -> Value {
     let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
     let digest = e.chain_digest.as_deref().filter(|_| sealed);
     let salt = e.chain_salt.as_deref().filter(|s| digest.is_some_and(|d| crate::audit_line::digest(s, &v) == d));
@@ -647,7 +679,7 @@ pub fn line_with(e: &AuditEvent, host: &str, checkpoint: Option<&Value>, sealed:
             o.insert("chainSalt".into(), json!(s));
         }
     }
-    v.to_string()
+    v
 }
 
 /// One event as an RFC 5424 message: facility "log audit", severity by outcome, the
@@ -671,6 +703,7 @@ enum Out {
     Http(reqwest::Client),
     Syslog { conn: Option<Box<dyn Stream>>, tls: Option<Arc<rustls::ClientConfig>> },
     Archive(crate::audit_archive::Client),
+    Monitor(crate::audit_azure::Client),
 }
 
 impl Out {
@@ -681,6 +714,7 @@ impl Out {
             }
             Kind::Syslog { tls, .. } => Out::Syslog { conn: None, tls: tls.then(platform_tls) },
             Kind::Archive(a) => Out::Archive(crate::audit_archive::Client::new(a)),
+            Kind::Monitor(m) => Out::Monitor(crate::audit_azure::Client::new(m)),
         }
     }
 
@@ -691,6 +725,16 @@ impl Out {
         if let (Out::Archive(client), Kind::Archive(a)) = (&mut *self, &sink.kind) {
             let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id), e.id > sealed_after) + "\n").collect();
             return client.send(a, rows, body.into_bytes()).await.map(Some);
+        }
+        if let (Out::Monitor(client), Kind::Monitor(m)) = (&mut *self, &sink.kind) {
+            let records: Vec<Value> = rows
+                .iter()
+                .flat_map(|e| {
+                    let v = line_value(e, host, extras.get(&e.id), e.id > sealed_after);
+                    crate::audit_azure::records(&v, &v.to_string())
+                })
+                .collect();
+            return client.send(m, &records).await.map(|()| None);
         }
         self.send_stream(sink, rows, extras, host, sealed_after).await.map(|()| None).map_err(|e| ("delivery_failed", e))
     }

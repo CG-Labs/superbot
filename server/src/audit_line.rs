@@ -23,6 +23,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SCHEMA: &str = "superbot.audit.v1";
+/// A piece of a line too long for where it went whole (ADR 0217), as [`parts`] writes it.
+pub const PART_SCHEMA: &str = "superbot.audit.part.v1";
+/// The most pieces a line is read back from.
+const MAX_PARTS: u64 = 10_000;
 /// The link before the first event of a log that has never been pruned.
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 pub const CHECKPOINT: &str = "audit.checkpoint";
@@ -58,6 +62,35 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
+/// `text`, the exported line of event `id` from `host`, as pieces of at most `size` bytes
+/// of it each, split between characters, every piece a JSON object of its own:
+/// `{"schema":"superbot.audit.part.v1","id":..,"host":..,"part":1,"parts":n,"text":..}`.
+/// [`Lines`] joins the texts in order and reads the line they make.
+pub fn parts(id: i64, host: &str, text: &str, size: usize) -> Vec<String> {
+    let mut texts = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = size.min(rest.len()).max(1);
+        while !rest.is_char_boundary(end) {
+            end += 1;
+        }
+        let (piece, more) = rest.split_at(end);
+        texts.push(piece);
+        rest = more;
+    }
+    let n = texts.len();
+    texts.iter().enumerate().map(|(i, t)| serde_json::json!({ "schema": PART_SCHEMA, "id": id, "host": host, "part": i + 1, "parts": n, "text": t }).to_string()).collect()
+}
+
+/// The pieces of one line read so far.
+struct Pieces {
+    parts: u64,
+    texts: BTreeMap<u64, String>,
+    at: String,
+    /// Two pieces disagree: the same piece with other text, or another count.
+    differ: bool,
 }
 
 /// The fields no erasure may change as the chain hashes them: a JSON array of the values
@@ -337,6 +370,8 @@ pub struct Lines {
     trust: tsa::Trust,
     digests_after: Option<i64>,
     hosts: BTreeMap<String, Vec<Copy>>,
+    /// Pieces of long lines ([`parts`]), by host and event.
+    pieces: BTreeMap<(String, i64), Pieces>,
     lines: u64,
     ignored: u64,
     unreadable: Vec<Problem>,
@@ -346,7 +381,7 @@ impl Lines {
     /// `keys`: the checkpoint keys to trust. None: any, so a checkpoint only shows the
     /// lines are consistent with whoever signed it.
     pub fn new(keys: Option<Vec<Vec<u8>>>) -> Lines {
-        Lines { keys, trust: tsa::Trust::default(), digests_after: None, hosts: BTreeMap::new(), lines: 0, ignored: 0, unreadable: Vec::new() }
+        Lines { keys, trust: tsa::Trust::default(), digests_after: None, hosts: BTreeMap::new(), pieces: BTreeMap::new(), lines: 0, ignored: 0, unreadable: Vec::new() }
     }
 
     /// The CAs a timestamp's TSA must chain to. Without any, a token is checked as far as
@@ -368,6 +403,10 @@ impl Lines {
     /// a syslog line, with RFC 5424's header before it, is read too.
     pub fn line(&mut self, text: &str, at: &str) {
         self.lines += 1;
+        self.read(text, at);
+    }
+
+    fn read(&mut self, text: &str, at: &str) {
         let text = text.trim();
         let Some(start) = text.find('{') else {
             self.ignored += 1;
@@ -376,12 +415,15 @@ impl Lines {
         let unreadable = |why: &str| Problem { id: None, at: at.to_string(), reason: "unreadable", error: format!("{at} {why}") };
         let v: Value = match serde_json::from_str(&text[start..]) {
             Ok(v) => v,
-            Err(_) if text.contains(SCHEMA) => return self.unreadable.push(unreadable("names the schema but isn't JSON")),
+            Err(_) if text.contains(SCHEMA) || text.contains(PART_SCHEMA) => return self.unreadable.push(unreadable("names the schema but isn't JSON")),
             Err(_) => {
                 self.ignored += 1;
                 return;
             }
         };
+        if v.get("schema").and_then(Value::as_str) == Some(PART_SCHEMA) {
+            return self.piece(&v, at);
+        }
         if v.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
             self.ignored += 1;
             return;
@@ -400,7 +442,38 @@ impl Lines {
         self.hosts.entry(host).or_default().push(copy);
     }
 
-    pub fn finish(self) -> Report {
+    /// One piece of a long line, kept until [`Lines::finish`] has them all. Copies of a
+    /// piece, as a retried delivery leaves, count once.
+    fn piece(&mut self, v: &Value, at: &str) {
+        let (id, host, part, parts, text) = (v["id"].as_i64(), v["host"].as_str(), v["part"].as_u64(), v["parts"].as_u64(), v["text"].as_str());
+        let (Some(id), Some(host), Some(part), Some(parts), Some(text)) = (id, host, part, parts, text) else {
+            return self.unreadable.push(Problem { id: None, at: at.to_string(), reason: "unreadable", error: format!("{at} is a piece of a line without its id, host, part, parts or text") });
+        };
+        if !(1..=MAX_PARTS).contains(&parts) || !(1..=parts).contains(&part) {
+            return self.unreadable.push(Problem { id: Some(id), at: at.to_string(), reason: "unreadable", error: format!("{at} is piece {part} of {parts} of event {id}'s line") });
+        }
+        let p = self.pieces.entry((host.to_string(), id)).or_insert_with(|| Pieces { parts, texts: BTreeMap::new(), at: at.to_string(), differ: false });
+        p.differ |= p.parts != parts;
+        match p.texts.get(&part) {
+            Some(t) => p.differ |= t != text,
+            None => {
+                p.texts.insert(part, text.to_string());
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Report {
+        for ((_, id), p) in std::mem::take(&mut self.pieces) {
+            let problem = |error: String| Problem { id: Some(id), at: p.at.clone(), reason: "unreadable", error };
+            if p.differ {
+                self.unreadable.push(problem(format!("{} has pieces of event {id}'s line that disagree", p.at)));
+            } else if p.texts.len() as u64 != p.parts {
+                self.unreadable.push(problem(format!("{} has {} of the {} pieces of event {id}'s line", p.at, p.texts.len(), p.parts)));
+            } else {
+                let whole: String = p.texts.into_values().collect();
+                self.read(&whole, &p.at);
+            }
+        }
         let keys = self.keys.as_deref();
         let after = self.digests_after;
         let trust = &self.trust;

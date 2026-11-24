@@ -44,6 +44,36 @@ pub fn forget(value: &str) {
     KNOWN.write().unwrap_or_else(|e| e.into_inner()).retain(|k| k != value.trim());
 }
 
+/// Values masked only while something holds them, such as a token in use: by holders,
+/// and whether the first hold registered it (one already known stays known).
+static HELD: std::sync::Mutex<BTreeMap<String, (usize, bool)>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Masks `value` until each [`hold`] of it is [`release`]d: the same token handed out
+/// again, or to two holders, stays masked while any still has it.
+pub fn hold(value: &str) {
+    let v = value.trim().to_string();
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = held.entry(v).or_insert_with_key(|v| (0, !known().contains(v)));
+    entry.0 += 1;
+    if entry.0 == 1 {
+        register(value);
+    }
+}
+
+pub fn release(value: &str) {
+    let v = value.trim();
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = held.get_mut(v) else { return };
+    entry.0 -= 1;
+    if entry.0 == 0 {
+        let added = entry.1;
+        held.remove(v);
+        if added {
+            forget(v);
+        }
+    }
+}
+
 pub fn known() -> Vec<String> {
     KNOWN.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -258,6 +288,26 @@ mod tests {
         forget(&key);
         assert!(text(&key).contains(&key));
         forget(&longer);
+    }
+
+    #[test]
+    fn a_held_value_stays_masked_until_every_holder_lets_go() {
+        let token = unique("eyJ.held");
+        hold(&token);
+        // The same token again, as a refresh can return: the new hold, then the old release.
+        hold(&token);
+        release(&token);
+        assert_eq!(text(&format!("x {token}")), "x [redacted]", "still in use");
+        release(&token);
+        assert!(text(&token).contains(&token), "no one holds it");
+        release(&token);
+
+        let kept = unique("sk-kept");
+        register(&kept);
+        hold(&kept);
+        release(&kept);
+        assert_eq!(text(&kept), MARK, "known before it was held, so still known");
+        forget(&kept);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Audit log: SIEM export and tamper evidence
 
-Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)), and send to up to four SIEMs, each with its own token ([below](#several-siems)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md), [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md), [ADR 0191](../adr/0191-several-siems-with-their-own-headers.md), [ADR 0199](../adr/0199-self-checking-audit-lines.md) and [ADR 0207](../adr/0207-checking-timestamps-from-exported-lines.md).
+Every audit event is sealed onto a hash chain as it is written, so a changed, removed, added or reordered event shows. Every hour botd signs a checkpoint of the chain's head, and can have each one timestamped by an RFC 3161 time-stamping authority (TSA). botd can also send every event to your SIEM as it happens: JSON lines over HTTPS, or RFC 5424 syslog over TLS. Or it can archive them in batches to an S3 bucket with Object Lock, where nobody can change or delete them until their retention ends ([below](#archive-events-to-write-once-s3)), or do both at once ([below](#a-siem-and-an-archive-together)), and send to up to four SIEMs, each with its own token ([below](#several-siems)), Microsoft Sentinel among them, signed in with Entra ID ([below](#microsoft-sentinel-azure-monitor)). The chain and checkpoints are always on and need nothing. Timestamps and the export are off until you set them. Design: [ADR 0122](../adr/0122-siem-export-and-tamper-evident-audit.md), [ADR 0149](../adr/0149-signed-and-timestamped-audit-checkpoints.md), [ADR 0154](../adr/0154-write-once-s3-audit-archive.md), [ADR 0163](../adr/0163-checking-the-audit-archive.md), [ADR 0173](../adr/0173-an-archive-alongside-a-siem.md), [ADR 0183](../adr/0183-daily-check-of-new-archive-objects.md), [ADR 0191](../adr/0191-several-siems-with-their-own-headers.md), [ADR 0199](../adr/0199-self-checking-audit-lines.md), [ADR 0207](../adr/0207-checking-timestamps-from-exported-lines.md) and [ADR 0217](../adr/0217-audit-export-to-azure-monitor.md).
 
 ## Check the chain
 
@@ -130,7 +130,7 @@ In `.env` (installer) or `deploy/docker/.env` (Compose), then restart botd:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `http://` and `syslog+tcp://` work only to loopback. Add `,s3://<bucket>/<prefix>` to archive them too ([below](#a-siem-and-an-archive-together)). Any entry can be named, `<name>=<url>`, and several SIEMs must be ([below](#several-siems)) |
+| `AUDIT_EXPORT` | `off` | Where to send events. `https://<collector>/<path>`: JSON lines. `syslog+tls://<host>[:6514]`: syslog over TLS. `azure-monitor://<host>/<dcr>/<stream>`: Microsoft Sentinel ([below](#microsoft-sentinel-azure-monitor)). `http://` and `syslog+tcp://` work only to loopback. Add `,s3://<bucket>/<prefix>` to archive them too ([below](#a-siem-and-an-archive-together)). Any entry can be named, `<name>=<url>`, and several SIEMs must be ([below](#several-siems)) |
 | `AUDIT_EXPORT_INSECURE` | `off` | `on` allows `http://` and `syslog+tcp://` to any host, for a collector on a private network such as the Compose network |
 | `AUDIT_EXPORT_HEADERS` or `AUDIT_EXPORT_HEADERS_FILE` | none | HTTPS only: headers, `name=value` pairs split by commas, such as `Authorization=Bearer <token>`. A secret: redacted everywhere, and no Bot's harness gets it. With `SECRETS_BACKEND=vault` it can live in Vault ([vault.md](vault.md)). For one SIEM only; with several, each has its own `AUDIT_EXPORT_HEADERS_<NAME>` |
 | `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on. A named sink can have its own, `AUDIT_EXPORT_START_<NAME>` |
@@ -157,6 +157,7 @@ One JSON object per event, the same shape as `GET /api/audit`, plus:
 Events are scrubbed when they are recorded: passwords, tokens, message text and routine instructions are never in them, and known secrets are redacted. The export headers are never in an event.
 
 - **Webhook**: `POST` with `Content-Type: application/x-ndjson`, up to 200 events per request, one per line. Answer any 2xx to accept the batch. Redirects aren't followed.
+- **Azure Monitor**: records of a data collection rule's stream, each with the line whole ([below](#microsoft-sentinel-azure-monitor)).
 - **Syslog**: RFC 5424, facility 13 (log audit), severity 6 (success), 5 (failure) or 4 (denied), APP-NAME `superbot`, MSGID the action, and the JSON object as the message. Octet-counted framing (RFC 5425). The certificate is checked against the system's trusted roots. Syslog has no acknowledgement, so a dropped connection can lose the batch in flight: use the webhook if every event must arrive.
 
 ### Delivery and failures
@@ -164,8 +165,8 @@ Events are scrubbed when they are recorded: passwords, tokens, message text and 
 - Events go in id order. The last delivered id is saved, so after a restart or an outage botd carries on from there. Delivery is at least once: de-duplicate on `host` and `id`.
 - A failure is retried with backoff from 1 second up to 5 minutes, for as long as it takes. Events wait in the database meanwhile, and retention (`AUDIT_RETENTION_DAYS`) never deletes an event the sink hasn't taken, so a long outage grows the table instead of losing events.
 - An event botd can't read from the database (a damaged row) is a failure too: export stops before it and retries, rather than skip it. `botctl audit verify` names the row.
-- After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable`, `cursor_unsaved` or, for the S3 archive, `not_write_once`; `audit.export_recovered` follows when delivery resumes.
-- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`, each labelled with the sink's `kind` (`webhook`, `syslog` or `s3`) and, for a named sink, its `name`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
+- After 3 failures in a row botd logs a warning and records `audit.export_failing` with a `reason` of `delivery_failed`, `unreadable`, `cursor_unsaved`, for Azure Monitor `sign_in_failed`, or, for the S3 archive, `not_write_once`; `audit.export_recovered` follows when delivery resumes.
+- `botctl audit siem` (or `GET /api/audit/siem`) shows the sink, the last delivered id, how many are pending, whether it's failing, and the last error. With metrics on, `/metrics` has `superbot_audit_export_pending_events`, `superbot_audit_export_failing` and `superbot_audit_export_last_delivery_timestamp_seconds`, each labelled with the sink's `kind` (`webhook`, `syslog`, `azure-monitor` or `s3`) and, for a named sink, its `name`. Alert on `superbot_audit_export_failing == 1` or a growing pending count.
 
 ### Examples
 
@@ -301,7 +302,7 @@ AUDIT_EXPORT_S3_ACCESS_KEY_ID=<key id>
 AUDIT_EXPORT_S3_SECRET_ACCESS_KEY=<secret>
 ```
 
-- **One archive.** One `s3://` archive at most, in any place in the list, beside up to four SIEMs (`https://`, `syslog+tls://`, or their plain forms; [below](#several-siems)). Two archives or an empty entry stop botd at startup. A comma in a webhook's path is written `%2C`.
+- **One archive.** One `s3://` archive at most, in any place in the list, beside up to four SIEMs (`https://`, `syslog+tls://`, `azure-monitor://`, or the plain forms; [below](#several-siems)). Two archives or an empty entry stop botd at startup. A comma in a webhook's path is written `%2C`.
 - **Each on its own.** Each sink has its own cursor, retries, `audit.export_failing` and `audit.export_recovered` (with `kind` in their details), so a SIEM outage doesn't stop the archive, and the archive's batching doesn't slow the SIEM. Both get the same lines, so `host` and `id` match across them.
 - **Retention waits for both.** `AUDIT_RETENTION_DAYS` never deletes an event either sink hasn't taken.
 - **Adding one keeps the other.** Cursors are kept per sink, so adding an archive beside a running SIEM (or the other way round) resumes the one that was there. The new one starts as `AUDIT_EXPORT_START` says: with `all`, the default, the archive starts with the history still in the database.
@@ -320,7 +321,7 @@ AUDIT_EXPORT_START_MDR=new
 ```
 
 - **Names.** `<name>=<url>`: 1 to 24 letters and digits, starting with a letter, case-insensitive (shown in lowercase). Not `file`. With more than one SIEM, every SIEM needs one; the archive may have one too. Two sinks with the same name, or the same URL listed twice, stop botd at startup.
-- **Headers.** `AUDIT_EXPORT_HEADERS_<NAME>` (or `_FILE`), the name in capitals, goes to that webhook and no other. It's a secret like `AUDIT_EXPORT_HEADERS`: redacted, never given to a Bot, and with Vault it lives in the server folder as `AUDIT_EXPORT_HEADERS_<NAME>`. With several SIEMs, `AUDIT_EXPORT_HEADERS` stops botd, since it would go to all of them. A webhook with no headers of its own sends none. Syslog and the archive take no headers.
+- **Headers.** `AUDIT_EXPORT_HEADERS_<NAME>` (or `_FILE`), the name in capitals, goes to that webhook and no other. It's a secret like `AUDIT_EXPORT_HEADERS`: redacted, never given to a Bot, and with Vault it lives in the server folder as `AUDIT_EXPORT_HEADERS_<NAME>`. With several SIEMs, `AUDIT_EXPORT_HEADERS` stops botd, since it would go to all of them. A webhook with no headers of its own sends none. Syslog, Azure Monitor and the archive take no headers.
 - **Where each starts.** `AUDIT_EXPORT_START_<NAME>` (`all` or `new`) is for that sink when it is new; otherwise `AUDIT_EXPORT_START` applies. Above, the MDR gets only what happens from now on, while a new archive still gets the history.
 - **Each on its own.** As with an archive: each SIEM has its own cursor (by URL, so naming a running sink resumes it), retries and failure events, so one outage doesn't hold up the others. `audit.export_failing` and `audit.export_recovered` carry the `name`. Every SIEM gets the same lines, so `host`, `id` and `chainHash` match across them and pins can come from any.
 - **Retention waits for all of them.** A SIEM that stays down grows the table for every sink: alert on each one's `pending`.
@@ -328,6 +329,104 @@ AUDIT_EXPORT_START_MDR=new
 - **A misspelt name** in `AUDIT_EXPORT_HEADERS_<NAME>` isn't caught at startup: that webhook sends no headers, its SIEM refuses them, and the export shows as failing for that sink.
 
 A single SIEM needs no name, so settings from before keep working. To move to several, name the one you have (it resumes where it was) and move its `AUDIT_EXPORT_HEADERS` to `AUDIT_EXPORT_HEADERS_<NAME>`.
+
+## Microsoft Sentinel (Azure Monitor)
+
+Sentinel reads a Log Analytics workspace, and botd writes there itself through Azure Monitor's Logs Ingestion API, with no collector beside it. It signs in to Entra ID as its own Azure identity, the one Key Vault uses ([cloud-secrets.md](cloud-secrets.md)): a managed identity on Azure or workload identity on AKS need no secret at all. Design: [ADR 0217](../adr/0217-audit-export-to-azure-monitor.md).
+
+```sh
+AUDIT_EXPORT=sentinel=azure-monitor://<dcr-name>-<suffix>.<region>-1.ingest.monitor.azure.com/<dcr immutable id>/Custom-SuperBotAudit
+AUDIT_EXPORT_AZURE_AUTH=managed-identity
+AZURE_CLIENT_ID=<user-assigned identity's client id, if not the system-assigned one>
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `AUDIT_EXPORT` | `off` | `azure-monitor://<host>/<dcr>/<stream>`, alone or beside other sinks (name it then). `<host>` is the rule's logs ingestion endpoint, or its data collection endpoint's (private link too), without `https://`; it must end in `.monitor.azure.com`, `.monitor.azure.us` or `.monitor.azure.cn`, which also picks the cloud tokens are for. `<dcr>` is the rule's immutable id (`dcr-` and 32 hex digits), `<stream>` its input stream (`Custom-<name>`) |
+| `AUDIT_EXPORT_AZURE_AUTH` | `AZURE_KEYVAULT_AUTH`, else `managed-identity` | `managed-identity`, `workload-identity` or `client-secret`, read with the same `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET` (or `_FILE`), `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST`, `IDENTITY_ENDPOINT` and `IDENTITY_HEADER` as Key Vault |
+
+It takes no headers, and no credentials in the URL. Tokens are asked for `https://monitor.azure.com` (or `.us`, `.cn`), kept until two thirds of their life, sent only to that host, and redacted everywhere.
+
+### Set it up
+
+1. Create the table, in the workspace Sentinel uses:
+
+```sh
+az monitor log-analytics workspace table create -g <rg> --workspace-name <workspace> -n SuperBotAudit_CL --columns \
+  TimeGenerated=datetime EventId=long Host=string Action=string Outcome=string ActorKind=string ActorId=string \
+  ActorName=string ActorEmail=string ActorRole=string AuthMethod=string TargetType=string TargetId=string BotId=string \
+  SourceIp=string SessionId=string Details=dynamic ChainHash=string LinePart=int Line=string
+```
+
+2. Create a data collection rule for it, in the workspace's region, with the same columns as its stream. Save this as `dcr.json`, with the workspace's resource id:
+
+```json
+{
+  "location": "<region>",
+  "kind": "Direct",
+  "properties": {
+    "streamDeclarations": {
+      "Custom-SuperBotAudit": {
+        "columns": [
+          { "name": "TimeGenerated", "type": "datetime" }, { "name": "EventId", "type": "long" },
+          { "name": "Host", "type": "string" }, { "name": "Action", "type": "string" }, { "name": "Outcome", "type": "string" },
+          { "name": "ActorKind", "type": "string" }, { "name": "ActorId", "type": "string" }, { "name": "ActorName", "type": "string" },
+          { "name": "ActorEmail", "type": "string" }, { "name": "ActorRole", "type": "string" }, { "name": "AuthMethod", "type": "string" },
+          { "name": "TargetType", "type": "string" }, { "name": "TargetId", "type": "string" }, { "name": "BotId", "type": "string" },
+          { "name": "SourceIp", "type": "string" }, { "name": "SessionId", "type": "string" }, { "name": "Details", "type": "dynamic" },
+          { "name": "ChainHash", "type": "string" }, { "name": "LinePart", "type": "int" }, { "name": "Line", "type": "string" }
+        ]
+      }
+    },
+    "destinations": { "logAnalytics": [{ "workspaceResourceId": "<workspace resource id>", "name": "workspace" }] },
+    "dataFlows": [{ "streams": ["Custom-SuperBotAudit"], "destinations": ["workspace"], "transformKql": "source", "outputStream": "Custom-SuperBotAudit_CL" }]
+  }
+}
+```
+
+```sh
+rule=/subscriptions/<subscription>/resourceGroups/<rg>/providers/Microsoft.Insights/dataCollectionRules/superbot-audit
+az rest --method put --url "https://management.azure.com$rule?api-version=2024-03-11" --body @dcr.json
+az rest --method get --url "https://management.azure.com$rule?api-version=2024-03-11" --query "properties.{dcr: immutableId, host: endpoints.logsIngestion}"
+```
+
+3. Give botd's identity the **Monitoring Metrics Publisher** role on the rule, and nothing more. It can take 30 minutes to apply; until then the export fails with 403 and retries.
+
+```sh
+az role assignment create --assignee <botd identity's principal id> --role "Monitoring Metrics Publisher" --scope "$rule"
+```
+
+4. Set `AUDIT_EXPORT` from the `dcr` and `host` above (the host without `https://`) and restart botd. New events show in `SuperBotAudit_CL` within a few minutes of the first delivery.
+
+### What arrives
+
+Each event is one row: `TimeGenerated` (the event's time), `EventId` (its `id`, which is a reserved column name in Log Analytics), the typed columns above, `LinePart` (0), and `Line`, the event's JSON line exactly as every other sink gets it ([above](#what-arrives)). The columns are read from `Line`, so they never say more than it does: what was redacted or erased there is so in them too. Queries use the columns:
+
+```kusto
+SuperBotAudit_CL
+| where Action startswith "auth." and Outcome != "success"
+| summarize failures = count() by ActorEmail, SourceIp, bin(TimeGenerated, 1h)
+```
+
+A transformation in the rule (`transformKql`) can drop columns you don't want, but keep `EventId`, `Host`, `ChainHash`, `LinePart` and `Line`.
+
+- **Requests.** A batch of up to 200 events goes as JSON arrays of at most 1 MB each, in order. If one fails, the batch goes again whole, and Azure keeps arrays it already took, so de-duplicate on `Host`, `EventId` and `LinePart` (`summarize arg_max(TimeGenerated, *) by Host, EventId, LinePart`).
+- **Tokens.** When Azure refuses one (401), botd gets a new one and tries once more; only a second refusal is a failure.
+- **Throttling.** A 429 waits as long as `Retry-After` says, up to 5 minutes, then the usual backoff.
+- **Failures** are recorded as for any sink, with Azure's error code and what to do: `403` needs the role (step 3), `404` a wrong rule, stream or host, `400` a stream that doesn't declare the columns (step 2). A failed sign-in is `sign_in_failed`: check the identity settings, and for a managed identity that botd runs where one is assigned.
+- **Size.** Azure cuts any field over 64 KB. A line over 32,000 bytes, such as the `audit.erased` of a long-lived user, goes as several rows with `LinePart` 1, 2, and so on, the same typed columns (`Details` empty), and in `Line` a piece of the line (`"schema":"superbot.audit.part.v1"`). `botctl audit verify-lines` puts the pieces back together, so nothing is cut. An erasure names at most 1,000 id ranges in each `audit.erased` event, so those lines stay under 43 KB for every sink.
+
+### Check the copy in Sentinel
+
+`Line` goes into `botctl audit verify-lines` unchanged, pieces of long lines too, in any order ([below](#check-exported-events-without-botd)):
+
+```sh
+az monitor log-analytics query -w <workspace id> -o tsv \
+  --analytics-query "SuperBotAudit_CL | where TimeGenerated > ago(30d) | project Line" \
+  | botctl audit verify-lines - --key <checkpoint public key hex> --digests-after <id>
+```
+
+A query returns at most 500,000 rows, so check a long history a month at a time. `ChainHash` gives pins for `botctl audit verify --pin <EventId>:<ChainHash>`. The typed columns aren't checked: compare them with `Line` if a detection depends on one.
 
 ## Check exported events without botd
 
@@ -364,4 +463,4 @@ What it can't tell you:
 ## Retention and erasure
 
 - Retention deletes events from the start of the log only, and keeps the last deleted event's hash as the anchor the chain carries on from. An old event written after a newer one waits until the newer one is old enough too. `audit.pruned` records the anchor.
-- Erasing a user ([ADR 0102](../adr/0102-erasing-a-users-data.md)) replaces their personal fields with a pseudonym and drops each event's salt, so its digest says nothing about them. The erasure records `audit.erased` with the ids it changed, and the chain still verifies. A salt cleared any other way fails as `erased`. Copies already in your SIEM aren't erased by botd: cover them with your SIEM's retention and your DPA, as with backups.
+- Erasing a user ([ADR 0102](../adr/0102-erasing-a-users-data.md)) replaces their personal fields with a pseudonym and drops each event's salt, so its digest says nothing about them. The erasure records the ids it changed in `audit.erased` events (several, of at most 1,000 id ranges each, when the rows are scattered), and the chain still verifies. A salt cleared any other way fails as `erased`. Copies already in your SIEM aren't erased by botd: cover them with your SIEM's retention and your DPA, as with backups.
