@@ -355,7 +355,7 @@ It takes no headers, and no credentials in the URL. Tokens are asked for `https:
 az monitor log-analytics workspace table create -g <rg> --workspace-name <workspace> -n SuperBotAudit_CL --columns \
   TimeGenerated=datetime EventId=long Host=string Action=string Outcome=string ActorKind=string ActorId=string \
   ActorName=string ActorEmail=string ActorRole=string AuthMethod=string TargetType=string TargetId=string BotId=string \
-  SourceIp=string SessionId=string Details=dynamic ChainHash=string Line=string
+  SourceIp=string SessionId=string Details=dynamic ChainHash=string LinePart=int Line=string
 ```
 
 2. Create a data collection rule for it, in the workspace's region, with the same columns as its stream. Save this as `dcr.json`, with the workspace's resource id:
@@ -374,7 +374,7 @@ az monitor log-analytics workspace table create -g <rg> --workspace-name <worksp
           { "name": "ActorEmail", "type": "string" }, { "name": "ActorRole", "type": "string" }, { "name": "AuthMethod", "type": "string" },
           { "name": "TargetType", "type": "string" }, { "name": "TargetId", "type": "string" }, { "name": "BotId", "type": "string" },
           { "name": "SourceIp", "type": "string" }, { "name": "SessionId", "type": "string" }, { "name": "Details", "type": "dynamic" },
-          { "name": "ChainHash", "type": "string" }, { "name": "Line", "type": "string" }
+          { "name": "ChainHash", "type": "string" }, { "name": "LinePart", "type": "int" }, { "name": "Line", "type": "string" }
         ]
       }
     },
@@ -400,7 +400,7 @@ az role assignment create --assignee <botd identity's principal id> --role "Moni
 
 ### What arrives
 
-Each event is one row: `TimeGenerated` (the event's time), `EventId` (its `id`, which is a reserved column name in Log Analytics), the typed columns above, and `Line`, the event's JSON line exactly as every other sink gets it ([above](#what-arrives)). The columns are read from `Line`, so they never say more than it does: what was redacted or erased there is so in them too. Queries use the columns:
+Each event is one row: `TimeGenerated` (the event's time), `EventId` (its `id`, which is a reserved column name in Log Analytics), the typed columns above, `LinePart` (0), and `Line`, the event's JSON line exactly as every other sink gets it ([above](#what-arrives)). The columns are read from `Line`, so they never say more than it does: what was redacted or erased there is so in them too. Queries use the columns:
 
 ```kusto
 SuperBotAudit_CL
@@ -408,17 +408,17 @@ SuperBotAudit_CL
 | summarize failures = count() by ActorEmail, SourceIp, bin(TimeGenerated, 1h)
 ```
 
-A transformation in the rule (`transformKql`) can drop columns you don't want, but keep `EventId`, `Host`, `ChainHash` and `Line`.
+A transformation in the rule (`transformKql`) can drop columns you don't want, but keep `EventId`, `Host`, `ChainHash`, `LinePart` and `Line`.
 
-- **Requests.** A batch of up to 200 events goes as JSON arrays of at most 1 MB each, in order. If one fails, the batch goes again whole, and Azure keeps arrays it already took, so de-duplicate on `Host` and `EventId` (`summarize arg_max(TimeGenerated, *) by Host, EventId`).
+- **Requests.** A batch of up to 200 events goes as JSON arrays of at most 1 MB each, in order. If one fails, the batch goes again whole, and Azure keeps arrays it already took, so de-duplicate on `Host`, `EventId` and `LinePart` (`summarize arg_max(TimeGenerated, *) by Host, EventId, LinePart`).
 - **Tokens.** When Azure refuses one (401), botd gets a new one and tries once more; only a second refusal is a failure.
 - **Throttling.** A 429 waits as long as `Retry-After` says, up to 5 minutes, then the usual backoff.
 - **Failures** are recorded as for any sink, with Azure's error code and what to do: `403` needs the role (step 3), `404` a wrong rule, stream or host, `400` a stream that doesn't declare the columns (step 2). A failed sign-in is `sign_in_failed`: check the identity settings, and for a managed identity that botd runs where one is assigned.
-- **Size.** Azure cuts any field over 64 KB. Audit details are clipped well below that, so no `Line` comes near it.
+- **Size.** Azure cuts any field over 64 KB. A line over 32,000 bytes, such as the `audit.erased` of a long-lived user, goes as several rows with `LinePart` 1, 2, and so on, the same typed columns (`Details` empty), and in `Line` a piece of the line (`"schema":"superbot.audit.part.v1"`). `botctl audit verify-lines` puts the pieces back together, so nothing is cut.
 
 ### Check the copy in Sentinel
 
-`Line` goes into `botctl audit verify-lines` unchanged ([below](#check-exported-events-without-botd)):
+`Line` goes into `botctl audit verify-lines` unchanged, pieces of long lines too, in any order ([below](#check-exported-events-without-botd)):
 
 ```sh
 az monitor log-analytics query -w <workspace id> -o tsv \
