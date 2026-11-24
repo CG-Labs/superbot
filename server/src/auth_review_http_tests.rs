@@ -165,10 +165,12 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
         }
         // Read-only people change nothing (signing out, removing this session's phone, and
         // their own second factor are their own account). Asking for a role changes nothing
-        // until an admin approves it (ADR 0209).
+        // until an admin approves it (ADR 0209). The service accounts they own they may only
+        // stop: disable them and revoke their tokens; handlers refuse the rest (ADR 0239).
         let own_mfa = p.starts_with("/api/auth/mfa/") && p != "/api/auth/mfa/policy";
         let asking = p.starts_with("/api/me/role-requests");
-        if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa && !asking {
+        let stopping = matches!((m.as_str(), p.as_str()), ("PATCH", "/api/service-accounts/{id}") | ("DELETE", "/api/service-accounts/{id}/tokens/{token}" | "/api/bots/{id}/keeper"));
+        if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa && !asking && !stopping {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
         // The admin portal, the audit log, the access-review report, retention and its holds, server backups, evidence bundles, secrets, signups, the setup wizard, the license, status incidents, custom roles, and SCIM tokens and group links are admin-only: some are delegable to a custom role (ADR 0123), but no other built-in role holds them.

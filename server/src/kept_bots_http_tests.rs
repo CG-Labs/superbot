@@ -245,3 +245,20 @@ async fn keeping_a_bot_its_access_already_covers_still_makes_an_earlier_sign_off
     assert_eq!(call(port, "DELETE", &format!("/api/bots/{shared}/keeper"), &ana_auth, "").await.0, 200);
     assert_eq!(digest(port, &admin).await, before);
 }
+
+#[tokio::test]
+async fn a_read_only_owner_still_takes_a_bot_back() {
+    let (port, _, admin, _) = serve_app().await;
+    let (ana, ana_auth) = user_with(port, &admin, "ana@example.com", "member").await;
+    let sa = account(port, &admin, json!({ "name": "Ana's reader", "role": "readonly" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &json!({ "owner": ana }).to_string()).await.0, 200);
+    let shared = bot(port, &ana_auth, "Shared", "shared").await;
+    assert_eq!(keep(port, &ana_auth, &shared, &sa).await.0, 200);
+
+    // Made read-only, Ana can't hand Bots over any more, but letting go only narrows (ADR 0239).
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"role":"readonly"}"#).await.0, 200);
+    assert_eq!(keep(port, &ana_auth, &shared, &sa).await.0, 403);
+    assert_eq!(call(port, "DELETE", &format!("/api/bots/{shared}/keeper"), &ana_auth, "").await.0, 200);
+    let (_, v) = json_call(port, "GET", &format!("/api/service-accounts/{sa}"), &ana_auth, "").await;
+    assert_eq!(v["keptBotList"], json!([]), "{v}");
+}

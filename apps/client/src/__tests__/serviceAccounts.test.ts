@@ -1,6 +1,7 @@
 import {
   canManageServiceAccounts,
   canRotate,
+  canSeeServiceAccounts,
   choiceError,
   formChoices,
   keptRole,
@@ -179,6 +180,13 @@ describe("a delegate's service accounts (ADR 0182)", () => {
     expect(canManageServiceAccounts({ permissions: ["account", "read", "users.manage"] })).toBe(true);
     expect(canManageServiceAccounts({ permissions: ["account", "read", "write", "audit.view"] })).toBe(false);
     expect(canManageServiceAccounts({})).toBe(false);
+  });
+
+  it("is offered to every owner too (ADR 0239)", () => {
+    expect(canSeeServiceAccounts({ permissions: ["account", "read"], ownedServiceAccounts: 1 })).toBe(true);
+    expect(canSeeServiceAccounts({ permissions: ["account", "read"], ownedServiceAccounts: 0 })).toBe(false);
+    expect(canSeeServiceAccounts({ permissions: ["account", "read", "users.manage"] })).toBe(true);
+    expect(canSeeServiceAccounts({ permissions: ["account", "read"], ownedServiceAccounts: null })).toBe(false);
   });
 
   it("offers the server's choices by team, keeping the account's own", () => {
