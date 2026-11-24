@@ -109,6 +109,13 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     expect(screen.getByText(" · owner inactive")).toBeTruthy();
   });
 
+  it("says how many Bots an account keeps (ADR 0222)", async () => {
+    const api = mockApi({ ...VIEW, serviceAccounts: [{ ...SA, keptBots: 2 }, { ...SA, id: "sa2", name: "Export", keptBots: 1 }] });
+    await show(api);
+    expect(await screen.findByText(/Member · 1 live token · keeps 2 Bots · last used/)).toBeTruthy();
+    expect(screen.getByText(/Member · 1 live token · keeps 1 Bot · last used/)).toBeTruthy();
+  });
+
   it("makes an account with its first token, and shows the secret once", async () => {
     const api = mockApi();
     const u = userEvent.setup();

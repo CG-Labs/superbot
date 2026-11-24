@@ -69,6 +69,8 @@ describe("access review labels", () => {
       { id: "b2", name: "Ledger", owner: { id: "u2", name: null }, own: false, visibility: "private", access: "operate", grant: "operator" },
     ];
     expect(botAccessLabel(person({ botAccess: { all: false, bots } }))).toBe("Scout (manage, own); Ledger (operate, u2's, granted operator)");
+    const kept = [{ id: "b3", name: "PR checks", owner: { id: "u1", name: "Ada" }, own: false, visibility: "private", access: "manage", grant: null, kept: true }];
+    expect(botAccessLabel(person({ botAccess: { all: false, bots: kept } }))).toBe("PR checks (manage, Ada's, kept)");
     expect(signInsLabel(person())).toBe("Not signed in");
     expect(signInsLabel(person({ apiTokens: [session("a", "token"), session("b", "token")], sessions: [session("c", "cookie")] }))).toBe("2 API tokens, 1 browser session");
     expect(machineLabel(person())).toBe("No machine");

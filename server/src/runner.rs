@@ -560,6 +560,9 @@ impl App {
             "owner": self.db.user(&b.owner_id).map(|u| json!({ "id": u.id, "name": u.name })),
             "visibility": b.visibility, "prompts": b.prompts,
         });
+        if let Some(sa) = b.service_account_id.as_deref().filter(|sa| crate::acl::kept_by(&self.db, b, sa)) {
+            v["serviceAccount"] = json!(self.db.user(sa).map(|u| json!({ "id": u.id, "name": u.name })));
+        }
         let has_login = crate::machines::logins::recipe(&b.harness).is_some();
         if let Some(on) = self.runs_on(b) {
             v["runsOn"] = json!(on);
@@ -963,11 +966,15 @@ impl App {
         // before someone left doesn't run for them.
         let off_team =
             (asker != bot.owner_id && self.db.user(&asker).is_some() && !self.db.same_team(&bot.owner_id, &asker)).then(|| asker.clone());
-        let for_other = Some(asker.clone()).filter(|a| isolated && *a != bot.owner_id);
-        // A service account reaches a Bot only through its grants, within its owner's
-        // access (ADR 0170), whatever SHARED_BOTS is: both may have changed while it waited.
+        // A service account's own Bot runs for it as for its owner (ADR 0222): their keys,
+        // facts, session and OS user. What the run's Bot may reach stays the account's.
+        let kept = crate::acl::kept_by(&self.db, &bot, &asker);
+        let for_other = Some(asker.clone()).filter(|a| isolated && *a != bot.owner_id && !kept);
+        // A service account reaches a Bot only through its grants or as its keeper, within
+        // its owner's access (ADR 0170), whatever SHARED_BOTS is: both may have changed while
+        // it waited.
         let service = (asker != bot.owner_id && self.db.user(&asker).is_some_and(|u| u.service)).then(|| asker.clone());
-        let checked = if isolated { for_other.clone() } else { off_team.or(service.clone()) };
+        let checked = if isolated { for_other.clone().or(service.clone()) } else { off_team.or(service.clone()) };
         let refusal = if isolated { self.wont_run(&bot, checked.as_deref()) } else { checked.as_deref().and_then(|a| self.wont_run(&bot, Some(a))) };
         if let Some((reason, text)) = refusal {
             self.give_back_routine(&bot, msg);
@@ -988,7 +995,7 @@ impl App {
         let people = Self::carries(&bot, &asker, &by);
         self.carried.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), people.clone());
         if isolated {
-            let asker = for_other.clone().unwrap_or_else(|| bot.owner_id.clone());
+            let asker = for_other.clone().or_else(|| service.clone()).unwrap_or_else(|| bot.owner_id.clone());
             self.askers.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
         }
         // The owner's session holds their conversation, and some harnesses keep its first
@@ -2559,6 +2566,31 @@ impl App {
             self.cancel_approvals(id, "The Bot was stopped");
         }
         stopped
+    }
+
+    /// Stops the Bot's current run if it is for `user_id`, started or not. Its queue
+    /// stays: queued work is checked again when it starts. Whether it stopped one.
+    pub fn stop_run_for(&self, bot_id: &str, user_id: &str) -> bool {
+        {
+            let mut st = self.state();
+            let Some(s) = st.get_mut(bot_id) else { return false };
+            if !s.serving.as_ref().is_some_and(|n| n.iter().any(|u| u == user_id)) {
+                return false;
+            }
+            match &s.run {
+                Some(r) => {
+                    r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                }
+                None => {
+                    s.stopped = true;
+                    if let Some(w) = &s.wake {
+                        w.notify_one();
+                    }
+                }
+            }
+        }
+        self.cancel_approvals(bot_id, "The Bot was stopped");
+        true
     }
 
     /// Whether the Bot has a run going, starting, or queued.

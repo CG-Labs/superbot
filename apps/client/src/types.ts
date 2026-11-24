@@ -43,6 +43,9 @@ export interface BotView {
   policyOverride?: boolean;
   /** Bot ACLs (ADR 0017). Servers from before send none of these. */
   owner?: { id: string; name: string } | null;
+  /** The owner's service account that made and keeps this Bot (ADR 0222). It runs as
+   *  its owner's, but its runs reach only what that account may. */
+  serviceAccount?: { id: string; name: string } | null;
   visibility?: Visibility;
   /** What you may do with it. */
   access?: BotAccess;
@@ -228,6 +231,8 @@ export type BotAccess = "view" | "operate" | "manage";
 export interface BotAccessView {
   botId: string;
   owner: { id: string; name: string | null; email: string | null };
+  /** The owner's service account that made and keeps it (ADR 0222). */
+  serviceAccount?: { id: string; name: string | null; email: string | null } | null;
   visibility: Visibility;
   access: BotAccess;
   grants?: { user: { id: string; name: string | null; email: string | null }; level: "viewer" | "operator" }[];
@@ -566,6 +571,8 @@ export interface ServiceAccount {
   /** Live tokens. */
   tokens: number;
   lastUsedAt: number | null;
+  /** Bots it made and keeps for its owner (ADR 0222). Servers from before leave it out. */
+  keptBots?: number;
   createdAt: number;
   createdBy: string | null;
   updatedAt: number;
@@ -606,6 +613,8 @@ export interface ServiceAccountsView {
   scopes: string[];
   defaultDays: number;
   maxDays: number;
+  /** Most Bots one may keep (ADR 0222). */
+  maxKeptBots?: number;
 }
 
 /** A role the caller may give a service account: built in (`readonly`, `member`) or custom. */
@@ -1085,7 +1094,17 @@ export interface AccessReviewPerson {
   /** Admins reach every Bot by role, so `all` is set and `bots` is empty. */
   botAccess: {
     all: boolean;
-    bots: { id: string; name: string; owner: { id: string; name: string | null }; own: boolean; visibility: string; access: string; grant: string | null }[];
+    bots: {
+      id: string;
+      name: string;
+      owner: { id: string; name: string | null };
+      own: boolean;
+      visibility: string;
+      access: string;
+      grant: string | null;
+      /** A service account's: one it made and keeps for its owner (ADR 0222). */
+      kept?: boolean;
+    }[];
   };
   sessions: AccessReviewSession[];
   apiTokens: AccessReviewSession[];

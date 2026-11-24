@@ -1,4 +1,4 @@
-import { botAccess, hasAccess, sharingLabel, whereItRuns, whoseKeys } from "../access";
+import { botAccess, hasAccess, keptBy, sharingLabel, whereItRuns, whoseKeys } from "../access";
 
 describe("Bot access", () => {
   it("follows what the server says", () => {
@@ -51,5 +51,11 @@ describe("Bot access", () => {
     expect(whoseKeys({ sharedBots: "isolated", visibility: "shared", owner: ada, teammateLogins: true }, "u1")).toBe(
       "Others' runs use their own login or the server's keys and their access, never your own",
     );
+  });
+
+  it("names the service account that keeps a Bot", () => {
+    expect(keptBy({})).toBeNull();
+    expect(keptBy({ serviceAccount: null })).toBeNull();
+    expect(keptBy({ serviceAccount: { id: "sa1", name: "CI" } })).toBe("Kept by service account CI: its runs reach only what that account may");
   });
 });

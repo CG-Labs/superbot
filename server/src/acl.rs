@@ -101,6 +101,13 @@ pub fn access(user_id: &str, role: Role, owner_id: &str, visibility: Visibility,
     if role == Role::Readonly { base.min(Access::View) } else { base }
 }
 
+/// Whether `id` is the service account keeping `bot` (ADR 0222): the one that made it,
+/// while it isn't deleted and its owner still owns the Bot. It manages the Bot as an owner
+/// would, but only within its role and its owner's access (`Viewer::service`).
+pub fn kept_by(db: &Db, bot: &Bot, id: &str) -> bool {
+    bot.service_account_id.as_deref() == Some(id) && db.service_account(id).is_some_and(|s| s.deleted_at.is_none() && s.owner_id == bot.owner_id)
+}
+
 /// Whether sharing reaches across two people's teams (ADR 0087): the same team, or both
 /// in none unless `strict` (TEAMS=on), where no team is a team of one.
 pub fn reaches(strict: bool, a: Option<&str>, b: Option<&str>) -> bool {
@@ -205,6 +212,7 @@ impl Viewer {
         match self {
             Viewer::All => Access::Manage,
             Viewer::Nobody => Access::None,
+            Viewer::User { id, role } if kept_by(db, bot, id) => access(id, *role, id, bot.visibility, None, true),
             Viewer::User { id, role } => access(id, *role, &bot.owner_id, bot.visibility, db.grant(&bot.id, id), db.same_team(&bot.owner_id, id)),
             Viewer::Within(a, b) => a.access(db, bot).min(b.access(db, bot)),
         }
@@ -233,6 +241,7 @@ impl Viewer {
                 let a = match self {
                     Viewer::All => Access::Manage,
                     Viewer::Nobody | Viewer::Within(..) => Access::None,
+                    Viewer::User { id, role } if kept_by(db, &b, id) => access(id, *role, id, b.visibility, None, true),
                     Viewer::User { id, role } => {
                         let same = b.owner_id == *id || reaches(strict, teams.get(&b.owner_id).map(String::as_str), teams.get(id).map(String::as_str));
                         access(id, *role, &b.owner_id, b.visibility, grants.get(&b.id).copied(), same)

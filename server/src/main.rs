@@ -202,6 +202,8 @@ mod secrets;
 mod server_backups;
 mod service_accounts;
 #[cfg(test)]
+mod service_account_bots_http_tests;
+#[cfg(test)]
 mod service_accounts_http_tests;
 #[cfg(test)]
 mod server_backups_http_tests;
@@ -2517,6 +2519,11 @@ fn visibility_field(v: &Value) -> Res<Option<Visibility>> {
 async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let p = bot_patch(&v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
+    // A service account's Bot is its owner's, private, and kept by the account (ADR 0222).
+    let keeper = c.user.as_ref().filter(|u| u.service).map(|u| u.id.clone());
+    if keeper.is_some() && visibility_field(&v)? == Some(Visibility::Shared) {
+        return Err(bad("A service account's Bots are private. Its owner can share one."));
+    }
     // Shared unless asked otherwise, as every Bot was before ACLs; private with
     // isolated shared Bots, so sharing one is a choice (ADR 0046).
     let visibility = visibility_field(&v)?.unwrap_or(match app.shared_bots() {
@@ -2530,8 +2537,10 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
         app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
         return Err(ApiError(StatusCode::FORBIDDEN, "A Bot working for a teammate can't make new Bots. Ask its owner.".into()));
     }
-    // A person owns what they make. A Bot's new Bot belongs to that Bot's owner.
+    // A person owns what they make. A Bot's new Bot belongs to that Bot's owner, and a
+    // service account's to its owner.
     let owner = match (&c.user, c.principal) {
+        (Some(u), _) if u.service => c.service.as_ref().map(|s| s.owner.clone()).ok_or_else(|| ApiError(StatusCode::FORBIDDEN, "This service account has no active owner.".into()))?,
         (Some(u), _) => u.id.clone(),
         (None, Principal::Bot) => acting_bot(&app, &c, &by, None)?.owner_id,
         (None, _) => users::OPERATOR.into(),
@@ -2543,33 +2552,50 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     };
     check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), None)?;
     let max = tier.limits.max_bots;
-    let made = erasure::unless_erasing(&[&owner], || {
-        app.db.create_bot_capped(
-            &name,
-            p.color.as_deref().unwrap_or(pick(&COLORS)),
-            p.shape.as_deref().unwrap_or(pick(&SHAPES)),
-            &harness,
-            p.model.flatten().as_deref(),
-            false,
-            &owner,
-            visibility,
-            max,
-        )
+    let (color, shape) = (p.color.as_deref().unwrap_or(pick(&COLORS)), p.shape.as_deref().unwrap_or(pick(&SHAPES)));
+    let model = p.model.flatten();
+    let made = erasure::unless_erasing(&[&owner], || match &keeper {
+        Some(sa) => app.db.create_service_account_bot(&name, color, shape, &harness, model.as_deref(), &owner, sa, max, service_accounts::MAX_KEPT_BOTS),
+        None => app.db.create_bot_capped(&name, color, shape, &harness, model.as_deref(), false, &owner, visibility, max).ok_or(db::KeptBotRefusal::PlanLimit),
     });
     // Not audited: the event would name them after their erasure rewrote the log.
     let Some(made) = made else {
         return Err(ApiError(StatusCode::CONFLICT, "This account is being erased, so it can't have new Bots.".into()));
     };
-    let bot = made.ok_or_else(|| {
-            let details = json!({ "reason": "tier_bot_limit", "name": name, "owner": owner, "tier": tier.name, "limit": max });
+    let bot = made.map_err(|why| {
+        let refused = |reason: &str, extra: Value| {
+            let mut details = json!({ "reason": reason, "name": name, "owner": owner });
+            if let Some(sa) = &keeper {
+                details["serviceAccount"] = json!(sa);
+            }
+            if let (Some(d), Value::Object(e)) = (details.as_object_mut(), extra) {
+                d.extend(e);
+            }
             app.db.record(&by.event("bot.create_refused").target("user", &owner).outcome(Outcome::Denied).details(details));
-            ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {} Bots, and they're all in use. Delete one first.", tier.label, max.unwrap_or(0)))
-        })?;
+        };
+        match why {
+            db::KeptBotRefusal::PlanLimit => {
+                refused("tier_bot_limit", json!({ "tier": tier.name, "limit": max }));
+                ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {} Bots, and they're all in use. Delete one first.", tier.label, max.unwrap_or(0)))
+            }
+            db::KeptBotRefusal::AccountLimit => {
+                refused("service_account_bot_limit", json!({ "limit": service_accounts::MAX_KEPT_BOTS }));
+                ApiError(StatusCode::CONFLICT, format!("A service account can keep at most {} Bots. Delete one first.", service_accounts::MAX_KEPT_BOTS))
+            }
+            db::KeptBotRefusal::Account => {
+                refused("service_account_changed", json!({}));
+                ApiError(StatusCode::CONFLICT, "This service account was deleted or given another owner meanwhile.".into())
+            }
+        }
+    })?;
     app.init_bot_files(&bot);
     app.push_bot(&bot.id);
-    let details = json!({
+    let mut details = json!({
         "name": bot.name, "harness": bot.harness, "harnessFrom": harness_from, "tier": tier.name, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility,
     });
+    if let Some(sa) = &bot.service_account_id {
+        details["serviceAccount"] = json!(sa);
+    }
     app.db.record(&by.event("bot.created").target("bot", &bot.id).bot(&bot.id).details(details));
     let access = viewer(&app, &c, &by).access(&app.db, &bot);
     Ok((StatusCode::CREATED, Json(bot_view_for(&app, &c, &bot, access))))
@@ -2671,6 +2697,9 @@ fn access_view(app: &App, b: &db::Bot, access: Access) -> Value {
         "visibility": b.visibility,
         "access": access,
     });
+    if let Some(sa) = b.service_account_id.as_deref().filter(|sa| acl::kept_by(&app.db, b, sa)) {
+        v["serviceAccount"] = person(app.db.user(sa), sa);
+    }
     if access == Access::Manage {
         let grants: Vec<Value> = app
             .db
@@ -2739,6 +2768,10 @@ pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::U
     app.db.remove_grant(id, &to.id);
     app.hand_over_memory(id, &bot.owner_id, &to.id);
     app.db.record(&by.event("bot.owner_changed").target("bot", id).bot(id).details(json!({ "from": bot.owner_id, "to": to.id })));
+    // A service account keeps only its own owner's Bots (ADR 0222).
+    if let Some(sa) = &bot.service_account_id {
+        service_accounts::note_released(app, by, sa, std::slice::from_ref(id), "bot_owner_changed");
+    }
     acl_changed(app, by, id, true).await;
     // It runs on the new owner's machine now: teammates may have no use for the old one.
     machines::offboard::check_owner(app, by, &bot.owner_id);
@@ -2991,7 +3024,8 @@ fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<
     let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users()) && app.shared_bots() == acl::SharedBots::Isolated;
     let me = match (&c.user, &c.bot) {
         (Some(u), _) => Some(u.id.clone()),
-        (None, Some(b)) => app.db.bot(b).map(|b| app.acting_for(&b)),
+        // A Bot a service account keeps runs as its owner, on their screen (ADR 0222).
+        (None, Some(b)) => app.db.bot(b).and_then(|b| Some(app.acting_for(&b)).filter(|u| !acl::kept_by(&app.db, &b, u))),
         (None, None) => None,
     };
     let admin = c.principal == Principal::User(Role::Admin);

@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { sharingLabel, whereItRuns, whoseKeys } from "../src/access";
+import { keptBy, sharingLabel, whereItRuns, whoseKeys } from "../src/access";
 import { confirmAsync, showError } from "../src/dialogs";
 import { promptsFor } from "../src/prompts";
 import { cronLabel } from "../src/routines";
@@ -278,7 +278,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
               <View style={styles.row}>
                 <Text style={styles.dim}>{sharingLabel(bot, me.id)}</Text>
               </View>
-              {[whereItRuns(bot, me.id), whoseKeys(bot, me.id)].filter(Boolean).map((line) => (
+              {[keptBy(bot), whereItRuns(bot, me.id), whoseKeys(bot, me.id)].filter(Boolean).map((line) => (
                 <View key={line} style={styles.row}>
                   <Text style={styles.dim}>{line}</Text>
                 </View>
