@@ -1326,6 +1326,9 @@ mod tests {
             let f = vault(&pairs);
             assert!(f.iter().all(|x| x.area != Area::Secrets || x.setting.as_deref() == Some("VAULT_ADDR")), "{method:?}: {f:?}");
         }
+        let empty = temp_file("offline-empty-aws-key-id", "\n");
+        let fallback = findings(&[("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", "https://vault.internal:8200"), ("VAULT_AUTH", "aws"), ("AWS_ACCESS_KEY_ID_FILE", &empty), ("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token"), ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/botd")], &[]);
+        assert_eq!(by(&fallback, "AWS_ENDPOINT_URL_STS").host.as_deref(), Some("sts.amazonaws.com"), "an empty key file is no key, so the chain goes on to web identity");
         let container = vault(&[("VAULT_AUTH", "aws"), ("AWS_CONTAINER_CREDENTIALS_FULL_URI", "https://creds.example.com/v1"), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://imds.example.com")]);
         assert_eq!(by(&container, "AWS_CONTAINER_CREDENTIALS_FULL_URI").host.as_deref(), Some("creds.example.com"));
         assert!(container.iter().all(|x| x.setting.as_deref() != Some("AWS_EC2_METADATA_SERVICE_ENDPOINT")), "the chain stops at the container");

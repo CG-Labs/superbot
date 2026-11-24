@@ -235,8 +235,17 @@ pub fn reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String
 /// the one `method_var` names, or for `chain` the first that is set, as it picks them.
 pub fn chosen_source(var: &dyn Fn(&str) -> String, method_var: &str) -> Result<&'static str, String> {
     let set = |k: &str| !var(k).trim().is_empty();
+    // As the environment store reads it: an empty key file is no key, so the chain goes on;
+    // one that can't be read stops botd at startup, so the chain ends there.
+    let key_set = || match var("AWS_ACCESS_KEY_ID").trim() {
+        "" => match var("AWS_ACCESS_KEY_ID_FILE").trim() {
+            "" => false,
+            f => std::fs::read_to_string(f).map(|v| !v.trim().is_empty()).unwrap_or(true),
+        },
+        _ => true,
+    };
     Ok(match var(method_var).trim() {
-        "" | "chain" if set("AWS_ACCESS_KEY_ID") || set("AWS_ACCESS_KEY_ID_FILE") => "env",
+        "" | "chain" if key_set() => "env",
         "" | "chain" if set("AWS_WEB_IDENTITY_TOKEN_FILE") => "web-identity",
         "" | "chain" if set("AWS_CONTAINER_CREDENTIALS_FULL_URI") || set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") => "container",
         "" | "chain" | "instance-profile" => "instance-profile",
