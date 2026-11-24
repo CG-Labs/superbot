@@ -2274,9 +2274,14 @@ async fn generated_keys_and_their_next_keys_are_checked_without_making_any() {
 /// An HTTP-POST binding page: where its form goes, the message it posts (decoded), and its
 /// RelayState.
 fn posted_form(body: &str) -> (String, String, Option<String>) {
+    posted_message(body, "SAMLRequest")
+}
+
+/// The same for a page that posts `param` (`SAMLRequest` or `SAMLResponse`).
+fn posted_message(body: &str, param: &str) -> (String, String, Option<String>) {
     let value = |name: &str| body.split(&format!(r#"name="{name}" value=""#)).nth(1).map(|v| v.split('"').next().unwrap().to_string());
     let action = body.split(r#"<form method="post" action=""#).nth(1).expect("a form").split('"').next().unwrap().replace("&amp;", "&");
-    let xml = String::from_utf8(STANDARD.decode(value("SAMLRequest").expect("a SAMLRequest")).unwrap()).unwrap();
+    let xml = String::from_utf8(STANDARD.decode(value(param).unwrap_or_else(|| panic!("a {param}"))).unwrap()).unwrap();
     (action, xml, value("RelayState"))
 }
 
@@ -2409,4 +2414,120 @@ async fn asking_again_for_a_recent_sign_in_posts_too() {
     let r = Response::new(&sp.acs(), &sp.entity(), &request_id(&again), db::now());
     let (code, _, head) = sp.post(Some(&r.posted()), new_relay.as_deref(), binders[0].split(';').next().unwrap()).await;
     assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(u.id)));
+}
+
+// Logout over HTTP-POST to the IdP (ADR 0248)
+
+/// A native provider whose IdP takes logout only over HTTP-POST, at `SLO_URL/post`.
+async fn serve_post_slo(extra: &[(&str, &str)]) -> Sp {
+    let sp = serve(extra).await;
+    let (code, view) = sp.import(&test_idp::with_post_slo(&test_idp::metadata())).await;
+    assert_eq!(code, 200, "{view}");
+    sp
+}
+
+impl Sp {
+    /// Signs `cookie`'s session out: the `logoutUrl` botd answers with, as a path on botd.
+    async fn sign_out(&self, cookie: &str) -> String {
+        let (code, _, body) = crate::tests::call_with(self.port, "POST", "/api/auth/logout", "", cookie, "").await;
+        assert_eq!(code, 200, "{body}");
+        let url = serde_json::from_str::<Value>(&body).unwrap()["logoutUrl"].as_str().expect("logoutUrl").to_string();
+        url.strip_prefix(&format!("http://127.0.0.1:{}", self.port)).unwrap_or_else(|| panic!("a page on botd: {url}")).to_string()
+    }
+}
+
+#[tokio::test]
+async fn signing_out_posts_the_logout_request_to_an_idp_that_takes_only_http_post() {
+    let sp = serve_post_slo(&[]).await;
+    let u = sp.link();
+    let v = sp.view().await;
+    assert_eq!((v["singleLogout"].as_bool(), v["idp"]["sloBinding"].as_str(), v["idp"]["sloUrl"].as_str()), (Some(true), Some("post"), Some(format!("{}/post", test_idp::SLO_URL).as_str())), "{v}");
+
+    let cookie = sp.cookie("_s1").await;
+    let page = sp.sign_out(&cookie).await;
+    assert_eq!(sp.who(&cookie).await, None, "signed out here first");
+    assert!(page.starts_with(&format!("/api/auth/sso/{}/logout?h=", sp.id)), "{page}");
+
+    // The page posts our signed LogoutRequest to the IdP, once.
+    let (code, head, body) = crate::tests::call_with(sp.port, "GET", &page, "", "", "").await;
+    assert_eq!(code, 200, "{head}\n{body}");
+    post_page_headers(&head);
+    assert!(header(&head, "set-cookie").is_none(), "{head}");
+    assert!(body.contains("sign out") && !body.contains("sign-in"), "{body}");
+    let (action, request, relay) = posted_message(&body, "SAMLRequest");
+    assert_eq!((action, relay), (format!("{}/post", test_idp::SLO_URL), None));
+    assert!(signed_inside(&request, &sp.sp_cert().await), "signed inside, with our published key: {request}");
+    assert!(request.contains("<samlp:LogoutRequest") && request.contains(&format!(r#"Destination="{}/post""#, test_idp::SLO_URL)), "{request}");
+    assert!(request.contains(&format!(">{NAME_ID}</saml:NameID>")) && request.contains("<samlp:SessionIndex>_s1</samlp:SessionIndex>"), "{request}");
+    let id = request_id(&request);
+    let logout = &sp.audit("auth.logout").await[0];
+    assert_eq!((logout["actorId"].as_str(), logout["details"]["slo"].as_str(), logout["details"]["sloBinding"].as_str()), (Some(u.id.as_str()), Some(id.as_str()), Some("post")));
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &page, "", "", "").await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login")), "spent: {head}");
+
+    // The IdP's answer, posted back: audited against the session, with the binding it came by.
+    let (code, to) = sp.slo_post(&Logout::response(&sp.slo(), &id, db::now()).post()).await;
+    assert_eq!((code, to.as_str()), (303, "/login"));
+    let done = &sp.audit("auth.slo_response").await[0];
+    assert_eq!((done["outcome"].as_str(), done["details"]["requestId"].as_str(), done["details"]["binding"].as_str()), (Some("success"), Some(id.as_str()), Some("post")));
+
+    // Handles that are made up, missing, or for another provider show nothing.
+    for path in [format!("/api/auth/sso/{}/logout?h=0123", sp.id), format!("/api/auth/sso/{}/logout", sp.id)] {
+        let (code, head, body) = crate::tests::call_with(sp.port, "GET", &path, "", "", "").await;
+        assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login")), "{path}");
+        assert!(!body.contains("SAMLRequest"), "{body}");
+    }
+    let page = sp.sign_out(&sp.cookie("_s2").await).await;
+    let other = page.replacen(&format!("/sso/{}/", sp.id), "/sso/other/", 1);
+    assert_eq!(crate::tests::call_with(sp.port, "GET", &other, "", "", "").await.0, 303);
+    assert_eq!(crate::tests::call_with(sp.port, "GET", &page, "", "", "").await.0, 303, "one try, whichever provider it named");
+}
+
+#[tokio::test]
+async fn the_idps_logout_request_is_answered_over_http_post_when_thats_all_it_takes() {
+    let sp = serve_post_slo(&[]).await;
+    let u = sp.link();
+    let (first, second) = (sp.cookie("_s1").await, sp.cookie("_s2").await);
+    let cert = sp.sp_cert().await;
+
+    // Over either binding to us, the answer goes over the IdP's.
+    let l = Logout::request(&sp.slo(), NAME_ID, Some("_s1"), db::now());
+    let res = http().get(format!("{}?{}", sp.slo(), l.redirect())).send().await.unwrap();
+    let head: String = res.headers().iter().map(|(k, v)| format!("{k}: {}\n", v.to_str().unwrap())).collect();
+    assert_eq!(res.status().as_u16(), 200, "{head}");
+    post_page_headers(&head);
+    assert!(header(&head, "set-cookie").is_none(), "the browser's own cookie is left alone: {head}");
+    let (action, answer, relay) = posted_message(&res.text().await.unwrap(), "SAMLResponse");
+    assert_eq!((action, relay.as_deref()), (format!("{}/post", test_idp::SLO_URL), Some("idp-relay")));
+    assert!(signed_inside(&answer, &cert), "signed inside: {answer}");
+    assert!(answer.contains(&format!(r#"InResponseTo="{}""#, l.id)) && answer.contains(&format!(r#"Destination="{}/post""#, test_idp::SLO_URL)) && answer.contains("status:Success"), "{answer}");
+    assert_eq!((sp.who(&first).await, sp.who(&second).await), (None, Some(u.id.clone())));
+    assert_eq!(sp.audit("auth.slo").await[0]["details"]["binding"], "redirect");
+
+    let l = Logout::request(&sp.slo(), NAME_ID, None, db::now());
+    let res = http().post(sp.slo()).form(&l.post()).send().await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let (_, answer, _) = posted_message(&res.text().await.unwrap(), "SAMLResponse");
+    assert!(signed_inside(&answer, &cert) && answer.contains(&format!(r#"InResponseTo="{}""#, l.id)), "{answer}");
+    assert_eq!(sp.who(&second).await, None);
+    assert_eq!(sp.audit("auth.slo").await[0]["details"]["binding"], "post");
+
+    // Still checked as before: a forged request revokes nothing and gets no answer.
+    let mut forged = Logout::request(&sp.slo(), NAME_ID, None, db::now());
+    forged.signer = Some(1);
+    assert_eq!(sp.slo_post(&forged.post()).await.0, 400);
+}
+
+#[tokio::test]
+async fn requests_over_http_post_by_choice_take_logout_over_it_too() {
+    let sp = serve(&[("REQUEST_BINDING", "post")]).await;
+    let (code, view) = sp.import(&test_idp::with_post_slo(&test_idp::with_slo(&test_idp::metadata()))).await;
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(sp.view().await["idp"]["sloBinding"], "post");
+    let plain = serve(&[]).await;
+    let (code, view) = plain.import(&test_idp::with_post_slo(&test_idp::with_slo(&test_idp::metadata()))).await;
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(plain.view().await["idp"]["sloBinding"], "redirect", "HTTP-Redirect first, as before");
+    let imported = plain.audit("sso.saml_metadata_imported").await;
+    assert_eq!(imported[0]["details"]["sloBinding"], "redirect");
 }

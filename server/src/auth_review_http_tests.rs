@@ -31,6 +31,8 @@ const PUBLIC: &[(&str, &str)] = &[
     ("POST", "/api/auth/sso/{id}/slo"),
     // The same over SOAP, server to server (ADR 0208).
     ("POST", "/api/auth/sso/{id}/slo/soap"),
+    // The page that posts our signed LogoutRequest to the IdP, once per sign-out (ADR 0248).
+    ("GET", "/api/auth/sso/{id}/logout"),
     ("POST", "/api/signups"),
     ("GET", "/api/signups/config"),
     // Stripe signs it; checked in `billing` (ADR 0040).
