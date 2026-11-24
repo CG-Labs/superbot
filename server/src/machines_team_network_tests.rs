@@ -257,6 +257,92 @@ async fn a_deleted_teams_network_is_removed_once_nothing_is_on_it() {
     assert!(has_network(&env, &theirs.id), "still never touched");
 }
 
+/// As audit retention would: the team's deletion is no longer in the log.
+fn prune_team_deletions(env: &Env) {
+    env.app.db.with_conn(|c| c.execute_batch("DROP TRIGGER IF EXISTS audit_events_no_delete; DELETE FROM audit_events WHERE action = 'team.deleted';").unwrap());
+}
+
+#[tokio::test]
+async fn a_deleted_teams_network_goes_after_audit_retention_has_pruned_its_deletion_and_the_view_says_whose_each_is() {
+    let env = serve().await;
+    let (ada, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (_gus, _) = user_with(env.port, &env.admin, "gus@example.com", "member").await;
+    let (dee, _) = user_with(env.port, &env.admin, "dee@example.com", "member").await;
+    let acme = team(&env, "Acme", "ada@example.com").await;
+    let globex = team(&env, "Globex", "gus@example.com").await;
+    join(&env, &globex, &dee).await;
+    for uid in [&ada, &dee] {
+        ask(&env, uid).await;
+    }
+    let acme_net = env.fake.network_of(&pid(&env, &ada)).unwrap();
+    let globex_net = env.fake.network_of(&pid(&env, &dee)).unwrap();
+    env.fake.join_network(&globex_net, "globex-database");
+    let label = team_network::label("otherbot", "t-theirs", "gb-lon").unwrap();
+    let theirs = env.fake.ensure_team_network(&label, "gb-lon", team_network::DEFAULT_SUBNET).await.unwrap();
+
+    let view = async || {
+        let (code, v) = json_call(&env, "GET", "/api/machines/team-networks", "").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["teamNetwork"]["remove"], "when-empty", "{v}");
+        v["networks"].as_array().unwrap().clone()
+    };
+    let find = |nets: &[Value], id: &str| nets.iter().find(|n| n["id"] == id).cloned();
+    let nets = view().await;
+    assert_eq!(nets.len(), 3, "{nets:?}");
+    let a = find(&nets, &acme_net).unwrap();
+    assert_eq!((a["status"].as_str(), a["team"]["id"].as_str(), a["team"]["name"].as_str()), (Some("team"), Some(acme.as_str()), Some("Acme")), "{a}");
+    let m = machine(&env, &ada);
+    assert_eq!(a["machines"], json!([{ "id": m.id, "userId": ada, "state": m.state.as_str(), "inUse": true, "leaving": false }]));
+    assert_eq!((a["subnet"].as_str(), a["region"].as_str(), a["otherInterfaces"].as_i64()), (Some(team_network::DEFAULT_SUBNET), Some("gb-lon"), Some(0)));
+    let g = find(&nets, &globex_net).unwrap();
+    assert_eq!((g["status"].as_str(), g["otherInterfaces"].as_i64(), g["machines"].as_array().unwrap().len()), (Some("team"), Some(1), 1), "{g}");
+    let t = find(&nets, &theirs.id).unwrap();
+    assert_eq!((t["status"].as_str(), &t["team"], &t["machines"]), (Some("unknown"), &Value::Null, &json!([])), "another server's: {t}");
+
+    // Acme is deleted, and retention prunes that from the audit log before its network
+    // is empty. This server's own record still knows the team was its own.
+    delete_team(&env, &acme).await;
+    prune_team_deletions(&env);
+    assert!(events(&env, "team.deleted").await.is_empty());
+    let a = find(&view().await, &acme_net).unwrap();
+    assert_eq!((a["status"].as_str(), a["team"]["id"].as_str(), a["team"]["name"].as_str()), (Some("deleted"), Some(acme.as_str()), None), "{a}");
+    assert!(a["team"]["deletedAt"].is_i64(), "{a}");
+    assert_eq!(a["machines"][0]["leaving"], true, "{a}");
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "leaving": 1 }));
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 1, "resumed": 1, "removed": 1 }));
+    assert!(!has_network(&env, &acme_net));
+    let removed = events(&env, "machine.team_network_removed").await;
+    assert_eq!((removed.len(), removed[0]["details"]["team"].as_str()), (1, Some(acme.as_str())), "{removed:?}");
+    assert_eq!(removed[0]["details"]["teamDeletedAt"], a["team"]["deletedAt"]);
+
+    // Globex too, its own service still on its network: kept, and the view says why.
+    delete_team(&env, &globex).await;
+    prune_team_deletions(&env);
+    reconcile(&env).await;
+    assert_eq!(reconcile(&env).await["teamNetworks"], json!({ "left": 1, "resumed": 1, "kept": 1 }));
+    let nets = view().await;
+    assert_eq!(nets.len(), 2, "{nets:?}");
+    let g = find(&nets, &globex_net).unwrap();
+    assert_eq!((g["status"].as_str(), &g["machines"], g["otherInterfaces"].as_i64()), (Some("deleted"), &json!([]), Some(1)), "{g}");
+    assert!(has_network(&env, &theirs.id), "never touched");
+    assert_eq!(find(&nets, &theirs.id).unwrap()["status"], "unknown");
+
+    // Admins only, and only with team networks on.
+    let (_, member) = user_with(env.port, &env.admin, "mo@example.com", "member").await;
+    assert_eq!(call(env.port, "GET", "/api/machines/team-networks", &member, "").await.0, 403);
+}
+
+#[tokio::test]
+async fn without_team_networks_there_is_nothing_to_view() {
+    let fake = Arc::new(Fake::default());
+    let p: Arc<dyn MachineProvider> = fake;
+    let cp = Arc::new(ControlPlane::for_tests(p));
+    let (port, _app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
+    let (code, body) = call(port, "GET", "/api/machines/team-networks", &owner, "").await;
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("MACHINE_TEAM_NETWORK"), "{body}");
+}
+
 #[tokio::test]
 async fn with_remove_off_a_deleted_teams_network_stays() {
     let env = serve_with(team_network::Remove::Off).await;

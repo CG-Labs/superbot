@@ -1185,6 +1185,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/{id}/backups", delete(machines::backup::delete_all))
         .route("/machines/recovery", get(machines::recovery::get))
         .route("/machines/substrate", get(machines::substrate))
+        .route("/machines/team-networks", get(machines::team_network::list))
         .route("/machines/egress-policy", get(machines::egress_policy::get_server).put(machines::egress_policy::set_server))
         .route("/regions", get(machines::region::list))
         .route("/machines/hosts", get(machines::hosts::list))

@@ -385,6 +385,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine upgrade <user> hold|release       Keep its agent at its build, or let it be upgraded again
   botctl machine harnesses <user>                  Install MACHINE_HARNESSES on it now, retrying failures
   botctl machine mirror                            Fetch every harness file machines would, from the mirrors, and check each pin (ADR 0186)
+  botctl machine team-networks                     Every team network: its team, or that this server deleted it, or none
+                                                   it knows (another server's), and our machines on it (ADR 0249)
   botctl machine legacy                            Machines whose agent is from before agent upgrades, and their rebuilds
   botctl machine rebuild <user> [--discard-work]   Wipe and reinstall it with today's agent (ADR 0056); same IP and firewall
   botctl machine rebuild <user> status|cancel      How its rebuild is going, or cancel one not yet sent
@@ -1196,6 +1198,7 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["upgrade", user, "release"] => ("DELETE", machine(user, "agent/hold")),
         ["harnesses", user] => ("POST", machine(user, "harnesses")),
         ["mirror"] | ["mirror", "check"] => ("GET", "/api/machines/harness-mirror".into()),
+        ["team-networks"] => ("GET", "/api/machines/team-networks".into()),
         ["bot-user", user] => ("POST", machine(user, "bot-user")),
         ["folder", user] => ("GET", machine(user, "folder-sync")),
         ["sync", user] => ("POST", machine(user, "folder-sync")),
@@ -1210,7 +1213,7 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["removals"] => ("GET", "/api/machines/teammate-removals?state=open".into()),
         ["removals", s @ ("pending" | "held" | "done" | "cancelled" | "open" | "all")] => ("GET", format!("/api/machines/teammate-removals?state={s}")),
         _ => {
-            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | mirror | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate> | logins <teammate> | logout <teammate> <harness>] | removals [pending|held|done|cancelled|open|all]".into());
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | mirror | team-networks | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate> | logins <teammate> | logout <teammate> <harness>] | removals [pending|held|done|cancelled|open|all]".into());
         }
     })
 }
@@ -3692,6 +3695,8 @@ mod tests {
         assert_eq!(machine_request(&["upgrade", "u1", "release"]).unwrap(), ("DELETE", "/api/users/u1/machine/agent/hold".into()));
         assert_eq!(machine_request(&["harnesses", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/harnesses".into()));
         assert_eq!(machine_request(&["mirror"]).unwrap(), ("GET", "/api/machines/harness-mirror".into()));
+        assert_eq!(machine_request(&["team-networks"]).unwrap(), ("GET", "/api/machines/team-networks".into()));
+        assert!(machine_request(&["team-networks", "acme"]).is_err());
         assert_eq!(machine_request(&["bot-user", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/bot-user".into()));
         assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
         assert_eq!(machine_request(&["folder", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/folder-sync".into()));
