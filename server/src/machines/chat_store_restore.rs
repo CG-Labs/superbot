@@ -18,11 +18,13 @@ use super::chat_stores;
 use crate::audit::{Who, clip};
 use crate::database_encryption::{self, DbKey, Format};
 use crate::db::{ChatStore, Db, ERASED_BOTS, Held};
+use crate::secrets::sealed::{self, Cipher};
 use crate::support_check::Settings;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const RESTORED: &str = "residency.chat_store_restored";
 /// Notes left in the store's folder by restores (`restored-<time>.json`), one each, for
@@ -59,6 +61,10 @@ pub struct Place {
     /// Whether botd's own database is encrypted, which its stores must match.
     encrypted: bool,
     db_key: Option<DbKey>,
+    /// What seals approvals' tool inputs: the current master key, then the previous one.
+    ciphers: Vec<Arc<Cipher>>,
+    /// SUPERBOT_FORGET_SEALED=1: botd drops at start the inputs neither key opens.
+    forget_sealed: bool,
     /// The region's bucket. Err: its settings are wrong, said only when it is needed.
     copies: Result<Option<Copies>, String>,
 }
@@ -108,10 +114,12 @@ impl Place {
         drop(c);
         let sealed = masters.iter().filter_map(|k| {
             let c = database_encryption::open_read_only(&db_path, db_key.as_ref()).ok()?;
-            Some(crate::secrets::sealed::SealedStore::new(c, std::sync::Arc::new(crate::secrets::sealed::Cipher::new(k))))
+            Some(crate::secrets::sealed::SealedStore::new(c, Arc::new(Cipher::new(k))))
         });
         let copies = bucket(s, region, folder, Sealed(sealed.collect()));
-        Ok(Place { region: region.to_string(), store, db_path, keys, encrypted, db_key, copies })
+        let ciphers = masters.iter().map(|k| Arc::new(Cipher::new(k))).collect();
+        let forget_sealed = s.get("SUPERBOT_FORGET_SEALED") == "1";
+        Ok(Place { region: region.to_string(), store, db_path, keys, encrypted, db_key, ciphers, forget_sealed, copies })
     }
 
     fn db(&self) -> Result<Connection, String> {
@@ -223,9 +231,25 @@ pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
             .map(|e| e.path())
             .collect();
         notes.sort();
-        let files = inodes(dir);
+        let kept = |path: &Path, e: String| format!("Regional chat stores: a restore's note {} couldn't be checked ({e}); it is kept for the next start (ADR 0256).", path.display());
+        let files = match inodes(dir) {
+            Ok(f) => f,
+            Err(e) => {
+                lines.extend(notes.iter().map(|p| kept(p, e.clone())));
+                continue;
+            }
+        };
         for path in notes {
-            let note: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+            // A note is synced before the store is replaced, so one that doesn't parse was
+            // cut off before that; one that can't be read may be of a restore that happened.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    lines.push(kept(&path, e.to_string()));
+                    continue;
+                }
+            };
+            let note: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let backup = note["backup"].as_str().map_or("a backup".to_string(), |b| clip(b, 200));
             if note["file"].as_u64().is_some_and(|f| files.contains(&f)) {
                 let mut details = json!({ "region": region });
@@ -252,11 +276,31 @@ pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
     lines
 }
 
-/// The inodes of a store's file and its backups, which a restore's note names.
-fn inodes(dir: &Path) -> Vec<u64> {
+/// The inodes of a store's file and its backups, which a restore's note names. Err when
+/// they can't all be checked, which isn't proof the note's file is gone.
+fn inodes(dir: &Path) -> Result<Vec<u64>, String> {
     use std::os::unix::fs::MetadataExt;
-    let backups = std::fs::read_dir(dir.join("backups")).into_iter().flatten().flatten().map(|e| e.path());
-    std::iter::once(dir.join("chats.sqlite")).chain(backups).filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.ino()).collect()
+    let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let mut paths = vec![dir.join("chats.sqlite")];
+    let backups = dir.join("backups");
+    match std::fs::read_dir(&backups) {
+        Ok(entries) => {
+            for e in entries {
+                paths.push(e.map_err(|e| format!("{}: {e}", backups.display()))?.path());
+            }
+        }
+        Err(e) if missing(&e) => {}
+        Err(e) => return Err(format!("{}: {e}", backups.display())),
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        match std::fs::metadata(&p) {
+            Ok(m) => out.push(m.ino()),
+            Err(e) if missing(&e) => {}
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        }
+    }
+    Ok(out)
 }
 
 // Listing
@@ -478,6 +522,8 @@ pub struct Plan {
     gone: Option<Held>,
     /// The store now doesn't open, and is deleted rather than kept.
     unreadable: Option<String>,
+    /// Approvals' saved tool inputs neither master key opens, which botd drops at start.
+    unopened: usize,
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
@@ -571,6 +617,14 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
     c.execute_batch("VACUUM").map_err(err)?;
     check(&c)?;
     plan.held = crate::db::held_in_copy(&c, &kept).map_err(err)?;
+    plan.unopened = unopened(&c, &place.ciphers).map_err(err)?;
+    if plan.unopened > 0 && !place.forget_sealed {
+        return Err(format!(
+            "{} saved tool inputs of approvals in that backup don't open with the master key or the previous one, so botd wouldn't start with it. \
+             Set SUPERBOT_MASTER_KEY_PREVIOUS to the key they were sealed under; if it's lost for good, set SUPERBOT_FORGET_SEALED=1 so botd drops them at start (ADR 0228)",
+            plan.unopened
+        ));
+    }
     match current {
         Current::Readable(k) => {
             let p = place.store.path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", place.store.path.display()))?;
@@ -592,6 +646,22 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
     drop(c);
     std::fs::File::open(work).and_then(|f| f.sync_all()).map_err(io(work))?;
     Ok(plan)
+}
+
+/// How many approvals' saved tool inputs are sealed under a key none of `ciphers` is, which
+/// botd refuses at start (ADR 0228). Plaintext ones it seals then.
+fn unopened(c: &Connection, ciphers: &[Arc<Cipher>]) -> rusqlite::Result<usize> {
+    let mut s = c.prepare("SELECT id, input FROM approvals")?;
+    let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut n = 0;
+    for row in rows {
+        let (id, input) = row?;
+        let context = sealed::approval_context(&id);
+        if sealed::is_sealed(&input) && !ciphers.iter().any(|k| k.open(&context, &input).is_ok()) {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// The rows of Bots other than `kept` in the store attached as `schema`.
@@ -789,6 +859,9 @@ impl Restore {
         if p.erased.total() > 0 {
             out.push_str(&format!("  Erased in it again: {} of people erased since.\n", p.erased.describe()));
         }
+        if p.unopened > 0 {
+            out.push_str(&format!("  {} saved tool inputs of approvals in it don't open with the master key; botd drops them at start (SUPERBOT_FORGET_SEALED=1).\n", p.unopened));
+        }
         match (&p.back, &p.gone, &p.unreadable) {
             (Some(back), Some(gone), _) => {
                 out.push_str(&format!("  Against the store now: {} come back, and {} made since the backup go.\n", back.describe(), gone.describe()));
@@ -942,8 +1015,11 @@ mod tests {
             Settings::new(None, Some(self.t.path().join("home")), p)
         }
 
+        /// With the key tests seal approvals under, which the settings don't name.
         fn place(&self) -> Place {
-            Place::locate(&self.settings(&[]), "gb-lon").unwrap()
+            let mut p = Place::locate(&self.settings(&[]), "gb-lon").unwrap();
+            p.ciphers.push(sealed::cipher());
+            p
         }
 
         fn store(&self) -> PathBuf {
@@ -1035,7 +1111,10 @@ mod tests {
         assert_eq!(undo.plan.back.unwrap().messages, 1);
         // A note of a restore cut off before it replaced the store names no file there.
         std::fs::write(w.lon.join(format!("{NOTE}1.json")), json!({ "backup": "chats-20200101-000000.sqlite", "file": 1 }).to_string()).unwrap();
-        assert_eq!(notes(&w.lon).len(), 3);
+        // One that can't be read is kept: it may be of a restore that happened.
+        let unread = w.lon.join(format!("{NOTE}9.json"));
+        std::fs::create_dir(&unread).unwrap();
+        assert_eq!(notes(&w.lon).len(), 4);
 
         // botd's next start audits each once, oldest first, before it touches the store.
         let db = Db::open(&w.app).unwrap();
@@ -1043,10 +1122,13 @@ mod tests {
         let cipher = crate::secrets::sealed::cipher();
         let opened = chat_stores::open(&db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
         let lines: Vec<&String> = opened.lines.iter().filter(|l| l.contains("restore")).collect();
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].contains("was cut off before it replaced the store, so nothing was restored"), "{lines:?}");
         assert!(lines[1].contains("gb-lon's store was restored from chats-") && lines[2].contains(r.kept.as_deref().unwrap()), "{lines:?}");
-        assert!(notes(&w.lon).is_empty() && audit_restores(&db, &w.dirs()).is_empty());
+        assert!(lines[3].contains("couldn't be checked") && lines[3].contains("kept for the next start"), "{lines:?}");
+        assert_eq!(notes(&w.lon), [unread.clone()]);
+        std::fs::remove_dir(&unread).unwrap();
+        assert!(audit_restores(&db, &w.dirs()).is_empty());
         let f = crate::audit::Filter { actions: vec![RESTORED.into()], ..Default::default() };
         let events: Vec<Value> = db.audit_events(&f, 10, true).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
         assert_eq!(events.len(), 2, "the cut-off one isn't audited: {events:?}");
@@ -1116,6 +1198,30 @@ mod tests {
         drop(app);
         restore(&w.place(), &opts("newest", true), now()).await.unwrap();
         assert_eq!(texts(&w.store()), ["[erased]", "chat-9i-adas-own"], "the Bot after the first 100 still counts");
+    }
+
+    #[tokio::test]
+    async fn a_backup_with_approvals_sealed_under_a_lost_key_is_refused_unless_botd_drops_them() {
+        let (w, db) = World::new();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        let lost = db.add_approval(&ada, "claude", "Bash", "tool", "ls", &json!({}), "read", "why", now() + DAY).id;
+        db.add_approval(&ada, "claude", "Bash", "tool", "pwd", &json!({}), "read", "why", now() + DAY);
+        backup_pass(&db, 7, now() - DAY);
+        drop(db);
+        let (_, backup) = chat_stores::backups_strictly(&w.place().store).unwrap().pop().unwrap();
+        let under_lost_key = Cipher::new(&crate::secrets::key::MasterKey::generate()).seal(&sealed::approval_context(&lost), br#"{"command":"ls"}"#);
+        Connection::open(&backup).unwrap().execute("UPDATE approvals SET input = ?1 WHERE id = ?2", rusqlite::params![under_lost_key, lost]).unwrap();
+        let before = std::fs::read(w.store()).unwrap();
+
+        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("1 saved tool inputs of approvals in that backup don't open") && e.contains("SUPERBOT_MASTER_KEY_PREVIOUS") && e.contains("SUPERBOT_FORGET_SEALED=1"), "{e}");
+        assert_eq!(std::fs::read(w.store()).unwrap(), before);
+        assert!(work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
+
+        let place = Place { forget_sealed: true, ..w.place() };
+        let r = restore(&place, &opts("newest", true), now()).await.unwrap();
+        assert_eq!(r.plan.unopened, 1);
+        assert!(r.text("gb-lon").contains("1 saved tool inputs of approvals in it don't open with the master key; botd drops them at start"), "{}", r.text("gb-lon"));
     }
 
     #[tokio::test]

@@ -72,6 +72,7 @@ The backup must be this region's store, open with the master key (or the previou
 | `didn't keep which Bots it deleted` | Someone was erased after the backup by an earlier botd, so botd can't tell which Bots their erasure deleted | Restore a backup made after that erasure |
 | `is <region>'s chat store, not ...` or `is of chat store <id>` | The backup is another region's, or an earlier store's in the folder | Pick this store's backup (`list` shows them) |
 | `doesn't open with the master key or the previous one` | Made under a master key botd no longer has | Restore a newer backup, or set `SUPERBOT_MASTER_KEY_PREVIOUS` to that key |
+| `saved tool inputs of approvals in that backup don't open` | Its approvals were sealed under a master key botd no longer has, so botd wouldn't start | Set `SUPERBOT_MASTER_KEY_PREVIOUS` to that key, or, if it's lost, set `SUPERBOT_FORGET_SEALED=1` so botd drops them at start |
 | `give the identity ... --identity` or `doesn't open this copy` | The copy is age-encrypted to other recipients | Give the identity matching `REGION_DATA_AGE_RECIPIENTS` when it was made |
 | `the store now doesn't open` | The store is damaged | Add `--replace-unreadable`: it is deleted, not kept |
 
