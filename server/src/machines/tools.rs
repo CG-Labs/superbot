@@ -391,7 +391,7 @@ impl Tools {
             control: Default::default(),
         });
         // An install a restart cut short starts again, and its login is gone first.
-        let _ = std::fs::remove_dir_all(t.login_dir());
+        t.forget_login();
         {
             let mut s = t.lock();
             for st in s.status.values_mut() {
@@ -615,20 +615,29 @@ impl Tools {
     async fn in_dl(&self, step: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
         let dl = self.dir.join(".dl");
         let _ = std::fs::remove_dir_all(&dl);
-        let _ = std::fs::remove_dir_all(self.login_dir());
+        self.forget_login();
         std::fs::create_dir_all(&dl).map_err(|e| e.to_string())?;
         let res = step.await;
         let _ = std::fs::remove_dir_all(&dl);
-        let _ = std::fs::remove_dir_all(self.login_dir());
+        self.forget_login();
         res
     }
 
     /// Where an install keeps the registry's login (ADR 0219): beside the tools, not in
     /// them, since `open_up` opens everything in them to Bots, at any time.
-    fn login_dir(&self) -> PathBuf {
-        let mut d = self.dir.clone().into_os_string();
-        d.push(".login");
-        PathBuf::from(d)
+    fn forget_login(&self) {
+        if let Some(d) = self.login_dir() {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Built from the folder's name, so `tools/` or `tools/.` can't put it inside.
+    fn login_dir(&self) -> Option<PathBuf> {
+        let dir = std::path::absolute(&self.dir).ok()?;
+        let dir: PathBuf = dir.components().collect();
+        let mut name = dir.file_name()?.to_os_string();
+        name.push(".login");
+        Some(dir.parent()?.join(name))
     }
 
     async fn install(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> Result<String, String> {
@@ -792,7 +801,7 @@ impl Tools {
             let registry = registry.as_deref().ok_or("a login is only for the plan's own npm registry")?;
             let l = self.npm_login(registry).await?;
             hide.extend(l.token.iter().chain(l.auth.iter()).cloned());
-            let dir = self.login_dir();
+            let dir = self.login_dir().ok_or_else(|| format!("{} has no folder name to keep the registry's login beside", self.dir.display()))?;
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             let file = dir.join("npmrc");
@@ -1601,13 +1610,27 @@ mod tests {
         assert!(!std::fs::read_to_string(dir.join(STATE_FILE)).unwrap().contains("tok-1234-abcd"), "and is never saved");
 
         // One a restart cut short is gone before anything opens the tools again.
-        let left = t.login_dir();
+        let left = t.login_dir().unwrap();
         std::fs::create_dir_all(&left).unwrap();
         std::fs::write(left.join("npmrc"), "left over").unwrap();
         drop(t);
         let t = Tools::new(dir.clone(), None).unwrap();
-        assert!(!t.login_dir().exists());
+        assert!(!t.login_dir().unwrap().exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_login_is_kept_beside_the_tools_however_their_path_is_written() {
+        let base = std::env::temp_dir().join(format!("superbot-login-dir-{}", now_ms()));
+        let tools = base.join("tools");
+        for written in [tools.clone(), base.join("tools/"), base.join("tools/."), base.join("./tools//"), base.join("x/../tools")] {
+            let t = Tools::new(written.clone(), None).unwrap();
+            let d = t.login_dir().unwrap();
+            assert_eq!(d.file_name().unwrap(), "tools.login", "{}", written.display());
+            assert!(!d.starts_with(&tools), "{} gave {}", written.display(), d.display());
+            assert!(!std::path::absolute(&d).unwrap().starts_with(std::path::absolute(&written).unwrap()), "{} gave {}", written.display(), d.display());
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
