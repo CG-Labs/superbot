@@ -577,8 +577,11 @@ fn off() -> ApiError {
 /// What an admin may declare now (ADR 0253): the roles each scope may give; the tenants
 /// botd knows (from SCIM tokens, the Google sync and groups already there), as
 /// suggestions, since a group may be declared before its tenant has a token; and the
-/// Google sync's role groups nobody has declared, which a pass never pushes.
+/// Google sync's role groups nobody has declared, which a pass never pushes. A pass also
+/// finds declarations by Directory id, which only Google knows, so once one has run its
+/// list counts; only those declared by email since are dropped from it.
 fn choices(app: &AppState, a: &Auth, all: &[ScimRoleGroup]) -> Value {
+    let last = a.scim.google.as_ref().and_then(|d| d.last_undeclared());
     let google = a.scim.google.as_ref().map(|d| &d.settings);
     let mut tenants: Vec<String> = app.db.scim_tokens().into_iter().map(|t| t.tenant).collect();
     tenants.extend(google.map(|s| s.tenant.clone()));
@@ -589,7 +592,8 @@ fn choices(app: &AppState, a: &Auth, all: &[ScimRoleGroup]) -> Value {
     let undeclared: Vec<Value> = google
         .map(|s| {
             let declared = |email: &str| all.iter().any(|g| g.tenant == s.tenant && (g.display_name.eq_ignore_ascii_case(email) || g.declared_display_name.eq_ignore_ascii_case(email)));
-            s.role_groups.iter().filter(|e| !declared(e)).map(|e| json!({ "tenant": s.tenant, "displayName": e })).collect()
+            let skipped = |e: &str| last.as_ref().is_none_or(|l| l.iter().any(|x| x.eq_ignore_ascii_case(e)));
+            s.role_groups.iter().filter(|e| skipped(e) && !declared(e)).map(|e| json!({ "tenant": s.tenant, "displayName": e })).collect()
         })
         .unwrap_or_default();
     json!({ "roles": super::roles::role_choices(app), "tenants": tenants, "undeclared": undeclared })

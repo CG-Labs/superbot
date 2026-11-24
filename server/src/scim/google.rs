@@ -716,6 +716,13 @@ impl Directory {
             "push": self.push.status(),
         })
     }
+
+    /// The role groups the latest pass that read them found no declaration for (by
+    /// Directory id or email). None before any such pass.
+    pub fn last_undeclared(&self) -> Option<Vec<String>> {
+        let read = |v: &Option<Value>| v.as_ref().and_then(|v| v["roleGroups"]["undeclared"].as_array().map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect()));
+        read(&self.last.lock().unwrap()).or_else(|| read(&self.last_success.lock().unwrap()))
+    }
 }
 
 // A pass.
