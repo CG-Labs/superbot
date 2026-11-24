@@ -260,6 +260,45 @@ GCP_RUN_CREDENTIALS="superbot-bots@<project>.iam.gserviceaccount.com"
 - **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
 - **Private Service Connect**: set `GCP_IAM_CREDENTIALS_ENDPOINT` to its endpoint (https only).
 
+## Short-lived Azure credentials for each run
+
+Off by default ([ADR 0213](../adr/0213-entra-app-tokens-for-each-run.md)); only with `SECRETS_BACKEND=azure-keyvault`. With `AZURE_RUN_CREDENTIALS`, botd gets an access token of an Entra app as each run starts and gives it to the run. The app trusts botd's managed identity (or its AKS workload identity) as a federated credential, so no client secret is made or stored, and a token a Bot leaks stops working about an hour after its run started. No Vault is needed; for Vault's Azure engine, see [Vault](vault.md#short-lived-credentials-for-each-run).
+
+botd must sign in with a **user-assigned** managed identity (`AZURE_CLIENT_ID`) and `AZURE_TENANT_ID`, or with workload identity. Entra doesn't accept a system-assigned identity or a client secret as another app's credential, so botd won't start with those and `AZURE_RUN_CREDENTIALS`.
+
+Register an app for the Bots, give it only the roles they need, and let it trust botd's identity:
+
+```sh
+az ad app create --display-name superbot-bots            # note its appId and id
+az ad sp create --id <app id>
+az role assignment create --assignee <app id> --role Reader --scope /subscriptions/<subscription>
+# Trust botd's user-assigned managed identity (its principal id, not its client id):
+az ad app federated-credential create --id <app object id> --parameters '{
+  "name": "superbot-botd",
+  "issuer": "https://login.microsoftonline.com/<tenant>/v2.0",
+  "subject": "<managed identity principal id>",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+```
+
+For AKS workload identity, use the cluster's OIDC issuer and `system:serviceaccount:<namespace>:<botd's service account>` as the subject instead. In US Government and China clouds the audience is `api://AzureADTokenExchangeUSGov` or `api://AzureADTokenExchangeChina`; botd picks it from `AZURE_AUTHORITY_HOST`.
+
+Then in `.env`:
+
+```sh
+AZURE_RUN_CREDENTIALS="<app id>"
+# or several, naming the resource and the variable each gives:
+# AZURE_RUN_CREDENTIALS="<app id>; <storage app id>@storage.azure.com BLOB_TOKEN=accessToken"
+```
+
+- **Format**: entries separated by `;` or new lines. Each is an app's client id, optionally `@` the host of the resource its tokens are for (`storage.azure.com`, `vault.azure.net`, `graph.microsoft.com`, ...), then `NAME=accessToken` pairs. With no resource, tokens are for Azure Resource Manager in botd's cloud. An entry with no pairs gives the token as `AZURE_ACCESS_TOKEN`. No Azure tool reads a token from the environment by itself: use `Connect-AzAccount -AccessToken $env:AZURE_ACCESS_TOKEN -AccountId <app id>`, `curl -H "Authorization: Bearer $AZURE_ACCESS_TOKEN"`, or a static token credential in code. At most 16 apps; each name once. There is no `{owner}`, since Entra picks app ids.
+- **Token length**: Entra chooses it: 60 to 90 minutes by default. A token that ends before the longest run could (`RUN_TIMEOUT_MINUTES`, 60 by default) refuses the run, so keep `RUN_TIMEOUT_MINUTES` at 60 or less, or give the app a token lifetime policy that covers it. A run also stops when its token expires, and the Bot says its credentials expired and to send the task again.
+- **Can't be revoked**: Entra can't end one token early. When the run ends, botd audits `secret.lease_released` with the token's expiry (`expiresAt`), and the token works until then. In an emergency, remove the app's federated credential or disable its service principal: no new tokens are made, and those out there run out.
+- **Fails closed**: if Entra refuses (no federated credential trusting botd, an app not in the tenant, a resource that doesn't exist, a token shorter than a run), the run doesn't start (`bot.run_refused`, reason `secrets_unavailable`), and the error names what to check, never Entra's own description. botd makes no token at startup, so a wrong app id or trust shows on the first run.
+- **Audit**: `botctl audit --action 'secret.lease_*'` shows each token made (`secret.lease_issued`, with the entry, a `leaseId` of `<entry>/superbot-<bot id>-<random>`, TTL and the variable names) and let go (`secret.lease_released`), never a token. The managed identity token botd trades is audited as `secret.backend_login` with its `audience`. Entra's sign-in logs show the app's service principal signing in with botd's managed identity as its credential.
+- **Redaction**: the token is redacted from everything botd saves and shows until it expires.
+- **Order**: these win over static secrets of the same name, and runs never inherit these names from botd's own environment.
+
 ## Day to day
 
 - **Rotate**: add a new version (`az keyvault secret set ...`, `gcloud secrets versions add ...`, `aws secretsmanager put-secret-value ...`). botd uses it within `SECRETS_CACHE_SECONDS`, with no restart. Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart.

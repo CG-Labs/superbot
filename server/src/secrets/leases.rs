@@ -25,6 +25,8 @@
 //!   with when they expire, and their values stay redacted until then.
 //! - With `GCP_RUN_CREDENTIALS` (ADR 0203) they are access tokens of Google service
 //!   accounts botd impersonates (`generateAccessToken`), which can't be revoked either.
+//! - With `AZURE_RUN_CREDENTIALS` (ADR 0213) they are Entra access tokens of apps that
+//!   trust botd's managed identity or workload identity, which can't be revoked either.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
@@ -123,6 +125,16 @@ fn service_account_ok(p: &str) -> bool {
     p.len() <= 254 && label_ok(&account) && domain.strip_suffix(".gserviceaccount.com").is_some_and(|d| d.split('.').all(label_ok))
 }
 
+/// An Entra app's client id (a GUID), optionally `@` the host of the resource its tokens
+/// are for (`storage.azure.com`). No `{owner}`: app ids are GUIDs Entra chooses.
+fn entra_app_ok(p: &str) -> bool {
+    let (app, resource) = p.split_once('@').map_or((p, None), |(a, r)| (a, Some(r)));
+    let groups: Vec<&str> = app.split('-').collect();
+    let guid = groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12]) && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()));
+    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    guid && resource.is_none_or(|r| r.len() <= 253 && r.contains('.') && r.split('.').all(label_ok))
+}
+
 /// How one backend's run credentials setting is written.
 pub struct Syntax {
     pub key: &'static str,
@@ -173,6 +185,19 @@ pub const GCP: Syntax = Syntax {
     defaults: &[("CLOUDSDK_AUTH_ACCESS_TOKEN", "accessToken"), ("GOOGLE_OAUTH_ACCESS_TOKEN", "accessToken")],
     own: &[],
     example: "GOOGLE_OAUTH_ACCESS_TOKEN=accessToken",
+};
+
+/// `AZURE_RUN_CREDENTIALS` (ADR 0213): Entra apps that trust botd's identity as a
+/// federated credential, a token of one made for each run. No Azure tool reads a token
+/// from the environment, so a bare entry gives it under one plain name.
+pub const AZURE: Syntax = Syntax {
+    key: "AZURE_RUN_CREDENTIALS",
+    what: "an Entra app's client id like \"00000000-0000-0000-0000-000000000000\", optionally @ the resource's host like \"@storage.azure.com\"",
+    path_ok: entra_app_ok,
+    fields: &["accessToken"],
+    defaults: &[("AZURE_ACCESS_TOKEN", "accessToken")],
+    own: &[],
+    example: "AZURE_ACCESS_TOKEN=accessToken",
 };
 
 /// `VAULT_RUN_CREDENTIALS`: entries separated by `;` or new lines, each a path and the
@@ -825,6 +850,36 @@ pub(crate) mod tests {
         ] {
             let e = parse_as(&GCP, raw).unwrap_err();
             assert!(e.starts_with("GCP_RUN_CREDENTIALS: ") && e.contains(err), "{raw}: {e}");
+        }
+    }
+
+    #[test]
+    fn azure_apps_are_checked_and_default_to_one_plain_name() {
+        let w = parse_as(&AZURE, "11111111-2222-3333-4444-555555555555;\n 66666666-7777-8888-9999-AAAAAAAAAAAA@storage.azure.com BLOB_TOKEN=accessToken").unwrap();
+        assert_eq!(w[0].path, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(w[0].names, [pair("AZURE_ACCESS_TOKEN", "accessToken")]);
+        assert_eq!((w[1].path.as_str(), w[1].names[0].0.as_str()), ("66666666-7777-8888-9999-AAAAAAAAAAAA@storage.azure.com", "BLOB_TOKEN"));
+        assert!(!w[0].per_owner() && !w[1].per_owner());
+        assert!(parse_as(&AZURE, "11111111-2222-3333-4444-555555555555@management.usgovcloudapi.net").is_ok());
+        for (raw, err) in [
+            ("superbot-bots@proj-1.iam.gserviceaccount.com", "Entra app's client id"),
+            ("11111111-2222-3333-4444-55555555555", "Entra app's client id"),
+            ("11111111-2222-3333-4444-55555555555g", "Entra app's client id"),
+            ("111111112222-3333-4444-555555555555", "Entra app's client id"),
+            ("{owner}-2222-3333-4444-555555555555", "Entra app's client id"),
+            ("11111111-2222-3333-4444-555555555555@", "Entra app's client id"),
+            ("11111111-2222-3333-4444-555555555555@localhost", "Entra app's client id"),
+            ("11111111-2222-3333-4444-555555555555@Storage.azure.com", "Entra app's client id"),
+            ("11111111-2222-3333-4444-555555555555@storage.azure.com/x", "Entra app's client id"),
+            ("11111111-2222-3333-4444-555555555555@-x.azure.com", "Entra app's client id"),
+            ("11111111-2222-3333-4444-555555555555@a@b.com", "Entra app's client id"),
+            ("11111111-2222-3333-4444-555555555555 X_TOKEN=expiresOn", "one of accessToken"),
+            ("11111111-2222-3333-4444-555555555555 X_TOKEN", "like AZURE_ACCESS_TOKEN=accessToken"),
+            ("11111111-2222-3333-4444-555555555555; 66666666-7777-8888-9999-aaaaaaaaaaaa", "AZURE_ACCESS_TOKEN is given twice"),
+            ("11111111-2222-3333-4444-555555555555 AZURE_CLIENT_SECRET=accessToken", "reserved"),
+        ] {
+            let e = parse_as(&AZURE, raw).unwrap_err();
+            assert!(e.starts_with("AZURE_RUN_CREDENTIALS: ") && e.contains(err), "{raw}: {e}");
         }
     }
 
