@@ -247,7 +247,7 @@ async fn a_deleted_teams_network_goes_with_its_acl_and_its_name_once_its_contain
     assert_eq!(env.incus.w().projects["superbot"]["restricted.networks.access"], format!("incusbr0,{net}"));
 
     // The operator's service for the team, in the default project, which botd's own
-    // project doesn't list (ADR 0249).
+    // project doesn't list (ADR 0251).
     let mut svc = env.incus.instance(&ma.label).unwrap();
     svc.project = "default".into();
     svc.body["devices"] = json!({ "eth0": { "type": "nic", "network": net } });

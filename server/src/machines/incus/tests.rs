@@ -804,7 +804,7 @@ async fn a_team_network_nothing_uses_goes_with_its_acl_and_its_name_on_the_acces
     let access = || s.w().projects["superbot"]["restricted.networks.access"].as_str().unwrap().to_string();
 
     // A container on it, or a NIC elsewhere behind its ACL: kept, nothing deleted. The
-    // view counts what members don't list (ADR 0249): not the member itself.
+    // view counts what members don't list (ADR 0251): not the member itself.
     assert_eq!(p.remove_team_network(&a).await, Ok(false));
     assert_eq!((p.team_network_unlisted(&a).await, p.team_network_unlisted(&b).await), (Ok(0), Ok(0)));
     let svc = json!({ "type": "nic", "network": "incusbr0", "name": "eth2", "security.acls": b.id });
