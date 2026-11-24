@@ -388,7 +388,7 @@ pub trait MachineProvider: Send + Sync {
         Box::pin(async { Err(no_networks()) })
     }
     /// How many things on network `n`, or using it, `team_network_members` doesn't list
-    /// but `remove_team_network` would still keep it for (ADR 0249): on Incus, anything
+    /// but `remove_team_network` would still keep it for (ADR 0251): on Incus, anything
     /// in another project on it or behind its ACL. Read for the view only, never changed.
     fn team_network_unlisted<'a>(&'a self, _n: &'a TeamNetwork) -> Fut<'a, usize> {
         Box::pin(async { Ok(0) })

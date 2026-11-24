@@ -106,6 +106,8 @@ botctl scim role-group add google auditors@example.com Auditor
 botctl scim role-group add google team-leads@example.com Lead --team   # Lead within each member's team
 ```
 
+Or in the console's SCIM section: the listed groups nobody has declared yet are shown under **Group roles**, and picking one fills in the declaration form ([ADR 0253](../adr/0253-scim-group-roles-in-the-console.md)).
+
 The next pass pushes it with its members who have an account, and they hold the role while they're in it, whatever team they're on; a [team role group](scim.md#team-role-groups)'s members hold it within the team they're on, if it's one of `GOOGLE_DIRECTORY_TEAM_GROUPS` ([ADR 0206](../adr/0206-scim-team-role-groups.md)). A listed group nobody declared is never pushed (it would become a team) and is named in the pass's `roleGroups.undeclared`. A declared group taken off the list is deleted on the next pass: its members lose the role, and the declaration waits again.
 
 ## 5. Check it

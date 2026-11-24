@@ -390,7 +390,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine harnesses <user>                  Install MACHINE_HARNESSES on it now, retrying failures
   botctl machine mirror                            Fetch every harness file machines would, from the mirrors, and check each pin (ADR 0186)
   botctl machine team-networks                     Every team network: its team, or that this server deleted it, or none
-                                                   it knows (another server's), and our machines on it (ADR 0249)
+                                                   it knows (another server's), and our machines on it (ADR 0251)
   botctl machine legacy                            Machines whose agent is from before agent upgrades, and their rebuilds
   botctl machine rebuild <user> [--discard-work]   Wipe and reinstall it with today's agent (ADR 0056); same IP and firewall
   botctl machine rebuild <user> status|cancel      How its rebuild is going, or cancel one not yet sent

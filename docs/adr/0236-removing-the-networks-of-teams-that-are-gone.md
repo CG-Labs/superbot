@@ -81,6 +81,6 @@ The reconciler adds `removed` and `kept` to `teamNetworks`.
 
 ## Deferred
 
-- Removing a gone team's network when audit retention has pruned its `team.deleted` event. That needs a record of deleted teams kept outside the audit log. Done in [ADR 0249](0249-a-record-of-deleted-teams-and-a-view-of-team-networks.md).
+- Removing a gone team's network when audit retention has pruned its `team.deleted` event. That needs a record of deleted teams kept outside the audit log. Done in [ADR 0251](0251-a-record-of-deleted-teams-and-a-view-of-team-networks.md).
 - Removing networks while team networks are off.
-- A `botctl` view listing each team network with its team (or that it is gone) and what is on it. Done in [ADR 0249](0249-a-record-of-deleted-teams-and-a-view-of-team-networks.md).
+- A `botctl` view listing each team network with its team (or that it is gone) and what is on it. Done in [ADR 0251](0251-a-record-of-deleted-teams-and-a-view-of-team-networks.md).
