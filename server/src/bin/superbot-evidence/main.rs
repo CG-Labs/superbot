@@ -96,10 +96,15 @@ approved, ended within a year and reviewed quarterly, conduct concerns triaged w
 7 days and closed within 90 (ADR 0214), and security events triaged in time by the
 security owner or operator, breach notices sent within the DPA's hours, post-incident
 reviews within 10 business days of closing, their actions done on time and a tabletop
-exercise each year (ADR 0223); with each --baseline (botctl
+exercise each year (ADR 0223), and production access granted on the security owner's
+(and for admin to a managed server or the hosting provider, Management's) approval,
+removed by a leaver's last day, and reviewed each quarter with MFA recorded and findings
+fixed in time (ADR 0231); with each --baseline (botctl
 evidence baseline json, or the month's evidence bundle's baseline.json, checked in the
 period or the 7 days after it), every setting the server excepted held to an exception in
-force. Refuses a register that
+force; with each --access-review (a managed server's evidence bundle access-review.json),
+each review of that server matched to an access_review.completed sign-off of the same
+digest that day. Refuses a register that
 doesn't hold together (unknown people, roles or policies, ids that aren't plain), listing
 every problem. People are named by register id; names, titles and notes stay out. No
 token and no network.";

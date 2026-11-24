@@ -6,6 +6,8 @@
 //! longer than a month. ADR 0214: the code of conduct is acknowledged like the other
 //! policies, and conduct concerns are checked in `conduct.json`, by id only. ADR 0223:
 //! security incidents, breach notices, reviews, actions and tabletops in `incidents.json`.
+//! ADR 0231: production access in `access.json`, with a managed server's review matched to
+//! the sign-off in its evidence bundle's `access-review.json`.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -66,6 +68,7 @@ fn register() -> Value {
             { "id": "p-a", "name": "Alice Example", "joined": "2025-12-01" },
             { "id": "p-b", "name": "Bob Example", "joined": "2025-12-01" },
             { "id": "p-c", "name": "Carol Example", "joined": "2025-12-01" },
+            { "id": "p-d", "name": "Dan Example", "joined": "2025-12-01", "left": "2026-10-15" },
         ],
         "roles": [role("Management", "p-a", "p-b"), role("Security owner", "p-b", "p-a"), role("Engineering lead", "p-c", "p-b"), role("Operator", "p-c", "p-b"), role("People lead", "p-a", "p-b"), role("Privacy lead", "p-b", "p-a")],
         "policyApprovals": approvals,
@@ -98,6 +101,33 @@ fn register() -> Value {
             },
         ],
         "tabletops": [{ "at": "2026-09-20", "attendees": ["p-a", "p-b", "p-c"], "recordSha256": hex(b"tabletop record"), "actions": [{ "id": "T-1", "owner": "Operator", "due": "2026-12-01" }] }],
+        "systems": [
+            { "id": "botd-1", "kind": "superbot", "since": "2026-01-01" },
+            { "id": "hosting", "kind": "hosting", "since": "2026-01-01" },
+            { "id": "code-host", "since": "2026-01-01", "notes": "Initech's GitHub organisation" },
+        ],
+        "access": [
+            { "person": "p-b", "system": "botd-1", "level": "admin", "granted": "2026-01-01" },
+            { "person": "p-c", "system": "hosting", "level": "admin", "granted": "2026-01-01" },
+            { "person": "p-d", "system": "code-host", "level": "user", "granted": "2026-01-01" },
+            { "person": "p-c", "system": "code-host", "level": "user", "requested": "2026-10-02", "approved": "2026-10-03", "approvedBy": ["p-b"], "granted": "2026-10-03", "notes": "login carol-gh" },
+        ],
+        "accessReviews": [
+            { "system": "botd-1", "at": "2026-10-12", "by": "p-b", "listSha256": REPORT, "mfa": true },
+            { "system": "hosting", "at": "2026-10-10", "by": "p-b", "listSha256": hex(b"hosting users"), "mfa": true },
+            { "system": "code-host", "at": "2026-09-20", "by": "p-b", "listSha256": hex(b"code host users"), "mfa": true },
+        ],
+    })
+}
+
+const REPORT: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+/// A managed server's evidence bundle `access-review.json`, with one sign-off of `REPORT`.
+fn access_review(signed_at: &str) -> Value {
+    json!({
+        "snapshotAt": "2026-11-01T00:00:00Z", "reportDigest": REPORT, "mfaPolicy": "admins", "summary": {}, "people": [{ "email": "carol@initech.test" }], "serviceAccounts": [], "reviewsSignedOffInPeriod": 1,
+        "period": { "counts": {}, "daily": [], "eventsTotal": 1, "eventsListed": 1, "events": [{ "id": 7, "time": signed_at, "action": "access_review.completed", "outcome": "ok", "actor": "u-2", "target": "access-review", "botId": null, "details": { "digest": REPORT } }] },
+        "periodCovered": { "from": "2026-10-01", "to": "2026-11-01", "days": 31 },
     })
 }
 
@@ -127,8 +157,9 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     write(&dir, "register.json", &register());
     write(&dir, "baseline-a.json", &baseline("2026-10-05T10:00:00Z", &["TEAMS"]));
     write(&dir, "baseline-b.json", &baseline("2026-11-01T00:00:05Z", &["AUTH_MFA"]));
+    write(&dir, "access-review.json", &access_review("2026-10-12T15:00:00Z"));
     let pol = policies();
-    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "-o", "register.tar"][..], &PERIOD].concat());
+    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "--access-review", "access-review.json", "-o", "register.tar"][..], &PERIOD].concat());
     let out = text(&o);
     assert!(o.status.success(), "{out}");
     for want in [
@@ -142,6 +173,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         "policy-exceptions.json: baselineExceptionNotApproved 1; evidence for CC5.1-1",
         "conduct.json: triagedLate 1; evidence for CC1.1-1",
         "incidents.json: reviewOverdue 1; evidence for CC7.3-1, CC7.4-1, CC7.4-2, CC7.5-1",
+        "access.json: leaverNotRemoved 1; evidence for CC6.1-2, CC6.2-2, CC6.3-2",
     ] {
         assert!(out.contains(want), "{want}\n{out}");
     }
@@ -153,15 +185,21 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         assert_eq!(fs::metadata(&tar).unwrap().permissions().mode() & 0o777, 0o600, "private to its owner");
     }
     let raw = fs::read(&tar).unwrap();
-    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex"] {
+    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex", "Initech", "carol-gh", "initech.test"] {
         assert!(!raw.windows(never.len()).any(|w| w == never.as_bytes()), "{never:?} is in the bundle");
     }
     let folder = unpack(&dir, &tar);
     let manifest = json_in(&folder, "manifest.json");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(3), Some(true), Some(2)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(4), Some(true), Some(2)));
+    assert_eq!(manifest["source"]["accessReviewFiles"], 1);
     assert_eq!(manifest["source"]["registerSha256"].as_str(), Some(hex(&fs::read(dir.join("register.json")).unwrap()).as_str()), "identifies the register kept beside it");
     let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
-    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json", "incidents.json"]);
+    assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json", "incidents.json", "access.json"]);
+    let access = json_in(&folder, "access.json");
+    assert_eq!(access["exceptions"]["leaverNotRemoved"], json!(["p-d on code-host (user): left 2026-10-15, not removed"]), "{access:#}");
+    let botd = access["reviews"].as_array().unwrap().iter().find(|r| r["system"] == "botd-1").unwrap();
+    assert_eq!((botd["signOffChecked"].as_bool(), botd["signedOffAt"].as_str()), (Some(true), Some("2026-10-12T15:00:00Z")), "{access:#}");
+    assert_eq!((access["signOffFiles"][0]["sha256"].as_str(), access["summary"]["grantedInPeriod"].as_u64()), (Some(hex(&fs::read(dir.join("access-review.json")).unwrap()).as_str()), Some(1)), "{access:#}");
     let incidents = json_in(&folder, "incidents.json");
     assert_eq!(incidents["exceptions"]["reviewOverdue"], json!(["INC-2 (closed 2026-10-14, not reviewed, due 2026-10-28)"]), "a possible breach needs a written review: {incidents:#}");
     assert_eq!(incidents["incidents"][1]["noticeDue"], "2026-10-14T09:30:00Z", "{incidents:#}");
@@ -184,13 +222,19 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     let r: Value = serde_json::from_slice(&o.stdout).unwrap();
     let kind = r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "policy-register").unwrap();
     assert_eq!((kind["complete"].as_bool(), r["bundles"][0]["verified"].as_bool()), (Some(true), Some(true)), "{r:#}");
-    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1", "CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"] {
+    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1", "CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1", "CC6.1-2", "CC6.2-2", "CC6.3-2"] {
         let x = r["rows"].as_array().unwrap().iter().find(|x| x["row"] == row).unwrap_or_else(|| panic!("{row}: {r:#}"));
         assert_eq!(x["complete"], true, "{row}");
     }
     assert_eq!(r["bundles"][0]["exceptions"]["policy-exceptions.json"]["baselineExceptionNotApproved"], 1);
     assert_eq!(r["bundles"][0]["exceptions"]["conduct.json"]["triagedLate"], 1);
     assert_eq!(r["bundles"][0]["exceptions"]["incidents.json"]["reviewOverdue"], 1);
+    assert_eq!(r["bundles"][0]["exceptions"]["access.json"]["leaverNotRemoved"], 1);
+
+    // A managed server's review with no sign-off that day in botd is flagged.
+    write(&dir, "other-day.json", &access_review("2026-10-13T09:00:00Z"));
+    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "other-day.json", "-o", "other-day.tar"][..], &PERIOD].concat());
+    assert!(o.status.success() && text(&o).contains("access.json: leaverNotRemoved 1, signOffNotFound 1"), "{}", text(&o));
 
     // A policy changed since its approval is flagged; the same command never writes over a file.
     let changed = dir.join("policies");
@@ -225,6 +269,15 @@ fn a_register_that_doesnt_hold_together_or_a_baseline_from_another_month_writes_
     write(&dir, "old.json", &baseline("2026-11-08T00:00:00Z", &[]));
     let o = evidence(&dir, &[&["register", "register.json", "--baseline", "old.json", "-o", "out.tar"][..], &PERIOD].concat());
     assert!(o.status.code() == Some(1) && text(&o).contains("outside the period"), "{}", text(&o));
+    assert!(!dir.join("out.tar").exists());
+
+    write(&dir, "not-access-review.json", &json!({ "format": 1 }));
+    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "not-access-review.json", "-o", "out.tar"][..], &PERIOD].concat());
+    assert!(o.status.code() == Some(1) && text(&o).contains("has no snapshotAt or reportDigest"), "{}", text(&o));
+    assert!(!dir.join("out.tar").exists());
+    write(&dir, "access-review.json", &access_review("2026-10-12T15:00:00Z"));
+    let o = evidence(&dir, &[&["register", "register.json", "--access-review", "access-review.json", "--access-review", "access-review.json", "-o", "out.tar"][..], &PERIOD].concat());
+    assert!(o.status.code() == Some(1) && text(&o).contains("same file as another --access-review"), "{}", text(&o));
     assert!(!dir.join("out.tar").exists());
 
     let o = evidence(&dir, &["register", "register.json", "--from", "2026-05-01", "--to", "2026-11-01", "-o", "out.tar"]);

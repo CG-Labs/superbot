@@ -8,7 +8,7 @@ Who may get access to the managed SuperBot service and the systems that run it, 
 | Approver | Management |
 | Review | Yearly |
 | Status | Draft, not yet approved |
-| Controls | CC5.3-1, CC6.1-1, CC6.1-2, CC6.1-3, CC6.2-1, CC6.3-1, CC6.3-2, CC6.5-1 |
+| Controls | CC5.3-1, CC6.1-1, CC6.1-2, CC6.1-3, CC6.2-1, CC6.2-2, CC6.3-1, CC6.3-2, CC6.5-1 |
 
 ## Scope
 
@@ -27,7 +27,7 @@ Two kinds of access:
 
 - Production access is requested in writing, saying the system, the level and why, and approved by the security owner; admin access to a managed server or the hosting provider also needs management's approval. Nobody approves their own request.
 - Access is set up through the system's own accounts: a SuperBot account with the lowest role that works (`readonly`, `member`, `admin`; [ADR 0012](../../adr/0012-users-sessions-rbac.md)), a GitHub team, a hosting provider user with a limited role.
-- The request, approval and grant are kept as evidence. In SuperBot itself, `user.created` and `user.role_changed` audit events record the grant and who made it.
+- The request, approval and grant are kept as evidence, and each grant of production access, its approvers and the day it ends are recorded in the [policy register](../policy-register.md#production-access). In SuperBot itself, `user.created` and `user.role_changed` audit events record the grant and who made it.
 
 ## Authentication
 
@@ -41,7 +41,7 @@ Two kinds of access:
 Every quarter, the security owner (or a delegate who isn't reviewing their own access) reviews:
 
 - **SuperBot users on each managed server**, with the access-review report: roles, status, second factor, last sign-in, Bot access, sessions, API tokens and machines ([ADR 0099](../../adr/0099-access-review-report.md)). The reviewer fixes what's wrong, exports the dated CSV, and signs off in the app, which records `access_review.completed` with the report's digest.
-- **Production access outside SuperBot**: the GitHub organisation, the hosting provider, object storage, DNS, Stripe and the other accounts in [scope](#scope), from each system's own user list. The reviewer records who has what, what changed, and signs off in the register.
+- **Production access outside SuperBot**: the GitHub organisation, the hosting provider, object storage, DNS, Stripe and the other accounts in [scope](#scope), from each system's own user list. The reviewer records who has what, what changed, and signs off in the [register](../policy-register.md#production-access), with the user list's SHA-256 and whether every account needs a second factor. Reviews of managed servers are recorded there too, with the report's digest they signed off.
 
 Findings (an account that should be gone, a role too high) are fixed within 5 business days, or 1 business day for admin access.
 

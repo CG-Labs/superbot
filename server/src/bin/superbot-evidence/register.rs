@@ -9,13 +9,16 @@
 //! vendor unassessed or unreviewed, an exception over a year or unreviewed, a server's
 //! baseline exception the register never approved, a conduct concern triaged or closed
 //! late, a security event triaged late or by someone who can't lead it, a breach notice,
-//! post-incident review or action overdue, a year without a tabletop exercise) and
+//! post-incident review or action overdue, a year without a tabletop exercise, production
+//! access granted without the approvals the access control policy asks for or kept past
+//! a leaver's last day, a production system not reviewed in a quarter, a review finding
+//! not fixed in time, a SuperBot review with no sign-off in botd's audit log) and
 //! writes a dated bundle in the shape of the others, which the coverage report checks
 //! (ADR 0169).
 //!
 //! Never in it: names, titles, notes or reasons from the register, nor the register
-//! itself. People, risks, vendors, exceptions and incidents are named by their register
-//! ids; the register's SHA-256 identifies the copy kept beside the bundle.
+//! itself. People, risks, vendors, exceptions, incidents and systems are named by their
+//! register ids; the register's SHA-256 identifies the copy kept beside the bundle.
 
 use crate::changes::{Bundle, Section, json_file, rfc3339, sha256};
 use crate::period::Period;
@@ -26,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214), 3
-/// `incidents.json` (ADR 0223).
-pub const FORMAT: u32 = 3;
+/// `incidents.json` (ADR 0223), 4 `access.json` (ADR 0231).
+pub const FORMAT: u32 = 4;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -35,6 +38,9 @@ pub const REGISTER_FORMAT: u64 = 1;
 pub const MAX_REGISTER_BYTES: u64 = 8 << 20;
 /// A baseline check larger than this isn't one.
 const MAX_BASELINE_BYTES: u64 = 4 << 20;
+/// An evidence bundle's `access-review.json` lists at most 5,000 events with everyone's
+/// access; none comes near this.
+const MAX_ACCESS_REVIEW_BYTES: u64 = 64 << 20;
 
 /// The roles of the information security policy's roles table.
 pub const ROLES: [&str; 6] = ["Management", "Security owner", "Engineering lead", "Operator", "People lead", "Privacy lead"];
@@ -75,6 +81,26 @@ pub const BREACH_NOTICE_HOURS: u32 = 48;
 /// controller the customer is.
 pub const MAX_BREACH_NOTICE_HOURS: u32 = 168;
 
+/// Production access (ADR 0231). A system is a managed SuperBot server (`superbot`),
+/// reviewed with botd's access-review report; the hosting provider (`hosting`); or any
+/// other production account in the access control policy's scope.
+pub const SYSTEM_KINDS: [&str; 3] = ["superbot", "hosting", "other"];
+pub const ACCESS_LEVELS: [&str; 2] = ["admin", "user"];
+/// Every grant of production access is approved by the security owner; admin access to a
+/// managed server or the hosting provider by Management too (access control policy,
+/// "Granting access"). Nobody approves their own; the policy names roles, not a head
+/// count, so one approver holding both is enough.
+pub const GRANT_APPROVER: &str = "Security owner";
+pub const ADMIN_GRANT_APPROVER: &str = "Management";
+/// The security owner reviews access, or a delegate who isn't reviewing their own.
+pub const ACCESS_REVIEWER: &str = "Security owner";
+/// A review finding (an account that should be gone, a role too high) is fixed within
+/// this many business days, or within one for admin access.
+pub const FINDING_BUSINESS_DAYS: u32 = 5;
+pub const ADMIN_FINDING_BUSINESS_DAYS: u32 = 1;
+/// The audit event botd records when an admin signs off its access-review report (ADR 0099).
+pub const SIGN_OFF_ACTION: &str = "access_review.completed";
+
 /// Yearly: policy reviews, acknowledgements, training, risk and vendor reviews.
 pub const YEAR_DAYS: i64 = 365;
 /// Quarterly: management reviews and exception reviews.
@@ -95,7 +121,7 @@ pub const MAX_PERIOD_DAYS: i64 = 31;
 /// a file to a row only while the register holds a current record for it (a role filled
 /// in the period, an approval within a year, a management review within a quarter), so a
 /// register that stopped being kept shows as a gap in the coverage report.
-pub const SECTIONS: [Section; 9] = [
+pub const SECTIONS: [Section; 10] = [
     Section { file: "roles.json", criteria: &["CC1.3"], rows: &["CC1.3-1"] },
     Section { file: "policies.json", criteria: &["CC3.1", "CC5.3"], rows: &["CC3.1-1", "CC5.3-1"] },
     Section { file: "people.json", criteria: &["CC1.4", "CC2.2"], rows: &["CC1.4-1", "CC2.2-1"] },
@@ -105,11 +131,12 @@ pub const SECTIONS: [Section; 9] = [
     Section { file: "policy-exceptions.json", criteria: &["CC5.1"], rows: &["CC5.1-1"] },
     Section { file: "conduct.json", criteria: &["CC1.1"], rows: &["CC1.1-1"] },
     Section { file: "incidents.json", criteria: &["CC7.3", "CC7.4", "CC7.5"], rows: &["CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"] },
+    Section { file: "access.json", criteria: &["CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-2", "CC6.2-2", "CC6.3-2"] },
 ];
 
 /// Files bundles of an older format don't have, and the format that added each, so the
 /// coverage report still verifies bundles made before them.
-pub const SINCE_FORMAT: [(&str, u64); 2] = [("conduct.json", 2), ("incidents.json", 3)];
+pub const SINCE_FORMAT: [(&str, u64); 3] = [("conduct.json", 2), ("incidents.json", 3), ("access.json", 4)];
 
 const README: &str = "SuperBot policy register bundle
 ===============================
@@ -138,6 +165,10 @@ after the period are left out.
   incidents.json           security events and incidents, triaged in time by someone who
                            may lead them, breach notices, post-incident reviews and
                            their actions, and the yearly tabletop exercise
+  access.json              production access: each grant approved by the right roles,
+                           leavers' access removed by their last day, each system
+                           reviewed every quarter with MFA recorded, findings fixed in
+                           time, and SuperBot reviews matched to botd's sign-offs
   manifest.json            what is in this bundle, the period, the register's SHA-256,
                            and each file's SHA-256
   SHA256SUMS               the same digests, for `sha256sum -c SHA256SUMS`
@@ -215,6 +246,12 @@ pub struct Register {
     pub incidents: Vec<Incident>,
     #[serde(default)]
     pub tabletops: Vec<Tabletop>,
+    #[serde(default)]
+    pub systems: Vec<System>,
+    #[serde(default)]
+    pub access: Vec<Grant>,
+    #[serde(default)]
+    pub access_reviews: Vec<AccessReview>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -465,6 +502,84 @@ pub struct Tabletop {
     #[serde(default)]
     #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
     pub notes: Option<String>,
+}
+
+/// A production system in the access control policy's scope: a managed server, the
+/// hosting provider's console, the code host, object storage, DNS, billing.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct System {
+    pub id: String,
+    #[serde(default = "other_kind")]
+    pub kind: String,
+    #[serde(deserialize_with = "day")]
+    pub since: NaiveDate,
+    /// The day it was retired, not included.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub until: Option<NaiveDate>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+fn other_kind() -> String {
+    "other".into()
+}
+
+/// One person's access to one system at one level, from the written request and its
+/// approval to its removal. A change of level ends one grant and starts another.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Grant {
+    pub person: String,
+    pub system: String,
+    pub level: String,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub requested: Option<NaiveDate>,
+    /// The day the request was approved, and who approved it: these go together.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub approved: Option<NaiveDate>,
+    #[serde(default)]
+    pub approved_by: Vec<String>,
+    #[serde(deserialize_with = "day")]
+    pub granted: NaiveDate,
+    /// The day the access was gone, not included.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub removed: Option<NaiveDate>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+/// A quarterly review of who has access to a system, from its own user list (or, for a
+/// managed SuperBot server, botd's access-review report, whose digest is the list's).
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AccessReview {
+    pub system: String,
+    #[serde(deserialize_with = "day")]
+    pub at: NaiveDate,
+    pub by: String,
+    /// The SHA-256 of the user list reviewed, kept beside the register.
+    pub list_sha256: String,
+    /// Whether every account on the system was seen to need a second factor.
+    pub mfa: bool,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+/// Something a review found wrong: an account that should be gone, or a role too high.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Finding {
+    pub id: String,
+    #[serde(default)]
+    pub admin: bool,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub fixed: Option<NaiveDate>,
 }
 
 /// A policy the register's approvals and acknowledgements may name.
@@ -768,6 +883,58 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
         }
         actions(&what, &t.actions, t.at, &mut bad);
     }
+    unique("system", r.systems.iter().map(|s| s.id.as_str()).collect(), &mut bad);
+    for s in &r.systems {
+        let what = format!("system {}", s.id);
+        if !SYSTEM_KINDS.contains(&s.kind.as_str()) {
+            bad.push(format!("{what}: kind is {}", SYSTEM_KINDS.join(", ")));
+        }
+        if s.until.is_some_and(|u| u <= s.since) {
+            bad.push(format!("{what}: until must be after since"));
+        }
+    }
+    let system = |what: &str, id: &str, bad: &mut Vec<String>| {
+        let s = r.systems.iter().find(|s| s.id == id);
+        if s.is_none() {
+            bad.push(format!("{what} names the system {id:.64}, which isn't in systems"));
+        }
+        s
+    };
+    for g in &r.access {
+        let what = format!("{}'s access to {} from {}", g.person, g.system, g.granted);
+        known(&what, &g.person, &mut bad);
+        if system(&what, &g.system, &mut bad).is_some_and(|s| g.granted < s.since || s.until.is_some_and(|u| g.granted >= u)) {
+            bad.push(format!("{what}: granted while the system wasn't in use (since to until)"));
+        }
+        if !ACCESS_LEVELS.contains(&g.level.as_str()) {
+            bad.push(format!("{what}: level is {}", ACCESS_LEVELS.join(" or ")));
+        }
+        if g.approved.is_some() == g.approved_by.is_empty() {
+            bad.push(format!("{what}: approved and approvedBy go together"));
+        }
+        for a in &g.approved_by {
+            known(&what, a, &mut bad);
+        }
+        if g.requested.zip(g.approved).is_some_and(|(q, a)| a < q) || g.requested.is_some_and(|q| g.granted < q) || g.approved.is_some_and(|a| g.granted < a) || g.removed.is_some_and(|x| x <= g.granted) {
+            bad.push(format!("{what}: dates out of order: requested, then approved, then granted, then removed (the day it was gone)"));
+        }
+    }
+    unique("review finding", r.access_reviews.iter().flat_map(|v| &v.findings).map(|f| f.id.as_str()).collect(), &mut bad);
+    for v in &r.access_reviews {
+        let what = format!("the access review of {} on {}", v.system, v.at);
+        known(&what, &v.by, &mut bad);
+        if system(&what, &v.system, &mut bad).is_some_and(|s| v.at < s.since) {
+            bad.push(format!("{what}: reviewed before the system's since"));
+        }
+        if !hex(&v.list_sha256, 64..=64) {
+            bad.push(format!("{what}: listSha256 is the reviewed user list's SHA-256, 64 lowercase hex digits (for a SuperBot server, the access-review report's digest)"));
+        }
+        for f in &v.findings {
+            if f.fixed.is_some_and(|x| x < v.at) {
+                bad.push(format!("{what}'s finding {}: fixed can't be before the review", f.id));
+            }
+        }
+    }
     if bad.is_empty() {
         return Ok(r);
     }
@@ -808,6 +975,46 @@ pub fn baseline(file: &str, bytes: &[u8], p: &Period) -> Result<Baseline, String
         checked_on: t.date_naive(),
         digest: v["digest"].as_str().filter(|d| hex(d, 64..=64)).map(String::from),
         excepted,
+    })
+}
+
+// botd's access-review sign-offs
+
+/// `access-review.json` from one of botd's evidence bundles (ADR 0142): the sign-offs of
+/// its access-review report in the bundle's period, each the report's digest and when.
+#[derive(Debug, Clone)]
+pub struct SignOffs {
+    pub file: String,
+    pub bytes: usize,
+    pub sha256: String,
+    pub period: Option<(String, String)>,
+    pub signed: Vec<(String, DateTime<Utc>)>,
+    /// The bundle lists only its first events; a sign-off past them isn't seen.
+    pub truncated: bool,
+}
+
+pub fn sign_offs(file: &str, bytes: &[u8]) -> Result<SignOffs, String> {
+    let hint = "give access-review.json from one of botd's monthly evidence bundles";
+    let v: Value = serde_json::from_slice(bytes).map_err(|_| format!("{file} isn't JSON: {hint}"))?;
+    if !v["snapshotAt"].is_string() || !v["reportDigest"].is_string() {
+        return Err(format!("{file} has no snapshotAt or reportDigest: {hint}"));
+    }
+    let events = v["period"]["events"].as_array().ok_or(format!("{file} has no period.events list: {hint}"))?;
+    let mut signed = Vec::new();
+    for e in events.iter().filter(|e| e["action"] == SIGN_OFF_ACTION) {
+        let digest = e["details"]["digest"].as_str().filter(|d| hex(d, 64..=64)).ok_or(format!("{file}: a {SIGN_OFF_ACTION} event has no report digest"))?;
+        let time = e["time"].as_str().and_then(|t| parse_time(t).ok()).ok_or(format!("{file}: a {SIGN_OFF_ACTION} event has no time"))?;
+        signed.push((digest.to_string(), time));
+    }
+    let listed = v["period"]["eventsListed"].as_u64().unwrap_or(events.len() as u64);
+    let period = v["periodCovered"]["from"].as_str().zip(v["periodCovered"]["to"].as_str()).map(|(f, t)| (f.to_string(), t.to_string()));
+    Ok(SignOffs {
+        file: Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        bytes: bytes.len(),
+        sha256: sha256(bytes),
+        period,
+        signed,
+        truncated: v["period"]["eventsTotal"].as_u64().is_some_and(|t| t > listed),
     })
 }
 
@@ -863,6 +1070,7 @@ pub struct Check<'a> {
     pub p: Period,
     pub policies: &'a [Policy],
     pub baselines: &'a [Baseline],
+    pub sign_offs: &'a [SignOffs],
 }
 
 impl Check<'_> {
@@ -924,6 +1132,9 @@ impl Check<'_> {
             + r.conduct_concerns.iter().filter(|x| x.received >= c).count()
             + r.incidents.iter().filter(|x| x.detected >= c).count()
             + r.tabletops.iter().filter(|x| x.at >= c).count()
+            + r.systems.iter().filter(|x| x.since >= c).count()
+            + r.access.iter().filter(|x| x.granted >= c).count()
+            + r.access_reviews.iter().filter(|x| x.at >= c).count()
     }
 
     pub fn roles(&self) -> (Value, Vec<&'static str>) {
@@ -1514,6 +1725,187 @@ impl Check<'_> {
         });
         (v, rows)
     }
+
+    fn system(&self, id: &str) -> Option<&System> {
+        self.r.systems.iter().find(|s| s.id == id)
+    }
+
+    fn has_access(&self, person: &str, system: &str, d: NaiveDate) -> bool {
+        self.r.access.iter().any(|g| g.person == person && g.system == system && g.granted <= d && g.removed.is_none_or(|x| d < x))
+    }
+
+    /// Production access (ADR 0231): every grant made in the period approved in writing by
+    /// the security owner (and for admin access to a managed server or the hosting
+    /// provider, by Management too, someone else), nobody approving their own; a leaver's
+    /// access gone by their last day; every system in use reviewed each quarter, by the
+    /// security owner or a delegate with no access to it, recording whether every account
+    /// needs a second factor; findings fixed in 5 business days, 1 for admin access; and,
+    /// with botd's `access-review.json` given, each SuperBot server's review matched to an
+    /// `access_review.completed` sign-off of the same report digest on the same day.
+    /// Something done late is an exception in the bundle of the period it was done in;
+    /// something not done past its deadline, in every bundle until it is done.
+    pub fn access(&self) -> (Value, Vec<&'static str>) {
+        let (p, cut) = (self.p, self.cut());
+        let in_period = |d: NaiveDate| d >= p.from && d < cut;
+        let at_end = |s: &System| s.until.is_none_or(|u| u >= cut);
+
+        let (mut not_approved, mut wrong_approver, mut self_approved, mut not_personnel) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut not_removed, mut removed_late) = (Vec::new(), Vec::new());
+        let mut grants = Vec::new();
+        for g in self.r.access.iter().filter(|g| g.granted < cut) {
+            let Some(s) = self.system(&g.system) else { continue };
+            let removed = g.removed.filter(|x| *x < cut);
+            let ended = [removed, s.until.filter(|u| *u < cut)].into_iter().flatten().min();
+            if ended.is_some_and(|e| e <= p.from) {
+                continue;
+            }
+            let who = format!("{} on {} ({})", g.person, g.system, g.level);
+            let approved = g.approved.filter(|a| *a < cut);
+            let needs_management = g.level == "admin" && matches!(s.kind.as_str(), "superbot" | "hosting");
+            if in_period(g.granted) {
+                match approved {
+                    None => not_approved.push(json!(format!("{who}, granted {}", g.granted))),
+                    Some(at) => {
+                        if g.approved_by.contains(&g.person) {
+                            self_approved.push(json!(format!("{who}, approved {at}")));
+                        }
+                        let others: Vec<&str> = g.approved_by.iter().map(String::as_str).filter(|a| *a != g.person).collect();
+                        let covers = |role: &str| others.iter().any(|a| self.held(a, &[role], at).is_some());
+                        if !covers(GRANT_APPROVER) || (needs_management && !covers(ADMIN_GRANT_APPROVER)) {
+                            let needs = if needs_management { format!("{GRANT_APPROVER} and {ADMIN_GRANT_APPROVER}") } else { GRANT_APPROVER.to_string() };
+                            wrong_approver.push(json!(format!("{who}, approved {at}: needs {needs}, held by someone other than {}", g.person)));
+                        }
+                    }
+                }
+                if !self.personnel_on(&g.person, g.granted) {
+                    not_personnel.push(json!(format!("{who}, granted {}", g.granted)));
+                }
+            }
+            let left = self.person(&g.person).and_then(|x| x.left).filter(|l| *l < cut);
+            if let Some(l) = left {
+                match ended {
+                    Some(e) if e > l && in_period(e) => removed_late.push(json!(format!("{who}: left {l}, removed {e}"))),
+                    None => not_removed.push(json!(format!("{who}: left {l}, not removed"))),
+                    _ => {}
+                }
+            }
+            let approvers: Vec<Value> = approved.map_or_else(Vec::new, |at| g.approved_by.iter().map(|a| json!({ "id": a, "heldRole": self.held(a, &[GRANT_APPROVER, ADMIN_GRANT_APPROVER], at) })).collect());
+            grants.push(json!({
+                "person": g.person, "system": g.system, "kind": s.kind, "level": g.level, "managementApproves": needs_management,
+                "requested": g.requested.filter(|q| *q < cut).map(ds), "approved": approved.map(ds), "approvers": approvers,
+                "granted": ds(g.granted), "removed": removed.map(ds), "removalDue": left.map(ds), "liveAtEnd": ended.is_none(),
+            }));
+        }
+
+        let (mut overdue, mut mfa_off) = (Vec::new(), Vec::new());
+        let used: Vec<&System> = self.r.systems.iter().filter(|s| s.since < cut && s.until.is_none_or(|u| u > p.from)).collect();
+        let (mut all_current, mut any_recent, mut lists_kept) = (true, false, true);
+        let live_on = |s: &System, admin: bool| self.r.access.iter().filter(|g| g.system == s.id && g.granted < cut && g.removed.is_none_or(|x| x >= cut) && (!admin || g.level == "admin")).count();
+        let systems: Vec<Value> = used
+            .iter()
+            .map(|s| {
+                let last = self.r.access_reviews.iter().filter(|v| v.system == s.id && v.at < cut).max_by_key(|v| v.at);
+                let due = plus(last.map_or(s.since, |v| v.at), QUARTER_DAYS);
+                if at_end(s) {
+                    if due < cut {
+                        all_current = false;
+                        overdue.push(json!(match last {
+                            Some(v) => format!("{} (last {})", s.id, v.at),
+                            None => format!("{} (none since {})", s.id, s.since),
+                        }));
+                    }
+                    if let Some(v) = last.filter(|v| !v.mfa) {
+                        mfa_off.push(json!(format!("{} (reviewed {})", s.id, v.at)));
+                    }
+                    any_recent |= last.is_some_and(|v| age(cut, v.at) <= QUARTER_DAYS);
+                    lists_kept &= live_on(s, false) > 0;
+                }
+                json!({
+                    "id": s.id, "kind": s.kind, "since": ds(s.since), "until": s.until.map(ds), "inUseAtEnd": at_end(s),
+                    "grantsAtEnd": live_on(s, false), "adminGrantsAtEnd": live_on(s, true),
+                    "lastReviewed": last.map(|v| ds(v.at)), "reviewDue": ds(due), "mfaAtLastReview": last.map(|v| v.mfa),
+                })
+            })
+            .collect();
+
+        let checked = !self.sign_offs.is_empty();
+        let truncated = self.sign_offs.iter().any(|f| f.truncated);
+        let (mut wrong_reviewer, mut no_sign_off, mut finding_overdue, mut finding_late) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut listed: Vec<&AccessReview> = self.r.access_reviews.iter().filter(|v| v.at < cut && (in_period(v.at) || v.findings.iter().any(|f| f.fixed.is_none_or(|x| x >= p.from)))).collect();
+        listed.sort_by(|a, b| (a.at, &a.system).cmp(&(b.at, &b.system)));
+        let mut reviews = Vec::new();
+        for v in listed {
+            let Some(s) = self.system(&v.system) else { continue };
+            let held = self.held(&v.by, &[ACCESS_REVIEWER], v.at);
+            let delegate = held.is_none() && self.personnel_on(&v.by, v.at) && !self.has_access(&v.by, &v.system, v.at);
+            if in_period(v.at) && held.is_none() && !delegate {
+                let why = if self.personnel_on(&v.by, v.at) { "has access to it" } else { "wasn't personnel" };
+                wrong_reviewer.push(json!(format!("{} on {}: {} didn't hold {ACCESS_REVIEWER} and {why}", v.system, v.at, v.by)));
+            }
+            let sign_off = (s.kind == "superbot" && checked).then(|| self.sign_offs.iter().flat_map(|f| &f.signed).find(|(d, t)| *d == v.list_sha256 && t.date_naive() == v.at).map(|(_, t)| rfc3339(t.timestamp_millis())));
+            if in_period(v.at) && matches!(sign_off, Some(None)) {
+                no_sign_off.push(json!(format!("{} on {}: no {SIGN_OFF_ACTION} of report {} that day{}", v.system, v.at, &v.list_sha256[..16], if truncated { " (an access-review.json given lists only some of its events)" } else { "" })));
+            }
+            let findings: Vec<Value> = v
+                .findings
+                .iter()
+                .map(|f| {
+                    let due = business_days(v.at, if f.admin { ADMIN_FINDING_BUSINESS_DAYS } else { FINDING_BUSINESS_DAYS });
+                    let fixed = f.fixed.filter(|x| *x < cut);
+                    match fixed {
+                        Some(x) if in_period(x) && x > due => finding_late.push(json!(format!("{} of {} on {} (due {due}, fixed {x})", f.id, v.system, v.at))),
+                        None if due < cut => finding_overdue.push(json!(format!("{} of {} on {} (due {due})", f.id, v.system, v.at))),
+                        _ => {}
+                    }
+                    json!({ "id": f.id, "admin": f.admin, "due": ds(due), "fixed": fixed.map(ds) })
+                })
+                .collect();
+            reviews.push(json!({
+                "system": v.system, "at": ds(v.at), "by": v.by, "heldRole": held, "delegate": delegate, "listSha256": v.list_sha256, "mfa": v.mfa,
+                "signOffChecked": sign_off.is_some(), "signedOffAt": sign_off.flatten(), "findings": findings,
+            }));
+        }
+
+        let in_force = used.iter().any(|s| at_end(s));
+        let mut rows = Vec::new();
+        if in_force && all_current && any_recent {
+            rows.push("CC6.1-2");
+        }
+        if in_force && lists_kept {
+            rows.push("CC6.2-2");
+        }
+        if in_force && all_current && any_recent {
+            rows.push("CC6.3-2");
+        }
+        let v = json!({
+            "basis": format!("every production system in use in the period (the access control policy's scope), by register id: each grant made in the period approved in writing on or before the day it was granted by people other than the grantee holding or deputising {GRANT_APPROVER} that day and, for admin access to a managed SuperBot server or the hosting provider, {ADMIN_GRANT_APPROVER} (one approver may hold both); a leaver's access removed by the day they left (the first day without access) or the system retired; each system in use at the period's end reviewed within {QUARTER_DAYS} days (a new one within {QUARTER_DAYS} days of its since), by someone holding or deputising {ACCESS_REVIEWER} or a delegate who was personnel and had no access to it that day, the latest review recording whether every account needs a second factor; each finding fixed within {FINDING_BUSINESS_DAYS} business days of the review, {ADMIN_FINDING_BUSINESS_DAYS} for admin access; and, when botd's access-review.json files are given, each review of a SuperBot server matched to a {SIGN_OFF_ACTION} event of the same report digest on the same UTC day. Business days are Monday to Friday; public holidays are not excluded. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done"),
+            "signOffsChecked": checked,
+            "signOffFiles": self.sign_offs.iter().map(|f| json!({
+                "file": f.file, "bytes": f.bytes, "sha256": f.sha256, "periodCovered": f.period.as_ref().map(|(a, b)| json!({ "from": a, "to": b })),
+                "signOffs": f.signed.len(), "truncated": f.truncated,
+            })).collect::<Vec<_>>(),
+            "summary": {
+                "systemsInUse": used.len(),
+                "systemsAtEnd": used.iter().filter(|s| at_end(s)).count(),
+                "grantsListed": grants.len(),
+                "grantedInPeriod": self.r.access.iter().filter(|g| in_period(g.granted)).count(),
+                "grantsAtEnd": grants.iter().filter(|g| g["liveAtEnd"] == true).count(),
+                "adminGrantsAtEnd": grants.iter().filter(|g| g["liveAtEnd"] == true && g["level"] == "admin").count(),
+                "leftInPeriod": self.r.people.iter().filter(|x| x.left.is_some_and(in_period)).count(),
+                "reviewsInPeriod": reviews.iter().filter(|r| r["at"].as_str().is_some_and(|d| parse_day(d).is_ok_and(in_period))).count(),
+            },
+            "exceptions": {
+                "grantNotApproved": not_approved, "grantApproverNotInRole": wrong_approver, "selfApproved": self_approved, "grantedToNonPersonnel": not_personnel,
+                "leaverNotRemoved": not_removed, "leaverRemovedLate": removed_late,
+                "reviewOverdue": overdue, "mfaNotRequired": mfa_off, "reviewerNotAllowed": wrong_reviewer, "signOffNotFound": no_sign_off,
+                "findingOverdue": finding_overdue, "findingFixedLate": finding_late,
+            },
+            "systems": systems,
+            "grants": grants,
+            "reviews": reviews,
+        });
+        (v, rows)
+    }
 }
 
 /// The calendar quarters that overlap the period and have ended by its end.
@@ -1552,7 +1944,7 @@ pub fn name(p: &Period, now_ms: i64) -> String {
 /// Each file's JSON and the rows its manifest maps it to.
 pub fn files(c: &Check) -> Vec<(&'static str, Value, Vec<&'static str>)> {
     let period = json!({ "from": c.p.from.to_string(), "to": c.p.to.to_string(), "days": c.p.days() });
-    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct(), c.incidents()];
+    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct(), c.incidents(), c.access()];
     SECTIONS
         .iter()
         .zip(parts)
@@ -1590,6 +1982,7 @@ pub fn build(c: &Check, src: &Source, now_ms: i64) -> Bundle {
             "policies": c.policies.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
             "policyTextsChecked": c.policies.iter().any(|p| p.sha256.is_some()),
             "baselineChecks": c.baselines.len(),
+            "accessReviewFiles": c.sign_offs.len(),
         },
         "recordsAfterPeriod": c.after_period(),
         "exceptions": exceptions,
@@ -1618,25 +2011,30 @@ pub fn summary(c: &Check) -> String {
 // The command
 
 pub const USAGE: &str = "  superbot-evidence register <register.json> [--policies <folder>] [--baseline <file>]...
-                    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
+                    [--access-review <file>]... [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
 
 struct Args {
     register: String,
     policies: Option<String>,
     baselines: Vec<String>,
+    access_reviews: Vec<String>,
     from: Option<String>,
     to: Option<String>,
     out: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut a = Args { register: String::new(), policies: None, baselines: Vec::new(), from: None, to: None, out: None };
+    let mut a = Args { register: String::new(), policies: None, baselines: Vec::new(), access_reviews: Vec::new(), from: None, to: None, out: None };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let value = |it: &mut std::slice::Iter<String>| it.next().filter(|v| !v.starts_with("--") && !v.is_empty()).cloned().ok_or(format!("{flag} needs a value"));
         let slot = match flag.as_str() {
             "--baseline" => {
                 a.baselines.push(value(&mut it)?);
+                continue;
+            }
+            "--access-review" => {
+                a.access_reviews.push(value(&mut it)?);
                 continue;
             }
             "--policies" => &mut a.policies,
@@ -1688,7 +2086,15 @@ pub fn run(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<String
         }
         baselines.push(b);
     }
-    let c = Check { r: &register, p, policies: &policies, baselines: &baselines };
+    let mut signed: Vec<SignOffs> = Vec::new();
+    for f in &a.access_reviews {
+        let s = sign_offs(f, &read_capped(f, MAX_ACCESS_REVIEW_BYTES)?)?;
+        if signed.iter().any(|x| x.sha256 == s.sha256) {
+            return Err(format!("{f} is the same file as another --access-review"));
+        }
+        signed.push(s);
+    }
+    let c = Check { r: &register, p, policies: &policies, baselines: &baselines, sign_offs: &signed };
     let src = Source { file: Path::new(&a.register).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), bytes: bytes.len(), sha256: sha256(&bytes) };
     let b = build(&c, &src, now.timestamp_millis());
     let file = a.out.clone().unwrap_or_else(|| format!("{}.tar", b.name));
@@ -1782,12 +2188,46 @@ mod tests {
             "tabletops": [
                 { "at": "2027-02-15", "attendees": ["p-sec", "p-ops", "p-eng"], "recordSha256": ZERO, "actions": [{ "id": "T-01", "owner": "Security owner", "due": "2027-04-15" }], "notes": "leaked master key scenario" },
             ],
+            "systems": [
+                { "id": "github", "since": "2026-06-01", "notes": "the code host's organisation" },
+                { "id": "linode", "kind": "hosting", "since": "2026-06-01" },
+                { "id": "botd-eu", "kind": "superbot", "since": "2026-06-01" },
+            ],
+            "access": [
+                { "person": "p-eng", "system": "github", "level": "user", "granted": "2026-06-01" },
+                { "person": "p-sec", "system": "botd-eu", "level": "admin", "granted": "2026-06-01" },
+                { "person": "p-ops", "system": "linode", "level": "admin", "requested": "2027-03-08", "approved": "2027-03-09", "approvedBy": ["p-sec", "p-mgmt"], "granted": "2027-03-10", "notes": "Dan's on-call login" },
+            ],
+            "accessReviews": [
+                { "system": "github", "at": "2027-03-15", "by": "p-sec", "listSha256": ZERO, "mfa": true, "findings": [{ "id": "AF-01", "fixed": "2027-03-18" }] },
+                { "system": "linode", "at": "2027-02-20", "by": "p-sec", "listSha256": ZERO, "mfa": true },
+                { "system": "botd-eu", "at": "2027-03-16", "by": "p-sec", "listSha256": SIGNED, "mfa": true },
+            ],
         })
+    }
+
+    const SIGNED: &str = "5ab1e0d1f1e6b7c2a3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9d0";
+
+    /// botd's `access-review.json` with the sign-offs given as (report digest, time).
+    fn access_review(signed: &[(&str, &str)], total: usize) -> Vec<u8> {
+        let events: Vec<Value> = signed
+            .iter()
+            .enumerate()
+            .map(|(i, (digest, time))| json!({ "id": i + 1, "time": time, "action": SIGN_OFF_ACTION, "outcome": "ok", "actor": "admin", "target": "access-review", "botId": null, "details": { "digest": digest } }))
+            .chain([json!({ "id": 99, "time": "2027-03-02T09:00:00Z", "action": "user.created", "outcome": "ok", "actor": "admin", "target": "u-1", "botId": null, "details": {} })])
+            .collect();
+        let listed = events.len();
+        serde_json::to_vec(&json!({
+            "snapshotAt": "2027-04-01T00:00:00Z", "reportDigest": SIGNED, "mfaPolicy": "required", "summary": {}, "people": [], "serviceAccounts": [], "reviewsSignedOffInPeriod": signed.len(),
+            "period": { "counts": {}, "daily": [], "eventsTotal": total.max(listed), "eventsListed": listed, "events": events },
+            "periodCovered": { "from": "2027-03-01", "to": "2027-04-01", "days": 31 },
+        }))
+        .unwrap()
     }
 
     fn check(v: &Value, f: &dyn Fn(&Check)) {
         let r = parse(&serde_json::to_vec(v).unwrap(), &builtin_policies()).unwrap();
-        f(&Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[] });
+        f(&Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[] });
     }
 
     fn exceptions(v: &Value) -> usize {
@@ -1844,7 +2284,7 @@ mod tests {
         let mut texts = builtin_policies();
         texts.iter_mut().for_each(|p| p.sha256 = Some(ZERO.into()));
         texts[2].sha256 = Some("1".repeat(64));
-        let c = Check { r: &r, p: period(), policies: &texts, baselines: &[] };
+        let c = Check { r: &r, p: period(), policies: &texts, baselines: &[], sign_offs: &[] };
         let (pol, rows) = c.policies();
         let ex = &pol["exceptions"];
         assert_eq!(ex["notApproved"], json!(["acceptable-use"]));
@@ -1938,13 +2378,13 @@ mod tests {
         let mut v = good();
         v["managementReviews"] = json!([{ "at": "2027-01-20", "attendees": ["p-eng"] }]);
         let r = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap();
-        let c = Check { r: &r, p: q, policies: &builtin_policies(), baselines: &[] };
+        let c = Check { r: &r, p: q, policies: &builtin_policies(), baselines: &[], sign_offs: &[] };
         let (m, rows) = c.management_reviews();
         assert_eq!(m["exceptions"]["quarterWithoutReview"], json!(["2026-Q4"]));
         assert_eq!(m["exceptions"]["withoutManagementOrSecurityOwner"], json!(["2027-01-20"]));
         assert_eq!(m["exceptions"]["noMinutes"], json!(["2027-01-20"]));
         assert_eq!(rows, ["CC1.2-1"], "within a quarter of the end");
-        let late = Check { r: &r, p: Period { from: d("2027-05-01"), to: d("2027-06-01") }, policies: &builtin_policies(), baselines: &[] };
+        let late = Check { r: &r, p: Period { from: d("2027-05-01"), to: d("2027-06-01") }, policies: &builtin_policies(), baselines: &[], sign_offs: &[] };
         assert!(late.management_reviews().1.is_empty(), "the last review is over a quarter old");
     }
 
@@ -1984,7 +2424,7 @@ mod tests {
         let b2 = baseline("b.json", &json_check("2027-04-01T00:00:05Z", &[]), &period()).unwrap();
         assert_eq!(b2.checked_on, d("2027-04-01"), "the month's evidence bundle, made on the 1st");
         let bs = [b1, b2];
-        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &bs };
+        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &bs, sign_offs: &[] };
         let (x, rows) = c.exceptions();
         let ex = &x["exceptions"];
         assert_eq!(ex["overAYear"], json!(["EX-02 (approved 2026-10-01, ends 2027-12-01)"]));
@@ -2053,7 +2493,7 @@ mod tests {
         older["acknowledgements"].as_array_mut().unwrap().retain(|a| a["policy"] != CODE_OF_CONDUCT);
         let set: Vec<Policy> = builtin_policies().into_iter().filter(|p| p.id != CODE_OF_CONDUCT).collect();
         let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
-        let c = Check { r: &r, p: period(), policies: &set, baselines: &[] };
+        let c = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[] };
         let (x, rows) = c.conduct();
         assert_eq!((x["codeOfConduct"]["inPolicySet"].as_bool(), rows.len()), (Some(false), 0), "a policy folder from before the code of conduct");
         assert_eq!(exceptions(&c.people().0), 0, "nobody is chased for a policy not in the set");
@@ -2154,7 +2594,7 @@ mod tests {
         let mut older = good();
         older["policyApprovals"].as_array_mut().unwrap().retain(|a| a["policy"] != INCIDENT_RESPONSE);
         let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
-        let c = Check { r: &r, p: period(), policies: &set, baselines: &[] };
+        let c = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[] };
         let (x, rows) = c.incidents();
         assert_eq!((x["incidentResponsePlan"]["inPolicySet"].as_bool(), rows.len(), exceptions(&x)), (Some(false), 0, 0), "a policy folder without the plan");
     }
@@ -2257,12 +2697,176 @@ mod tests {
     }
 
     #[test]
+    fn production_access_granted_without_approval_or_kept_past_a_leavers_last_day() {
+        let mut v = good();
+        let people = v["people"].as_array_mut().unwrap();
+        people.push(json!({ "id": "p-gone", "joined": "2026-01-01", "left": "2027-03-05" }));
+        people.push(json!({ "id": "p-late", "joined": "2026-01-01", "left": "2027-03-05" }));
+        people.push(json!({ "id": "p-old", "joined": "2026-01-01", "left": "2027-01-10" }));
+        people.push(json!({ "id": "p-new", "joined": "2027-03-15" }));
+        v["roles"][0]["deputy"] = json!("p-eng");
+        v["access"][2]["approvedBy"] = json!(["p-sec"]);
+        let access = v["access"].as_array_mut().unwrap();
+        access.push(json!({ "person": "p-gone", "system": "github", "level": "user", "granted": "2026-06-01" }));
+        access.push(json!({ "person": "p-late", "system": "linode", "level": "user", "granted": "2026-06-01", "removed": "2027-03-08" }));
+        access.push(json!({ "person": "p-old", "system": "github", "level": "user", "granted": "2026-06-01", "removed": "2027-01-20" }));
+        access.push(json!({ "person": "p-eng", "system": "github", "level": "admin", "granted": "2027-03-20" }));
+        access.push(json!({ "person": "p-sec", "system": "botd-eu", "level": "user", "approved": "2027-03-02", "approvedBy": ["p-sec"], "granted": "2027-03-02" }));
+        access.push(json!({ "person": "p-new", "system": "github", "level": "user", "approved": "2027-03-11", "approvedBy": ["p-sec"], "granted": "2027-03-12" }));
+        access.push(json!({ "person": "p-eng", "system": "botd-eu", "level": "user", "approved": "2027-03-11", "approvedBy": ["p-mgmt"], "granted": "2027-03-12" }));
+        check(&v, &|c| {
+            let (a, rows) = c.access();
+            let ex = &a["exceptions"];
+            assert_eq!(ex["grantNotApproved"], json!(["p-eng on github (admin), granted 2027-03-20"]));
+            assert_eq!(
+                ex["grantApproverNotInRole"],
+                json!(["p-ops on linode (admin), approved 2027-03-09: needs Security owner and Management, held by someone other than p-ops", "p-sec on botd-eu (user), approved 2027-03-02: needs Security owner, held by someone other than p-sec"]),
+                "the security owner alone can't approve admin access to the hosting provider; a deputy alone is enough for user access"
+            );
+            assert_eq!(ex["selfApproved"], json!(["p-sec on botd-eu (user), approved 2027-03-02"]));
+            assert_eq!(ex["grantedToNonPersonnel"], json!(["p-new on github (user), granted 2027-03-12"]));
+            assert_eq!(ex["leaverNotRemoved"], json!(["p-gone on github (user): left 2027-03-05, not removed"]));
+            assert_eq!(ex["leaverRemovedLate"], json!(["p-late on linode (user): left 2027-03-05, removed 2027-03-08"]));
+            assert_eq!(exceptions(&a), 7, "a removal late before the period was that period's: {ex}");
+            let grants = a["grants"].as_array().unwrap();
+            assert!(!grants.iter().any(|g| g["person"] == "p-old"), "access ended before the period isn't listed");
+            let ops = grants.iter().find(|g| g["person"] == "p-ops").unwrap();
+            assert_eq!((ops["managementApproves"].as_bool(), ops["approvers"][0]["heldRole"].as_str()), (Some(true), Some("Security owner")));
+            assert_eq!(a["summary"]["leftInPeriod"], 2);
+            assert_eq!(rows, ["CC6.1-2", "CC6.2-2", "CC6.3-2"], "grants are exceptions, not gaps");
+            assert!(!a.to_string().contains("on-call"), "no notes: {a}");
+        });
+        let mut retired = good();
+        retired["people"].as_array_mut().unwrap().push(json!({ "id": "p-gone", "joined": "2026-01-01", "left": "2027-03-05" }));
+        retired["systems"].as_array_mut().unwrap().push(json!({ "id": "old-ci", "since": "2026-01-01", "until": "2027-03-03" }));
+        retired["access"].as_array_mut().unwrap().push(json!({ "person": "p-gone", "system": "old-ci", "level": "admin", "granted": "2026-01-01" }));
+        check(&retired, &|c| assert_eq!(exceptions(&c.access().0), 0, "a system retired before they left took their access with it"));
+    }
+
+    #[test]
+    fn production_systems_unreviewed_reviews_without_mfa_or_by_the_wrong_person_and_findings_late() {
+        let mut v = good();
+        let systems = v["systems"].as_array_mut().unwrap();
+        systems.push(json!({ "id": "dns", "since": "2026-06-01" }));
+        systems.push(json!({ "id": "s3", "since": "2026-12-01" }));
+        systems.push(json!({ "id": "billing", "since": "2027-02-01" }));
+        v["access"].as_array_mut().unwrap().push(json!({ "person": "p-mgmt", "system": "dns", "level": "admin", "granted": "2026-06-01" }));
+        v["access"].as_array_mut().unwrap().push(json!({ "person": "p-mgmt", "system": "billing", "level": "admin", "granted": "2027-02-01" }));
+        let reviews = v["accessReviews"].as_array_mut().unwrap();
+        reviews[0]["by"] = json!("p-eng");
+        reviews[0]["findings"].as_array_mut().unwrap().push(json!({ "id": "AF-02", "admin": true, "fixed": "2027-03-17" }));
+        reviews[1]["findings"] = json!([{ "id": "AF-03" }]);
+        reviews[2]["mfa"] = json!(false);
+        reviews.push(json!({ "system": "dns", "at": "2026-11-01", "by": "p-sec", "listSha256": ZERO, "mfa": true }));
+        check(&v, &|c| {
+            let (a, rows) = c.access();
+            let ex = &a["exceptions"];
+            assert_eq!(ex["reviewOverdue"], json!(["dns (last 2026-11-01)", "s3 (none since 2026-12-01)"]), "billing is new: due 92 days after its since");
+            assert_eq!(ex["mfaNotRequired"], json!(["botd-eu (reviewed 2027-03-16)"]));
+            assert_eq!(ex["reviewerNotAllowed"], json!(["github on 2027-03-15: p-eng didn't hold Security owner and has access to it"]));
+            assert_eq!(ex["findingFixedLate"], json!(["AF-02 of github on 2027-03-15 (due 2027-03-16, fixed 2027-03-17)"]));
+            assert_eq!(ex["findingOverdue"], json!(["AF-03 of linode on 2027-02-20 (due 2027-02-26)"]), "Saturday's review: five business days from the Monday");
+            assert_eq!(ex["signOffNotFound"], json!([]));
+            assert_eq!(a["signOffsChecked"], false);
+            assert_eq!(a["reviews"].as_array().unwrap().iter().map(|r| r["system"].as_str().unwrap()).collect::<Vec<_>>(), ["linode", "github", "botd-eu"], "an older review is listed while its finding is open");
+            assert!(rows.is_empty(), "a system unreviewed or without a grant on record maps nothing: {rows:?}");
+        });
+        let mut delegate = good();
+        delegate["accessReviews"][0]["by"] = json!("p-ops");
+        check(&delegate, &|c| {
+            let (a, _) = c.access();
+            assert_eq!(exceptions(&a), 0, "a delegate with no access to the system may review it");
+            assert_eq!((a["reviews"][0]["system"].as_str(), a["reviews"][0]["delegate"].as_bool()), (Some("github"), Some(true)));
+        });
+        let mut none = good();
+        none["systems"] = json!([]);
+        none["access"] = json!([]);
+        none["accessReviews"] = json!([]);
+        check(&none, &|c| assert!(c.access().1.is_empty(), "no system on record maps nothing"));
+    }
+
+    #[test]
+    fn superbot_reviews_are_matched_to_botds_sign_offs() {
+        let r = parse(&serde_json::to_vec(&good()).unwrap(), &builtin_policies()).unwrap();
+        let run = |files: &[SignOffs]| Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: files }.access().0;
+        let signed = sign_offs("/evidence/access-review.json", &access_review(&[(SIGNED, "2027-03-16T14:00:00Z")], 0)).unwrap();
+        assert_eq!((signed.file.as_str(), signed.signed.len(), signed.truncated, signed.period.clone()), ("access-review.json", 1, false, Some(("2027-03-01".into(), "2027-04-01".into()))));
+        let a = run(std::slice::from_ref(&signed));
+        assert_eq!(exceptions(&a), 0, "{}", a["exceptions"]);
+        let botd = a["reviews"].as_array().unwrap().iter().find(|x| x["system"] == "botd-eu").unwrap();
+        assert_eq!((botd["signOffChecked"].as_bool(), botd["signedOffAt"].as_str()), (Some(true), Some("2027-03-16T14:00:00Z")));
+        let github = a["reviews"].as_array().unwrap().iter().find(|x| x["system"] == "github").unwrap();
+        assert_eq!(github["signOffChecked"], false, "only SuperBot servers sign off in botd");
+        assert_eq!((a["signOffsChecked"].as_bool(), a["signOffFiles"][0]["signOffs"].as_u64()), (Some(true), Some(1)));
+
+        let other_day = sign_offs("a.json", &access_review(&[(SIGNED, "2027-03-17T09:00:00Z"), (ZERO, "2027-03-16T09:00:00Z")], 6000)).unwrap();
+        assert!(other_day.truncated);
+        let a = run(&[other_day]);
+        assert_eq!(a["exceptions"]["signOffNotFound"], json!(["botd-eu on 2027-03-16: no access_review.completed of report 5ab1e0d1f1e6b7c2 that day (an access-review.json given lists only some of its events)"]));
+        assert_eq!(run(&[])["reviews"][1]["signOffChecked"], false, "not checked without botd's files");
+
+        for (bytes, want) in [
+            (b"{".to_vec(), "isn't JSON"),
+            (br#"{"period":{"events":[]}}"#.to_vec(), "no snapshotAt"),
+            (br#"{"snapshotAt":"x","reportDigest":"y"}"#.to_vec(), "no period.events"),
+            (access_review(&[("abc", "2027-03-16T14:00:00Z")], 0), "has no report digest"),
+            (access_review(&[(SIGNED, "16 March")], 0), "has no time"),
+        ] {
+            let e = sign_offs("a.json", &bytes).unwrap_err();
+            assert!(e.contains(want), "{want}: {e}");
+        }
+    }
+
+    #[test]
+    fn access_records_that_dont_hold_together_are_refused() {
+        let mut v = good();
+        let systems = v["systems"].as_array_mut().unwrap();
+        systems.push(json!({ "id": "github", "since": "2026-01-01" }));
+        systems.push(json!({ "id": "ops@example.com", "since": "2026-01-01" }));
+        systems.push(json!({ "id": "vault", "kind": "secrets", "since": "2027-01-01", "until": "2026-12-01" }));
+        let access = v["access"].as_array_mut().unwrap();
+        access.push(json!({ "person": "p-who", "system": "nas", "level": "root", "granted": "2027-03-01" }));
+        access.push(json!({ "person": "p-eng", "system": "linode", "level": "user", "approved": "2027-03-02", "granted": "2027-03-01" }));
+        access.push(json!({ "person": "p-eng", "system": "botd-eu", "level": "user", "requested": "2027-03-05", "approved": "2027-03-04", "approvedBy": ["p-nobody"], "granted": "2027-03-06", "removed": "2027-03-06" }));
+        access.push(json!({ "person": "p-ops", "system": "github", "level": "user", "granted": "2026-01-01" }));
+        let reviews = v["accessReviews"].as_array_mut().unwrap();
+        reviews.push(json!({ "system": "nas", "at": "2027-03-01", "by": "p-who", "listSha256": "abc", "mfa": true, "findings": [{ "id": "AF-01" }, { "id": "AF-09", "fixed": "2027-02-01" }] }));
+        reviews.push(json!({ "system": "github", "at": "2026-05-01", "by": "p-sec", "listSha256": ZERO, "mfa": true }));
+        let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
+        for want in [
+            "system id github is used twice",
+            "system id ops@example.com isn't plain",
+            "system vault: kind is superbot, hosting, other",
+            "system vault: until must be after since",
+            "p-who's access to nas from 2027-03-01 names p-who, who isn't in people",
+            "p-who's access to nas from 2027-03-01 names the system nas, which isn't in systems",
+            "p-who's access to nas from 2027-03-01: level is admin or user",
+            "p-eng's access to linode from 2027-03-01: approved and approvedBy go together",
+            "p-eng's access to linode from 2027-03-01: dates out of order",
+            "p-eng's access to botd-eu from 2027-03-06 names p-nobody, who isn't in people",
+            "p-eng's access to botd-eu from 2027-03-06: dates out of order",
+            "p-ops's access to github from 2026-01-01: granted while the system wasn't in use",
+            "review finding id AF-01 is used twice",
+            "the access review of nas on 2027-03-01 names the system nas",
+            "the access review of nas on 2027-03-01: listSha256 is the reviewed user list's SHA-256",
+            "the access review of nas on 2027-03-01's finding AF-09: fixed can't be before the review",
+            "the access review of github on 2026-05-01: reviewed before the system's since",
+        ] {
+            assert!(e.contains(want), "{want}\n{e}");
+        }
+        let e = parse(&serde_json::to_vec(&json!({ "superbotRegister": 1, "accessReviews": [{ "system": "s", "at": "2027-03-01", "by": "p", "listSha256": ZERO }] })).unwrap(), &builtin_policies()).unwrap_err();
+        assert!(e.contains("missing field `mfa`"), "whether MFA was required is always recorded: {e}");
+    }
+
+    #[test]
     fn records_after_the_period_are_left_out() {
         let mut v = good();
         v["managementReviews"].as_array_mut().unwrap().push(json!({ "at": "2027-04-02", "attendees": ["p-mgmt"] }));
         v["policyApprovals"].as_array_mut().unwrap().push(json!({ "policy": "access-control", "sha256": "1".repeat(64), "approvedBy": "p-eng", "approvedAt": "2027-04-01" }));
+        v["access"].as_array_mut().unwrap().push(json!({ "person": "p-ops", "system": "github", "level": "admin", "granted": "2027-04-01" }));
         check(&v, &|c| {
-            assert_eq!(c.after_period(), 2);
+            assert_eq!(c.after_period(), 3);
+            assert_eq!(exceptions(&c.access().0), 0, "a grant after the period isn't this period's");
             assert_eq!(exceptions(&c.policies().0), 0, "a later approval by the wrong person isn't this period's");
             assert_eq!(c.management_reviews().0["summary"]["reviewsInTheYear"], 1);
         });
@@ -2274,7 +2878,7 @@ mod tests {
         v["managementReviews"] = json!([]);
         let bytes = serde_json::to_vec(&v).unwrap();
         let r = parse(&bytes, &builtin_policies()).unwrap();
-        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[] };
+        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[] };
         let src = Source { file: "register.json".into(), bytes: bytes.len(), sha256: sha256(&bytes) };
         let now = period().end_ms() + 3_600_000;
         let b = build(&c, &src, now);
@@ -2282,7 +2886,7 @@ mod tests {
         assert!(![crate::changes::PREFIX, crate::vulns::PREFIX, crate::drills::PREFIX, "superbot-evidence-"].iter().any(|p| b.name.starts_with(p)));
         let entries = crate::coverage::untar(&b.tar).unwrap();
         let all: String = entries.iter().map(|(_, x)| String::from_utf8_lossy(x).into_owned()).collect();
-        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse"] {
+        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse", "on-call login", "code host's organisation"] {
             assert!(!all.contains(never), "{never:?} is in the bundle");
         }
         let manifest: Value = serde_json::from_slice(&entries.iter().find(|(n, _)| n.ends_with("/manifest.json")).unwrap().1).unwrap();
@@ -2300,9 +2904,9 @@ mod tests {
     #[test]
     fn options() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let a = parse_args(&s(&["r.json", "--policies", "docs", "--baseline", "a.json", "--baseline", "b.json", "--from", "2027-03-01", "--to", "2027-04-01", "-o", "x.tar"])).unwrap();
-        assert_eq!((a.register.as_str(), a.policies.as_deref(), a.baselines.len(), a.out.as_deref()), ("r.json", Some("docs"), 2, Some("x.tar")));
-        for bad in [&[][..], &["--policies", "d"], &["r.json", "s.json"], &["r.json", "--from"], &["r.json", "-o", "a", "-o", "b"], &["r.json", "--token", "x"], &["r.json", "--baseline"]] {
+        let a = parse_args(&s(&["r.json", "--policies", "docs", "--baseline", "a.json", "--baseline", "b.json", "--access-review", "c.json", "--from", "2027-03-01", "--to", "2027-04-01", "-o", "x.tar"])).unwrap();
+        assert_eq!((a.register.as_str(), a.policies.as_deref(), a.baselines.len(), a.access_reviews.len(), a.out.as_deref()), ("r.json", Some("docs"), 2, 1, Some("x.tar")));
+        for bad in [&[][..], &["--policies", "d"], &["r.json", "s.json"], &["r.json", "--from"], &["r.json", "-o", "a", "-o", "b"], &["r.json", "--token", "x"], &["r.json", "--baseline"], &["r.json", "--access-review"]] {
             assert!(parse_args(&s(bad)).is_err(), "{bad:?}");
         }
     }
@@ -2321,6 +2925,8 @@ mod tests {
         assert_eq!(r.policy_approvals.iter().map(|a| a.policy.as_str()).collect::<BTreeSet<_>>(), POLICIES.iter().copied().collect::<BTreeSet<_>>());
         assert!(r.people.iter().all(|p| p.name.as_deref().is_none_or(|n| n.starts_with('<'))), "placeholders only");
         assert!(r.risks.iter().any(|x| x.fraud), "the template has a fraud risk to start from");
+        assert_eq!(r.systems.iter().map(|s| s.kind.as_str()).collect::<BTreeSet<_>>(), SYSTEM_KINDS.iter().copied().collect::<BTreeSet<_>>(), "the template has a system of each kind");
+        assert!(!r.access.is_empty() && !r.access_reviews.is_empty());
     }
 
     /// Every file maps to criteria the control mapping has and rows the readiness checklist
