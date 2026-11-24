@@ -280,6 +280,12 @@ fn list(ids: &[String]) -> String {
     ids.join(", ")
 }
 
+/// `s` with its first letter in capitals.
+fn sentence(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
 fn band_words(b: &str) -> &str {
     match b {
         "at_risk" => "at risk",
@@ -378,9 +384,7 @@ fn judge(id: &str, i: &Inputs) -> (Status, String) {
             if open.is_empty() {
                 (Done, format!("No open incident; {} resolved in the last {MONTH_DAYS} days, each major or critical one with a review drafted.", plural(c.resolved as u64, "incident", "incidents")))
             } else {
-                let mut d = open.join("; ");
-                d[..1].make_ascii_uppercase();
-                (Open, format!("{d}."))
+                (Open, format!("{}.", sentence(&open.join("; "))))
             }
         }
         "sign_in" => from_signal(&s.identity, "See the score's identity reasons and the sign-in or SAML runbook."),
@@ -462,9 +466,7 @@ fn judge(id: &str, i: &Inputs) -> (Status, String) {
                 if open.is_empty() {
                     (Done, format!("No machine is past its RPO; {} in the last {MONTH_DAYS} days, none past the RTO.", plural(m.restores as u64, "restore", "restores")))
                 } else {
-                    let mut d = open.join("; ");
-                    d[..1].make_ascii_uppercase();
-                    (Open, format!("{d}: see botctl machine recovery."))
+                    (Open, format!("{}: see botctl machine recovery.", sentence(&open.join("; "))))
                 }
             }
         },
