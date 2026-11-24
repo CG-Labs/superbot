@@ -38,6 +38,9 @@
 //!   and transitive session tags with the Bot's and owner's ids (`tags=bot,owner`), with
 //!   `{owner}` and `{bot}` in the policies filled in for each run. One that names the
 //!   owner is only for the owner's runs, as a role with `{owner}` is.
+//! - A `GCP_RUN_CREDENTIALS` entry may downscope each run's token (ADR 0240): a Credential
+//!   Access Boundary from a file (`boundary=`), with `{owner}` and `{bot}` filled in the
+//!   same way, limits it to the Cloud Storage buckets, roles and objects it names.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
@@ -56,12 +59,19 @@ pub const OWNER: &str = "{owner}";
 /// Stands for the Bot's id in a session policy.
 pub const BOT: &str = "{bot}";
 /// The entry options that narrow an STS session (ADR 0230).
-const SESSION_OPTIONS: [&str; 3] = ["policy", "policy-arn", "tags"];
+const SESSION_OPTIONS: &[&str] = &["policy", "policy-arn", "tags"];
+/// The entry option that downscopes a Google access token (ADR 0240).
+const BOUNDARY_OPTIONS: &[&str] = &["boundary"];
 /// STS's most managed session policies, and longest inline one, as plain text.
 pub const MAX_POLICY_ARNS: usize = 10;
 pub const MAX_POLICY: usize = 2048;
-/// The largest session policy file read.
+/// The largest session policy or access boundary file read.
 const MAX_POLICY_FILE: u64 = 64 * 1024;
+/// The most rules a Credential Access Boundary may have, as Google allows.
+pub const MAX_BOUNDARY_RULES: usize = 10;
+/// What every rule's resource starts with: Credential Access Boundaries cover Cloud
+/// Storage buckets only.
+const BUCKET_RESOURCE: &str = "//storage.googleapis.com/projects/_/buckets/";
 /// A lease's TTL as kept here, at most a year, so arithmetic on it can't overflow.
 const MAX_TTL: u64 = 86_400 * 366;
 /// How much longer than a run renewals keep its leases alive: the run's end, its
@@ -114,12 +124,12 @@ pub trait Issuer: Send + Sync {
     fn renew(&self, _lease_id: &str, _increment: Duration) -> Result<Renewal, Error> {
         Ok(Renewal::Refused(format!("{} leases can't be renewed", self.kind())))
     }
-    /// `issue`, with the session narrowed as `narrowed` says (ADR 0230). Only a setting
-    /// that takes session options gives a non-empty one; a backend that can't narrow
-    /// its leases refuses it rather than make a wider one.
+    /// `issue`, with the session narrowed as `narrowed` says (ADR 0230, ADR 0240). Only a
+    /// setting that takes these options gives a non-empty one; a backend that can't
+    /// narrow its leases refuses it rather than make a wider one.
     fn issue_narrowed(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
         if !narrowed.is_empty() {
-            return Err(Error::Unavailable(format!("{}: leases can't be narrowed with a session policy or tags", self.kind())));
+            return Err(Error::Unavailable(format!("{}: leases can't be narrowed with a session policy, tags or an access boundary", self.kind())));
         }
         self.issue(path, fields, run_for, bot_id)
     }
@@ -142,8 +152,8 @@ impl Tag {
     }
 }
 
-/// How an entry narrows each run's session (ADR 0230); empty unless its setting takes
-/// `policy=`, `policy-arn=` and `tags=`.
+/// How an entry narrows each run's session (ADR 0230) or token (ADR 0240); empty unless
+/// its setting takes `policy=`, `policy-arn=` and `tags=`, or `boundary=`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Narrowing {
     /// The inline session policy from `policy=<file>`, read once at startup; `{owner}`
@@ -152,20 +162,29 @@ pub struct Narrowing {
     /// Managed session policies, `{owner}` allowed in their names.
     pub policy_arns: Vec<String>,
     pub tags: Vec<Tag>,
+    /// The Credential Access Boundary from `boundary=<file>`, read once at startup;
+    /// `{owner}` and `{bot}` filled in as in a policy.
+    pub boundary: Option<Value>,
 }
 
 /// One run's narrowing, its ids filled in: the policy as sent (compact JSON), the
-/// managed policies' ARNs, and the tags (key, value).
+/// managed policies' ARNs, the tags (key, value), and the access boundary as sent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Narrowed {
     pub policy: Option<String>,
     pub policy_arns: Vec<String>,
     pub tags: Vec<(&'static str, String)>,
+    pub boundary: Option<String>,
 }
 
 impl Narrowed {
     pub fn is_empty(&self) -> bool {
-        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty()
+        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty() && self.boundary.is_none()
+    }
+
+    /// Whether it narrows an STS session: what only AWS can do.
+    pub fn narrows_session(&self) -> bool {
+        self.policy.is_some() || !self.policy_arns.is_empty() || !self.tags.is_empty()
     }
 }
 
@@ -198,16 +217,23 @@ fn bot_id_ok(id: &str) -> bool {
 
 impl Narrowing {
     fn is_empty(&self) -> bool {
-        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty()
+        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty() && self.boundary.is_none()
     }
 
     fn per_owner(&self) -> bool {
-        self.tags.contains(&Tag::Owner) || self.policy_arns.iter().any(|a| a.contains(OWNER)) || self.policy.as_ref().is_some_and(|p| mentions(p, OWNER))
+        self.tags.contains(&Tag::Owner)
+            || self.policy_arns.iter().any(|a| a.contains(OWNER))
+            || self.policy.as_ref().is_some_and(|p| mentions(p, OWNER))
+            || self.boundary.as_ref().is_some_and(|b| mentions(b, OWNER))
     }
 
     /// What a run of `bot_id` owned by `owner` gets. Refused when the Bot's id can't
-    /// stand in a policy or tag, or the policy grows past STS's limit with the ids in.
+    /// stand in a policy, tag or boundary, or the policy grows past STS's limit with the
+    /// ids in.
     fn for_run(&self, owner: &str, bot_id: &str) -> Result<Narrowed, String> {
+        if self.boundary.as_ref().is_some_and(|b| mentions(b, BOT)) && !bot_id_ok(bot_id) {
+            return Err(format!("the Bot's id {bot_id:?} can't stand in an access boundary"));
+        }
         let needs_bot = self.tags.contains(&Tag::Bot) || self.policy.as_ref().is_some_and(|p| mentions(p, BOT));
         if needs_bot && !bot_id_ok(bot_id) {
             return Err(format!("the Bot's id {bot_id:?} can't stand in a session policy or tag"));
@@ -235,7 +261,11 @@ impl Narrowing {
                 (t.key(), v.to_string())
             })
             .collect();
-        Ok(Narrowed { policy, policy_arns: self.policy_arns.iter().map(|a| a.replace(OWNER, owner)).collect(), tags })
+        let boundary = match &self.boundary {
+            Some(b) => Some(serde_json::to_string(&substitute(b, &fill)).map_err(|e| format!("the access boundary can't be written: {e}"))?),
+            None => None,
+        };
+        Ok(Narrowed { policy, policy_arns: self.policy_arns.iter().map(|a| a.replace(OWNER, owner)).collect(), tags, boundary })
     }
 }
 
@@ -307,13 +337,7 @@ fn policy_arn_ok(p: &str) -> bool {
 /// U+00FF. Never quoted in errors.
 fn read_policy(file: &str) -> Result<Value, String> {
     let bad = |why: String| format!("policy={file}: {why}");
-    let f = std::fs::File::open(file).map_err(|e| bad(format!("can't be read ({e})")))?;
-    let mut text = String::new();
-    f.take(MAX_POLICY_FILE + 1).read_to_string(&mut text).map_err(|e| bad(format!("can't be read ({e})")))?;
-    if text.len() as u64 > MAX_POLICY_FILE {
-        return Err(bad(format!("is over {MAX_POLICY_FILE} bytes")));
-    }
-    let v: Value = serde_json::from_str(&text).map_err(|e| bad(format!("isn't JSON ({e})")))?;
+    let v = read_json(file).map_err(bad)?;
     if !v.get("Statement").is_some_and(|s| s.is_array() || s.is_object()) {
         return Err(bad("must be an IAM policy: a JSON object with a Statement".into()));
     }
@@ -328,9 +352,74 @@ fn read_policy(file: &str) -> Result<Value, String> {
     Ok(v)
 }
 
-/// One of `SESSION_OPTIONS`, `name=value`, after `role` in an entry.
+/// The JSON in `file`, at most `MAX_POLICY_FILE` bytes. Errors never quote it.
+fn read_json(file: &str) -> Result<Value, String> {
+    let f = std::fs::File::open(file).map_err(|e| format!("can't be read ({e})"))?;
+    let mut text = String::new();
+    f.take(MAX_POLICY_FILE + 1).read_to_string(&mut text).map_err(|e| format!("can't be read ({e})"))?;
+    if text.len() as u64 > MAX_POLICY_FILE {
+        return Err(format!("is over {MAX_POLICY_FILE} bytes"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("isn't JSON ({e})"))
+}
+
+/// The Credential Access Boundary in `file`, checked as Google's client libraries do
+/// before they send one. Never quoted in errors.
+fn read_boundary(file: &str) -> Result<Value, String> {
+    let bad = |why: String| format!("boundary={file}: {why}");
+    let v = read_json(file).map_err(bad)?;
+    check_boundary(&v).map_err(bad)?;
+    Ok(v)
+}
+
+/// `{"accessBoundary": {"accessBoundaryRules": [...]}}` with 1 to 10 rules, each a Cloud
+/// Storage bucket, `inRole:` permissions and an optional condition; nothing else, so a
+/// misspelt key fails at startup rather than being dropped by Google.
+fn check_boundary(v: &Value) -> Result<(), String> {
+    let shape = || "must be a Credential Access Boundary: {\"accessBoundary\": {\"accessBoundaryRules\": [...]}} and nothing else".to_string();
+    let only = |o: &serde_json::Map<String, Value>, keys: &[&str]| o.keys().all(|k| keys.contains(&k.as_str()));
+    let top = v.as_object().filter(|o| only(o, &["accessBoundary"])).ok_or_else(shape)?;
+    let boundary = top.get("accessBoundary").and_then(Value::as_object).filter(|o| only(o, &["accessBoundaryRules"])).ok_or_else(shape)?;
+    let rules = boundary.get("accessBoundaryRules").and_then(Value::as_array).ok_or_else(shape)?;
+    if rules.is_empty() || rules.len() > MAX_BOUNDARY_RULES {
+        return Err(format!("has {} rules; Google takes 1 to {MAX_BOUNDARY_RULES}", rules.len()));
+    }
+    let word = |s: &str| !s.is_empty() && !s.chars().any(char::is_whitespace);
+    for (i, rule) in rules.iter().enumerate() {
+        let n = i + 1;
+        let rule = rule
+            .as_object()
+            .filter(|o| only(o, &["availableResource", "availablePermissions", "availabilityCondition"]))
+            .ok_or_else(|| format!("rule {n} must be an object with availableResource, availablePermissions and, optionally, availabilityCondition"))?;
+        let bucket = rule.get("availableResource").and_then(Value::as_str).and_then(|r| r.strip_prefix(BUCKET_RESOURCE));
+        if !bucket.is_some_and(|b| word(b) && !b.contains('/')) {
+            return Err(format!("rule {n}'s availableResource must be a Cloud Storage bucket, {BUCKET_RESOURCE}<bucket>: access boundaries cover nothing else"));
+        }
+        let roles = rule.get("availablePermissions").and_then(Value::as_array);
+        if !roles.is_some_and(|r| !r.is_empty() && r.iter().all(|p| p.as_str().and_then(|p| p.strip_prefix("inRole:")).is_some_and(word))) {
+            return Err(format!("rule {n}'s availablePermissions must be a list of roles, like [\"inRole:roles/storage.objectViewer\"]"));
+        }
+        if let Some(c) = rule.get("availabilityCondition") {
+            let ok = c.as_object().is_some_and(|c| {
+                only(c, &["expression", "title", "description"]) && c.values().all(Value::is_string) && c.get("expression").and_then(Value::as_str).is_some_and(|e| !e.trim().is_empty())
+            });
+            if !ok {
+                return Err(format!("rule {n}'s availabilityCondition must have an expression, and may have a title and description, all strings"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One of `SESSION_OPTIONS` or `BOUNDARY_OPTIONS`, `name=value`, after `role` in an entry.
 fn session_option(n: &mut Narrowing, role: &str, name: &str, value: &str) -> Result<(), String> {
     match name {
+        "boundary" => {
+            if n.boundary.is_some() {
+                return Err("boundary= is given twice; put every rule in one file".into());
+            }
+            n.boundary = Some(read_boundary(value)?);
+        }
         "policy" => {
             if n.policy.is_some() {
                 return Err("policy= is given twice; put every statement in one file".into());
@@ -400,8 +489,9 @@ pub struct Syntax {
     defaults: &'static [(&'static str, &'static str)],
     /// Names botd may sign in with that a lease may still give: the run's own, never botd's.
     own: &'static [&'static str],
-    /// Whether entries may narrow their sessions (`policy=`, `policy-arn=`, `tags=`).
-    session: bool,
+    /// The options its entries may take to narrow what they make: `SESSION_OPTIONS` or
+    /// `BOUNDARY_OPTIONS`, or none.
+    options: &'static [&'static str],
     example: &'static str,
 }
 
@@ -413,7 +503,7 @@ pub const VAULT: Syntax = Syntax {
     fields: &[],
     defaults: &[],
     own: &[],
-    session: false,
+    options: &[],
     example: "AWS_ACCESS_KEY_ID=access_key",
 };
 
@@ -428,12 +518,13 @@ pub const AWS: Syntax = Syntax {
     fields: &["AccessKeyId", "SecretAccessKey", "SessionToken"],
     defaults: &AWS_KEYS,
     own: &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
-    session: true,
+    options: SESSION_OPTIONS,
     example: "AWS_ACCESS_KEY_ID=AccessKeyId",
 };
 
 /// `GCP_RUN_CREDENTIALS` (ADR 0203): Google service accounts botd impersonates for each
-/// run. A bare entry gives the token under the names gcloud and Terraform read.
+/// run. A bare entry gives the token under the names gcloud and Terraform read; one with
+/// `boundary=` gives it downscoped (ADR 0240).
 pub const GCP: Syntax = Syntax {
     key: "GCP_RUN_CREDENTIALS",
     what: "a service account's email like \"superbot-bots@my-project.iam.gserviceaccount.com\" (with {owner} for the Bot owner's id before the @)",
@@ -441,7 +532,7 @@ pub const GCP: Syntax = Syntax {
     fields: &["accessToken"],
     defaults: &[("CLOUDSDK_AUTH_ACCESS_TOKEN", "accessToken"), ("GOOGLE_OAUTH_ACCESS_TOKEN", "accessToken")],
     own: &[],
-    session: false,
+    options: BOUNDARY_OPTIONS,
     example: "GOOGLE_OAUTH_ACCESS_TOKEN=accessToken",
 };
 
@@ -455,7 +546,7 @@ pub const AZURE: Syntax = Syntax {
     fields: &["accessToken"],
     defaults: &[("AZURE_ACCESS_TOKEN", "accessToken")],
     own: &[],
-    session: false,
+    options: &[],
     example: "AZURE_ACCESS_TOKEN=accessToken",
 };
 
@@ -483,9 +574,13 @@ pub fn parse_as(syntax: &Syntax, raw: &str) -> Result<Vec<Wanted>, String> {
             let Some((name, field)) = pair.split_once('=') else {
                 return Err(format!("{key}: {pair:?} after {path} must be NAME=field, like {}", syntax.example));
             };
-            if SESSION_OPTIONS.contains(&name) {
-                if !syntax.session {
-                    return Err(format!("{key}: {name}= narrows AWS STS sessions, so only AWS_RUN_CREDENTIALS takes it"));
+            if SESSION_OPTIONS.contains(&name) || BOUNDARY_OPTIONS.contains(&name) {
+                if !syntax.options.contains(&name) {
+                    return Err(if SESSION_OPTIONS.contains(&name) {
+                        format!("{key}: {name}= narrows AWS STS sessions, so only AWS_RUN_CREDENTIALS takes it")
+                    } else {
+                        format!("{key}: {name}= downscopes Google access tokens, so only GCP_RUN_CREDENTIALS takes it")
+                    });
                 }
                 session_option(&mut narrowing, path, name, field).map_err(|e| format!("{key}: {path}: {e}"))?;
                 continue;
@@ -909,6 +1004,9 @@ impl RunCredentials {
             }
             if !narrowed.tags.is_empty() {
                 d["tags"] = Value::Object(narrowed.tags.iter().map(|(k, v)| (k.to_string(), json!(v))).collect());
+            }
+            if let Some(b) = &narrowed.boundary {
+                d["boundarySha256"] = json!(crate::sigv4::sha256_hex(b.as_bytes()));
             }
             let fields: Vec<String> = w.names.iter().map(|(_, f)| f.clone()).collect();
             let lease = match self.issuer.issue_narrowed(&path, &fields, run_for, bot_id, &narrowed) {
@@ -1734,6 +1832,114 @@ pub(crate) mod tests {
         let tagged = Narrowed { tags: vec![("superbot-bot", "b1".into())], ..Narrowed::default() };
         let e = Plain.issue_narrowed("p", &[], RUN, "b1", &tagged).err().unwrap().to_string();
         assert!(e.contains("plain: leases can't be narrowed"), "{e}");
+        let bounded = Narrowed { boundary: Some("{}".into()), ..Narrowed::default() };
+        assert!(Plain.issue_narrowed("p", &[], RUN, "b1", &bounded).is_err(), "nor downscoped");
+        assert!(!bounded.narrows_session() && tagged.narrows_session());
         assert!(Plain.issue_narrowed("p", &[], RUN, "b1", &Narrowed::default()).is_ok());
+    }
+
+    pub(crate) const BOUNDARY: &str = r#"{
+        "accessBoundary": { "accessBoundaryRules": [{
+            "availableResource": "//storage.googleapis.com/projects/_/buckets/acme-bots",
+            "availablePermissions": ["inRole:roles/storage.objectViewer", "inRole:roles/storage.objectCreator"],
+            "availabilityCondition": { "title": "this Bot's own", "expression": "resource.name.startsWith('projects/_/buckets/acme-bots/objects/{bot}/')" }
+        }] }
+    }"#;
+    const OWNER_BOUNDARY: &str = r#"{ "accessBoundary": { "accessBoundaryRules": [{ "availableResource": "//storage.googleapis.com/projects/_/buckets/acme-u-{owner}", "availablePermissions": ["inRole:roles/storage.objectAdmin"] }] } }"#;
+
+    /// A boundary with `rules` (JSON), in a file of its own.
+    fn rules_file(label: &str, rules: &str) -> String {
+        policy_file(label, &format!(r#"{{"accessBoundary":{{"accessBoundaryRules":{rules}}}}}"#))
+    }
+
+    #[test]
+    fn gcp_entries_downscope_their_tokens_and_are_checked() {
+        let bots = policy_file("boundary-bots", BOUNDARY);
+        let owners = policy_file("boundary-owners", OWNER_BOUNDARY);
+        let w = parse_as(&GCP, &format!("superbot-bots@p.iam.gserviceaccount.com boundary={bots}; superbot-users@p.iam.gserviceaccount.com USER_GCP_TOKEN=accessToken boundary={owners}")).unwrap();
+        assert_eq!(w[0].names, [pair("CLOUDSDK_AUTH_ACCESS_TOKEN", "accessToken"), pair("GOOGLE_OAUTH_ACCESS_TOKEN", "accessToken")], "an option isn't a variable");
+        assert_eq!(w[0].narrowing.boundary.as_ref().unwrap()["accessBoundary"]["accessBoundaryRules"][0]["availableResource"], "//storage.googleapis.com/projects/_/buckets/acme-bots", "read once, at startup");
+        assert!(!w[0].per_owner() && w[1].per_owner(), "a boundary naming the owner: the owner's runs only");
+
+        let n = w[0].narrowing.for_run("u1", "bdown-1").unwrap();
+        assert!(!n.is_empty() && !n.narrows_session() && n.policy.is_none() && n.tags.is_empty());
+        let sent = n.boundary.unwrap();
+        assert!(!sent.contains('\n'), "sent compact");
+        let back: Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(back["accessBoundary"]["accessBoundaryRules"][0]["availabilityCondition"]["expression"], "resource.name.startsWith('projects/_/buckets/acme-bots/objects/bdown-1/')", "the run's Bot in place, as a JSON string");
+        assert!(w[1].narrowing.for_run("uown9", "b*").unwrap().boundary.unwrap().contains("acme-u-uown9"), "a Bot id not in the boundary needn't stand in one");
+        for bad in ["b*", "b'||true||'", ""] {
+            let e = w[0].narrowing.for_run("u1", bad).unwrap_err();
+            assert!(e.contains("can't stand in an access boundary"), "{bad:?}: {e}");
+        }
+
+        let rule = r#""availableResource":"//storage.googleapis.com/projects/_/buckets/b","availablePermissions":["inRole:roles/storage.objectViewer"]"#;
+        let eleven = format!("[{}]", vec![format!("{{{rule}}}"); MAX_BOUNDARY_RULES + 1].join(","));
+        let notjson = policy_file("boundary-notjson", "accessBoundary: secret-in-a-bad-file-7a6b");
+        let sa = "superbot@p.iam.gserviceaccount.com";
+        for (file, err) in [
+            ("/nonexistent/superbot/boundary.json".to_string(), "boundary=/nonexistent/superbot/boundary.json: can't be read"),
+            (notjson, "isn't JSON"),
+            (policy_file("boundary-policy", BOTS_POLICY), "must be a Credential Access Boundary"),
+            (policy_file("boundary-extra", r#"{"accessBoundary":{"accessBoundaryRules":[]},"x":"secret-in-a-bad-file-7a6b"}"#), "must be a Credential Access Boundary"),
+            (policy_file("boundary-inner", r#"{"accessBoundary":{"rules":[]}}"#), "must be a Credential Access Boundary"),
+            (rules_file("boundary-zero", "[]"), "has 0 rules; Google takes 1 to 10"),
+            (rules_file("boundary-eleven", &eleven), "has 11 rules"),
+            (rules_file("boundary-typo", r#"[{"availableResource":"//storage.googleapis.com/projects/_/buckets/b","availablePermission":["inRole:roles/storage.objectViewer"]}]"#), "rule 1 must be an object with availableResource"),
+            (rules_file("boundary-project", r#"[{"availableResource":"//cloudresourcemanager.googleapis.com/projects/p","availablePermissions":["inRole:roles/viewer"]}]"#), "rule 1's availableResource must be a Cloud Storage bucket"),
+            (rules_file("boundary-object", r#"[{"availableResource":"//storage.googleapis.com/projects/_/buckets/b/objects/x","availablePermissions":["inRole:roles/storage.objectViewer"]}]"#), "must be a Cloud Storage bucket"),
+            (rules_file("boundary-nobucket", r#"[{"availableResource":"//storage.googleapis.com/projects/_/buckets/","availablePermissions":["inRole:roles/storage.objectViewer"]}]"#), "must be a Cloud Storage bucket"),
+            (rules_file("boundary-noroles", r#"[{"availableResource":"//storage.googleapis.com/projects/_/buckets/b","availablePermissions":[]}]"#), "availablePermissions must be a list of roles"),
+            (rules_file("boundary-permission", r#"[{"availableResource":"//storage.googleapis.com/projects/_/buckets/b","availablePermissions":["storage.objects.get"]}]"#), "availablePermissions must be a list of roles"),
+            (rules_file("boundary-emptyrole", r#"[{"availableResource":"//storage.googleapis.com/projects/_/buckets/b","availablePermissions":["inRole:"]}]"#), "availablePermissions must be a list of roles"),
+            (rules_file("boundary-noexpr", &format!(r#"[{{{rule}}},{{{rule},"availabilityCondition":{{"title":"x"}}}}]"#)), "rule 2's availabilityCondition must have an expression"),
+            (rules_file("boundary-condkey", &format!(r#"[{{{rule},"availabilityCondition":{{"expression":"true","location":"x"}}}}]"#)), "availabilityCondition must have an expression"),
+            (rules_file("boundary-condtype", &format!(r#"[{{{rule},"availabilityCondition":{{"expression":"true","title":7}}}}]"#)), "availabilityCondition must have an expression"),
+        ] {
+            let e = parse_as(&GCP, &format!("{sa} boundary={file}")).unwrap_err();
+            assert!(e.starts_with("GCP_RUN_CREDENTIALS: superbot@p.iam.gserviceaccount.com: boundary=") && e.contains(err), "{file}: {e}");
+            assert!(!e.contains("secret-in-a-bad-file"), "a boundary file is never quoted: {e}");
+        }
+        let e = parse_as(&GCP, &format!("{sa} boundary={bots} boundary={owners}")).unwrap_err();
+        assert!(e.contains("boundary= is given twice"), "{e}");
+        assert!(parse_as(&GCP, &format!("{sa} policy={bots}")).unwrap_err().contains("only AWS_RUN_CREDENTIALS takes it"));
+        for (syntax, raw) in [(&AWS, "arn:aws:iam::123456789012:role/r"), (&VAULT, "gcp/token/bots X_TOKEN=token"), (&AZURE, "11111111-2222-3333-4444-555555555555")] {
+            let e = parse_as(syntax, &format!("{raw} boundary={bots}")).unwrap_err();
+            assert!(e.contains("boundary= downscopes Google access tokens, so only GCP_RUN_CREDENTIALS takes it"), "{raw}: {e}");
+        }
+    }
+
+    #[test]
+    fn downscoped_tokens_get_the_runs_ids_and_are_audited() {
+        let bots = policy_file("downscoped-bots", BOUNDARY);
+        let owners = policy_file("downscoped-owners", OWNER_BOUNDARY);
+        let token: &[(&str, Option<&str>)] = &[("accessToken", Some("ya29.downscoped-4e5f"))];
+        let f = fake(&[("dsbots@pdown.iam.gserviceaccount.com", token), ("dsusers@pdown.iam.gserviceaccount.com", token)]);
+        f.unrevocable.store(true, Ordering::SeqCst);
+        f.ttl.store(3600, Ordering::SeqCst);
+        let raw = format!("dsbots@pdown.iam.gserviceaccount.com boundary={bots}; dsusers@pdown.iam.gserviceaccount.com USER_GCP_TOKEN=accessToken boundary={owners}");
+        let rc = RunCredentials::new(f.clone(), parse_as(&GCP, &raw).unwrap());
+        assert!(rc.describe().contains("dsbots@pdown.iam.gserviceaccount.com (narrowed), dsusers@pdown.iam.gserviceaccount.com (narrowed)"), "{}", rc.describe());
+
+        let (e, _l) = rc.issue("udown2", "bdown2", true, RUN).unwrap();
+        assert_eq!(env(&e).len(), 3);
+        let narrowed = f.narrowed.lock().unwrap().clone();
+        let [(p0, n0), (p1, n1)] = &narrowed[..] else { panic!("{narrowed:?}") };
+        assert_eq!((p0.as_str(), p1.as_str()), ("dsbots@pdown.iam.gserviceaccount.com", "dsusers@pdown.iam.gserviceaccount.com"));
+        assert!(n0.boundary.as_deref().unwrap().contains("acme-bots/objects/bdown2/") && !n0.narrows_session());
+        assert!(n1.boundary.as_deref().unwrap().contains("buckets/acme-u-udown2"));
+
+        let ev = external::tests::audited("dsbots@pdown.iam.gserviceaccount.com");
+        let issued = ev.iter().find(|e| e.action == "secret.lease_issued").unwrap();
+        assert_eq!(issued.details["boundarySha256"], crate::sigv4::sha256_hex(n0.boundary.as_deref().unwrap().as_bytes()), "which boundary, never the file's path");
+        assert!(issued.details.get("policySha256").is_none() && issued.details.get("tags").is_none() && !format!("{ev:?}").contains("downscoped-bots"));
+        let users = external::tests::audited("dsusers@pdown.iam.gserviceaccount.com");
+        assert_eq!(users.iter().find(|e| e.action == "secret.lease_issued").unwrap().details["userId"], "udown2");
+
+        // A run for someone else: no token the owner's boundary would scope.
+        f.narrowed.lock().unwrap().clear();
+        let (e, _l) = rc.issue("udown2", "bdown2", false, RUN).unwrap();
+        assert_eq!(env(&e).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), ["CLOUDSDK_AUTH_ACCESS_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]);
+        assert_eq!(f.narrowed.lock().unwrap().len(), 1);
     }
 }

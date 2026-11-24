@@ -12,11 +12,13 @@
 //! It is also the `leases::Issuer` of `GCP_RUN_CREDENTIALS` (ADR 0203): an access token
 //! of a service account botd impersonates (IAM Credentials' `generateAccessToken`), made
 //! for each run with botd's own token, lasting the longest the run may. Google can't
-//! revoke one, so it is let go at its expiry.
+//! revoke one, so it is let go at its expiry. An entry with `boundary=` (ADR 0240) trades
+//! that token at Google's Security Token Service for one limited by its Credential Access
+//! Boundary, and the run gets only that one.
 
 use super::external::{Provider, Scope};
 use super::http::{self, Bearer, Worker};
-use super::leases::{Field, Issuer, Lease};
+use super::leases::{Field, Issuer, Lease, Narrowed};
 use super::{Error, SecretStore};
 use aws_lc_rs::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -32,6 +34,11 @@ const METADATA_HOST: &str = "169.254.169.254";
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const IAM_CREDENTIALS: &str = "https://iamcredentials.googleapis.com";
+const STS: &str = "https://sts.googleapis.com";
+const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+/// The longest downscoped token taken: Google's are at most 12 KB.
+const MAX_DOWNSCOPED: usize = 16 * 1024;
 /// An impersonated token's shortest life; its longest without the organization policy
 /// `constraints/iam.allowServiceAccountCredentialLifetimeExtension`, and with it.
 const MIN_LIFETIME: u64 = 300;
@@ -62,6 +69,9 @@ pub struct Config {
     pub auth: Auth,
     /// IAM Credentials, for `GCP_RUN_CREDENTIALS`; no trailing slash.
     pub iam_endpoint: String,
+    /// The Security Token Service, for `GCP_RUN_CREDENTIALS` entries with `boundary=`; no
+    /// trailing slash.
+    pub sts_endpoint: String,
 }
 
 fn prefix_setting(raw: &str) -> Result<String, String> {
@@ -263,7 +273,11 @@ impl Config {
             "" => IAM_CREDENTIALS.to_string(),
             e => http::base_url("GCP_IAM_CREDENTIALS_ENDPOINT", e, IAM_CREDENTIALS)?,
         };
-        Ok(Config { endpoint, parent, prefix: prefix_setting(&var("GCP_SECRET_MANAGER_PREFIX"))?, auth, iam_endpoint })
+        let sts_endpoint = match var("GCP_STS_ENDPOINT").trim() {
+            "" => STS.to_string(),
+            e => http::base_url("GCP_STS_ENDPOINT", e, STS)?,
+        };
+        Ok(Config { endpoint, parent, prefix: prefix_setting(&var("GCP_SECRET_MANAGER_PREFIX"))?, auth, iam_endpoint, sts_endpoint })
     }
 }
 
@@ -411,9 +425,10 @@ impl Inner {
     }
 
     /// A new access token of `email` for one run of `bot_id` (ADR 0203), lasting `run_for`
-    /// (at least Google's 5 minutes), asked for with botd's own token. When Google refuses
-    /// that token, gets a new one and asks once more.
-    async fn impersonate(&self, email: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
+    /// (at least Google's 5 minutes), asked for with botd's own token, and downscoped to
+    /// `boundary` if given (ADR 0240). When Google refuses botd's token, gets a new one and
+    /// asks once more.
+    async fn impersonate(&self, email: &str, fields: &[String], run_for: Duration, bot_id: &str, boundary: Option<&str>) -> Result<Lease, Error> {
         let secs = run_for.as_secs().max(MIN_LIFETIME);
         if secs > MAX_LIFETIME {
             return Err(Error::Unavailable(format!("GCP IAM: a run may last {secs} s (RUN_TIMEOUT_MINUTES), longer than Google's longest access token ({MAX_LIFETIME} s), so GCP_RUN_CREDENTIALS can't cover it")));
@@ -433,7 +448,12 @@ impl Inner {
             }
             let reply = Zeroizing::new(res.bytes().await.map_err(|e| iam_unavailable(&what, e))?.to_vec());
             if status.is_success() {
-                return token_lease(&reply, email, fields, secs, bot_id, &what);
+                let (token, ttl) = access_token(&reply, secs, &what)?;
+                let (token, ttl) = match boundary {
+                    Some(b) => self.downscope(&token, b, ttl, secs, email).await?,
+                    None => (token, ttl),
+                };
+                return Ok(token_lease(token, ttl, email, fields, bot_id));
             }
             let hint = match status.as_u16() {
                 403 => "; botd's service account needs roles/iam.serviceAccountTokenCreator on it, and the IAM Service Account Credentials API must be on in botd's project".to_string(),
@@ -445,17 +465,49 @@ impl Inner {
         }
         unreachable!("the second pass returns")
     }
+
+    /// `token`, of `email`, traded at Google's Security Token Service for one that can do
+    /// only what `boundary` (a Credential Access Boundary, as JSON) allows. It ends when
+    /// `token` does (`ttl`), or sooner if STS says so; one that ends more than a minute
+    /// before the run could (`run_for`) is refused. The exchange needs no other credential:
+    /// `token` is its own proof.
+    async fn downscope(&self, token: &str, boundary: &str, ttl: u64, run_for: u64, email: &str) -> Result<(Zeroizing<String>, u64), Error> {
+        let what = format!("downscoping the token of {email}");
+        let url = format!("{}/v1/token", self.cfg.sts_endpoint);
+        let form = [("grant_type", TOKEN_EXCHANGE), ("subject_token_type", ACCESS_TOKEN_TYPE), ("requested_token_type", ACCESS_TOKEN_TYPE), ("subject_token", token), ("options", boundary)];
+        let unavailable = |e: &dyn std::fmt::Display| Error::Unavailable(format!("GCP STS: {what}: {e}"));
+        let res = self.http.post(&url).form(&form).send().await.map_err(|e| unavailable(&e))?;
+        let status = res.status();
+        let reply = Zeroizing::new(res.bytes().await.map_err(|e| unavailable(&e))?.to_vec());
+        if !status.is_success() {
+            let hint = match status.as_u16() {
+                400 => "; check the entry's boundary= file: Google takes only roles it knows after inRole: and conditions in CEL",
+                403 => "; the Security Token Service API (sts.googleapis.com) must be on in botd's project",
+                _ => "",
+            };
+            return Err(Error::Unavailable(format!("GCP STS answered {status}{} for {what}{hint}", http::error_code(&reply))));
+        }
+        let bad = |why: &str| Error::Unavailable(format!("GCP STS: {what} {why}"));
+        let v: Value = serde_json::from_slice(&reply).map_err(|_| bad("answered with something that isn't JSON"))?;
+        let down = v["access_token"].as_str().filter(|t| !t.is_empty() && t.len() <= MAX_DOWNSCOPED && t.bytes().all(|b| b.is_ascii_graphic())).ok_or_else(|| bad("gave no access token"))?;
+        if down == token {
+            return Err(bad("gave back the token it was sent, not a downscoped one"));
+        }
+        let ttl = http::seconds(&v["expires_in"]).map_or(ttl, |s| s.min(ttl));
+        if ttl + 60 < run_for {
+            return Err(bad(&format!("gave a token that ends in {ttl} s, but a run may last {run_for} s (RUN_TIMEOUT_MINUTES)")));
+        }
+        Ok((Zeroizing::new(down.to_string()), ttl))
+    }
 }
 
 fn iam_unavailable(what: &str, e: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("GCP IAM: {what}: {e}"))
 }
 
-/// A run's lease from `generateAccessToken`'s answer: the token under each field asked
-/// for, and how long it lasts. A token that ends before the run could is refused. Google
-/// gives a token no id, so the lease's is the account and `superbot-<bot id>-<random>`,
-/// for SuperBot's own audit log.
-fn token_lease(body: &[u8], email: &str, fields: &[String], run_for: u64, bot_id: &str, what: &str) -> Result<Lease, Error> {
+/// The token in `generateAccessToken`'s answer, and how long it lasts. A token that ends
+/// before the run could is refused.
+fn access_token(body: &[u8], run_for: u64, what: &str) -> Result<(Zeroizing<String>, u64), Error> {
     let bad = |why: &str| Error::Unavailable(format!("GCP IAM: {what} {why}"));
     let v: Value = serde_json::from_slice(body).map_err(|_| bad("answered with something that isn't JSON"))?;
     let token = v["accessToken"].as_str().filter(|t| !t.is_empty() && t.len() <= 8192 && t.bytes().all(|b| b.is_ascii_graphic())).ok_or_else(|| bad("gave no access token"))?;
@@ -465,8 +517,15 @@ fn token_lease(body: &[u8], email: &str, fields: &[String], run_for: u64, bot_id
     if ttl + 60 < run_for {
         return Err(bad(&format!("gave a token that ends in {ttl} s, but a run may last {run_for} s (RUN_TIMEOUT_MINUTES)")));
     }
-    let fields = fields.iter().map(|f| if f == "accessToken" { Field::Value(Zeroizing::new(token.to_string())) } else { Field::Missing }).collect();
-    Ok(Lease { id: format!("{email}/{}", super::aws::session_name(bot_id)), ttl, renewable: false, fields })
+    Ok((Zeroizing::new(token.to_string()), ttl))
+}
+
+/// A run's lease of `token`: under each field asked for, lasting `ttl`. Google gives a
+/// token no id, so the lease's is the account and `superbot-<bot id>-<random>`, for
+/// SuperBot's own audit log.
+fn token_lease(token: Zeroizing<String>, ttl: u64, email: &str, fields: &[String], bot_id: &str) -> Lease {
+    let fields = fields.iter().map(|f| if f == "accessToken" { Field::Value(token.clone()) } else { Field::Missing }).collect();
+    Lease { id: format!("{email}/{}", super::aws::session_name(bot_id)), ttl, renewable: false, fields }
 }
 
 /// A signed JWT that trades for an access token (RFC 7523), good for an hour.
@@ -511,8 +570,15 @@ impl Issuer for SecretManager {
     }
 
     fn issue(&self, email: &str, fields: &[String], run_for: Duration, bot_id: &str) -> Result<Lease, Error> {
-        let (inner, email, fields, bot_id) = (Arc::clone(&self.inner), email.to_string(), fields.to_vec(), bot_id.to_string());
-        self.worker.run(async move { inner.impersonate(&email, &fields, run_for, &bot_id).await })
+        self.issue_narrowed(email, fields, run_for, bot_id, &Narrowed::default())
+    }
+
+    fn issue_narrowed(&self, email: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
+        if narrowed.narrows_session() {
+            return Err(Error::Unavailable("GCP IAM: a token can't be narrowed with a session policy or tags, only an access boundary".into()));
+        }
+        let (inner, email, fields, bot_id, boundary) = (Arc::clone(&self.inner), email.to_string(), fields.to_vec(), bot_id.to_string(), narrowed.boundary.clone());
+        self.worker.run(async move { inner.impersonate(&email, &fields, run_for, &bot_id, boundary.as_deref()).await })
     }
 
     fn revoke(&self, _lease_id: &str) -> Result<(), Error> {
@@ -564,6 +630,8 @@ mod tests {
         impersonated: Mutex<Vec<(String, String, Value)>>,
         /// The access tokens made for runs.
         run_tokens: Mutex<Vec<String>>,
+        /// Each token exchange at STS: the subject token, the options as sent, the token made.
+        downscoped: Mutex<Vec<(String, String, String)>>,
     }
 
     type F = Arc<Fake>;
@@ -683,12 +751,46 @@ mod tests {
         (StatusCode::OK, Json(json!({ "accessToken": token, "expireTime": at })))
     }
 
+    /// STS's `v1/token`: trades a run token IAM Credentials made, and nothing else, for a
+    /// downscoped one, as Google does for a service account's token (no `expires_in`). The
+    /// first rule's bucket picks an odd answer: `refused`, `forbidden`, `short`, `echo`, `odd`.
+    async fn sts(State(f): State<F>, Form(form): Form<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+        let refuse = |code: StatusCode, error: &str| (code, Json(json!({ "error": error, "error_description": "quoting-the-request" })));
+        if f.down.load(Ordering::SeqCst) {
+            return refuse(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+        }
+        let get = |k: &str| form.get(k).cloned().unwrap_or_default();
+        if get("grant_type") != TOKEN_EXCHANGE || get("subject_token_type") != ACCESS_TOKEN_TYPE || get("requested_token_type") != ACCESS_TOKEN_TYPE {
+            return refuse(StatusCode::BAD_REQUEST, "invalid_request");
+        }
+        let subject = get("subject_token");
+        if !f.run_tokens.lock().unwrap().contains(&subject) {
+            return refuse(StatusCode::BAD_REQUEST, "invalid_grant");
+        }
+        let Ok(options) = serde_json::from_str::<Value>(&get("options")) else { return refuse(StatusCode::BAD_REQUEST, "invalid_request") };
+        let bucket = options["accessBoundary"]["accessBoundaryRules"][0]["availableResource"].as_str().and_then(|r| r.rsplit('/').next()).unwrap_or_default().to_string();
+        let token = match bucket.as_str() {
+            "echo" => subject.clone(),
+            "short" => "ya29.down-short".to_string(),
+            _ => format!("ya29.down-{}", crate::random_hex(8)),
+        };
+        f.downscoped.lock().unwrap().push((subject, get("options"), token.clone()));
+        match bucket.as_str() {
+            "refused" => refuse(StatusCode::BAD_REQUEST, "invalid_request"),
+            "forbidden" => refuse(StatusCode::FORBIDDEN, "access_denied"),
+            "odd" => (StatusCode::OK, Json(json!({ "token_type": "Bearer" }))),
+            "short" => (StatusCode::OK, Json(json!({ "access_token": token, "expires_in": 60, "token_type": "Bearer" }))),
+            _ => (StatusCode::OK, Json(json!({ "access_token": token, "issued_token_type": ACCESS_TOKEN_TYPE, "token_type": "Bearer" }))),
+        }
+    }
+
     fn stand_in() -> (String, F) {
         let f = F::default();
         f.expires_in.store(3599, Ordering::SeqCst);
         let app = axum::Router::new()
             .route("/computeMetadata/v1/instance/service-accounts/default/token", axum::routing::get(metadata_token))
             .route("/token", axum::routing::post(oauth_token))
+            .route("/v1/token", axum::routing::post(sts))
             .route("/v1/{*rest}", axum::routing::get(api).post(iam))
             .with_state(Arc::clone(&f));
         (serve(app), f)
@@ -864,6 +966,7 @@ mod tests {
             ("GCP_SECRET_MANAGER_PROJECT", "proj-1"),
             ("GCP_SECRET_MANAGER_ENDPOINT", url),
             ("GCP_IAM_CREDENTIALS_ENDPOINT", url),
+            ("GCP_STS_ENDPOINT", url),
             ("GCE_METADATA_HOST", host),
             ("GCP_RUN_CREDENTIALS", accounts),
         ];
@@ -953,6 +1056,70 @@ mod tests {
         assert!(matches!(rc.issue("ugcp8", "bgcp8", true, RUN), Err(Error::Unavailable(_))), "Google down: refused, never a run without its token");
     }
 
+    use super::super::leases::tests::{policy_file, BOUNDARY};
+
+    #[test]
+    fn a_boundary_downscopes_each_runs_token_at_googles_sts() {
+        let (url, f) = stand_in();
+        let file = policy_file("gcp-boundary", BOUNDARY);
+        let rc = run_credentials(&url, &format!("superbot-bots@proj-1.iam.gserviceaccount.com boundary={file}; superbot-plain@proj-1.iam.gserviceaccount.com PLAIN_GCP_TOKEN=accessToken"));
+        let (e, l) = rc.issue("ugcp9", "bgcp9", true, RUN).unwrap();
+        let v = values(&e);
+        let downs = f.downscoped.lock().unwrap().clone();
+        let [(subject, options, token)] = &downs[..] else { panic!("{downs:?}") };
+        assert_eq!((&v["GOOGLE_OAUTH_ACCESS_TOKEN"], &v["CLOUDSDK_AUTH_ACCESS_TOKEN"]), (token, token), "the run gets the downscoped token");
+        assert!(f.run_tokens.lock().unwrap().contains(subject), "traded the token IAM Credentials made, checked by the stand-in");
+        assert!(!v.values().any(|t| t == subject), "never the token it was traded for");
+        assert!(f.run_tokens.lock().unwrap().contains(&v["PLAIN_GCP_TOKEN"]), "an entry with no boundary isn't downscoped");
+        let sent: Value = serde_json::from_str(options).unwrap();
+        assert_eq!(sent["accessBoundary"]["accessBoundaryRules"][0]["availabilityCondition"]["expression"], "resource.name.startsWith('projects/_/buckets/acme-bots/objects/bgcp9/')");
+        assert_eq!(redact::text(&format!("leaked {token}")), format!("leaked {}", redact::MARK));
+
+        let ev: Vec<_> = audited("superbot-bots@proj-1.iam.gserviceaccount.com").into_iter().filter(|e| e.bot_id.as_deref() == Some("bgcp9")).collect();
+        let issued = ev.iter().find(|e| e.action == "secret.lease_issued").unwrap();
+        assert_eq!(issued.details["boundarySha256"], crate::sigv4::sha256_hex(options.as_bytes()), "the boundary exactly as sent");
+        assert!((3590..=3600).contains(&issued.details["ttl"].as_u64().unwrap()), "as long as the token it came from: {:?}", issued.details);
+        assert!(!format!("{ev:?}").contains(token.as_str()) && !format!("{ev:?}").contains(subject.as_str()), "never a token");
+        drop(l);
+        let released = audited("superbot-bots@proj-1.iam.gserviceaccount.com").into_iter().filter(|e| e.action == "secret.lease_released" && e.bot_id.as_deref() == Some("bgcp9")).count();
+        assert_eq!(released, 1);
+        assert_eq!(redact::text(token), redact::MARK, "it works until it expires, so it stays redacted");
+
+        // A session policy or tags can't narrow a Google token: refused, not ignored.
+        let sm = SecretManager::new(Config::from_env(&settings(&[("GCP_SECRET_MANAGER_PROJECT", "proj-1")]), &EnvStore::fixed(&[])).unwrap()).unwrap();
+        let tagged = Narrowed { tags: vec![("superbot-bot", "b1".into())], ..Narrowed::default() };
+        let e = sm.issue_narrowed("superbot-bots@proj-1.iam.gserviceaccount.com", &["accessToken".into()], RUN, "b1", &tagged).err().unwrap().to_string();
+        assert!(e.contains("can't be narrowed with a session policy or tags"), "{e}");
+    }
+
+    #[test]
+    fn sts_refusing_or_odd_refuses_the_run() {
+        let (url, f) = stand_in();
+        for (bucket, err) in [
+            ("refused", "GCP STS answered 400 Bad Request (invalid_request) for downscoping the token of superbot-bots@proj-1.iam.gserviceaccount.com; check the entry's boundary= file"),
+            ("forbidden", "403 Forbidden (access_denied) for downscoping the token of superbot-bots@proj-1.iam.gserviceaccount.com; the Security Token Service API (sts.googleapis.com) must be on"),
+            ("short", "gave a token that ends in 60 s, but a run may last 3600 s"),
+            ("echo", "gave back the token it was sent"),
+            ("odd", "gave no access token"),
+        ] {
+            let file = policy_file(&format!("gcp-sts-{bucket}"), &BOUNDARY.replace("acme-bots", bucket));
+            let rc = run_credentials(&url, &format!("superbot-bots@proj-1.iam.gserviceaccount.com boundary={file}"));
+            let e = rc.issue("ugcp10", &format!("bsts-{bucket}"), true, RUN).err().unwrap().to_string();
+            assert!(e.contains(err) && !e.contains("quoting"), "{bucket}: {e}");
+            let ev = audited("superbot-bots@proj-1.iam.gserviceaccount.com");
+            assert!(ev.iter().any(|e| e.action == "secret.lease_issued" && e.outcome == Outcome::Failure && e.bot_id.as_deref() == Some(&format!("bsts-{bucket}"))), "{bucket}");
+        }
+        assert!(!redact::text("ya29.down-short").contains(redact::MARK), "a refused token is never held");
+
+        // STS down: refused, never the wider token instead.
+        let file = policy_file("gcp-sts-down", BOUNDARY);
+        let rc = run_credentials(&url, &format!("superbot-bots@proj-1.iam.gserviceaccount.com boundary={file}"));
+        let before = f.downscoped.lock().unwrap().len();
+        f.down.store(true, Ordering::SeqCst);
+        assert!(matches!(rc.issue("ugcp10", "bsts-down", true, RUN), Err(Error::Unavailable(_))));
+        assert_eq!(f.downscoped.lock().unwrap().len(), before);
+    }
+
     #[test]
     fn run_credentials_settings_are_checked() {
         let base = [("SECRETS_BACKEND", "gcp-secret-manager"), ("GCP_SECRET_MANAGER_PROJECT", "proj-1")];
@@ -967,6 +1134,8 @@ mod tests {
         assert!(e.contains("GCP_RUN_CREDENTIALS") && e.contains("service account's email"));
         let e = with(&[("GCP_IAM_CREDENTIALS_ENDPOINT", "http://iamcredentials.example.com")]).err().unwrap();
         assert!(e.contains("GCP_IAM_CREDENTIALS_ENDPOINT") && e.contains("must use https"));
+        let e = with(&[("GCP_STS_ENDPOINT", "http://sts.example.com")]).err().unwrap();
+        assert!(e.contains("GCP_STS_ENDPOINT") && e.contains("must use https"));
         let var = settings(&[("GCP_RUN_CREDENTIALS", "superbot-bots@proj-1.iam.gserviceaccount.com")]);
         assert_eq!(super::super::external::unused_settings(&var, "aws"), ["GCP_RUN_CREDENTIALS"], "only SECRETS_BACKEND=gcp-secret-manager reads it");
         assert!(super::super::external::unused_settings(&var, "gcp-secret-manager").is_empty());
@@ -984,7 +1153,7 @@ mod tests {
         let c = ok(&[("GCP_SECRET_MANAGER_PROJECT", "proj-1")]).unwrap();
         assert_eq!((c.endpoint.as_str(), c.parent.as_str(), c.prefix.as_str()), ("https://secretmanager.googleapis.com", "projects/proj-1", "superbot"));
         assert!(matches!(&c.auth, Auth::Metadata { host } if host == METADATA_HOST));
-        assert_eq!(c.iam_endpoint, "https://iamcredentials.googleapis.com");
+        assert_eq!((c.iam_endpoint.as_str(), c.sts_endpoint.as_str()), ("https://iamcredentials.googleapis.com", "https://sts.googleapis.com"));
         let c = ok(&[("GCP_SECRET_MANAGER_PROJECT", "proj-1"), ("GCP_SECRET_MANAGER_LOCATION", "europe-west2")]).unwrap();
         assert_eq!((c.endpoint.as_str(), c.parent.as_str()), ("https://secretmanager.europe-west2.rep.googleapis.com", "projects/proj-1/locations/europe-west2"));
         let p = ("GCP_SECRET_MANAGER_PROJECT", "proj-1");
