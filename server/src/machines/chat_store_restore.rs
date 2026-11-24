@@ -481,27 +481,40 @@ pub struct Plan {
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
-/// erasures deleted, from botd's database. Refused when the audit log no longer reaches
-/// back to the backup and someone was erased since, as their Bots can't all be found.
+/// erasures deleted, from botd's database. A person erased after the backup was made must
+/// have their Bots named by their erasure's `user.erased` event (`botIds`), which is newer
+/// than the backup, so audit retention never prunes it before older events: an erasure
+/// deletes their Bots before it erases what those Bots wrote in others' chats, so a backup
+/// made in between holds that, and `bot.deleted` events from before it may be pruned.
+/// Refused when that event is gone, or is from a botd that didn't name the Bots.
 fn erasures(c: &Connection, backup_at: i64) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let db = |e: rusqlite::Error| format!("botd's database: {e}");
     let people: Vec<(String, String, i64)> = {
         let mut s = c.prepare("SELECT id, COALESCE(erased_as, ''), erased_at FROM users WHERE erased_at IS NOT NULL ORDER BY erased_at").map_err(db)?;
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
     };
-    let bots: Vec<String> = {
+    let mut bots: Vec<String> = {
         let mut s = c
             .prepare("SELECT DISTINCT target_id FROM audit_events WHERE action = 'bot.deleted' AND target_id IS NOT NULL AND json_valid(details) AND json_extract(details, '$.reason') = 'user_erased'")
             .map_err(db)?;
         s.query_map([], |r| r.get(0)).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
     };
-    let oldest: Option<i64> = c.query_row("SELECT MIN(at) FROM audit_events", [], |r| r.get(0)).map_err(db)?;
-    if people.iter().any(|(_, _, at)| *at >= backup_at) && oldest.is_none_or(|o| o > backup_at) {
-        return Err(format!(
-            "someone was erased after this backup was made ({}), and botd's audit log no longer goes back that far, so the Bots their erasure deleted can't all be found. Restore a newer backup (ADR 0256)",
-            date(backup_at)
-        ));
+    for (_, pseudonym, at) in people.iter().filter(|(_, _, at)| *at >= backup_at) {
+        let refuse = |why: &str| format!("{pseudonym} was erased {}, after this backup was made ({}), and {why}, so what their Bots wrote can't all be found. Restore a backup made after their erasure (ADR 0256)", date(*at), date(backup_at));
+        let details: Option<String> = c
+            .query_row("SELECT details FROM audit_events WHERE action = 'user.erased' AND target_id = ?1 ORDER BY at DESC LIMIT 1", [pseudonym], |r| r.get(0))
+            .optional()
+            .map_err(db)?;
+        let Some(details) = details else { return Err(refuse("botd's audit log no longer records their erasure")) };
+        let d: Value = serde_json::from_str(&details).unwrap_or(Value::Null);
+        match d["botIds"].as_array() {
+            Some(ids) => bots.extend(ids.iter().filter_map(|b| b.as_str().map(str::to_string))),
+            None if d["bots"].as_u64() == Some(0) => {}
+            None => return Err(refuse("their erasure was made by an earlier botd that didn't record which Bots it deleted")),
+        }
     }
+    bots.sort();
+    bots.dedup();
     Ok((people.into_iter().map(|(id, p, _)| (id, p)).collect(), bots))
 }
 
@@ -775,12 +788,12 @@ impl Restore {
         match (&p.back, &p.gone, &p.unreadable) {
             (Some(back), Some(gone), _) => {
                 out.push_str(&format!("  Against the store now: {} come back, and {} made since the backup go.\n", back.describe(), gone.describe()));
-                if back.routines > 0 {
-                    out.push_str("  Routines that come back run on their schedule again once botd starts; check them.\n");
-                }
             }
             (_, _, Some(e)) => out.push_str(&format!("  The store now doesn't open ({e}); it {} deleted, not kept.\n", if self.done { "was" } else { "is" })),
             _ => out.push_str("  The store is missing, so nothing in it is lost.\n"),
+        }
+        if p.back.map_or(p.held.routines, |b| b.routines) > 0 {
+            out.push_str("  Routines that come back run on their schedule again once botd starts; check them.\n");
         }
         match (&self.kept, self.done) {
             (Some(k), _) => out.push_str(&format!("  The store as it was is kept as backups/{k}, so this can be undone.\n")),
@@ -1072,19 +1085,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_backup_from_before_the_audit_log_is_refused_once_someone_was_erased_since() {
+    async fn bots_erased_after_the_backup_come_from_the_erasure_event_not_pruned_bot_events() {
         let (w, db) = World::new();
         let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
-        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
-        db.add_message(&ada, "user", "chat-8h", None, false, None);
+        let (bob, bobs) = pinned_bot(&db, "bob", "gb-lon");
+        db.add_message_from(&ada, "user", "chat-8h-from-bobs-bot", None, false, None, Some(&bobs));
+        db.add_message(&ada, "user", "chat-9i-adas-own", None, false, None);
         backup_pass(&db, 7, now() - 30 * DAY);
         db.erase_user(&bob, "erased-91b0", None, &[]).unwrap();
         drop(db);
         let before = std::fs::read(w.store()).unwrap();
+        let erased = |details: Value| Db::open(&w.app).unwrap().record(&Who::system("t").event("user.erased").target("user", "erased-91b0").details(details));
+
         let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
-        assert!(e.contains("audit log no longer goes back that far") && e.contains("Restore a newer backup"), "{e}");
+        assert!(e.contains("erased-91b0 was erased") && e.contains("no longer records their erasure") && e.contains("Restore a backup made after"), "{e}");
+        erased(json!({ "bots": 1 }));
+        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("earlier botd that didn't record which Bots"), "{e}");
         assert_eq!(std::fs::read(w.store()).unwrap(), before);
         assert!(work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
+
+        erased(json!({ "bots": 1, "botIds": [bobs] }));
+        restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!(texts(&w.store()), ["[erased]", "chat-9i-adas-own"]);
     }
 
     #[tokio::test]
@@ -1119,6 +1142,7 @@ mod tests {
         assert!(Place::locate(&rotated(&[("SUPERBOT_MASTER_KEY_PREVIOUS", key.as_str())]), "gb-lon").unwrap().copies().unwrap().is_some());
         let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
         db.add_message(&ada, "user", "chat-9i-off-the-host", None, false, None);
+        db.add_routine_by(&ada, "daily", "0 9 * * *", "chat-9i-daily", true, None);
         backup_pass(&db, 7, now() - DAY);
         let copies = place.copies().unwrap().expect("the bucket, its secret key from botd's saved secrets");
         assert_eq!(copies.pass(&db, now()).await["gb-lon"].as_ref().map(|c| c.uploaded), Ok(1));
@@ -1141,7 +1165,8 @@ mod tests {
         let right = Options { identities: vec![id], ..opts("newest", true) };
         let r = restore(&place, &right, now()).await.unwrap();
         assert!(matches!(r.chosen.source, Source::Bucket(_)) && r.kept.is_none(), "{r:?}");
-        assert!(r.text("gb-lon").contains("The store is missing, so nothing in it is lost"), "{}", r.text("gb-lon"));
+        let text = r.text("gb-lon");
+        assert!(text.contains("The store is missing, so nothing in it is lost") && text.contains("Routines that come back run on their schedule"), "{text}");
         assert_eq!(texts(&w.store()), ["chat-9i-off-the-host"]);
         assert!(work_files(&w.lon).is_empty());
     }
