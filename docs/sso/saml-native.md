@@ -1,6 +1,6 @@
 # Sign in with SAML 2.0 (Okta, Microsoft Entra ID, ADFS, OneLogin, …)
 
-SuperBot is the SAML service provider (SP) itself: your IdP posts its signed answer straight to SuperBot, which checks the signature against the IdP's certificate and the audience, recipient, time and request it answers ([ADR 0127](../adr/0127-native-saml-service-provider.md)). There is nothing else to run. People land on the same users as with any other provider. If your IdP also speaks OpenID Connect, [OIDC](oidc.md) works just as well; the [Keycloak bridge](saml.md) remains for IdPs that can only encrypt assertions with AES-CBC (Entra ID and ADFS do), if you must encrypt there.
+SuperBot is the SAML service provider (SP) itself: your IdP posts its signed answer straight to SuperBot, which checks the signature against the IdP's certificate and the audience, recipient, time and request it answers ([ADR 0127](../adr/0127-native-saml-service-provider.md)). There is nothing else to run. People land on the same users as with any other provider. If your IdP also speaks OpenID Connect, [OIDC](oidc.md) works just as well; the [Keycloak bridge](saml.md) remains for an IdP that encrypts assertions with AES-CBC but can't sign the whole response ([below](#aes-cbc-entra-id-and-adfs)).
 
 ```
 browser ──► SuperBot ──AuthnRequest──► Okta / Entra ID / ADFS
@@ -195,6 +195,9 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_AUTHN_CONTEXT` | | Only people the IdP says signed in one of these ways get in, comma separated (exact): authentication context classes, or values of `AUTHN_METHODS_ATTRIBUTE` ([below](#require-mfa-at-the-idp)). |
 | `SSO_<ID>_AUTHN_METHODS_ATTRIBUTE` | | The assertion attribute listing how the person signed in, whose values count for `AUTHN_CONTEXT` too (Entra ID: `http://schemas.microsoft.com/claims/authnmethodsreferences`). Needs `AUTHN_CONTEXT`. |
 | `SSO_<ID>_REQUEST_AUTHN_CONTEXT` | `false` | `true`: AuthnRequests ask the IdP for the `AUTHN_CONTEXT` classes (`RequestedAuthnContext`, exact). Needs `AUTHN_CONTEXT`. |
+| `SSO_<ID>_FORCE_AUTHN` | `false` | `true`: every AuthnRequest asks the IdP to sign the person in again (`ForceAuthn`), and an answer from before the request is refused ([below](#sign-in-age-and-the-idps-session-limit)). |
+| `SSO_<ID>_MAX_AUTHN_AGE` | | A duration (`30m`, `12h`, `7d`; 5m to 365d): a sign-in at the IdP older than this is sent back once with `ForceAuthn`. Not with `FORCE_AUTHN`. |
+| `SSO_<ID>_IDP_SESSION_LIMIT` | `on` | Sessions end at the IdP's `SessionNotOnOrAfter`, if sooner than `SESSION_MAX_AGE`. `off` ignores it. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
 
@@ -368,6 +371,27 @@ App tiles ([above](#idp-initiated-sign-in-app-tiles)) aren't held to it, because
 
 If the values are wrong, nobody gets in with this provider. Break-glass and one-time codes still work. Fix the setting from what the audit log says the IdP sent.
 
+## Sign-in age and the IdP's session limit
+
+The signed assertion says when the IdP signed the person in (`AuthnInstant`) and, from some IdPs, when its own session for them ends (`SessionNotOnOrAfter`). SuperBot uses both ([ADR 0225](../adr/0225-saml-session-lifetime-and-reauthentication.md)):
+
+- **Sessions end with the IdP's.** A SuperBot session (web or app) from an assertion with `SessionNotOnOrAfter` ends then, or at `SESSION_MAX_AGE` if that's sooner. When it ends, the person signs in again through the IdP. This is on by default; `SSO_CORP_IDP_SESSION_LIMIT=off` ignores the IdP's limit.
+- **An ended IdP session gets a new sign-in.** If the IdP's limit has already passed (or is under two minutes away), SuperBot sends the browser back to the IdP once, asking it to sign the person in again (`ForceAuthn`), instead of making a session that is already over.
+- **Require a recent sign-in.** `SSO_CORP_MAX_AUTHN_AGE=12h` sends anyone whose IdP sign-in is older than 12 hours back to the IdP once, with `ForceAuthn`. `SSO_CORP_FORCE_AUTHN=true` asks for a new sign-in every time instead. Set one, not both.
+
+```bash
+# Sign in at the IdP at least once a working day to use SuperBot.
+SSO_CORP_MAX_AUTHN_AGE=12h
+```
+
+- **One retry, then a clear refusal.** The IdP's answer to a `ForceAuthn` request must show a sign-in after that request (within two minutes of clock difference). If it answers from its old session again, the sign-in is refused: `stale_authn` (or `idp_session_ended`) in the audit log, and the person sees that their organization's sign-in was too long ago. An assertion without `AuthnInstant` can't show it's recent, so it's refused when a recent sign-in is required.
+- **Checked last**, after the signature, required groups and MFA, and before the account is looked up, so just in time never makes an account from a stale sign-in. The sign-in asked again is audited as `auth.saml_reauthn` (`reason`, `authnInstant`, `authnSince`, `idpSessionEnds`). Every `auth.login` records `authnInstant`, `idpSessionEnds` when the IdP set one, and `forceAuthn` when SuperBot asked.
+- **Several statements.** With more than one `AuthnStatement`, the latest `AuthnInstant` and the earliest `SessionNotOnOrAfter` count. Values outside the signed assertion are never read.
+- **App tiles** ([above](#idp-initiated-sign-in-app-tiles)) aren't held to it, because their response never signs anyone in. The sign-in they restart is.
+- **Sessions people already have aren't changed.** The settings apply from their next sign-in. `botctl sso saml corp` shows them.
+
+Most IdPs honour `ForceAuthn` (Okta: the app's **Honor Force Authentication** setting must stay on). Some sign people in again silently, with Kerberos or a passkey, which is still a new sign-in. An IdP that ignores it fails with `stale_authn` every time: fix the app at the IdP, or set a longer `MAX_AUTHN_AGE`.
+
 ## Troubleshooting
 
 Every refused sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`, `idp` = `saml`; `idpInitiated` is true for posts from an app tile). Failures nobody vouched for, such as bad signatures, are logged at most once a minute per address, with a count of those skipped. People see a short message on the sign-in page.
@@ -397,6 +421,8 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
 | `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |
+| `stale_authn` | `FORCE_AUTHN` or `MAX_AUTHN_AGE` is set, and the IdP's answer to SuperBot's `ForceAuthn` request was from an older sign-in. `authnInstant` and `authnSince` say how old. The IdP ignores `ForceAuthn`: fix the app at the IdP ([above](#sign-in-age-and-the-idps-session-limit)). |
+| `idp_session_ended` | The IdP's `SessionNotOnOrAfter` had passed, and its answer to SuperBot's `ForceAuthn` request was in the same ended session. `idpSessionEnds` says when. Fix the IdP's session lifetime, or set `IDP_SESSION_LIMIT=off`. |
 | `user_disabled` | The person is disabled in SuperBot. |
 | `not_in_group` | `SSO_<ID>_REQUIRED_GROUPS` is set and the assertion lists none of them. Check the name or id (exact, case included) and that the IdP sends the attribute `GROUPS_ATTRIBUTE` names. |
 | `groups_unknown` | The IdP couldn't list the groups: `groups` = `overage` (Entra ID: send only groups assigned to the application) or `too_many` (over 500). |
