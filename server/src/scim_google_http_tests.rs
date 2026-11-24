@@ -752,6 +752,15 @@ async fn the_health_check_counts_the_sync_as_provisioning() {
     assert_eq!(sync(&w, "").await.0, 502);
     let (status, detail) = scim().await;
     assert_eq!((status.as_str(), detail.as_str()), ("open", "The Google Workspace sync's latest pass didn't succeed (google_error): botctl scim google."));
+
+    g.set(|d| d.down = false);
+    synced(&w).await;
+    let now = db::now();
+    let t = w.app.db.create_scim_token("okta", None, None, "stand-in-hash", None, now + 86_400_000, Default::default()).unwrap();
+    w.app.db.set_scim_token_expiry(&t.id, Some(now - 1000));
+    let (status, detail) = scim().await;
+    assert_eq!(status, "open", "a working sync doesn't hide another tenant whose tokens expired: {detail}");
+    assert!(detail.starts_with("Every token of 1 tenant has expired"), "{detail}");
 }
 
 #[tokio::test]

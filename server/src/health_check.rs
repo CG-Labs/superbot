@@ -183,6 +183,9 @@ pub struct Scim {
     /// A working token was used in the score's window.
     pub used_recently: bool,
     pub tenants_expiring: usize,
+    /// Tenants with an expired token and no working one: their IdP can't provision or
+    /// disable anyone. A tenant whose tokens were all revoked was retired on purpose.
+    pub tenants_lapsed: usize,
     /// GOOGLE_DIRECTORY_SYNC=on: its tenant takes no SCIM token, so its passes stand in for one.
     pub google: Option<GoogleSync>,
 }
@@ -425,6 +428,13 @@ fn judge(id: &str, i: &Inputs) -> (Status, String) {
             Some(Scim { google: Some(GoogleSync { passed_recently: false, .. }), .. }) => {
                 (Open, format!("The Google Workspace sync has no successful pass in the last {SCORE_DAYS} days: botctl scim google."))
             }
+            Some(c) if c.tenants_lapsed > 0 => (
+                Open,
+                format!(
+                    "Every token of {} has expired, so its IdP can't provision or disable anyone: botctl scim token create.",
+                    plural(c.tenants_lapsed as u64, "tenant", "tenants")
+                ),
+            ),
             Some(c) if c.working_tokens == 0 && c.google.is_none() => (Open, "SCIM is on, but no tenant has a working token: botctl scim token create.".into()),
             Some(c) if c.tenants_expiring > 0 => {
                 (Open, format!("Every token of {} ends within {} days: botctl scim token rotate.", plural(c.tenants_expiring as u64, "tenant", "tenants"), crate::scim::WARN_DAYS))
@@ -718,6 +728,10 @@ pub fn gather(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
             working_tokens: tokens.iter().filter(working).count(),
             used_recently: tokens.iter().filter(working).any(|t| t.last_used_at.is_some_and(|u| u >= window)),
             tenants_expiring: crate::scim::tenants_expiring(&tokens, now_ms).len(),
+            tenants_lapsed: {
+                let lapsed: std::collections::BTreeSet<&str> = tokens.iter().filter(|t| crate::scim::token_state(t, now_ms) == "expired").map(|t| t.tenant.as_str()).collect();
+                lapsed.into_iter().filter(|n| !tokens.iter().any(|t| t.tenant == *n && working(&t))).count()
+            },
             google: a.scim.google.as_ref().map(|_| {
                 let passes = |outcome: Option<&str>| {
                     let f = Filter { from: Some(window), actions: vec![GOOGLE_SYNC.into()], outcome: outcome.map(String::from), ..Default::default() };
@@ -1005,6 +1019,8 @@ mod tests {
             (google(Some("too_many_removals"), true), "The Google Workspace sync's latest pass didn't succeed (too_many_removals): botctl scim google."),
             (google(None, false), "The Google Workspace sync has no successful pass in the last 30 days: botctl scim google."),
             (Scim { working_tokens: 1, ..google(None, true) }, "No SCIM request in the last 30 days"),
+            (Scim { tenants_lapsed: 1, ..google(None, true) }, "Every token of 1 tenant has expired, so its IdP can't provision or disable anyone"),
+            (Scim { working_tokens: 1, used_recently: true, tenants_lapsed: 2, ..Default::default() }, "Every token of 2 tenants has expired"),
         ] {
             i.scim = Some(s);
             let (st, d) = status(&check(&i), "scim");
