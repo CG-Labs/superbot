@@ -356,10 +356,50 @@ Logins that go through a vendor's website (`claude login`, `codex login`) don't 
 | `--with-hermes` | Downloads Hermes Agent: with `--offline`, give `--hermes-bundle` ([Hermes Agent](#hermes-agent)) |
 | Harness CLIs on users' machines | Claude Code, Codex and Pi from botd's harness bundle (`MACHINE_HARNESS_BUNDLE`, [above](#claude-code-codex-and-pi-from-botds-harness-bundle)), or from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent from botd's Hermes bundle (`MACHINE_HERMES_BUNDLE`, [above](#hermes-agent-on-users-machines)) |
 | Billing (Stripe), push notifications (`PUSH_PROVIDER=expo`), Turnstile on the sign-up form | Need the internet: leave them off (the default) |
-| Managed machines on Linode | Need the internet: use Incus hosts inside your network, or none |
+| Managed machines on Linode | Need the internet: use Incus hosts inside your network, or none. Incus fetches images from `images.linuxcontainers.org` unless you import them and set `INCUS_IMAGE_SERVER=local` ([guide](incus-containers.md)) |
 | Off-host backups | An S3-compatible store inside your network (MinIO, Ceph) |
 | Error reporting and traces | Off by default; point them at a Sentry-compatible tracker or OTLP collector inside your network |
 | Email | Your own SMTP relay |
+
+## Checking settings before going offline
+
+`botd offline check` reads botd's settings and lists every address they name, or that botd uses by default, with whether it is inside your network ([ADR 0257](../adr/0257-checking-settings-for-air-gapped-networks.md)). It opens no connection and looks up no name, so run it before cutting the server off, and again after changing `.env`:
+
+```sh
+sudo -u superbot botd offline check --home /home/superbot --internal corp.example,203.0.113.0/24
+```
+
+- `--home <dir>` reads the installer's `<dir>/superbot/.env`; `--env-file <file>` reads that file. Either way the file wins over botd's environment, as when botd starts. With neither, botd's environment alone.
+- `--internal` adds DNS suffixes and address ranges that are inside your network. Private and loopback addresses, single-label names and names under `.internal`, `.local`, `.lan`, `.home.arpa`, `.corp`, `.intranet` and `.private` are inside already. It may repeat or take a comma list.
+- `--json` prints the findings for a script.
+
+Each finding is one of:
+
+- `internet`: a service that is only on the internet, such as Stripe, npm's registry or Microsoft Entra ID. Change the setting as the line says.
+- `check`: botd can't tell from the name alone, such as a public address, an unknown name, or a cloud service (AWS, Azure, Google Cloud) you may reach through a private endpoint. If it is inside, add it with `--internal`.
+- `ok`: inside your network, or off.
+
+It exits 1 while anything is `internet`, else 0, and 2 for a usage error. `install.sh --offline` runs it at the end of an install and warns, without stopping, when something reaches the internet.
+
+| Area | What it reads |
+|------|---------------|
+| License | Nothing: the license is checked offline |
+| Sign-in | Each SSO provider's issuer, authority or metadata URL (`SSO_*`), defaults included |
+| Model providers | The tiers file's `providers` and routes, `SUPERBOT_HERMES_BASE_URL`, `ANTHROPIC_BASE_URL`, or an API key with no base URL |
+| Machines | `LINODE_TOKEN`; `INCUS_URL`, `INCUS_HOSTS` and `INCUS_IMAGE_SERVER` |
+| Harnesses on machines | `MACHINE_HARNESSES` (or the managed tiers' harnesses), `MACHINE_HARNESS_BUNDLE`, `MACHINE_NODE_MIRROR`, `MACHINE_NPM_REGISTRY`, `MACHINE_HERMES_BUNDLE`, `MACHINE_HARNESS_LOGINS` |
+| Billing | `BILLING` |
+| Push notifications | `PUSH_PROVIDER` |
+| Sign-up form | `TURNSTILE_SITE_KEY` |
+| Email | `SMTP_HOST` |
+| Approval webhooks | `NOTIFY_WEBHOOK_URL` and each `NOTIFY_WEBHOOK_URL_BOT_*` |
+| Backups | `SERVER_BACKUP_S3_*` and each `MACHINE_BACKUP_S3_*_ENDPOINT` |
+| Audit export | `AUDIT_EXPORT`, `AUDIT_EXPORT_S3_ENDPOINT`, `AUDIT_TIMESTAMP_URL` |
+| Errors and traces | `ERROR_REPORT_DSN`, `TRACES_OTLP_ENDPOINT` |
+| Secrets manager | `SECRETS_BACKEND` and its address |
+| Directory sync | `GOOGLE_DIRECTORY_SYNC` |
+
+It reads only botd's settings. Secrets saved with `botctl secret set` or kept in a secrets manager (a Linode token or error-report DSN there, for example) aren't read, nor a Bot's own Codex or Pi configuration on its machine. An OIDC provider's discovery document may name token and key endpoints on other hosts. So treat a clean check as the start, and test sign-in, a Bot run and a backup from inside the network.
 
 ## License and seats
 
