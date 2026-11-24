@@ -69,6 +69,9 @@ pub struct Sink {
     pub name: Option<String>,
     /// `AUDIT_EXPORT_START_<NAME>`, for a named sink with no cursor yet.
     start: Option<Start>,
+    /// Request bodies go gzipped (`AUDIT_EXPORT_COMPRESS`, or `_<NAME>`, ADR 0227): webhook
+    /// and Azure Monitor only. The archive's own setting is [`crate::audit_archive::Archive::gzip`].
+    gzip: bool,
 }
 
 /// Splits `<name>=<url>` into its name and URL. An entry is named when what comes
@@ -97,6 +100,16 @@ fn start_from(var: &str, raw: &str) -> Result<Option<Start>, String> {
         "all" => Ok(Some(Start::All)),
         "new" => Ok(Some(Start::New)),
         other => Err(format!("{var} must be all or new, not \"{other}\"")),
+    }
+}
+
+/// `gzip` or `off` (ADR 0227); None when unset.
+pub(crate) fn compress_from(var: &str, raw: &str) -> Result<Option<bool>, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "gzip" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        other => Err(format!("{var} must be gzip or off, not \"{}\"", crate::audit::clip(other, 40))),
     }
 }
 
@@ -148,6 +161,11 @@ impl Sink {
         self.archive().is_none()
     }
 
+    /// Whether what goes to it is gzipped: its request bodies, or the archive's objects.
+    fn gzipped(&self) -> bool {
+        self.gzip || self.archive().is_some_and(|a| a.gzip)
+    }
+
     /// `sink`, `kind` and, for a named sink, `name`: what a SIEM rule matches on.
     fn about(&self) -> Value {
         let mut v = json!({ "sink": self.shown, "kind": self.kind() });
@@ -158,11 +176,11 @@ impl Sink {
     }
 
     fn from_archive(a: crate::audit_archive::Archive) -> Sink {
-        Sink { shown: a.shown(), id: a.id(), kind: Kind::Archive(Box::new(a)), name: None, start: None }
+        Sink { shown: a.shown(), id: a.id(), kind: Kind::Archive(Box::new(a)), name: None, start: None, gzip: false }
     }
 
     fn from_monitor(m: crate::audit_azure::Monitor) -> Sink {
-        Sink { shown: m.shown(), id: m.id(), kind: Kind::Monitor(Box::new(m)), name: None, start: None }
+        Sink { shown: m.shown(), id: m.id(), kind: Kind::Monitor(Box::new(m)), name: None, start: None, gzip: false }
     }
 
     pub fn parse(raw: &str, insecure: bool) -> Result<Sink, String> {
@@ -202,8 +220,35 @@ impl Sink {
             Kind::Syslog { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}", u.scheme())),
             Kind::Archive(_) | Kind::Monitor(_) => unreachable!("s3:// and azure-monitor:// sinks are read with their settings"),
         };
-        Ok(Sink { kind, shown, id, name: None, start: None })
+        Ok(Sink { kind, shown, id, name: None, start: None, gzip: false })
     }
+}
+
+/// `AUDIT_EXPORT_COMPRESS` for every webhook and Azure Monitor sink, and
+/// `AUDIT_EXPORT_COMPRESS_<NAME>` for a named one, which wins (ADR 0227). Syslog has no
+/// compression and the archive has its own `AUDIT_EXPORT_S3_COMPRESS`, so a setting that
+/// would do nothing stops botd rather than look as if it did.
+fn compression(sinks: &mut [Sink], get: &dyn Fn(&str) -> String) -> Result<(), String> {
+    const FOR: &str = "is for https and azure-monitor sinks";
+    let all = compress_from("AUDIT_EXPORT_COMPRESS", &get("AUDIT_EXPORT_COMPRESS"))?;
+    for s in sinks.iter_mut() {
+        let var = s.name.as_deref().map(|n| own("AUDIT_EXPORT_COMPRESS", n));
+        let mine = match &var {
+            Some(v) => compress_from(v, &get(v))?,
+            None => None,
+        };
+        let var = var.unwrap_or_default();
+        match (&s.kind, mine) {
+            (Kind::Webhook { .. } | Kind::Monitor(_), mine) => s.gzip = mine.or(all).unwrap_or(false),
+            (Kind::Syslog { .. }, Some(true)) => return Err(format!("{var} {FOR}; syslog has no compression")),
+            (Kind::Archive(_), Some(_)) => return Err(format!("{var} {FOR}; the archive's is AUDIT_EXPORT_S3_COMPRESS")),
+            _ => {}
+        }
+    }
+    if all == Some(true) && !sinks.iter().any(|s| matches!(s.kind, Kind::Webhook { .. } | Kind::Monitor(_))) {
+        return Err(format!("AUDIT_EXPORT_COMPRESS {FOR}, and AUDIT_EXPORT has none: syslog has no compression, and the archive's is AUDIT_EXPORT_S3_COMPRESS"));
+    }
+    Ok(())
 }
 
 /// Where to start a sink the database has no cursor for: every event kept (`all`, the
@@ -310,6 +355,7 @@ impl Settings {
                 None => return Err("AUDIT_EXPORT_HEADERS is for an https sink; the S3 archive signs with AUDIT_EXPORT_S3_ACCESS_KEY_ID and _SECRET_ACCESS_KEY".into()),
             }
         }
+        compression(&mut sinks, get)?;
         Ok(Settings { sinks, start })
     }
 
@@ -324,11 +370,13 @@ impl Settings {
                 let how = match &s.kind {
                     Kind::Webhook { headers, plain, headers_from, .. } => {
                         let with = if headers.is_empty() { String::new() } else { format!(", with headers ({headers_from})") };
-                        format!("as JSON lines over {}{with}", if *plain { "plain HTTP" } else { "HTTPS" })
+                        let gz = if s.gzip { "gzipped " } else { "" };
+                        format!("as {gz}JSON lines over {}{with}", if *plain { "plain HTTP" } else { "HTTPS" })
                     }
                     Kind::Syslog { tls: true, .. } => "as RFC 5424 syslog over TLS".into(),
                     Kind::Syslog { .. } => "as RFC 5424 syslog over plain TCP".into(),
                     Kind::Archive(a) => a.describe(),
+                    Kind::Monitor(m) if s.gzip => format!("{}, gzipped", m.describe()),
                     Kind::Monitor(m) => m.describe(),
                 };
                 let from = match (s.start, &s.name) {
@@ -417,6 +465,7 @@ impl Exporter {
             "failingSince": s.failing_since,
             "failedTries": s.failures,
             "lastError": s.last_error,
+            "compress": if self.sink.gzipped() { "gzip" } else { "off" },
         });
         match &self.sink.kind {
             Kind::Archive(a) => v["archive"] = a.view(s.archived.as_ref()),
@@ -734,7 +783,7 @@ impl Out {
                     crate::audit_azure::records(&v, &v.to_string())
                 })
                 .collect();
-            return client.send(m, &records).await.map(|()| None);
+            return client.send(m, &records, sink.gzip).await.map(|()| None);
         }
         self.send_stream(sink, rows, extras, host, sealed_after).await.map(|()| None).map_err(|e| ("delivery_failed", e))
     }
@@ -743,7 +792,11 @@ impl Out {
         match (self, &sink.kind) {
             (Out::Http(http), Kind::Webhook { url, headers, .. }) => {
                 let body: String = rows.iter().map(|e| line_with(e, host, extras.get(&e.id), e.id > sealed_after) + "\n").collect();
-                let mut req = http.post(url).header(reqwest::header::CONTENT_TYPE, "application/x-ndjson").body(body);
+                let mut req = http.post(url).header(reqwest::header::CONTENT_TYPE, "application/x-ndjson");
+                req = match sink.gzip {
+                    true => req.header(reqwest::header::CONTENT_ENCODING, "gzip").body(crate::audit_line::gzip(body.as_bytes())),
+                    false => req.body(body),
+                };
                 for (k, v) in headers {
                     req = req.header(k.as_str(), v.expose());
                 }
@@ -1014,6 +1067,47 @@ pub(crate) mod tests {
         assert!(d.contains("over HTTPS, starting with the history kept (AUDIT_EXPORT_START_SPLUNK)") && !d.contains("AUDIT_EXPORT_START_SOC"), "{d}");
         let e = settings(&[("AUDIT_EXPORT", "soc=syslog+tls://soc.example.net"), ("AUDIT_EXPORT_START_SOC", "later")]).unwrap_err();
         assert!(e.contains("AUDIT_EXPORT_START_SOC must be all or new"), "{e}");
+    }
+
+    #[test]
+    fn compression_is_for_webhooks_and_azure_monitor_and_a_named_sinks_own_wins() {
+        let gz = |s: &Settings| s.sinks.iter().map(|s| s.gzip).collect::<Vec<_>>();
+        let s = settings(&[("AUDIT_EXPORT", "https://siem.example.net/in")]).unwrap();
+        assert_eq!(gz(&s), [false], "off unless asked: not every collector takes gzip");
+        let s = settings(&[("AUDIT_EXPORT", "https://siem.example.net/in"), ("AUDIT_EXPORT_COMPRESS", "Gzip")]).unwrap();
+        assert_eq!(gz(&s), [true]);
+        assert!(s.describe().contains("as gzipped JSON lines over HTTPS"), "{}", s.describe());
+        assert_eq!(Exporter::new(s.sinks.into_iter().next().unwrap(), 0).view(0)["compress"], "gzip");
+
+        let all = with_archive(&[
+            ("AUDIT_EXPORT", "splunk=https://hec.example.net/raw,mdr=https://mdr.example.net/in,soc=syslog+tls://soc.example.net,s3://audit-archive/prod"),
+            ("AUDIT_EXPORT_COMPRESS", "gzip"),
+            ("AUDIT_EXPORT_COMPRESS_MDR", "off"),
+            ("AUDIT_EXPORT_COMPRESS_SOC", "off"),
+        ])
+        .unwrap();
+        assert_eq!(gz(&all), [true, false, false, false], "the archive's objects are AUDIT_EXPORT_S3_COMPRESS's, and syslog has none");
+        let s = settings(&[("AUDIT_EXPORT", "a=https://a.example.net/in,b=https://b.example.net/in"), ("AUDIT_EXPORT_COMPRESS_B", "gzip")]).unwrap();
+        assert_eq!(gz(&s), [false, true]);
+        let d = s.describe();
+        assert!(d.contains("a (https://a.example.net:443) as JSON lines") && d.contains("b (https://b.example.net:443) as gzipped JSON lines"), "{d}");
+        assert!(settings(&[("AUDIT_EXPORT_COMPRESS", "gzip")]).is_ok(), "a leftover setting doesn't matter while export is off");
+
+        for (vars, why) in [
+            (vec![("AUDIT_EXPORT", "https://siem.example.net/in"), ("AUDIT_EXPORT_COMPRESS", "br")], "AUDIT_EXPORT_COMPRESS must be gzip or off, not \"br\""),
+            (vec![("AUDIT_EXPORT", "a=https://a.example.net/in"), ("AUDIT_EXPORT_COMPRESS_A", "yes")], "AUDIT_EXPORT_COMPRESS_A must be gzip or off"),
+            (vec![("AUDIT_EXPORT", "syslog+tls://logs.example.net"), ("AUDIT_EXPORT_COMPRESS", "gzip")], "AUDIT_EXPORT has none: syslog has no compression"),
+            (vec![("AUDIT_EXPORT", "a=https://a.example.net/in,soc=syslog+tls://soc.example.net"), ("AUDIT_EXPORT_COMPRESS_SOC", "gzip")], "AUDIT_EXPORT_COMPRESS_SOC is for https and azure-monitor sinks; syslog has no compression"),
+        ] {
+            let e = settings(&vars).unwrap_err();
+            assert!(e.contains(why), "{vars:?}: {e}");
+        }
+        let e = with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/prod"), ("AUDIT_EXPORT_COMPRESS", "gzip")]).unwrap_err();
+        assert!(e.contains("the archive's is AUDIT_EXPORT_S3_COMPRESS"), "{e}");
+        let e = with_archive(&[("AUDIT_EXPORT", "vault=s3://audit-archive/prod"), ("AUDIT_EXPORT_COMPRESS_VAULT", "gzip")]).unwrap_err();
+        assert!(e.contains("AUDIT_EXPORT_COMPRESS_VAULT is for https and azure-monitor sinks; the archive's is AUDIT_EXPORT_S3_COMPRESS"), "{e}");
+        let s = with_archive(&[("AUDIT_EXPORT", "s3://audit-archive/prod"), ("AUDIT_EXPORT_S3_COMPRESS", "gzip")]).unwrap();
+        assert_eq!(Exporter::new(s.sinks.into_iter().next().unwrap(), 0).view(0)["compress"], "gzip", "the archive's shows the same way");
     }
 
     #[test]

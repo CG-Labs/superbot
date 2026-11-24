@@ -64,6 +64,30 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
+/// Whether `bytes` begin as gzip does (RFC 1952).
+pub fn gzipped(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1f, 0x8b])
+}
+
+/// `bytes` gzipped, as the export compresses request bodies and archive objects (ADR 0227).
+pub fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::default());
+    gz.write_all(bytes).and_then(|()| gz.finish()).expect("gzip into memory")
+}
+
+/// `bytes` gunzipped, every member in turn (`cat a.gz b.gz` too), at most `max` bytes of
+/// them: more, or anything after a member that isn't another, is an error.
+pub fn gunzip(bytes: &[u8], max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(bytes).take(max.saturating_add(1)).read_to_end(&mut out).map_err(|e| format!("it isn't gzip, or is cut short ({e})"))?;
+    if out.len() as u64 > max {
+        return Err(format!("it holds more than {max} bytes uncompressed"));
+    }
+    Ok(out)
+}
+
 /// `text`, the exported line of event `id` from `host`, as pieces of at most `size` bytes
 /// of it each, split between characters, every piece a JSON object of its own:
 /// `{"schema":"superbot.audit.part.v1","id":..,"host":..,"part":1,"parts":n,"text":..}`.
@@ -656,6 +680,21 @@ pub mod tests {
 
     fn reasons(r: &Report) -> Vec<&'static str> {
         r.hosts.iter().flat_map(|h| h.first_problems.iter().map(|p| p.reason)).collect()
+    }
+
+    #[test]
+    fn gzip_comes_back_whole_and_no_bigger_than_allowed() {
+        let text = "{\"schema\":\"superbot.audit.v1\"}\n".repeat(100);
+        let gz = gzip(text.as_bytes());
+        assert!(gzipped(&gz) && !gzipped(text.as_bytes()) && gz.len() * 10 < text.len(), "{} bytes", gz.len());
+        assert_eq!(gunzip(&gz, text.len() as u64).unwrap(), text.as_bytes());
+        let mut two = gz.clone();
+        two.extend(gzip(b"more\n"));
+        assert_eq!(gunzip(&two, u64::MAX).unwrap(), format!("{text}more\n").as_bytes(), "every member, in turn");
+        let e = gunzip(&gz, text.len() as u64 - 1).unwrap_err();
+        assert!(e.contains(&format!("more than {} bytes uncompressed", text.len() - 1)), "{e}");
+        assert!(gunzip(b"plain text", u64::MAX).unwrap_err().contains("isn't gzip"));
+        assert!(gunzip(&[], u64::MAX).unwrap_err().contains("isn't gzip"), "an empty object holds no gzip member");
     }
 
     #[test]

@@ -221,16 +221,23 @@ impl Client {
         Client { http }
     }
 
-    /// Sends one batch's records, a request per body. Each is accepted with a 204; a
-    /// failed one fails the batch, which goes again whole (Azure keeps the bodies it took,
-    /// so a retry can repeat events, as any at-least-once export can).
-    pub async fn send(&self, m: &Monitor, records: &[Value]) -> Result<(), (&'static str, String)> {
+    /// Sends one batch's records, a request per body, `gzip`ped if asked (ADR 0227). Azure's
+    /// 1 MB holds for a body before it is compressed too, so bodies are cut the same either
+    /// way. Each is accepted with a 204; a failed one fails the batch, which goes again
+    /// whole (Azure keeps the bodies it took, so a retry can repeat events, as any
+    /// at-least-once export can).
+    pub async fn send(&self, m: &Monitor, records: &[Value], gzip: bool) -> Result<(), (&'static str, String)> {
         let shown = m.shown();
         for body in bodies(records) {
+            let body = if gzip { crate::audit_line::gzip(&body) } else { body };
             let mut fresh = false;
             loop {
                 let token = m.entra.token(fresh).await.map_err(|e| ("sign_in_failed", format!("couldn't sign in to Entra ID for {shown}: {e}")))?;
-                let req = self.http.post(&m.url).bearer_auth(token.as_str()).header(reqwest::header::CONTENT_TYPE, "application/json").body(body.clone());
+                let mut req = self.http.post(&m.url).bearer_auth(token.as_str()).header(reqwest::header::CONTENT_TYPE, "application/json");
+                if gzip {
+                    req = req.header(reqwest::header::CONTENT_ENCODING, "gzip");
+                }
+                let req = req.body(body.clone());
                 let r = req.send().await.map_err(|e| ("delivery_failed", format!("couldn't reach {shown}: {}", e.without_url())))?;
                 let status = r.status();
                 if status.is_success() {
@@ -468,6 +475,9 @@ mod tests {
         refuse: AtomicUsize,
         /// Hands out the first token again, as the instance metadata service does from its cache.
         same: AtomicBool,
+        /// Gzipped uploads, and their bytes as sent.
+        gzipped: AtomicUsize,
+        sent: AtomicUsize,
     }
 
     type A = Arc<Azure>;
@@ -483,12 +493,22 @@ mod tests {
         (StatusCode::OK, axum::Json(json!({ "access_token": token, "expires_in": "86399", "token_type": "Bearer" })))
     }
 
-    async fn upload(State(a): State<A>, Path((dcr, stream)): Path<(String, String)>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, axum::Json(body): axum::Json<Vec<Value>>) -> (StatusCode, axum::Json<Value>) {
+    async fn upload(State(a): State<A>, Path((dcr, stream)): Path<(String, String)>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, raw: axum::body::Bytes) -> (StatusCode, axum::Json<Value>) {
         a.requests.fetch_add(1, Ordering::SeqCst);
         assert_eq!((dcr.as_str(), stream.as_str(), q.get("api-version").map(String::as_str)), (DCR, "Custom-SuperBotAudit", Some(API_VERSION)));
         assert_eq!(h.get("content-type").and_then(|v| v.to_str().ok()), Some("application/json"));
         let size: usize = h.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).expect("a request's size");
         assert!(size <= MAX_BODY, "{size}");
+        let plain = match h.get("content-encoding").and_then(|v| v.to_str().ok()) {
+            Some("gzip") => {
+                a.gzipped.fetch_add(1, Ordering::SeqCst);
+                a.sent.fetch_add(size, Ordering::SeqCst);
+                crate::audit_line::gunzip(&raw, MAX_BODY as u64).expect("gzip within Azure's 1 MB, uncompressed too")
+            }
+            None => raw.to_vec(),
+            Some(other) => panic!("Content-Encoding {other}"),
+        };
+        let body: Vec<Value> = serde_json::from_slice(&plain).expect("a JSON array");
         let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let known = a.tokens.lock().unwrap().iter().any(|t| auth == format!("Bearer {t}"));
         if !known || a.revoked.lock().unwrap().iter().any(|t| auth == format!("Bearer {t}")) {
@@ -579,6 +599,35 @@ mod tests {
 
         azure.refuse.store(0, Ordering::SeqCst);
         until("recovered", || xs.delivered() >= app.db.audit_head()).await;
+    }
+
+    #[tokio::test]
+    async fn gzipped_bodies_are_cut_at_1_mb_before_compression_and_check_the_same() {
+        let (_, app, _, _) = crate::tests::serve_app().await;
+        let (base, azure) = stand_in().await;
+        for i in 0..30 {
+            app.db.record(&Event::new(Actor::system("test"), "test.sentinel").details(json!({ "n": i, "pad": "p".repeat(200) })));
+        }
+        let url = format!("sentinel=azure-monitor://{HOST}/{DCR}/Custom-SuperBotAudit");
+        let mut s = settings(&[("AUDIT_EXPORT", &url), ("AUDIT_EXPORT_COMPRESS_SENTINEL", "gzip")]).unwrap();
+        assert!(s.describe().contains("signing in to Entra ID as managed identity, gzipped"), "{}", s.describe());
+        s.sinks[0].monitor_mut().unwrap().point_at(&base);
+        crate::audit_export::start(&app, s);
+        let xs = app.audit_export.get().unwrap().clone();
+        until("delivered", || xs.delivered() >= app.db.audit_head()).await;
+        let (requests, gzipped) = (azure.requests.load(Ordering::SeqCst), azure.gzipped.load(Ordering::SeqCst));
+        assert!(requests > 1 && gzipped == requests, "every body gzipped, still cut where the uncompressed one reaches 1 MB: {gzipped} of {requests}");
+        let records = azure.records.lock().unwrap().clone();
+        let plain: usize = bodies(&records).iter().map(Vec::len).sum();
+        assert!(azure.sent.load(Ordering::SeqCst) * 3 < plain, "{} bytes sent for {plain}", azure.sent.load(Ordering::SeqCst));
+        let mut lines = crate::audit_line::Lines::new(None);
+        for (n, r) in records.iter().enumerate() {
+            lines.line(r["Line"].as_str().unwrap(), &format!("workspace:{}", n + 1));
+        }
+        let report = lines.finish();
+        let ids: std::collections::BTreeSet<i64> = records.iter().filter_map(|r| r["EventId"].as_i64()).collect();
+        assert!(report.ok && report.hosts[0].events == ids.len() as u64 && ids.first() == Some(&1), "{report:?}");
+        assert_eq!(xs.view(app.db.audit_head())["compress"], "gzip");
     }
 
     #[tokio::test]

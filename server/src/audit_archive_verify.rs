@@ -154,7 +154,8 @@ impl Meta {
     }
 }
 
-/// The ids a key names: `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`.
+/// The ids a key names: `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`, or
+/// `.jsonl.gz` for a gzipped object (ADR 0227).
 pub fn ids(prefix: &str, key: &str) -> Option<(i64, i64)> {
     let rest = key.strip_prefix(prefix)?.strip_prefix('/')?;
     let parts: Vec<&str> = rest.split('/').collect();
@@ -163,7 +164,7 @@ pub fn ids(prefix: &str, key: &str) -> Option<(i64, i64)> {
     if !(digits(y, 4) && digits(m, 2) && digits(d, 2)) {
         return None;
     }
-    let (first, last) = name.strip_suffix(".jsonl")?.split_once('-')?;
+    let (first, last) = name.strip_suffix(".jsonl.gz").or_else(|| name.strip_suffix(".jsonl"))?.split_once('-')?;
     if !(digits(first, 20) && digits(last, 20)) {
         return None;
     }
@@ -368,7 +369,7 @@ impl<'a> Walker<'a> {
     }
 
     pub fn stray(&mut self, key: &str) {
-        self.problem(Some(key), None, "stray", "botd didn't write this key: it isn't <prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl".into());
+        self.problem(Some(key), None, "stray", "botd didn't write this key: it isn't <prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl (or .jsonl.gz)".into());
     }
 
     pub fn skipped(&mut self) {
@@ -593,7 +594,9 @@ struct Read {
 }
 
 /// `version` as listed, `null` included: an object written before versioning was on has
-/// that id, and reading without one would give the newest version instead.
+/// that id, and reading without one would give the newest version instead. A `.gz` key's
+/// body comes back gunzipped, held to the same size, so versions compare by what they
+/// hold, however a gzip of the same lines came out.
 async fn body(s3: &S3, key: &str, version: &str) -> Result<(Meta, Vec<u8>), String> {
     let res = s3.get_version(key, Some(version)).await?;
     if res.content_length().is_some_and(|n| n as usize > MAX_OBJECT_BYTES) {
@@ -604,7 +607,15 @@ async fn body(s3: &S3, key: &str, version: &str) -> Result<(Meta, Vec<u8>), Stri
     if bytes.len() > MAX_OBJECT_BYTES {
         return Err(format!("{key} is larger than any batch botd writes"));
     }
-    Ok((meta, bytes.to_vec()))
+    Ok((meta, unpacked(key, &bytes)?))
+}
+
+/// An object's lines: a `.gz` key's gunzipped, at most [`MAX_OBJECT_BYTES`] of them.
+fn unpacked(key: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if !key.ends_with(".gz") {
+        return Ok(bytes.to_vec());
+    }
+    crate::audit_line::gunzip(bytes, MAX_OBJECT_BYTES as u64).map_err(|e| format!("{key}: {e}"))
 }
 
 async fn read(s3: &S3, object: Object) -> Read {
@@ -921,7 +932,11 @@ mod tests {
     #[test]
     fn keys_name_their_ids() {
         assert_eq!(ids("prod", "prod/2026/11/23/00000000000000000001-00000000000000000200.jsonl"), Some((1, 200)));
+        assert_eq!(ids("prod", "prod/2026/11/23/00000000000000000001-00000000000000000200.jsonl.gz"), Some((1, 200)), "gzipped");
         for bad in [
+            "prod/2026/11/23/00000000000000000001-00000000000000000200.gz",
+            "prod/2026/11/23/00000000000000000001-00000000000000000200.jsonl.gz.gz",
+            "prod/2026/11/23/00000000000000000001-00000000000000000200.json.gz",
             "prod/2026/11/23/1-200.jsonl",
             "prod/2026/11/23/00000000000000000201-00000000000000000200.jsonl",
             "prod/2026/11/00000000000000000001-00000000000000000200.jsonl",
@@ -931,6 +946,22 @@ mod tests {
         ] {
             assert_eq!(ids("prod", bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_gz_keys_body_is_read_gunzipped() {
+        let plain = body(1..=3);
+        let gz = crate::audit_line::gzip(&plain);
+        assert_eq!(unpacked("prod/a.jsonl.gz", &gz).unwrap(), plain);
+        assert_eq!(unpacked("prod/a.jsonl", &plain).unwrap(), plain, "a plain key's body as it is");
+        assert_eq!(unpacked("prod/a.jsonl", &gz).unwrap(), gz, "and so not lines: unreadable when walked");
+        let e = unpacked("prod/a.jsonl.gz", &plain).unwrap_err();
+        assert!(e.starts_with("prod/a.jsonl.gz: it isn't gzip"), "{e}");
+        let e = unpacked("prod/a.jsonl.gz", &gz[..gz.len() - 4]).unwrap_err();
+        assert!(e.contains("cut short"), "{e}");
+        let mut trailing = gz.clone();
+        trailing.extend(b"{\"forged\":1}\n");
+        assert!(unpacked("prod/a.jsonl.gz", &trailing).is_err(), "nothing unread after the gzip");
     }
 
     #[test]

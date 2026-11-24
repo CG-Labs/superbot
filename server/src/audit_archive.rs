@@ -69,6 +69,8 @@ pub struct Archive {
     pub batch_ms: i64,
     /// Whether botd's daily self-check also checks objects new since its last pass (ADR 0183).
     pub daily_check: bool,
+    /// Objects are gzipped, keyed `.jsonl.gz` (`AUDIT_EXPORT_S3_COMPRESS=gzip`, ADR 0227).
+    pub gzip: bool,
 }
 
 impl std::fmt::Debug for Archive {
@@ -130,6 +132,7 @@ impl Archive {
             "off" => false,
             other => return Err(format!("AUDIT_EXPORT_S3_CHECK must be daily or off, not \"{}\"", crate::audit::clip(other, 40))),
         };
+        let gzip = crate::audit_export::compress_from("AUDIT_EXPORT_S3_COMPRESS", &get("AUDIT_EXPORT_S3_COMPRESS"))?.unwrap_or(false);
 
         let name = "AUDIT_EXPORT_S3";
         let endpoint = get("AUDIT_EXPORT_S3_ENDPOINT");
@@ -145,7 +148,7 @@ impl Archive {
         let access = key("AUDIT_EXPORT_S3_ACCESS_KEY_ID")?;
         let region = Some(get("AUDIT_EXPORT_S3_REGION")).filter(|r| !r.trim().is_empty()).unwrap_or("us-east-1".into());
         let s3 = s3::Settings::named(name, &endpoint, &bucket, &region, &access, &secret)?;
-        Ok(Archive { s3, bucket, prefix, lock, retain_days, batch_ms, daily_check })
+        Ok(Archive { s3, bucket, prefix, lock, retain_days, batch_ms, daily_check, gzip })
     }
 
     /// What logs, the API and the audit log show.
@@ -166,14 +169,17 @@ impl Archive {
             (l, d) => format!("each locked in {} mode for {} days", l.name(), d.unwrap_or_default()),
         };
         let check = if self.daily_check { "new objects checked daily" } else { "not checked daily (AUDIT_EXPORT_S3_CHECK=off)" };
-        format!("as JSON-lines objects at {} every {} s or {MAX_EVENTS} events, {lock}, {check}", self.s3.endpoint, self.batch_ms / 1000)
+        let what = if self.gzip { "gzipped JSON-lines objects (AUDIT_EXPORT_S3_COMPRESS=gzip)" } else { "JSON-lines objects" };
+        format!("as {what} at {} every {} s or {MAX_EVENTS} events, {lock}, {check}", self.s3.endpoint, self.batch_ms / 1000)
     }
 
-    /// `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`, dated by the first event,
-    /// ids zero-padded so keys sort in order. A retried batch has the same key.
+    /// `<prefix>/<yyyy>/<mm>/<dd>/<first id>-<last id>.jsonl`, or `.jsonl.gz` gzipped,
+    /// dated by the first event, ids zero-padded so keys sort in order. A retried batch has
+    /// the same key.
     pub fn key(&self, first: &AuditEvent, last: &AuditEvent) -> String {
         let day = chrono::DateTime::from_timestamp_millis(first.at).unwrap_or_default().format("%Y/%m/%d");
-        format!("{}/{day}/{:020}-{:020}.jsonl", self.prefix, first.id, last.id)
+        let gz = if self.gzip { ".gz" } else { "" };
+        format!("{}/{day}/{:020}-{:020}.jsonl{gz}", self.prefix, first.id, last.id)
     }
 
     /// `GET /api/audit/siem`'s `archive`: how objects are kept, and the last one written.
@@ -186,6 +192,7 @@ impl Archive {
             "retainDays": self.retain_days,
             "batchSeconds": self.batch_ms / 1000,
             "dailyCheck": self.daily_check,
+            "compress": if self.gzip { "gzip" } else { "off" },
             "lastObject": last,
         })
     }
@@ -242,10 +249,14 @@ impl Client {
             self.checked = true;
         }
         let key = a.key(first, last);
+        let plain = body.len();
+        // The object is the gzip file itself, with no Content-Encoding a client might undo
+        // on the way down: every tool gets the bytes the `.gz` key names.
+        let (body, content_type) = if a.gzip { (crate::audit_line::gzip(&body), "application/gzip") } else { (body, "application/x-ndjson") };
         let bytes = body.len();
         let sha = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &body);
         let mut headers: Vec<(&str, String)> = vec![
-            ("content-type", "application/x-ndjson".into()),
+            ("content-type", content_type.into()),
             // Object Lock writes need a checksum (Content-MD5 or one of these).
             ("x-amz-sdk-checksum-algorithm", "SHA256".into()),
             ("x-amz-checksum-sha256", base64::engine::general_purpose::STANDARD.encode(sha.as_ref())),
@@ -268,6 +279,9 @@ impl Client {
         let put = self.s3.put_with(&key, body, &headers).await.map_err(|e| ("delivery_failed", e))?;
         let version = header(&put, "x-amz-version-id").filter(|v| v != "null");
         let mut out = json!({ "key": key, "version": version, "events": rows.len(), "bytes": bytes, "firstId": first.id, "lastId": last.id, "at": now() });
+        if a.gzip {
+            out["uncompressedBytes"] = json!(plain);
+        }
         if a.lock == Lock::Off {
             return Ok(out);
         }
@@ -326,6 +340,10 @@ pub(crate) mod tests {
         assert!(a.daily_check && a.describe().contains("new objects checked daily"), "{}", a.describe());
         let unchecked = archive(&[("AUDIT_EXPORT_S3_CHECK", "Off")]).unwrap();
         assert!(!unchecked.daily_check && unchecked.describe().contains("AUDIT_EXPORT_S3_CHECK=off"), "{}", unchecked.describe());
+        assert!(!a.gzip && a.view(None)["compress"] == "off", "off unless asked: keys downstream tools read stay as they were");
+        let gz = archive(&[("AUDIT_EXPORT_S3_COMPRESS", " GZIP ")]).unwrap();
+        assert!(gz.gzip && gz.describe().contains("as gzipped JSON-lines objects (AUDIT_EXPORT_S3_COMPRESS=gzip)") && gz.view(None)["compress"] == "gzip", "{}", gz.describe());
+        assert!(!archive(&[("AUDIT_EXPORT_S3_COMPRESS", "off")]).unwrap().gzip);
 
         for (vars, why) in [
             (vec![("AUDIT_EXPORT", "s3://No_Caps/x")], "bucket name"),
@@ -341,6 +359,7 @@ pub(crate) mod tests {
             (vec![("AUDIT_EXPORT_S3_RETAIN_DAYS", "30")], "goes with"),
             (vec![("AUDIT_EXPORT_S3_BATCH_SECONDS", "-1")], "BATCH_SECONDS"),
             (vec![("AUDIT_EXPORT_S3_CHECK", "hourly")], "AUDIT_EXPORT_S3_CHECK must be daily or off"),
+            (vec![("AUDIT_EXPORT_S3_COMPRESS", "zstd")], "AUDIT_EXPORT_S3_COMPRESS must be gzip or off"),
             (vec![("AUDIT_EXPORT_S3_ENDPOINT", "http://s3.example.net")], "AUDIT_EXPORT_S3_ENDPOINT"),
             (vec![("AUDIT_EXPORT_S3_ENDPOINT", " ")], "AUDIT_EXPORT_S3_ENDPOINT is needed"),
         ] {
@@ -359,5 +378,8 @@ pub(crate) mod tests {
         let mut last = first.clone();
         last.id = 12_345;
         assert_eq!(a.key(&first, &last), "prod/2026/11/18/00000000000000000007-00000000000000012345.jsonl");
+        let gz = archive(&[("AUDIT_EXPORT_S3_COMPRESS", "gzip")]).unwrap();
+        assert_eq!(gz.key(&first, &last), "prod/2026/11/18/00000000000000000007-00000000000000012345.jsonl.gz");
+        assert_eq!(crate::audit_archive_verify::ids("prod", &gz.key(&first, &last)), Some((7, 12_345)), "the check reads the keys it writes");
     }
 }

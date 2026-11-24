@@ -181,13 +181,23 @@ async fn erasure_and_retention_keep_the_chain_whole() {
 /// What a collector saw: how many requests, the lines it took, and each request's headers.
 pub(crate) type Collected = Arc<StdMutex<(usize, Vec<String>, Vec<String>)>>;
 
+/// A request's body as text, gunzipped when it says it is gzip, as collectors do.
+fn collected(headers: &axum::http::HeaderMap, raw: &[u8]) -> String {
+    let body = match headers.get("content-encoding").and_then(|v| v.to_str().ok()) {
+        Some("gzip") => crate::audit_line::gunzip(raw, u64::MAX).expect("the gzip its header names"),
+        None => raw.to_vec(),
+        Some(other) => panic!("Content-Encoding {other}"),
+    };
+    String::from_utf8(body).expect("UTF-8 lines")
+}
+
 /// A webhook collector: answers 500 to the first `fail` requests, then takes the batches.
 pub(crate) async fn collector(fail: usize) -> (String, Collected) {
     let got: Collected = Default::default();
     let state = got.clone();
     let r = axum::Router::new().route(
         "/ingest",
-        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+        axum::routing::post(move |headers: axum::http::HeaderMap, raw: axum::body::Bytes| {
             let state = state.clone();
             async move {
                 let mut s = state.lock().unwrap();
@@ -196,7 +206,7 @@ pub(crate) async fn collector(fail: usize) -> (String, Collected) {
                 if s.0 <= fail {
                     return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
                 }
-                s.1.extend(body.lines().map(String::from));
+                s.1.extend(collected(&headers, &raw).lines().map(String::from));
                 axum::http::StatusCode::OK
             }
         }),
@@ -264,7 +274,7 @@ async fn switchable_collector(down: Arc<std::sync::atomic::AtomicBool>) -> (Stri
     let state = got.clone();
     let r = axum::Router::new().route(
         "/ingest",
-        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+        axum::routing::post(move |headers: axum::http::HeaderMap, raw: axum::body::Bytes| {
             let (state, down) = (state.clone(), down.clone());
             async move {
                 let mut s = state.lock().unwrap();
@@ -273,7 +283,7 @@ async fn switchable_collector(down: Arc<std::sync::atomic::AtomicBool>) -> (Stri
                 if down.load(std::sync::atomic::Ordering::SeqCst) {
                     return axum::http::StatusCode::SERVICE_UNAVAILABLE;
                 }
-                s.1.extend(body.lines().map(String::from));
+                s.1.extend(collected(&headers, &raw).lines().map(String::from));
                 axum::http::StatusCode::OK
             }
         }),
@@ -348,6 +358,39 @@ async fn several_siems_each_get_their_own_headers_start_and_cursor() {
     assert!(!lines.contains(splunk_token) && !lines.contains(elastic_token));
     let head = app.db.audit_head();
     assert_eq!((app.db.audit_export_cursor(&splunk_url), app.db.audit_export_cursor(&elastic_url)), (Some(head), Some(head)), "a cursor each, by URL");
+}
+
+#[tokio::test]
+async fn webhooks_can_take_their_batches_gzipped_each_as_it_is_set() {
+    let (port, app, admin, _) = serve_app().await;
+    let (zipped_url, zipped) = collector(1).await;
+    let (plain_url, plain) = collector(0).await;
+    for i in 0..5 {
+        app.db.record(&Event::new(Actor::system("test"), "test.gzip").details(json!({ "n": i, "pad": "p".repeat(300) })));
+    }
+    let export = format!("splunk={zipped_url},legacy={plain_url}");
+    export_to(&app, &[("AUDIT_EXPORT", &export), ("AUDIT_EXPORT_COMPRESS", "gzip"), ("AUDIT_EXPORT_COMPRESS_LEGACY", "off")]);
+    let xs = app.audit_export.get().unwrap().clone();
+    until("both delivered", || xs.sinks.iter().all(|x| x.delivered() >= app.db.audit_head())).await;
+
+    let (tries, lines, headers) = zipped.lock().unwrap().clone();
+    assert!(tries >= 2 && headers.iter().all(|h| h.contains("\"content-encoding\": \"gzip\"") && h.contains("application/x-ndjson")), "{headers:?}");
+    assert!(plain.lock().unwrap().2.iter().all(|h| !h.contains("content-encoding")), "AUDIT_EXPORT_COMPRESS_LEGACY=off wins for it");
+    let ids = |lines: &[String]| lines.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].as_i64().unwrap()).collect::<Vec<_>>();
+    let got = ids(&lines);
+    assert!(got[0] == 1 && got.windows(2).all(|w| w[1] == w[0] + 1), "every event once, in order, after a retry: {got:?}");
+    let other = ids(&plain.lock().unwrap().1);
+    let n = got.len().min(other.len());
+    assert!(n >= 5 && got[..n] == other[..n], "the same lines either way: {got:?} {other:?}");
+    let mut check = crate::audit_line::Lines::new(None);
+    for (n, l) in lines.iter().enumerate() {
+        check.line(l, &format!("splunk:{}", n + 1));
+    }
+    assert!(check.finish().ok, "a gzipped batch's lines check as any others");
+
+    let v = parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1);
+    let compress: Vec<(&str, &str)> = v["sinks"].as_array().unwrap().iter().map(|s| (s["name"].as_str().unwrap(), s["compress"].as_str().unwrap())).collect();
+    assert_eq!(compress, [("splunk", "gzip"), ("legacy", "off")], "{v}");
 }
 
 #[tokio::test]
