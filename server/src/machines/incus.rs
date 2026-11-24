@@ -1910,7 +1910,7 @@ impl MachineProvider for Incus {
                 };
                 for (k, dev) in devices.as_object().into_iter().flatten() {
                     if dev["type"] == "nic" && dev["network"] == id {
-                        out.push(NetworkMember { machine: machine.into(), config: String::new(), interface: k.clone(), active: true });
+                        out.push(NetworkMember { machine: machine.into(), config: String::new(), interface: k.clone(), active: true, needs_power_off: false });
                     }
                 }
             }

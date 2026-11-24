@@ -245,6 +245,10 @@ pub struct ControlPlane {
     network_joining: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The last reason each machine couldn't join its team's network, audited once.
     network_join_refused: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Machines powered off to be given a team network's interface that their provider
+    /// adds only while they are off (ADR 0226), and when: powered on again once given it
+    /// or refused it, never left off by the sweep.
+    network_join_off: std::sync::Mutex<std::collections::HashMap<String, i64>>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -280,6 +284,7 @@ impl Default for ControlPlane {
             network_suspended: Default::default(),
             network_joining: Default::default(),
             network_join_refused: Default::default(),
+            network_join_off: Default::default(),
             ops: tokio::sync::Mutex::new(()),
             provider_seen: Default::default(),
         }
@@ -428,6 +433,9 @@ impl ControlPlane {
             if let Some(n) = team_network::Settings::from_env(&var)? {
                 return Err(format!("MACHINE_TEAM_NETWORK={} needs the control plane: {NEEDS_IT}", n.kind.as_str()));
             }
+            if !var("MACHINE_LINODE_INTERFACES").trim().is_empty() {
+                return Err(format!("MACHINE_LINODE_INTERFACES needs the control plane: {NEEDS_IT}"));
+            }
             return Ok(ControlPlane::default());
         };
         let token = token.expose().trim().to_string();
@@ -442,7 +450,11 @@ impl ControlPlane {
         if team_network.is_some() && firewall::Settings::from_env(&var)?.is_none() {
             return Err("MACHINE_TEAM_NETWORK=vpc needs MACHINE_FIREWALL=on: the firewall's inbound drops are what keep teammates' machines apart on their network".into());
         }
-        let mut api = linode::Linode::new(&token, linode::API_URL);
+        let interfaces = linode::Generation::parse(&var("MACHINE_LINODE_INTERFACES"))?;
+        if interfaces == linode::Generation::Linode && firewall::Settings::from_env(&var)?.is_none() {
+            return Err("MACHINE_LINODE_INTERFACES=linode needs MACHINE_FIREWALL=on: each Linode interface takes the machines' firewall, and none would leave it to the account's default".into());
+        }
+        let mut api = linode::Linode::new(&token, linode::API_URL).with_interfaces(interfaces);
         if firewall::egress_from_env(&var)? {
             let mut rules = linode::outbound(&firewall::egress_deny(&var)?, firewall::control_from_env(&var))?;
             if let Some(n) = &team_network {
@@ -472,6 +484,9 @@ impl ControlPlane {
     fn incus_from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<ControlPlane, String> {
         if store.get("LINODE_TOKEN").map_err(|e| e.to_string())?.is_some() {
             return Err("MACHINE_PROVIDER=incus and LINODE_TOKEN are both set; a control plane uses one provider".into());
+        }
+        if !var("MACHINE_LINODE_INTERFACES").trim().is_empty() {
+            return Err("MACHINE_LINODE_INTERFACES is for Linode; Incus containers have no Linode interfaces".into());
         }
         if var("MACHINE_CONTROL_URL").trim().is_empty() {
             return Err("MACHINE_PROVIDER=incus needs MACHINE_CONTROL_URL: containers enroll and are reached like any machine".into());
@@ -1275,13 +1290,19 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     let networks = team_network::sweep(app, cp).await;
     let disabled = crate::deprovision::sweep(app, cp).await;
     let kept_pins_ended = residency::end_kept(app, cp).await;
-    let chats_moved: usize = chat_stores::place(&app.db).iter().map(|m| m.messages).sum();
+    let moves = chat_stores::place(&app.db);
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if kept_pins_ended > 0 {
         out["keptPinsEnded"] = kept_pins_ended.into();
     }
-    if chats_moved > 0 {
-        out["chatsMoved"] = chats_moved.into();
+    for (key, n) in [
+        ("chatsMoved", moves.iter().map(|m| m.messages).sum::<usize>()),
+        ("routinesMoved", moves.iter().map(|m| m.routines).sum()),
+        ("approvalsMoved", moves.iter().map(|m| m.approvals).sum()),
+    ] {
+        if n > 0 {
+            out[key] = n.into();
+        }
     }
     if teams != json!({}) {
         out["teams"] = teams;
@@ -2306,6 +2327,7 @@ mod tests {
             // On Incus a team's network is an OVN network (ADR 0212), whose subnet is
             // apart from what containers reach or are kept off through eth0.
             (&certs, &[("MACHINE_TEAM_NETWORK", "vpc")][..], "MACHINE_TEAM_NETWORK=vpc is for Linode"),
+            (&certs, &[("MACHINE_LINODE_INTERFACES", "linode")][..], "MACHINE_LINODE_INTERFACES is for Linode"),
             (&certs, &[("MACHINE_TEAM_NETWORK", "ovn"), ("MACHINE_CONTROL_URL", "https://10.248.0.9:8444")][..], "meets 10.248.0.9, which containers reach botd"),
             (&certs, &[("MACHINE_TEAM_NETWORK", "ovn"), ("INCUS_EGRESS_ALLOW", "10.248.1.20:443")][..], "meets 10.248.1.20"),
             (&certs, &[("MACHINE_TEAM_NETWORK", "ovn"), ("INCUS_EGRESS_DENY", "10.248.2.0/24")][..], "meets 10.248.2.0/24, which containers are kept off"),
@@ -2583,5 +2605,29 @@ mod tests {
         assert!(err.contains("off, vpc or ovn"), "{err}");
         let err = ControlPlane::from_env(&token, vars("on", "", "ovn")).err().unwrap();
         assert!(err.contains("MACHINE_TEAM_NETWORK=ovn is for MACHINE_PROVIDER=incus"), "{err}");
+    }
+
+    #[test]
+    fn linode_interfaces_are_asked_for_and_need_the_firewall() {
+        let token = EnvStore::fixed(&[("LINODE_TOKEN", "interfaces-test-token-5b7e")]);
+        let vars = |fw: &'static str, kind: &'static str| {
+            move |k: &str| match k {
+                "MACHINE_REGIONS" => "gb-lon".to_string(),
+                "MACHINE_FIREWALL" => fw.to_string(),
+                "MACHINE_CONTROL_URL" => "https://10.1.2.3:8443".to_string(),
+                "MACHINE_LINODE_INTERFACES" => kind.to_string(),
+                _ => String::new(),
+            }
+        };
+        let legacy = ControlPlane::from_env(&token, vars("", "")).unwrap();
+        assert_eq!(legacy.need().unwrap().settings()["interfaces"], "legacy", "configuration profiles unless asked");
+        let on = ControlPlane::from_env(&token, vars("on", "linode")).unwrap();
+        assert_eq!(on.need().unwrap().settings()["interfaces"], "linode");
+        let err = ControlPlane::from_env(&token, vars("", "linode")).err().unwrap();
+        assert!(err.contains("MACHINE_LINODE_INTERFACES=linode needs MACHINE_FIREWALL=on"), "{err}");
+        let err = ControlPlane::from_env(&token, vars("on", "vlan")).err().unwrap();
+        assert!(err.contains("legacy or linode"), "{err}");
+        let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("", "linode")).err().unwrap();
+        assert!(err.contains("MACHINE_LINODE_INTERFACES needs the control plane"), "{err}");
     }
 }
