@@ -65,7 +65,7 @@ These match `SECURITY.md`. CI already fails on fixable Critical image findings a
 
 ## People
 
-- **Before access:** background checks where the law allows, proportionate to the role, and acknowledgement of this policy and the [acceptable use policy](acceptable-use.md).
+- **Before access:** background checks where the law allows, proportionate to the role, and acknowledgement of this policy, the [acceptable use policy](acceptable-use.md) and the [code of conduct](code-of-conduct.md).
 - **Training:** security awareness at onboarding and yearly; incident response roles take part in the yearly tabletop; engineers get secure-development training yearly. The people lead keeps completion records.
 - **Leaving:** access removed as the [access control policy](access-control.md#removing-access) says.
 - **Accountability:** security duties are part of each role's description and of performance reviews. Breaking a policy, on purpose or through repeated negligence, leads to disciplinary action up to ending the engagement, under the provider's disciplinary process.
