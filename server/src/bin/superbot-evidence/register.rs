@@ -2088,7 +2088,7 @@ impl Check<'_> {
     /// window from the day it was received (the strictest until it is assessed); a
     /// penetration test within a year of the last (the first a year after the information
     /// security policy's first approval), and its critical and high findings retested
-    /// within 30 days of the last being fixed. Something done late is an exception in the
+    /// within 30 days of the last being fixed or accepted. Something done late is an exception in the
     /// bundle of the period it was done in; something overdue, in every bundle until done.
     pub fn vulnerabilities(&self) -> (Value, Vec<&'static str>) {
         let (p, cut) = (self.p, self.cut());
@@ -2160,7 +2160,8 @@ impl Check<'_> {
             let serious: Vec<&&Vulnerability> = findings.iter().filter(|x| x.assessed.is_some_and(|a| a < cut) && matches!(x.severity.as_deref(), Some("critical" | "high"))).collect();
             let last_fix = serious.iter().filter_map(|x| x.fixed.filter(|d| *d < cut)).max();
             let all_closed = !serious.is_empty() && serious.iter().all(|x| closed_on(x).is_some());
-            let retest_due = last_fix.filter(|_| all_closed).map(|f| plus(f, RETEST_DAYS));
+            let last_closed = serious.iter().filter_map(|x| closed_on(x)).max();
+            let retest_due = last_fix.zip(last_closed).filter(|_| all_closed).map(|(f, c)| plus(f.max(c), RETEST_DAYS));
             let retested = t.retested.filter(|d| *d < cut);
             let covering = retested.filter(|r| last_fix.is_none_or(|f| *r >= f));
             match (covering, retest_due) {
@@ -2199,7 +2200,7 @@ impl Check<'_> {
             rows.push("CC4.2-1");
         }
         let v = json!({
-            "basis": format!("every vulnerability found outside the scans (reported under SECURITY.md, by a penetration test, by a vendor, or by the provider) received before the period's end and still being handled in it, by register id: a report acknowledged within {ACKNOWLEDGE_DAYS} days of being received; its severity set and an owner role named (assessed) within {ASSESS_DAYS}; and fixed, or accepted by someone holding or deputising {} that day, within its severity's window from the day it was received ({}; the strictest until it is assessed; none for one assessed as not a vulnerability); an external penetration test within a year (from a year after the information security policy's first approval), and its critical and high findings, once each is fixed or accepted, retested within {RETEST_DAYS} days of the last fix. Calendar days, as SECURITY.md's targets are. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done", VULNERABILITY_ACCEPTERS.join(" or "), windows.0.iter().map(|(k, d)| format!("{k} {d} days")).collect::<Vec<_>>().join(", ")),
+            "basis": format!("every vulnerability found outside the scans (reported under SECURITY.md, by a penetration test, by a vendor, or by the provider) received before the period's end and still being handled in it, by register id: a report acknowledged within {ACKNOWLEDGE_DAYS} days of being received; its severity set and an owner role named (assessed) within {ASSESS_DAYS}; and fixed, or accepted by someone holding or deputising {} that day, within its severity's window from the day it was received ({}; the strictest until it is assessed; none for one assessed as not a vulnerability); an external penetration test within a year (from a year after the information security policy's first approval), and its critical and high findings, once each is fixed or accepted, retested within {RETEST_DAYS} days of the last being fixed or accepted (a retest counting only on or after the last fix). Calendar days, as SECURITY.md's targets are. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done", VULNERABILITY_ACCEPTERS.join(" or "), windows.0.iter().map(|(k, d)| format!("{k} {d} days")).collect::<Vec<_>>().join(", ")),
             "informationSecurityPolicy": { "inPolicySet": in_set, "lastApproved": approved.map(ds), "approvalCurrent": current, "lastPenTest": last_test.map(ds), "penTestDue": test_due.map(|d| ds(last_test.map_or(d, |l| plus(l, YEAR_DAYS).max(d)))) },
             "windows": windows.0,
             "summary": {
@@ -3280,6 +3281,20 @@ mod tests {
             let ex = &c.vulnerabilities().0["exceptions"];
             assert_eq!((ex["retestOverdue"].clone(), ex["fixOverdue"].clone()), (json!([]), json!(["V-02 high (received 2027-02-10, open, due 2027-03-12)"])), "no retest is due while a finding is open: the finding is overdue");
         });
+        let mut accepted_later = good();
+        accepted_later["penTests"][0]["reported"] = json!("2027-01-05");
+        accepted_later["penTests"][0]["retested"] = json!("2027-02-15");
+        for (k, d) in [("received", "2027-01-05"), ("assessed", "2027-01-06"), ("fixed", "2027-01-10")] {
+            accepted_later["vulnerabilities"][1][k] = json!(d);
+        }
+        accepted_later["vulnerabilities"].as_array_mut().unwrap().push(json!({ "id": "V-12", "source": "pentest", "penTest": "PT-01", "received": "2027-01-05", "assessed": "2027-01-06", "severity": "high", "owner": "Engineering lead", "accepted": "2027-02-04", "acceptedBy": "p-sec" }));
+        check(&accepted_later, &|c| {
+            let x = c.vulnerabilities().0;
+            assert_eq!((x["penTests"][0]["retestDue"].as_str(), x["penTests"][0]["retestCoversFixes"].as_bool()), (Some("2027-03-06"), Some(true)), "due 30 days after the last finding is closed, here accepted: {x:#}");
+            assert_eq!(exceptions(&x), 0, "the retest was within 30 days of the last closing: {x:#}");
+        });
+        accepted_later["penTests"][0]["retested"] = json!("2027-03-10");
+        check(&accepted_later, &|c| assert_eq!(c.vulnerabilities().0["exceptions"]["retestLate"], json!(["PT-01 (last fixed 2027-01-10, retested 2027-03-10, due 2027-03-06)"])));
 
         let mut old = good();
         old["penTests"][0]["reported"] = json!("2026-01-10");
