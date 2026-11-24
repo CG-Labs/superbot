@@ -169,7 +169,7 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
         // stop: disable them and revoke their tokens; handlers refuse the rest (ADR 0239).
         let own_mfa = p.starts_with("/api/auth/mfa/") && p != "/api/auth/mfa/policy";
         let asking = p.starts_with("/api/me/role-requests");
-        let stopping = matches!((m.as_str(), p.as_str()), ("PATCH", "/api/service-accounts/{id}") | ("DELETE", "/api/service-accounts/{id}/tokens/{token}"));
+        let stopping = matches!((m.as_str(), p.as_str()), ("PATCH", "/api/service-accounts/{id}") | ("DELETE", "/api/service-accounts/{id}/tokens/{token}" | "/api/bots/{id}/keeper"));
         if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa && !asking && !stopping {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }

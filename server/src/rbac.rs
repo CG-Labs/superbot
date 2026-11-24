@@ -366,8 +366,10 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("PATCH", ["bots", _, "access"]) => Write,
         ("PUT" | "DELETE", ["bots", _, "grants", _]) => Write,
         // Which of its owner's service accounts keeps it (ADR 0229). Handlers also require
-        // the Bot's owner or an admin.
-        ("PUT" | "DELETE", ["bots", _, "keeper"]) => Write,
+        // the Bot's owner or an admin, and refuse Bots. Taking it back only narrows, so a
+        // read-only owner may too (ADR 0239).
+        ("PUT", ["bots", _, "keeper"]) => Write,
+        ("DELETE", ["bots", _, "keeper"]) => Account,
         ("POST", ["ask" | "handoff"]) => Write,
         ("POST", ["approvals", "check"]) => Write,
 
@@ -482,7 +484,7 @@ mod tests {
             ("PUT", "/api/bots/b1/grants/u1", Perm::Write),
             ("DELETE", "/api/bots/b1/grants/a%40example.com", Perm::Write),
             ("PUT", "/api/bots/b1/keeper", Perm::Write),
-            ("DELETE", "/api/bots/b1/keeper", Perm::Write),
+            ("DELETE", "/api/bots/b1/keeper", Perm::Account),
             ("GET", "/api/policy", Perm::Read),
             ("GET", "/api/policy/rules", Perm::Read),
             ("GET", "/api/approvals", Perm::Review),
