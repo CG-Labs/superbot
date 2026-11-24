@@ -209,11 +209,13 @@ The Provider pins the covered team or users to the Agreed Region in the Service,
 
 (g) **[Only if the Provider runs the server and its backup store in the Agreed Region; otherwise delete.]** the Service's own data (its database and files, and server backups) is in the Agreed Region: the Provider states so in the Service (`SERVER_DATA_REGION`, and the region of the server backups' off-host store), and the residency report shows it ([ADR 0184](../adr/0184-botds-own-data-region.md)). **[If the Provider runs with `RESIDENCY_SERVER_DATA=require`: the Service refuses any pin to another region and doesn't start unless server backups' off-host copies are in the Agreed Region.]**
 
+(h) **[Only if the Provider keeps a chat store in the Agreed Region; otherwise delete.]** the chat history of the covered team's or users' Bots is kept in a database in the Agreed Region, separate from the Service's own database, with its backups in the same region; chat moved there when the pin is made is recorded in the audit log, and the residency report's "Chats" section shows where it is ([ADR 0215](../adr/0215-pinned-chats-in-a-store-in-their-region.md)).
+
 ### IV.2 What the pin doesn't cover
 
 | Data | Where it is | Note |
 |------|-------------|------|
-| The control plane: the Service's database (accounts, chat history, routines, sealed secrets, the audit log), the files beside it, and server backups | **[Where the Provider runs the server and keeps its backups, e.g. also London]** | The pin doesn't move these. They are in the Agreed Region only if the Provider runs the server and its backup store there; then IV.1(g) applies and this row can say "covered by IV.1(g)". The residency report's "botd's own data" section shows where the Provider states they are ([ADR 0184](../adr/0184-botds-own-data-region.md)). |
+| The control plane: the Service's database (accounts, chat history, routines, sealed secrets, the audit log), the files beside it, and server backups | **[Where the Provider runs the server and keeps its backups, e.g. also London]** | The pin doesn't move these. They are in the Agreed Region only if the Provider runs the server and its backup store there; then IV.1(g) applies and this row can say "covered by IV.1(g)". The residency report's "botd's own data" section shows where the Provider states they are ([ADR 0184](../adr/0184-botds-own-data-region.md)). Chat history isn't in this row where IV.1(h) applies. |
 | Model calls outside the plan's routes | [IV.4](#iv4-model-providers) | The pin holds the plan's routes (IV.1(e)). It doesn't hold what a Bot's own tools send, such as a script calling an API with a key the user saved. |
 | Push notifications, email, webhooks, billing and sign-in | As [Annex III](#annex-iii-subprocessors) says | |
 | Harness logins with a person's own subscription | The model provider, under the person's own account | Not the Provider's Subprocessor (Annex III). |

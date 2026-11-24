@@ -181,37 +181,49 @@ pub fn looks_secret(name: &str) -> bool {
 /// subjects. Safe to run on every start. The audit log is append-only, so its rows are
 /// redacted when read instead; approval inputs are sealed, and redacted before sealing.
 pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
+    scrub_rows_in(c, &["main.messages"], true)
+}
+
+/// As `scrub_rows`, over the messages tables named (a region's chat store's too, ADR
+/// 0215), and approval subjects when `approvals`.
+pub fn scrub_rows_in(c: &Connection, messages: &[&str], approvals: bool) -> rusqlite::Result<usize> {
     let tx = c.unchecked_transaction()?;
     let mut n = 0;
+    let mut tables: Vec<(&str, &str)> = messages.iter().map(|t| (*t, "text")).collect();
+    if approvals {
+        tables.push(("main.approvals", "subject"));
+    }
     // A user's own Bots' rows first, with their secrets and botd's together, longest
     // first (as `text_for`), so a short value of theirs can't split a longer secret.
     for (owner, values) in owned() {
         let mut all: Vec<String> = known().into_iter().chain(values).collect();
         all.sort_by_key(|k| std::cmp::Reverse(k.len()));
         for s in all {
-            for (table, col) in [("messages", "text"), ("approvals", "subject")] {
-                let sql = format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0 AND bot_id IN (SELECT id FROM bots WHERE owner_id = ?3)");
+            for (table, col) in &tables {
+                let sql = format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0 AND bot_id IN (SELECT id FROM main.bots WHERE owner_id = ?3)");
                 n += tx.execute(&sql, params![s, MARK, owner])?;
             }
         }
     }
     for s in known() {
-        for (table, col) in [("messages", "text"), ("approvals", "subject")] {
+        for (table, col) in &tables {
             n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
         }
     }
     // Choice cards and saved requesters are JSON, where a secret with quotes or
     // backslashes is escaped, so they're parsed and redacted value by value.
-    for col in ["question", "requested_by"] {
-        let rows: Vec<(i64, String, Option<String>)> = {
-            let mut s = tx.prepare(&format!("SELECT m.id, m.{col}, b.owner_id FROM messages m LEFT JOIN bots b ON b.id = m.bot_id WHERE m.{col} IS NOT NULL"))?;
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
-        };
-        for (id, raw, owner) in rows {
-            let Ok(json) = serde_json::from_str::<Value>(&raw) else { continue };
-            let clean = value_for(owner.as_deref().as_slice(), json.clone());
-            if clean != json {
-                n += tx.execute(&format!("UPDATE messages SET {col} = ? WHERE id = ?"), params![clean.to_string(), id])?;
+    for table in messages {
+        for col in ["question", "requested_by"] {
+            let rows: Vec<(i64, String, Option<String>)> = {
+                let mut s = tx.prepare(&format!("SELECT m.id, m.{col}, b.owner_id FROM {table} m LEFT JOIN main.bots b ON b.id = m.bot_id WHERE m.{col} IS NOT NULL"))?;
+                s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
+            };
+            for (id, raw, owner) in rows {
+                let Ok(json) = serde_json::from_str::<Value>(&raw) else { continue };
+                let clean = value_for(owner.as_deref().as_slice(), json.clone());
+                if clean != json {
+                    n += tx.execute(&format!("UPDATE {table} SET {col} = ? WHERE id = ?"), params![clean.to_string(), id])?;
+                }
             }
         }
     }

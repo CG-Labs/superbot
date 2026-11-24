@@ -85,14 +85,14 @@ On the app's **Sign On** tab, the **Metadata URL** is `SSO_CORP_IDP_METADATA_URL
 2. **Single sign-on → SAML → Basic SAML Configuration**: **Identifier (Entity ID)** the SP entity ID, **Reply URL (Assertion Consumer Service URL)** the ACS URL. Set **Sign on URL** to `https://superbot.example.com/api/auth/sso/corp/start`, so the My Apps tile starts the sign-in at SuperBot ([app tiles](#idp-initiated-sign-in-app-tiles)), and leave **Relay State** empty. The **Logout Url** is the SLO URL if you want [single logout](#single-logout).
 3. **Attributes & Claims → Unique User Identifier (Name ID)**: **Name identifier format** Persistent, **Source attribute** `user.objectid`. The default (`user.userprincipalname`) can change and move to someone else.
 4. Keep the default claims: Entra sends the email as `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` (from `user.mail`) and the name as `http://schemas.microsoft.com/identity/claims/displayname`, which SuperBot reads without settings.
-5. **SAML Certificates**: **Signing Option** Sign SAML assertion (or Sign SAML response and assertion), **Signing Algorithm** SHA-256. Leave **Token encryption** off: Entra ID encrypts with AES-CBC, which SuperBot refuses.
+5. **SAML Certificates**: **Signing Option** Sign SAML assertion (or Sign SAML response and assertion), **Signing Algorithm** SHA-256. Leave **Token encryption** off, unless your policy wants assertions encrypted: Entra ID encrypts with AES-CBC, which needs **Sign SAML response and assertion** and `SSO_CORP_AES_CBC=signed-response` ([below](#aes-cbc-entra-id-and-adfs)).
 6. **Properties → Assignment required?** Yes, then **Users and groups**: only those who should use SuperBot.
 
 Under **SAML Certificates**, the **App Federation Metadata Url** is `SSO_CORP_IDP_METADATA_URL`. Under **Set up SuperBot**, the **Microsoft Entra Identifier** (`https://sts.windows.net/<tenant-id>/`) is `SSO_CORP_IDP_ENTITY_ID`.
 
 ### ADFS, OneLogin, PingFederate
 
-The same in their terms: a relying party or SAML app from SuperBot's SP metadata URL, a persistent NameID from an immutable id (for ADFS, the custom rule in [the bridge guide](saml.md#adfs)), signed assertions with SHA-256, and email and name attributes. ADFS's entity ID is usually `http://<adfs-host>/adfs/services/trust` and its metadata is at `https://<adfs-host>/FederationMetadata/2007-06/FederationMetadata.xml`.
+The same in their terms: a relying party or SAML app from SuperBot's SP metadata URL, a persistent NameID from an immutable id (for ADFS, the custom rule in [the bridge guide](saml.md#adfs)), signed assertions with SHA-256, and email and name attributes. ADFS encrypts assertions with AES-CBC: turn encryption off at the relying party, or sign the response too ([below](#aes-cbc-entra-id-and-adfs)). ADFS's entity ID is usually `http://<adfs-host>/adfs/services/trust` and its metadata is at `https://<adfs-host>/FederationMetadata/2007-06/FederationMetadata.xml`.
 
 ## 3. Let people in
 
@@ -185,6 +185,7 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_PRIVATE_KEY` | | With `SP_CERT_FILE`: the SP's private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_ENCRYPTED_ASSERTIONS` | `off` | `allow`: take encrypted assertions as well as plain ones; `require`: only encrypted ones ([below](#encrypted-assertions)). `off` refuses them. |
 | `SSO_<ID>_SP_ENCRYPTION_CERT_FILE` | | With `allow` or `require`: your own encryption certificate (PEM), another key than the signing one, with its key as `SSO_<ID>_ENCRYPTION_PRIVATE_KEY`. Without it, botd makes and keeps one. |
+| `SSO_<ID>_AES_CBC` | `off` | `signed-response`: also take AES-CBC encrypted assertions (Entra ID, ADFS), only inside a response the IdP signed ([below](#aes-cbc-entra-id-and-adfs)). Needs `ENCRYPTED_ASSERTIONS`. |
 | `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` | | With `SP_ENCRYPTION_CERT_FILE`: its private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_METADATA_SIGNING_CERT_FILE` | | The certificates (PEM, one or more) the IdP signs its metadata with. Metadata is then checked on every load ([below](#signed-idp-metadata)). |
 | `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked. Badly signed metadata is refused either way. |
@@ -217,13 +218,26 @@ Assertions travel through the browser over HTTPS, so most setups don't need them
 
 What botd takes and refuses:
 
-- **Content**: AES-128-GCM, AES-192-GCM, AES-256-GCM. AES-CBC and Triple DES are refused (`weak_algorithm`): unauthenticated, they allow padding-oracle attacks. Entra ID and ADFS only encrypt with AES-256-CBC, so leave encryption off for them.
+- **Content**: AES-128-GCM, AES-192-GCM, AES-256-GCM. AES-CBC is refused (`weak_algorithm`) unless `AES_CBC=signed-response` ([below](#aes-cbc-entra-id-and-adfs)). Triple DES is always refused.
 - **Key transport**: RSA-OAEP (`rsa-oaep-mgf1p`, or XML Encryption 1.1 `rsa-oaep` with SHA-1 to SHA-512). RSA PKCS #1 v1.5 is refused (`weak_key_transport`).
 - **Keys** come only from botd, never from the message. Several `EncryptedKey`s (as during an IdP certificate rollover) are fine; the one for botd's key is used.
 - **The IdP's signature still counts.** Anyone can encrypt to SuperBot's public certificate, so the assertion inside must be signed by the IdP, exactly as a plain one. A signature on the response is checked before anything is decrypted. The decrypted assertion goes through every other check: one assertion only, no assertion inside it, signatures only where they belong, IDs unique across the response and the assertion.
 - **Encrypted NameIDs** (`EncryptedID`), in assertions and in the IdP's LogoutRequests, are decrypted the same way, with the same key and algorithms ([ADR 0151](../adr/0151-saml-encrypted-nameids-ecdsa-and-signed-metadata.md)). They need `ENCRYPTED_ASSERTIONS=allow` or `require`, even if the IdP encrypts only the NameID. With it `off`, they're refused (`encrypted_id`). They're read only after the IdP's signature over them is checked. Inside there must be exactly one `NameID`, and a subject with two identifiers is refused (`wrapped`).
 
 To use your own key, set `SSO_CORP_SP_ENCRYPTION_CERT_FILE=/etc/superbot/corp-enc.pem` and `botctl secret set SSO_CORP_ENCRYPTION_PRIVATE_KEY < corp-enc.key`. It must be another key than the signing one, and RSA (IdPs encrypt to it with RSA-OAEP). The provider isn't offered until the key is set and matches. To change the keys botd made, [roll them over](#rolling-over-superbots-keys).
+
+The audit log's `auth.login` events show which cipher each sign-in used (`details.assertionEncryption`, such as `aes256-gcm`).
+
+### AES-CBC (Entra ID and ADFS)
+
+Entra ID and ADFS encrypt assertions only with AES-256-CBC. CBC alone isn't authenticated: changed ciphertext still decrypts, and the errors that gives can leak the plaintext (a padding oracle). SuperBot takes it only when the IdP signs the whole response, which covers the encrypted assertion, and checks that signature before decrypting ([ADR 0218](../adr/0218-saml-aes-cbc-in-signed-responses.md)). Changed ciphertext then fails as `bad_signature` and is never decrypted.
+
+1. Set `SSO_CORP_ENCRYPTED_ASSERTIONS=allow` and `SSO_CORP_AES_CBC=signed-response`, and restart. The SP metadata then lists AES-256-CBC and AES-128-CBC after GCM.
+2. Sign the response as well as the assertion. **Entra ID**: **SAML Certificates → Signing Option** Sign SAML response and assertion. **ADFS**: `Set-AdfsRelyingPartyTrust -TargetName SuperBot -SamlResponseSignature MessageAndAssertion`.
+3. Turn encryption on with SuperBot's encryption certificate. **Entra ID**: **Token encryption → Import Certificate**, then **Activate token encryption certificate**. **ADFS**: the relying party's **Encryption** tab (importing SuperBot's metadata sets it).
+4. Once sign-ins work, set `SSO_CORP_ENCRYPTED_ASSERTIONS=require`.
+
+A CBC assertion in a response that isn't signed is refused as `cbc_unsigned_response`. The assertion inside must still be signed. Encrypted NameIDs never take CBC; Entra ID and ADFS don't encrypt them on their own.
 
 ## Rolling over SuperBot's keys
 
@@ -363,11 +377,12 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `not_linked` | Link the person, or turn on just in time. The event has the `subject` and the IdP's entity ID as `issuer`. |
 | `unsigned` | The IdP signs only the response, or nothing: sign the assertion. |
 | `bad_signature` | The IdP signed with a certificate botd doesn't have: refresh or import the metadata (`botctl sso saml <id>` shows the certificates in use). Often its certificate rolled over: look for `sso.saml_certificate_expiring` ([above](#certificates-that-are-ending)). |
-| `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 or ECDSA with SHA-256/384 (SHA-1 is refused), and AES-GCM if you encrypt (AES-CBC is refused). |
+| `weak_algorithm`, `bad_algorithm` | Use RSA-SHA256 or ECDSA with SHA-256/384 (SHA-1 is refused), and AES-GCM if you encrypt. AES-CBC (Entra ID, ADFS) needs `AES_CBC=signed-response` ([above](#aes-cbc-entra-id-and-adfs)). |
 | `encrypted_assertion` | The IdP encrypts but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: turn it on ([above](#encrypted-assertions)), or turn off encryption at the IdP. |
 | `unencrypted_assertion` | `ENCRYPTED_ASSERTIONS=require`, but the IdP sent a plain assertion: turn on encryption at the IdP. |
 | `bad_encryption` | botd couldn't decrypt: the IdP encrypts to another certificate (import SuperBot's metadata again; after a [key rollover](#rolling-over-superbots-keys), it may still use a retired key), or the encrypted data is malformed. |
-| `weak_key_transport` | The IdP wraps the key with RSA PKCS #1 v1.5: choose RSA-OAEP. (AES-CBC content shows as `weak_algorithm`: choose AES-GCM.) |
+| `weak_key_transport` | The IdP wraps the key with RSA PKCS #1 v1.5: choose RSA-OAEP. (AES-CBC content shows as `weak_algorithm`.) |
+| `cbc_unsigned_response` | An AES-CBC assertion in a response the IdP didn't sign: sign the response too (Entra ID: Sign SAML response and assertion; ADFS: `MessageAndAssertion`). |
 | `encrypted_id` | The IdP encrypts the NameID but `SSO_<ID>_ENCRYPTED_ASSERTIONS` is `off`: set it to `allow`, and give the IdP SuperBot's encryption certificate. |
 | `no_sp_key` | botd has no decryption key: with `SP_ENCRYPTION_CERT_FILE`, set `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` (`botctl sso saml <id>` shows the problem). |
 | `wrapped` | The response is shaped to fool signature checks, or the subject names the person twice (say, a `NameID` and an `EncryptedID`). |

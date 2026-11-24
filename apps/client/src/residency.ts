@@ -32,12 +32,22 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
     else warnings.push(`${b.outside} of your computer's ${b.kept} backups are outside ${p.region}. Your admins see a warning about it.`);
   }
   const s = v.serverData;
-  if (s?.inRegion) lines.push(`SuperBot's own copy of your account and chats is in ${p.region}.`);
+  const c = v.chats;
+  const moving = !!c?.store && (c.moving ?? !c.inRegion);
+  const chatsHeld = !!c?.store && !moving && !s?.inRegion;
+  if (moving) lines.push(`Your chats are being moved to ${p.region}'s own database.`);
+  else if (c?.store) {
+    lines.push(`Your chats are kept in ${p.region}, in a database of their own there.`);
+    const n = c.earlierBackups ?? 0;
+    if (n > 0) lines.push(`${n === 1 ? "A backup" : `${n} backups`} from before they moved still ${n === 1 ? "holds" : "hold"} earlier copies in another region until ${n === 1 ? "it is" : "they are"} deleted.`);
+  }
+  const what = chatsHeld ? "account" : "account and chats";
+  if (s?.inRegion) lines.push(`SuperBot's own copy of your ${what} is in ${p.region}.`);
   else if (s) {
     const where =
       s.region === p.region && s.backupsInRegion === false
-        ? `SuperBot's own copy of your account and chats is in ${p.region}, but its backups aren't kept there`
-        : `SuperBot's own copy of your account and chats isn't in ${p.region}${s.region ? `; it is in ${s.region}` : ""}`;
+        ? `SuperBot's own copy of your ${what} is in ${p.region}, but its backups aren't kept there`
+        : `SuperBot's own copy of your ${what} isn't in ${p.region}${s.region ? `; it is in ${s.region}` : ""}`;
     if (s.required) warnings.push(`${where}. Your admins see a warning about it.`);
     else lines.push(`${where}. Your agreement says where it is.`);
   }
