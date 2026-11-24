@@ -196,6 +196,8 @@ mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;
 #[cfg(test)]
+mod scim_scopes_http_tests;
+#[cfg(test)]
 mod scim_tokens_http_tests;
 mod screen;
 mod secrets;

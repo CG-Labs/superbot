@@ -1633,9 +1633,12 @@ pub struct ScimToken {
     /// The last expiry notice audited for it: `expiring`, then `expired`.
     #[serde(skip)]
     pub expiry_notice: Option<String>,
+    /// What it may do (ADR 0224). All four for tokens made before scopes.
+    pub scopes: crate::scim::scopes::Scopes,
 }
 
 fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
+    let scopes: Option<String> = r.get("scopes")?;
     Ok(ScimToken {
         id: r.get("id")?,
         tenant: r.get("tenant")?,
@@ -1649,6 +1652,7 @@ fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
         expires_at: r.get("expires_at")?,
         rotated_to: r.get("rotated_to")?,
         expiry_notice: r.get("expiry_notice")?,
+        scopes: crate::scim::scopes::Scopes::from_stored(scopes.as_deref()),
     })
 }
 
@@ -2314,7 +2318,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 68] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 69] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2383,7 +2387,18 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 68] = [
     migrate_scim_team_role_groups,
     migrate_role_requests,
     migrate_service_account_bots,
+    migrate_scim_token_scopes,
 ];
+
+/// SCIM token scopes (ADR 0224): a JSON list of scope names. Tokens made before keep a
+/// null, which is every scope, so upgrading changes nothing an IdP can do.
+fn migrate_scim_token_scopes(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('scim_tokens') WHERE name = 'scopes'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE scim_tokens ADD COLUMN scopes TEXT;")
+}
 
 /// Service accounts' own Bots (ADR 0222): a Bot a service account made names it. The Bot
 /// is still its owner's (machine, plan, keys, memory); the account keeps it only while it's
@@ -8425,7 +8440,17 @@ impl Db {
 
     /// A tenant's first token sets its SSO provider for good: a token naming another gets
     /// `Err` with the tenant's provider. Checked and written in one transaction.
-    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>, expires_at: i64) -> Result<ScimToken, Option<String>> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_scim_token(
+        &self,
+        tenant: &str,
+        label: Option<&str>,
+        sso_provider: Option<&str>,
+        token_hash: &str,
+        by: Option<&str>,
+        expires_at: i64,
+        scopes: crate::scim::scopes::Scopes,
+    ) -> Result<ScimToken, Option<String>> {
         let id = format!("st{}", crate::random_hex(4));
         let c = self.c();
         let tx = c.unchecked_transaction().unwrap();
@@ -8437,8 +8462,8 @@ impl Db {
             return Err(first);
         }
         tx.execute(
-            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![id, tenant, label, sso_provider, token_hash, now(), by, expires_at],
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, tenant, label, sso_provider, token_hash, now(), by, expires_at, scopes.to_stored()],
         )
         .unwrap();
         let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).unwrap();
@@ -8479,10 +8504,10 @@ impl Db {
     }
 
     /// Replaces a live, unrotated token with a new one of the same tenant, label and SSO
-    /// link, in one transaction (ADR 0196). The old one is revoked now, or with
-    /// `keep_until`, expires then unless it would sooner. None if the old one was revoked,
-    /// expired or rotated meanwhile.
-    pub fn rotate_scim_token(&self, old: &str, token_hash: &str, expires_at: i64, keep_until: Option<i64>, by: Option<&str>) -> Option<ScimToken> {
+    /// link, with `scopes`, in one transaction (ADR 0196). The old one is revoked now, or
+    /// with `keep_until`, expires then unless it would sooner. None if the old one was
+    /// revoked, expired or rotated meanwhile.
+    pub fn rotate_scim_token(&self, old: &str, token_hash: &str, expires_at: i64, keep_until: Option<i64>, by: Option<&str>, scopes: crate::scim::scopes::Scopes) -> Option<ScimToken> {
         let id = format!("st{}", crate::random_hex(4));
         let at = now();
         let c = self.c();
@@ -8504,9 +8529,9 @@ impl Db {
             return None;
         }
         tx.execute(
-            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at)
-             SELECT ?1, tenant, label, sso_provider, ?2, ?3, ?4, ?5 FROM scim_tokens WHERE id = ?6",
-            params![id, token_hash, at, by, expires_at, old],
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at, scopes)
+             SELECT ?1, tenant, label, sso_provider, ?2, ?3, ?4, ?5, ?7 FROM scim_tokens WHERE id = ?6",
+            params![id, token_hash, at, by, expires_at, old, scopes.to_stored()],
         )
         .ok()?;
         let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).ok()?;
@@ -8543,6 +8568,11 @@ impl Db {
     #[cfg(test)]
     pub fn set_scim_token_notice(&self, id: &str, notice: Option<&str>) {
         self.c().execute("UPDATE scim_tokens SET expiry_notice = ?1 WHERE id = ?2", params![notice, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn set_scim_token_scopes(&self, id: &str, scopes: Option<&str>) {
+        self.c().execute("UPDATE scim_tokens SET scopes = ?1 WHERE id = ?2", params![scopes, id]).unwrap();
     }
 
     #[cfg(test)]

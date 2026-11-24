@@ -386,10 +386,15 @@
         <input id="scim-tenant" placeholder="Tenant, e.g. entra" required spellcheck="false" />
         <input id="scim-label" placeholder="Label (optional)" />
         <input id="scim-sso" placeholder="SSO provider id (optional)" spellcheck="false" />
+        <select id="scim-scopes" title="What the token can do">
+          <option value="users:write,groups:write">Users and groups</option>
+          <option value="users:write">Users only</option>
+          <option value="users:read,groups:read">Read only</option>
+        </select>
         <button type="submit" class="btn primary">New token</button>
       </form>
       <table class="grid">
-        <thead><tr><th>Tenant</th><th>Label</th><th>SSO</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead>
+        <thead><tr><th>Tenant</th><th>Label</th><th>SSO</th><th>Can</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead>
         <tbody id="scim-rows"></tbody>
       </table>
       <div class="empty" id="scim-empty" hidden></div>

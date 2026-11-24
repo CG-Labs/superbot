@@ -1,8 +1,8 @@
 //! SCIM Bulk (RFC 7644 section 3.7): `POST /scim/v2/Bulk` carries up to
 //! MAX_OPERATIONS POST, PUT, PATCH and DELETE operations on `/Users` and `/Groups`.
 //! Each operation goes to the handler a single request would reach, with the same
-//! token, so validation, tenant scoping, deprovisioning and audit events are exactly
-//! theirs. Operations run one at a time in the order sent, except that one using
+//! token and after the scope check the guard makes for that request (ADR 0224), so
+//! validation, tenant scoping, deprovisioning and audit events are exactly theirs. Operations run one at a time in the order sent, except that one using
 //! `bulkId:<id>` waits for the POST that defines it. Nothing is rolled back: an
 //! operation that succeeded stays done whatever the rest do.
 //! Design: docs/adr/0153-scim-bulk.md.
@@ -49,6 +49,15 @@ impl Kind {
             Kind::Users => "Users",
             Kind::Groups => "Groups",
         }
+    }
+
+    /// The scope every operation on it needs: all of Bulk's methods write.
+    fn needs(self) -> scopes::Scope {
+        let resource = match self {
+            Kind::Users => scopes::Resource::Users,
+            Kind::Groups => scopes::Resource::Groups,
+        };
+        scopes::Scope(resource, scopes::Access::Write)
     }
 
     /// What one request to this endpoint may carry, so Bulk is never a way round it.
@@ -377,6 +386,7 @@ pub async fn bulk(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
                 stopped = Some(Stopped::RateLimited);
                 Err(ScimError::new(StatusCode::TOO_MANY_REQUESTS, None, format!("Too many requests. Send this operation and the rest again in {} seconds.", retry.max(1))))
             }
+            _ if !c.token.scopes.allows(op.kind.needs()) => Err(insufficient_scope(c.token.scopes, op.kind.needs())),
             (None, Some(r)) if circular => Err(ScimError::new(StatusCode::CONFLICT, None, format!("bulkId:{r}: this operation's bulkId references are circular, so it was not run."))),
             (None, Some(r)) if !posts.contains(r.as_str()) => Err(ScimError::new(StatusCode::CONFLICT, None, format!("bulkId:{r} isn't the bulkId of a POST in this request."))),
             (None, Some(r)) => Err(ScimError::new(StatusCode::CONFLICT, None, format!("bulkId:{r}: the POST that defines it failed, so this operation was not run."))),

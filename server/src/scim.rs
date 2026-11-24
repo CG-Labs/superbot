@@ -3,20 +3,23 @@
 //! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas,
 //! the Enterprise User extension (ADR 0176), and Bulk (`bulk`); sorting and ETags are
 //! not supported. Each IdP connection is a tenant with its own bearer tokens (`sbp_`,
-//! stored hashed, expiring and rotatable, ADR 0196), and sees only the users it
+//! stored hashed, expiring and rotatable, ADR 0196, and limited to the resources its
+//! scopes name, ADR 0224, `scopes`), and sees only the users it
 //! provisioned and the groups it made or an admin linked to it. The IdP never names a
 //! role: with SCIM_GROUP_ROLES=on, an admin may map a group to a custom role, never
 //! admin, and its members get and lose it with the group (`roles`), or declare a group a
 //! role group that gives a role and is no team (`role_groups`).
 //! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md,
 //! docs/adr/0138-scim-group-role-mapping.md, docs/adr/0176-scim-enterprise-user-extension.md,
-//! docs/adr/0180-scim-role-groups.md, docs/adr/0196-scim-token-expiry-and-rotation.md.
+//! docs/adr/0180-scim-role-groups.md, docs/adr/0196-scim-token-expiry-and-rotation.md,
+//! docs/adr/0224-scim-token-scopes.md.
 
 pub mod bulk;
 pub mod google;
 pub mod groups;
 pub mod role_groups;
 pub mod roles;
+pub mod scopes;
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
 use crate::db::{self, Enterprise, NewIdentity, ScimConflict, ScimFields, ScimKey, ScimToken, ScimUser, User};
@@ -143,11 +146,13 @@ pub struct ScimError {
     status: StatusCode,
     scim_type: Option<&'static str>,
     detail: String,
+    /// The scope the token lacked, for a 403 `insufficient_scope` (ADR 0224).
+    scope: Option<scopes::Scope>,
 }
 
 impl ScimError {
     fn new(status: StatusCode, scim_type: Option<&'static str>, detail: impl Into<String>) -> ScimError {
-        ScimError { status, scim_type, detail: detail.into() }
+        ScimError { status, scim_type, detail: detail.into(), scope: None }
     }
 
     fn body(&self) -> Value {
@@ -175,33 +180,61 @@ fn server_error(detail: impl Into<String>) -> ScimError {
     ScimError::new(StatusCode::INTERNAL_SERVER_ERROR, None, detail)
 }
 
+/// A token whose scopes don't include `need`: 403, as RFC 6750 answers a bearer token
+/// with too little scope. RFC 7644 has no `scimType` for it.
+fn insufficient_scope(have: scopes::Scopes, need: scopes::Scope) -> ScimError {
+    let have = match have.names() {
+        n if n.is_empty() => "none".to_string(),
+        n => n.join(", "),
+    };
+    let detail = format!(
+        "This SCIM token's scopes ({have}) don't include {}. Give the tenant a token that has it (botctl scim token create <tenant> --scopes ...), or stop the IdP sending {} requests.",
+        need.name(),
+        need.0.noun(),
+    );
+    ScimError { scope: Some(need), ..ScimError::new(StatusCode::FORBIDDEN, None, detail) }
+}
+
 impl IntoResponse for ScimError {
     fn into_response(self) -> Response {
         let mut r = scim_json(self.status, self.body());
-        r.extensions_mut().insert(Failed(self.scim_type));
+        if let Some(s) = self.scope {
+            let challenge = format!("Bearer realm=\"SuperBot SCIM\", error=\"insufficient_scope\", scope=\"{}\"", s.name());
+            r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_str(&challenge).expect("scope names are ASCII"));
+        }
+        r.extensions_mut().insert(Failed { scim_type: self.scim_type, scope: self.scope });
         r
     }
 }
 
-/// On an error response: its `scimType`, for [`request_failed`].
+/// On an error response: its `scimType` and the scope the token lacked, for [`request_failed`].
 #[derive(Clone, Copy)]
-struct Failed(Option<&'static str>);
+struct Failed {
+    scim_type: Option<&'static str>,
+    scope: Option<scopes::Scope>,
+}
 
 /// A request with a valid token that the server refused or failed: the IdP's provisioning
 /// is stuck until someone fixes it. Not a 404, which IdPs get in their normal course (a
-/// lookup, or a delete already done). The reason is the `scimType` in snake case
-/// (`invalid_syntax`), or the status: a code the support bundle and health score keep.
+/// lookup, or a delete already done). The reason is `insufficient_scope` (with the scope
+/// lacked), the `scimType` in snake case (`invalid_syntax`), or the status: a code the
+/// support bundle and health score keep.
 fn request_failed(app: &AppState, who: &Who, tenant: &str, method: &str, path: &str, r: &Response) {
     let status = r.status();
     if !(status.is_client_error() || status.is_server_error()) || status == StatusCode::NOT_FOUND {
         return;
     }
-    let reason = match r.extensions().get::<Failed>().and_then(|f| f.0) {
-        Some(t) => snake_case(t),
-        None => format!("status_{}", status.as_u16()),
+    let failed = r.extensions().get::<Failed>().copied();
+    let reason = match failed {
+        Some(Failed { scope: Some(_), .. }) => "insufficient_scope".to_string(),
+        Some(Failed { scim_type: Some(t), .. }) => snake_case(t),
+        _ => format!("status_{}", status.as_u16()),
     };
     let resource = path.trim_start_matches('/').split('/').find(|s| !s.is_empty() && *s != "scim" && *s != "v2").unwrap_or("");
-    let details = json!({ "tenant": tenant, "status": status.as_u16(), "reason": reason, "method": method, "resource": resource });
+    let mut details = json!({ "tenant": tenant, "status": status.as_u16(), "reason": reason, "method": method, "resource": resource });
+    if let Some(s) = failed.and_then(|f| f.scope) {
+        details["scope"] = json!(s.name());
+    }
     app.db.record(&who.event("scim.request_failed").outcome(Outcome::Failure).details(details));
 }
 
@@ -310,8 +343,9 @@ fn token_shaped(t: &str) -> bool {
     t.strip_prefix(TOKEN_PREFIX).is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Checks the Host, that SCIM is on, the token, the tenant's rate, and the client IP's
-/// failures, before any SCIM handler runs. Session cookies and tokens, the break-glass
+/// Checks the Host, that SCIM is on, the token, the tenant's rate, the client IP's
+/// failures, and that the token's scopes cover the request (Bulk checks each of its
+/// operations), before any SCIM handler runs. Session cookies and tokens, the break-glass
 /// password, and the Bots' token never work here.
 ///
 /// A valid token is never refused for its IP's failures: Entra and Okta send from
@@ -356,8 +390,14 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
     }
     let who = Who { actor: actor(&a, &t), source };
     let (tenant, method, path) = (t.tenant.clone(), req.method().to_string(), req.uri().path().to_string());
-    req.extensions_mut().insert(Caller { token: t, who: who.clone() });
-    let r = next.run(req).await;
+    let lacking = scopes::needed(req.method(), &path).filter(|s| !t.scopes.allows(*s));
+    let r = match lacking {
+        Some(need) => insufficient_scope(t.scopes, need).into_response(),
+        None => {
+            req.extensions_mut().insert(Caller { token: t, who: who.clone() });
+            next.run(req).await
+        }
+    };
     request_failed(&app, &who, &tenant, &method, &path, &r);
     r
 }
@@ -394,7 +434,7 @@ pub async fn service_provider_config(headers: HeaderMap) -> Response {
             "etag": { "supported": false },
             "authenticationSchemes": [{
                 "type": "oauthbearertoken", "name": "Bearer token", "primary": true,
-                "description": "A per-tenant token from `botctl scim token create`, sent as Authorization: Bearer sbp_...",
+                "description": "A per-tenant token from `botctl scim token create`, sent as Authorization: Bearer sbp_..., limited to its scopes (users:read, users:write, groups:read, groups:write)",
                 "documentationUri": DOCS,
             }],
             "meta": { "resourceType": "ServiceProviderConfig", "location": format!("{}/ServiceProviderConfig", base_url(&headers)) },
@@ -1263,7 +1303,12 @@ pub async fn list_tokens(State(app): State<AppState>, Extension(a): Extension<Ar
         "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "groups": a.scim.groups, "groupRoles": a.scim.group_roles,
         "tokens": tokens.iter().map(|t| token_view(t, at)).collect::<Vec<_>>(),
         "expiringTenants": tenants_expiring(&tokens, at), "warnDays": WARN_DAYS, "defaultDays": DEFAULT_TOKEN_DAYS, "maxDays": MAX_TOKEN_DAYS,
+        "scopes": scopes::Scopes::ALL,
     }))
+}
+
+fn token_scopes(v: &Value) -> Res<Option<scopes::Scopes>> {
+    scopes::Scopes::from_request(v).map_err(bad)
 }
 
 /// A whole number from `lo` to `hi`, or `default` when it's missing.
@@ -1279,10 +1324,11 @@ fn token_days(v: &Value) -> Res<i64> {
     whole(v, "expiresInDays", 1, MAX_TOKEN_DAYS, DEFAULT_TOKEN_DAYS)
 }
 
-/// `POST /api/scim/tokens {tenant, label?, sso?, expiresInDays?}`. `sso` names a
+/// `POST /api/scim/tokens {tenant, label?, sso?, expiresInDays?, scopes?}`. `sso` names a
 /// configured SSO provider whose subjects this tenant's `externalId`s are; a tenant's
 /// first token sets it for good. It expires after `expiresInDays` (default 365, at most
-/// 730). The token is returned once; only its hash is kept.
+/// 730), and can do what `scopes` names (default all; ADR 0224). The token is returned
+/// once; only its hash is kept.
 pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<Response> {
     let tenant = tenant_name(&v["tenant"])?;
     if a.scim.google.as_ref().is_some_and(|g| g.settings.tenant == tenant) {
@@ -1290,6 +1336,7 @@ pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<A
     }
     let label = users::clean_label(&v["label"]);
     let expires_at = db::now() + token_days(&v["expiresInDays"])? * DAY_MS;
+    let scopes = token_scopes(&v["scopes"])?.unwrap_or_default();
     let sso = match &v["sso"] {
         Value::Null => None,
         Value::String(s) if s.trim().is_empty() => None,
@@ -1304,26 +1351,29 @@ pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<A
         p.issuer_for(None).map_err(|e| bad(format!("SCIM can't link {pid}: {e}")))?;
     }
     let token = users::new_secret(TOKEN_PREFIX);
-    let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref(), expires_at).map_err(|first| {
+    let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref(), expires_at, scopes).map_err(|first| {
         let had = first.map_or("no SSO provider".to_string(), |p| format!("the SSO provider {p}"));
         ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} links {had}; its tokens all must. Use a new tenant name for another link."))
     })?;
-    app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(json!({ "tenant": t.tenant, "label": t.label, "sso": t.sso_provider, "expiresAt": t.expires_at })));
+    app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(json!({
+        "tenant": t.tenant, "label": t.label, "sso": t.sso_provider, "expiresAt": t.expires_at, "scopes": t.scopes,
+    })));
     let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": token_view(&t, db::now()), "enabled": a.scim.enabled }))).into_response();
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(res)
 }
 
-/// `POST /api/scim/tokens/{id}/rotate {expiresInDays?, keepOldHours?}`: a new token for
-/// the same tenant, label and SSO link. The old one keeps working for `keepOldHours`
-/// (default 24, at most 168; 0 stops it now), so the new one can be pasted into the IdP
-/// before it stops, and is never rotated again. The new token is returned once.
+/// `POST /api/scim/tokens/{id}/rotate {expiresInDays?, keepOldHours?, scopes?}`: a new
+/// token for the same tenant, label and SSO link, with the old one's scopes unless
+/// `scopes` names others. The old one keeps working for `keepOldHours` (default 24, at
+/// most 168; 0 stops it now), so the new one can be pasted into the IdP before it stops,
+/// and is never rotated again. The new token is returned once.
 pub async fn rotate_token(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<Response> {
     if !v.is_object() && !v.is_null() {
-        return Err(bad("Send an object: {expiresInDays?, keepOldHours?}"));
+        return Err(bad("Send an object: {expiresInDays?, keepOldHours?, scopes?}"));
     }
-    if let Some(k) = v.as_object().and_then(|o| o.keys().find(|k| !["expiresInDays", "keepOldHours"].contains(&k.as_str()))) {
-        return Err(bad(format!("Unknown field {k}: send expiresInDays and keepOldHours only")));
+    if let Some(k) = v.as_object().and_then(|o| o.keys().find(|k| !["expiresInDays", "keepOldHours", "scopes"].contains(&k.as_str()))) {
+        return Err(bad(format!("Unknown field {k}: send expiresInDays, keepOldHours and scopes only")));
     }
     let at = db::now();
     let old = app.db.scim_token(&id).ok_or_else(|| not_found("SCIM token"))?;
@@ -1333,15 +1383,18 @@ pub async fn rotate_token(State(app): State<AppState>, Extension(a): Extension<A
     let expires_at = at + token_days(&v["expiresInDays"])? * DAY_MS;
     let keep = whole(&v["keepOldHours"], "keepOldHours", 0, MAX_KEEP_HOURS, DEFAULT_KEEP_HOURS)?;
     let keep_until = (keep > 0).then_some(at + keep * HOUR_MS);
+    let scopes = token_scopes(&v["scopes"])?.unwrap_or(old.scopes);
     let token = users::new_secret(TOKEN_PREFIX);
     let t = app
         .db
-        .rotate_scim_token(&old.id, &users::hash(&token), expires_at, keep_until, by.actor.id.as_deref())
+        .rotate_scim_token(&old.id, &users::hash(&token), expires_at, keep_until, by.actor.id.as_deref(), scopes)
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "This token was revoked, expired, or rotated meanwhile.".into()))?;
     let old_ends = keep_until.map_or(at, |u| old.expires_at.map_or(u, |e| e.min(u)));
-    app.db.record(&by.event("scim.token_rotated").target("scim_token", &old.id).details(json!({
-        "tenant": old.tenant, "label": old.label, "to": t.id, "oldEndsAt": old_ends, "expiresAt": t.expires_at,
-    })));
+    let mut details = json!({ "tenant": old.tenant, "label": old.label, "to": t.id, "oldEndsAt": old_ends, "expiresAt": t.expires_at, "scopes": t.scopes });
+    if t.scopes != old.scopes {
+        details["oldScopes"] = json!(old.scopes);
+    }
+    app.db.record(&by.event("scim.token_rotated").target("scim_token", &old.id).details(details));
     let replaced = json!({ "id": old.id, "endsAt": old_ends });
     let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": token_view(&t, at), "replaced": replaced, "enabled": a.scim.enabled }))).into_response();
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
