@@ -857,8 +857,9 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     let machine_backups = control_plane.offsite.as_ref().map(|o| &o.s);
-    backup_encryption::check(&server_backups, machine_backups).unwrap_or_else(|e| exit(format!("Backup encryption: {e}")));
-    let backup_targets = backup_encryption::targets(&server_backups, machine_backups);
+    let chat_copies = control_plane.chat_copies.as_deref().map(|c| c.settings());
+    backup_encryption::check(&server_backups, machine_backups, chat_copies).unwrap_or_else(|e| exit(format!("Backup encryption: {e}")));
+    let backup_targets = backup_encryption::targets(&server_backups, machine_backups, chat_copies);
     let (encryption_line, encryption_warnings) = backup_encryption::startup_lines(server_backups.encryption, &backup_targets);
     log_info!("Backup encryption: {encryption_line} (ADR 0114).");
     for w in encryption_warnings {
