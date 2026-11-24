@@ -33,11 +33,17 @@
 //!   renewal is audited (`secret.lease_renewed`). A lease the backend won't renew past a
 //!   point (its `max_ttl`), or that ends while renewals fail, stops the run when it ends,
 //!   as an STS session does.
+//! - An `AWS_RUN_CREDENTIALS` entry may narrow each run's session (ADR 0230): an inline
+//!   session policy from a file (`policy=`), managed session policies (`policy-arn=`)
+//!   and transitive session tags with the Bot's and owner's ids (`tags=bot,owner`), with
+//!   `{owner}` and `{bot}` in the policies filled in for each run. One that names the
+//!   owner is only for the owner's runs, as a role with `{owner}` is.
 
 use super::external::{self, Scope};
 use super::{check_name, redact, Error, Secret};
 use crate::audit::{Event, Outcome};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::io::Read;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -47,6 +53,15 @@ use zeroize::Zeroizing;
 pub const MAX_PATHS: usize = 16;
 /// Stands for the Bot owner's id in a path.
 pub const OWNER: &str = "{owner}";
+/// Stands for the Bot's id in a session policy.
+pub const BOT: &str = "{bot}";
+/// The entry options that narrow an STS session (ADR 0230).
+const SESSION_OPTIONS: [&str; 3] = ["policy", "policy-arn", "tags"];
+/// STS's most managed session policies, and longest inline one, as plain text.
+pub const MAX_POLICY_ARNS: usize = 10;
+pub const MAX_POLICY: usize = 2048;
+/// The largest session policy file read.
+const MAX_POLICY_FILE: u64 = 64 * 1024;
 /// A lease's TTL as kept here, at most a year, so arithmetic on it can't overflow.
 const MAX_TTL: u64 = 86_400 * 366;
 /// How much longer than a run renewals keep its leases alive: the run's end, its
@@ -99,19 +114,143 @@ pub trait Issuer: Send + Sync {
     fn renew(&self, _lease_id: &str, _increment: Duration) -> Result<Renewal, Error> {
         Ok(Renewal::Refused(format!("{} leases can't be renewed", self.kind())))
     }
+    /// `issue`, with the session narrowed as `narrowed` says (ADR 0230). Only a setting
+    /// that takes session options gives a non-empty one; a backend that can't narrow
+    /// its leases refuses it rather than make a wider one.
+    fn issue_narrowed(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
+        if !narrowed.is_empty() {
+            return Err(Error::Unavailable(format!("{}: leases can't be narrowed with a session policy or tags", self.kind())));
+        }
+        self.issue(path, fields, run_for, bot_id)
+    }
+}
+
+/// A run's id its STS session is tagged with, so the role's policies can match on
+/// `aws:PrincipalTag/<key>` (ADR 0230).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tag {
+    Bot,
+    Owner,
+}
+
+impl Tag {
+    pub fn key(self) -> &'static str {
+        match self {
+            Tag::Bot => "superbot-bot",
+            Tag::Owner => "superbot-owner",
+        }
+    }
+}
+
+/// How an entry narrows each run's session (ADR 0230); empty unless its setting takes
+/// `policy=`, `policy-arn=` and `tags=`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Narrowing {
+    /// The inline session policy from `policy=<file>`, read once at startup; `{owner}`
+    /// and `{bot}` in its strings are filled in for each run.
+    pub policy: Option<Value>,
+    /// Managed session policies, `{owner}` allowed in their names.
+    pub policy_arns: Vec<String>,
+    pub tags: Vec<Tag>,
+}
+
+/// One run's narrowing, its ids filled in: the policy as sent (compact JSON), the
+/// managed policies' ARNs, and the tags (key, value).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Narrowed {
+    pub policy: Option<String>,
+    pub policy_arns: Vec<String>,
+    pub tags: Vec<(&'static str, String)>,
+}
+
+impl Narrowed {
+    pub fn is_empty(&self) -> bool {
+        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty()
+    }
+}
+
+/// Whether `needle` is in any key or string of `v`.
+fn mentions(v: &Value, needle: &str) -> bool {
+    match v {
+        Value::String(s) => s.contains(needle),
+        Value::Array(a) => a.iter().any(|v| mentions(v, needle)),
+        Value::Object(o) => o.iter().any(|(k, v)| k.contains(needle) || mentions(v, needle)),
+        _ => false,
+    }
+}
+
+/// `v` with `fill` applied to every key and string: values are put in as JSON strings,
+/// never as text, so an id can't change the policy's shape.
+fn substitute(v: &Value, fill: &dyn Fn(&str) -> String) -> Value {
+    match v {
+        Value::String(s) => Value::String(fill(s)),
+        Value::Array(a) => Value::Array(a.iter().map(|v| substitute(v, fill)).collect()),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (fill(k), substitute(v, fill))).collect()),
+        v => v.clone(),
+    }
+}
+
+/// A Bot id that may stand in a policy or tag: letters, digits, `_` and `-`, so it can't
+/// be a wildcard (`*`, `?`) or a path (`/`) in an ARN.
+fn bot_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+impl Narrowing {
+    fn is_empty(&self) -> bool {
+        self.policy.is_none() && self.policy_arns.is_empty() && self.tags.is_empty()
+    }
+
+    fn per_owner(&self) -> bool {
+        self.tags.contains(&Tag::Owner) || self.policy_arns.iter().any(|a| a.contains(OWNER)) || self.policy.as_ref().is_some_and(|p| mentions(p, OWNER))
+    }
+
+    /// What a run of `bot_id` owned by `owner` gets. Refused when the Bot's id can't
+    /// stand in a policy or tag, or the policy grows past STS's limit with the ids in.
+    fn for_run(&self, owner: &str, bot_id: &str) -> Result<Narrowed, String> {
+        let needs_bot = self.tags.contains(&Tag::Bot) || self.policy.as_ref().is_some_and(|p| mentions(p, BOT));
+        if needs_bot && !bot_id_ok(bot_id) {
+            return Err(format!("the Bot's id {bot_id:?} can't stand in a session policy or tag"));
+        }
+        let fill = |s: &str| s.replace(OWNER, owner).replace(BOT, bot_id);
+        let policy = match &self.policy {
+            Some(p) => {
+                let text = serde_json::to_string(&substitute(p, &fill)).map_err(|e| format!("the session policy can't be written: {e}"))?;
+                if text.len() > MAX_POLICY {
+                    return Err(format!("the session policy is {} characters with this run's ids in it, over STS's {MAX_POLICY}", text.len()));
+                }
+                Some(text)
+            }
+            None => None,
+        };
+        let tags = self
+            .tags
+            .iter()
+            .map(|t| {
+                let v = match t {
+                    Tag::Bot => bot_id,
+                    Tag::Owner => owner,
+                };
+                (t.key(), v.to_string())
+            })
+            .collect();
+        Ok(Narrowed { policy, policy_arns: self.policy_arns.iter().map(|a| a.replace(OWNER, owner)).collect(), tags })
+    }
 }
 
 /// One path and the environment variables its fields become.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Wanted {
     pub path: String,
     /// (variable, field)
     pub names: Vec<(String, String)>,
+    pub narrowing: Narrowing,
 }
 
 impl Wanted {
+    /// Only for the owner's own runs: the path, or how its session is narrowed, names them.
     fn per_owner(&self) -> bool {
-        self.path.contains(OWNER)
+        self.path.contains(OWNER) || self.narrowing.per_owner()
     }
 }
 
@@ -140,6 +279,92 @@ fn role_arn_ok(p: &str) -> bool {
         && plain.len() <= 2048
         && role.split('/').all(|part| !part.is_empty())
         && role.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-/".contains(&b))
+}
+
+/// An ARN's partition (`aws`, `aws-cn`, `aws-us-gov`).
+fn partition(arn: &str) -> &str {
+    arn.split(':').nth(1).unwrap_or_default()
+}
+
+/// A managed policy's ARN, `arn:<partition>:iam::<account or aws>:policy/<path/name>`,
+/// where `{owner}` may stand in the policy's path or name.
+fn policy_arn_ok(p: &str) -> bool {
+    let plain = p.replace(OWNER, "x");
+    let parts: Vec<&str> = plain.splitn(6, ':').collect();
+    let ["arn", partition, "iam", "", account, resource] = parts[..] else { return false };
+    let policy = resource.strip_prefix("policy/").unwrap_or_default();
+    matches!(partition, "aws" | "aws-cn" | "aws-us-gov")
+        && (account == "aws" || (account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit())))
+        && !policy.is_empty()
+        && plain.len() <= 2048
+        && policy.split('/').all(|part| !part.is_empty())
+        && policy.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-/".contains(&b))
+}
+
+/// The session policy in `file`, checked as STS would: a JSON object with a `Statement`,
+/// at most `MAX_POLICY` characters once spaces are taken out, and only characters up to
+/// U+00FF. Never quoted in errors.
+fn read_policy(file: &str) -> Result<Value, String> {
+    let bad = |why: String| format!("policy={file}: {why}");
+    let f = std::fs::File::open(file).map_err(|e| bad(format!("can't be read ({e})")))?;
+    let mut text = String::new();
+    f.take(MAX_POLICY_FILE + 1).read_to_string(&mut text).map_err(|e| bad(format!("can't be read ({e})")))?;
+    if text.len() as u64 > MAX_POLICY_FILE {
+        return Err(bad(format!("is over {MAX_POLICY_FILE} bytes")));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| bad(format!("isn't JSON ({e})")))?;
+    if !v.get("Statement").is_some_and(|s| s.is_array() || s.is_object()) {
+        return Err(bad("must be an IAM policy: a JSON object with a Statement".into()));
+    }
+    let compact = serde_json::to_string(&v).map_err(|e| bad(e.to_string()))?;
+    if compact.chars().any(|c| u32::from(c) > 0xFF) {
+        return Err(bad("has characters STS won't take in a policy (only up to U+00FF)".into()));
+    }
+    if compact.len() > MAX_POLICY {
+        return Err(bad(format!("is {} characters with spaces taken out, over STS's {MAX_POLICY}; move statements to a managed policy (policy-arn=)", compact.len())));
+    }
+    Ok(v)
+}
+
+/// One of `SESSION_OPTIONS`, `name=value`, after `role` in an entry.
+fn session_option(n: &mut Narrowing, role: &str, name: &str, value: &str) -> Result<(), String> {
+    match name {
+        "policy" => {
+            if n.policy.is_some() {
+                return Err("policy= is given twice; put every statement in one file".into());
+            }
+            n.policy = Some(read_policy(value)?);
+        }
+        "policy-arn" => {
+            if !policy_arn_ok(value) || partition(value) != partition(role) {
+                return Err(format!("policy-arn={value:?} must be a managed policy's ARN in the role's partition, like \"arn:aws:iam::aws:policy/ReadOnlyAccess\""));
+            }
+            if n.policy_arns.iter().any(|a| a == value) {
+                return Err(format!("policy-arn={value} is given twice"));
+            }
+            if n.policy_arns.len() == MAX_POLICY_ARNS {
+                return Err(format!("at most {MAX_POLICY_ARNS} policy-arn= for one role, as STS allows"));
+            }
+            n.policy_arns.push(value.to_string());
+        }
+        _ => {
+            if !n.tags.is_empty() {
+                return Err("tags= is given twice".into());
+            }
+            for t in value.split(',') {
+                let tag = match t {
+                    "bot" => Tag::Bot,
+                    "owner" => Tag::Owner,
+                    _ => return Err(format!("tags= takes bot, owner or both (tags=bot,owner), not {value:?}")),
+                };
+                if n.tags.contains(&tag) {
+                    return Err(format!("tags= names {t} twice"));
+                }
+                n.tags.push(tag);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A Google service account's email, `<account>@<domain>.gserviceaccount.com`, where
@@ -173,6 +398,8 @@ pub struct Syntax {
     defaults: &'static [(&'static str, &'static str)],
     /// Names botd may sign in with that a lease may still give: the run's own, never botd's.
     own: &'static [&'static str],
+    /// Whether entries may narrow their sessions (`policy=`, `policy-arn=`, `tags=`).
+    session: bool,
     example: &'static str,
 }
 
@@ -184,6 +411,7 @@ pub const VAULT: Syntax = Syntax {
     fields: &[],
     defaults: &[],
     own: &[],
+    session: false,
     example: "AWS_ACCESS_KEY_ID=access_key",
 };
 
@@ -198,6 +426,7 @@ pub const AWS: Syntax = Syntax {
     fields: &["AccessKeyId", "SecretAccessKey", "SessionToken"],
     defaults: &AWS_KEYS,
     own: &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
+    session: true,
     example: "AWS_ACCESS_KEY_ID=AccessKeyId",
 };
 
@@ -210,6 +439,7 @@ pub const GCP: Syntax = Syntax {
     fields: &["accessToken"],
     defaults: &[("CLOUDSDK_AUTH_ACCESS_TOKEN", "accessToken"), ("GOOGLE_OAUTH_ACCESS_TOKEN", "accessToken")],
     own: &[],
+    session: false,
     example: "GOOGLE_OAUTH_ACCESS_TOKEN=accessToken",
 };
 
@@ -223,6 +453,7 @@ pub const AZURE: Syntax = Syntax {
     fields: &["accessToken"],
     defaults: &[("AZURE_ACCESS_TOKEN", "accessToken")],
     own: &[],
+    session: false,
     example: "AZURE_ACCESS_TOKEN=accessToken",
 };
 
@@ -245,10 +476,18 @@ pub fn parse_as(syntax: &Syntax, raw: &str) -> Result<Vec<Wanted>, String> {
             return Err(format!("{key}: {path:?} must be {}", syntax.what));
         }
         let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut narrowing = Narrowing::default();
         for pair in parts {
             let Some((name, field)) = pair.split_once('=') else {
                 return Err(format!("{key}: {pair:?} after {path} must be NAME=field, like {}", syntax.example));
             };
+            if SESSION_OPTIONS.contains(&name) {
+                if !syntax.session {
+                    return Err(format!("{key}: {name}= narrows AWS STS sessions, so only AWS_RUN_CREDENTIALS takes it"));
+                }
+                session_option(&mut narrowing, path, name, field).map_err(|e| format!("{key}: {path}: {e}"))?;
+                continue;
+            }
             pairs.push((name.to_string(), field.to_string()));
         }
         if pairs.is_empty() {
@@ -271,7 +510,7 @@ pub fn parse_as(syntax: &Syntax, raw: &str) -> Result<Vec<Wanted>, String> {
         if names.is_empty() {
             return Err(format!("{key}: {path} gives no variables; add NAME=field after it"));
         }
-        out.push(Wanted { path: path.to_string(), names });
+        out.push(Wanted { path: path.to_string(), names, narrowing });
     }
     if out.len() > MAX_PATHS {
         return Err(format!("{key}: at most {MAX_PATHS} paths, not {}", out.len()));
@@ -623,9 +862,10 @@ impl RunCredentials {
         self.wanted.iter().map(|w| w.path.as_str()).collect()
     }
 
-    /// For the startup line: paths only.
+    /// For the startup line: paths, and which sessions are narrowed.
     pub fn describe(&self) -> String {
-        format!("short-lived credentials for each run from {}", self.paths().join(", "))
+        let paths: Vec<String> = self.wanted.iter().map(|w| if w.narrowing.is_empty() { w.path.clone() } else { format!("{} (narrowed)", w.path) }).collect();
+        format!("short-lived credentials for each run from {}", paths.join(", "))
     }
 
     /// New leases for one run of `bot_id`, owned by `owner`, and the variables they give.
@@ -651,8 +891,25 @@ impl RunCredentials {
             let owner_id = per_owner.then_some(owner);
             let (e, mut d) = event("secret.lease_issued", self.issuer.kind(), &path, bot_id, owner_id);
             d["names"] = json!(w.names.iter().map(|(n, _)| n).collect::<Vec<_>>());
+            let narrowed = match w.narrowing.for_run(owner, bot_id) {
+                Ok(n) => n,
+                Err(why) => {
+                    d["error"] = json!("narrowing");
+                    external::audit(e.outcome(Outcome::Failure).details(d));
+                    return Err(Error::Unavailable(format!("{}: {path}: {why}", self.issuer.kind())));
+                }
+            };
+            if let Some(p) = &narrowed.policy {
+                d["policySha256"] = json!(crate::sigv4::sha256_hex(p.as_bytes()));
+            }
+            if !narrowed.policy_arns.is_empty() {
+                d["policyArns"] = json!(narrowed.policy_arns);
+            }
+            if !narrowed.tags.is_empty() {
+                d["tags"] = Value::Object(narrowed.tags.iter().map(|(k, v)| (k.to_string(), json!(v))).collect());
+            }
             let fields: Vec<String> = w.names.iter().map(|(_, f)| f.clone()).collect();
-            let lease = match self.issuer.issue(&path, &fields, run_for, bot_id) {
+            let lease = match self.issuer.issue_narrowed(&path, &fields, run_for, bot_id, &narrowed) {
                 Ok(l) => l,
                 Err(err) => {
                     d["error"] = json!(err.kind());
@@ -784,6 +1041,8 @@ pub(crate) mod tests {
         pub renew_down: AtomicBool,
         /// How long each renewal takes to answer.
         pub renew_delay_ms: AtomicU64,
+        /// (path, what its session was narrowed to) of each lease asked for.
+        pub narrowed: Mutex<Vec<(String, Narrowed)>>,
     }
 
     /// The longest a test's run may last.
@@ -818,6 +1077,10 @@ pub(crate) mod tests {
                 t => t,
             };
             Ok(Lease { id: format!("{path}/lease{n}"), ttl, renewable: !self.not_renewable.load(Ordering::SeqCst), fields })
+        }
+        fn issue_narrowed(&self, path: &str, fields: &[String], run_for: Duration, bot_id: &str, narrowed: &Narrowed) -> Result<Lease, Error> {
+            self.narrowed.lock().unwrap().push((path.to_string(), narrowed.clone()));
+            self.issue(path, fields, run_for, bot_id)
         }
         fn revoke(&self, lease_id: &str) -> Result<(), Error> {
             if self.revoke_down.load(Ordering::SeqCst) {
@@ -1302,5 +1565,169 @@ pub(crate) mod tests {
         assert!(renewed("renew/creds/hung").is_empty(), "the renewal is still waiting on the backend");
         let at = l.expires_first().unwrap();
         assert!(at <= issued + Duration::from_secs(2) && at <= Instant::now(), "the run's end is the lease's, past now, though the renewal hasn't answered");
+    }
+
+    /// A policy file in its own folder, its path.
+    pub(crate) fn policy_file(label: &str, text: &str) -> String {
+        let file = crate::db::temp_path(label).join("policy.json");
+        std::fs::write(&file, text).unwrap();
+        file.to_string_lossy().into_owned()
+    }
+
+    const BOTS_POLICY: &str = r#"{
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::acme-bots/{bot}/*" }]
+    }"#;
+    const OWNER_POLICY: &str = r#"{ "Version": "2012-10-17", "Statement": { "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::acme-users/{owner}/*" } }"#;
+
+    #[test]
+    fn aws_entries_narrow_their_sessions_and_are_checked() {
+        let bots = policy_file("narrow-bots", BOTS_POLICY);
+        let owners = policy_file("narrow-owners", OWNER_POLICY);
+        let raw = format!(
+            "arn:aws:iam::123456789012:role/bots policy={bots} policy-arn=arn:aws:iam::aws:policy/ReadOnlyAccess tags=bot;\
+             arn:aws:iam::123456789012:role/users tags=bot,owner policy-arn=arn:aws:iam::123456789012:policy/u-{{owner}} USER_KEY_ID=AccessKeyId USER_SECRET=SecretAccessKey USER_TOKEN=SessionToken;\
+             arn:aws:iam::123456789012:role/shared SHARED_KEY_ID=AccessKeyId SHARED_SECRET=SecretAccessKey SHARED_TOKEN=SessionToken policy={owners}"
+        );
+        let w = parse_as(&AWS, &raw).unwrap();
+        assert_eq!(w[0].names, [pair("AWS_ACCESS_KEY_ID", "AccessKeyId"), pair("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"), pair("AWS_SESSION_TOKEN", "SessionToken")], "options aren't variables: the SDKs' names still");
+        assert_eq!(w[0].narrowing.policy.as_ref().unwrap()["Statement"][0]["Resource"], "arn:aws:s3:::acme-bots/{bot}/*", "read once, at startup");
+        assert_eq!((w[0].narrowing.policy_arns.as_slice(), w[0].narrowing.tags.as_slice()), (&["arn:aws:iam::aws:policy/ReadOnlyAccess".to_string()][..], &[Tag::Bot][..]));
+        assert!(!w[0].per_owner(), "{{bot}} is every run's");
+        assert_eq!(w[1].narrowing.tags, [Tag::Bot, Tag::Owner]);
+        assert!(w[1].per_owner() && w[2].per_owner(), "tagged with the owner, or a policy naming them: the owner's runs only");
+        assert!(parse_as(&AWS, "arn:aws:iam::123456789012:role/r policy-arn=arn:aws:iam::123456789012:policy/team/{owner}-read").unwrap()[0].per_owner());
+
+        let big = policy_file("narrow-big", &format!(r#"{{"Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Resource":"{}"}}]}}"#, "x".repeat(MAX_POLICY)));
+        let latin = policy_file("narrow-latin", r#"{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::caf\u00e9"}]}"#);
+        let wide = policy_file("narrow-wide", r#"{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::\u0100"}]}"#);
+        let nostatement = policy_file("narrow-nostatement", r#"{"Version":"2012-10-17"}"#);
+        let notjson = policy_file("narrow-notjson", "Statement: allow everything, secret-in-a-bad-file-1f2e");
+        let huge = policy_file("narrow-huge", &" ".repeat(MAX_POLICY_FILE as usize + 1));
+        assert!(parse_as(&AWS, &format!("arn:aws:iam::123456789012:role/r policy={latin}")).is_ok(), "Latin-1 is what STS takes");
+        let role = "arn:aws:iam::123456789012:role/r";
+        let arn = |n: usize| format!("arn:aws:iam::123456789012:policy/p{n}");
+        let eleven: Vec<String> = (0..=MAX_POLICY_ARNS).map(|n| format!("policy-arn={}", arn(n))).collect();
+        for (raw, err) in [
+            (format!("{role} policy=/nonexistent/superbot/policy.json"), "policy=/nonexistent/superbot/policy.json: can't be read"),
+            (format!("{role} policy={notjson}"), "isn't JSON"),
+            (format!("{role} policy={nostatement}"), "a JSON object with a Statement"),
+            (format!("{role} policy={big}"), "over STS's 2048; move statements to a managed policy"),
+            (format!("{role} policy={wide}"), "only up to U+00FF"),
+            (format!("{role} policy={huge}"), "is over 65536 bytes"),
+            (format!("{role} policy={bots} policy={owners}"), "policy= is given twice"),
+            (format!("{role} policy-arn=arn:aws:iam::123456789012:role/r"), "must be a managed policy's ARN"),
+            (format!("{role} policy-arn=arn:aws:iam::aws:policy/*"), "must be a managed policy's ARN"),
+            (format!("{role} policy-arn=arn:aws:iam::aws:policy/"), "must be a managed policy's ARN"),
+            ("arn:aws-us-gov:iam::123456789012:role/r policy-arn=arn:aws:iam::aws:policy/ReadOnlyAccess".to_string(), "in the role's partition"),
+            (format!("{role} policy-arn={} policy-arn={}", arn(1), arn(1)), "is given twice"),
+            (format!("{role} {}", eleven.join(" ")), "at most 10 policy-arn="),
+            (format!("{role} tags=everyone"), "tags= takes bot, owner or both"),
+            (format!("{role} tags="), "tags= takes bot, owner or both"),
+            (format!("{role} tags=bot,bot"), "names bot twice"),
+            (format!("{role} tags=bot tags=owner"), "tags= is given twice"),
+        ] {
+            let e = parse_as(&AWS, &raw).unwrap_err();
+            assert!(e.starts_with("AWS_RUN_CREDENTIALS: arn:aws") && e.contains(err), "{raw}: {e}");
+            assert!(!e.contains("secret-in-a-bad-file"), "a policy file is never quoted: {e}");
+        }
+        for (syntax, raw) in [(&VAULT, "aws/sts/bots X_KEY=access_key tags=bot"), (&GCP, "a@p.iam.gserviceaccount.com policy-arn=x"), (&AZURE, "11111111-2222-3333-4444-555555555555 policy=/x")] {
+            let e = parse_as(syntax, raw).unwrap_err();
+            assert!(e.contains("narrows AWS STS sessions, so only AWS_RUN_CREDENTIALS takes it"), "{raw}: {e}");
+        }
+    }
+
+    fn sts_fake(roles: &[&str]) -> Arc<Fake> {
+        let fields: &[(&str, Option<&str>)] = &[("AccessKeyId", Some("ASIANARROW")), ("SecretAccessKey", Some("narrow-secret-4d3c")), ("SessionToken", Some("narrow-token-4d3c"))];
+        let f = fake(&roles.iter().map(|r| (*r, fields)).collect::<Vec<_>>());
+        f.unrevocable.store(true, Ordering::SeqCst);
+        f.ttl.store(3600, Ordering::SeqCst);
+        f
+    }
+
+    #[test]
+    fn narrowed_sessions_get_the_runs_ids_and_are_audited() {
+        let bots = policy_file("narrowed-bots", BOTS_POLICY);
+        let owners = policy_file("narrowed-owners", OWNER_POLICY);
+        let f = sts_fake(&["arn:aws:iam::123456789012:role/nbots", "arn:aws:iam::123456789012:role/nusers", "arn:aws:iam::123456789012:role/nshared"]);
+        let raw = format!(
+            "arn:aws:iam::123456789012:role/nbots policy={bots} policy-arn=arn:aws:iam::aws:policy/ReadOnlyAccess tags=bot;\
+             arn:aws:iam::123456789012:role/nusers tags=bot,owner policy-arn=arn:aws:iam::123456789012:policy/u-{{owner}} USER_KEY_ID=AccessKeyId;\
+             arn:aws:iam::123456789012:role/nshared policy={owners} SHARED_KEY_ID=AccessKeyId"
+        );
+        let rc = RunCredentials::new(f.clone(), parse_as(&AWS, &raw).unwrap());
+        assert!(rc.describe().contains("role/nbots (narrowed), arn:aws:iam::123456789012:role/nusers (narrowed)"), "{}", rc.describe());
+
+        let (e, _l) = rc.issue("unar1", "bnar1", true, RUN).unwrap();
+        assert_eq!(env(&e).len(), 5);
+        let narrowed = f.narrowed.lock().unwrap().clone();
+        let [(p0, n0), (p1, n1), (p2, n2)] = &narrowed[..] else { panic!("{narrowed:?}") };
+        assert_eq!((p0.as_str(), p1.as_str(), p2.as_str()), ("arn:aws:iam::123456789012:role/nbots", "arn:aws:iam::123456789012:role/nusers", "arn:aws:iam::123456789012:role/nshared"));
+        let sent: Value = serde_json::from_str(n0.policy.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["Statement"][0]["Resource"], "arn:aws:s3:::acme-bots/bnar1/*", "the run's Bot in place");
+        assert!(!n0.policy.as_deref().unwrap().contains(['\n', ' ']), "sent with no spaces, as STS counts it");
+        assert_eq!((n0.policy_arns.as_slice(), n0.tags.as_slice()), (&["arn:aws:iam::aws:policy/ReadOnlyAccess".to_string()][..], &[("superbot-bot", "bnar1".to_string())][..]));
+        assert_eq!(n1.tags, [("superbot-bot", "bnar1".to_string()), ("superbot-owner", "unar1".to_string())]);
+        assert_eq!((n1.policy.as_deref(), n1.policy_arns.as_slice()), (None, &["arn:aws:iam::123456789012:policy/u-unar1".to_string()][..]));
+        assert!(n2.policy.as_deref().unwrap().contains("acme-users/unar1/*") && n2.tags.is_empty());
+
+        let ev = external::tests::audited("arn:aws:iam::123456789012:role/nbots");
+        let issued = ev.iter().find(|e| e.action == "secret.lease_issued" && e.bot_id.as_deref() == Some("bnar1")).unwrap();
+        assert_eq!(issued.details["policySha256"], crate::sigv4::sha256_hex(n0.policy.as_deref().unwrap().as_bytes()), "which policy, never the file's path");
+        assert_eq!((issued.details["policyArns"].clone(), issued.details["tags"].clone()), (json!(["arn:aws:iam::aws:policy/ReadOnlyAccess"]), json!({ "superbot-bot": "bnar1" })));
+        let users = external::tests::audited("arn:aws:iam::123456789012:role/nusers");
+        let issued = users.iter().find(|e| e.action == "secret.lease_issued").unwrap();
+        assert_eq!((issued.details["tags"].clone(), issued.details["userId"].as_str()), (json!({ "superbot-bot": "bnar1", "superbot-owner": "unar1" }), Some("unar1")));
+        assert!(issued.details.get("policySha256").is_none());
+
+        // A run for someone else: none of the entries naming the owner.
+        f.narrowed.lock().unwrap().clear();
+        let (e, _l) = rc.issue("unar1", "bnar1", false, RUN).unwrap();
+        assert_eq!(env(&e).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]);
+        assert_eq!(f.narrowed.lock().unwrap().len(), 1);
+        assert_eq!(rc.names_for("unar1", false), ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]);
+    }
+
+    #[test]
+    fn a_session_that_cant_be_narrowed_refuses_the_run() {
+        let bots = policy_file("unnarrowable-bots", BOTS_POLICY);
+        let f = sts_fake(&["arn:aws:iam::123456789012:role/plain", "arn:aws:iam::123456789012:role/tagged"]);
+        let rc = RunCredentials::new(f.clone(), parse_as(&AWS, "arn:aws:iam::123456789012:role/plain; arn:aws:iam::123456789012:role/tagged tags=bot X_KEY_ID=AccessKeyId").unwrap());
+        for bad in ["b*", "b/../x", "", &"b".repeat(65)] {
+            let e = rc.issue("ubad2", bad, true, RUN).err().unwrap().to_string();
+            assert!(e.contains("role/tagged") && e.contains("can't stand in a session policy or tag"), "{bad:?}: {e}");
+        }
+        let ev = external::tests::audited("arn:aws:iam::123456789012:role/tagged");
+        assert!(ev.iter().any(|e| e.action == "secret.lease_issued" && e.outcome == Outcome::Failure && e.details["error"] == "narrowing"), "{ev:?}");
+        assert!(f.narrowed.lock().unwrap().iter().all(|(p, _)| p.ends_with("/plain")), "never asked for a session it couldn't narrow");
+        let rc = RunCredentials::new(f.clone(), parse_as(&AWS, &format!("arn:aws:iam::123456789012:role/plain policy={bots}")).unwrap());
+        assert!(rc.issue("ubad2", "b-x_1", true, RUN).is_ok(), "letters, digits, - and _");
+
+        // Grown past STS's limit once the owner's id is in.
+        let resources = vec!["arn:aws:s3:::b/{owner}"; 70];
+        let long = policy_file("unnarrowable-long", &json!({ "Statement": [{ "Effect": "Allow", "Action": "s3:GetObject", "Resource": resources }] }).to_string());
+        let f = sts_fake(&["arn:aws:iam::123456789012:role/long"]);
+        let rc = RunCredentials::new(f.clone(), parse_as(&AWS, &format!("arn:aws:iam::123456789012:role/long policy={long}")).unwrap());
+        assert!(rc.issue("u1", "blong3", true, RUN).is_ok());
+        let e = rc.issue(&"u".repeat(64), "blong3", true, RUN).err().unwrap().to_string();
+        assert!(e.contains("with this run's ids in it, over STS's 2048"), "{e}");
+
+        // A backend that can't narrow its leases refuses rather than make a wider one.
+        struct Plain;
+        impl Issuer for Plain {
+            fn kind(&self) -> &'static str {
+                "plain"
+            }
+            fn issue(&self, path: &str, _: &[String], _: Duration, _: &str) -> Result<Lease, Error> {
+                Ok(Lease { id: path.into(), ttl: 60, renewable: false, fields: Vec::new() })
+            }
+            fn revoke(&self, _: &str) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let tagged = Narrowed { tags: vec![("superbot-bot", "b1".into())], ..Narrowed::default() };
+        let e = Plain.issue_narrowed("p", &[], RUN, "b1", &tagged).err().unwrap().to_string();
+        assert!(e.contains("plain: leases can't be narrowed"), "{e}");
+        assert!(Plain.issue_narrowed("p", &[], RUN, "b1", &Narrowed::default()).is_ok());
     }
 }
