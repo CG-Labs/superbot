@@ -19,6 +19,7 @@ import { colors, HARNESS_NAMES } from "../src/theme";
 import type { Routine } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
+import { KeeperPanel } from "./KeeperPanel";
 import { PromptsEditor } from "./PromptsEditor";
 import { RoutineEditor } from "./RoutineEditor";
 import { SuggestedPrompts } from "./SuggestedPrompts";
@@ -302,6 +303,9 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
                   onValueChange={(v) => void setBotVisibility(bot.id, v ? "shared" : "private").catch(showError)}
                 />
               </View>
+              {api && canManage && !bot.primary && (bot.owner?.id === me.id || can("admin")) ? (
+                <KeeperPanel key={bot.id} api={api} botId={bot.id} botName={bot.name} />
+              ) : null}
             </>
           ) : null}
           {!bot.primary && canManage ? (

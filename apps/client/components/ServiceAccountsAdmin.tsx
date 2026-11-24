@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { keeperQuestion } from "../src/access";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
@@ -289,6 +290,7 @@ function AccountDetail({
   const [rotating, setRotating] = useState<string | null>(null);
   const [keepOld, setKeepOld] = useState(0);
   const [rotateDays, setRotateDays] = useState(view.defaultDays);
+  const [handing, setHanding] = useState("");
 
   const loadFull = useCallback(async () => {
     const next = await api.serviceAccount(account.id);
@@ -309,6 +311,9 @@ function AccountDetail({
   const invalid = draftError(draft, customRoles(choices, sa)) ?? choiceError(draft, choices, draftOf(sa));
   const kept: Kept = { role: keptRole(sa), team: sa.team };
   const tokens = full?.tokenList;
+  const keptBots = full?.keptBotList ?? [];
+  const keepable = full?.keepable ?? [];
+  const room = keptBots.length < (view.maxKeptBots ?? 20);
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -366,6 +371,27 @@ function AccountDetail({
     await refresh();
   });
 
+  const handOver = async () => {
+    const b = keepable.find((k) => k.id === handing);
+    if (!b) return;
+    const q = keeperQuestion(b.name, sa.name, b.keptBy?.name ?? null);
+    if (!(await confirmAsync(q.title, q.body, "Hand it over"))) return;
+    void run(async () => {
+      await api.keepBot(b.id, sa.id);
+      setHanding("");
+      await refresh();
+    });
+  };
+
+  const takeBack = async (bot: { id: string; name: string }) => {
+    const q = keeperQuestion(bot.name, null, sa.name);
+    if (!(await confirmAsync(q.title, q.body, "Take it back"))) return;
+    void run(async () => {
+      await api.releaseKeptBot(bot.id);
+      await refresh();
+    });
+  };
+
   const revoke = async (tokenId: string, name: string) => {
     if (!(await confirmAsync(`Revoke ${name}?`, "It stops working at once. Whatever uses it needs a new token.", "Revoke"))) return;
     void run(async () => {
@@ -394,6 +420,30 @@ function AccountDetail({
         <Tags names={sa.effective} empty="Nothing" />
         {sa.team ? <Text style={styles.faint}>In {sa.team.name}: {sa.teamPermissions.length ? sa.teamPermissions.join(", ") : "no team permissions"}.</Text> : null}
       </Section>
+
+      {full && (keptBots.length || keepable.length) ? (
+        <Section title={`Bots it keeps (${keptBots.length} of ${view.maxKeptBots ?? 20})`}>
+          {keptBots.map((b) => (
+            <View key={b.id} style={styles.row}>
+              <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
+                {b.name}
+              </Text>
+              <Button label="Take back" a11y={`Take ${b.name} back`} disabled={busy} onPress={() => void takeBack(b)} />
+            </View>
+          ))}
+          {!keptBots.length ? <Text style={styles.dim}>None yet.</Text> : null}
+          {keptBots.length ? <Text style={styles.faint}>They stay {sa.owner?.name || "its owner"}&apos;s: taking one back, deleting the account or changing its owner leaves them with the owner.</Text> : null}
+          {keepable.length && room ? (
+            <>
+              <Text style={styles.dim}>Hand it one of {sa.owner?.name || "its owner"}&apos;s Bots to manage:</Text>
+              <Chips options={keepable.map((b) => ({ value: b.id, label: b.keptBy ? `${b.name} (from ${b.keptBy.name})` : b.name }))} value={handing} onChange={setHanding} disabled={busy} />
+              <View style={styles.row}>
+                <Button label="Hand it over" primary disabled={busy || !handing} onPress={() => void handOver()} />
+              </View>
+            </>
+          ) : null}
+        </Section>
+      ) : null}
 
       <Section title={`Tokens${tokens ? ` (${sa.tokens} live)` : ""}`}>
         {tokens == null ? (

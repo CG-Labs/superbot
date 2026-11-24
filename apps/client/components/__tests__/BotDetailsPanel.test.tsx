@@ -13,6 +13,10 @@ const mockCtx: Record<string, unknown> = {
 };
 jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
+jest.mock("../KeeperPanel", () => {
+  const { Text } = jest.requireActual("react-native");
+  return { KeeperPanel: ({ botId }: { botId: string }) => <Text>Keeper picker for {botId}</Text> };
+});
 
 const bot = (id: string, name: string): BotView => ({
   id,
@@ -101,6 +105,26 @@ describe("BotDetailsPanel", () => {
     await act(async () => fireEvent(toggle, "valueChange", false));
     expect(setBotVisibility).toHaveBeenCalledWith("b", "private");
     expect(screen.getByText("Delete bot")).toBeOnTheScreen();
+  });
+
+  it("offers the service account picker only to the owner or an admin, never on a primary Bot (ADR 0229)", async () => {
+    const owned = { ...shared("manage"), visibility: "private" as const };
+    Object.assign(mockCtx, { bots: [owned], activeId: "b", fetchRoutines: jest.fn(async () => []), api: {}, can: (p: string) => p !== "admin" });
+    const ui = await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.getByText("Keeper picker for b")).toBeOnTheScreen();
+
+    Object.assign(mockCtx, { bots: [{ ...owned, primary: true }] });
+    await ui.rerender(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.queryByText("Keeper picker for b")).not.toBeOnTheScreen();
+
+    // Someone else's Bot: only for an admin.
+    Object.assign(mockCtx, { bots: [{ ...owned, owner: { id: "u2", name: "Grace" } }] });
+    await ui.rerender(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.queryByText("Keeper picker for b")).not.toBeOnTheScreen();
+    Object.assign(mockCtx, { can: () => true });
+    await ui.rerender(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.getByText("Keeper picker for b")).toBeOnTheScreen();
+    Object.assign(mockCtx, { api: undefined });
   });
 
   it("lets an operator run a Bot but not change who sees it", async () => {
