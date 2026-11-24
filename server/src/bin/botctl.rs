@@ -1914,6 +1914,13 @@ fn saml_summary(v: &Value) -> String {
     for c in v["metadataSigningCertificates"].as_array().into_iter().flatten() {
         out += &format!("    Trusted signer: SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
+    let setting = v["requestBinding"].as_str().unwrap_or("auto");
+    let binding = match (v["idp"]["ssoBinding"].as_str(), setting) {
+        (Some("post"), _) | (None, "post") => "HTTP-POST",
+        (Some(_), _) | (None, "redirect") => "HTTP-Redirect",
+        (None, _) => "HTTP-Redirect, or HTTP-POST if that's all the IdP offers",
+    };
+    out += &format!("  AuthnRequests over:       {binding} (REQUEST_BINDING={setting})\n");
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -4132,6 +4139,19 @@ mod tests {
         v["roleMappings"] = json!(2);
         let out = saml_summary(&v);
         assert!(out.contains("Required groups:          SuperBot Users, Admins\n  Group role mappings:      2 "), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_the_binding_authn_requests_go_over() {
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null });
+        assert!(saml_summary(&v).contains("  AuthnRequests over:       HTTP-Redirect, or HTTP-POST if that's all the IdP offers (REQUEST_BINDING=auto)\n"));
+        v["requestBinding"] = json!("post");
+        assert!(saml_summary(&v).contains("  AuthnRequests over:       HTTP-POST (REQUEST_BINDING=post)\n"), "before the metadata is in");
+        v["requestBinding"] = json!("auto");
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso/post", "ssoBinding": "post", "certificates": [] });
+        assert!(saml_summary(&v).contains("  AuthnRequests over:       HTTP-POST (REQUEST_BINDING=auto)\n"), "the IdP offers only POST");
+        v["idp"]["ssoBinding"] = json!("redirect");
+        assert!(saml_summary(&v).contains("  AuthnRequests over:       HTTP-Redirect (REQUEST_BINDING=auto)\n"));
     }
 
     #[test]
