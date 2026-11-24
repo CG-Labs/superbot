@@ -165,6 +165,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0187-offline-support-check-and-bundle.md"));
     files.push(repo().join("docs/adr/0201-incident-review-drafts.md"));
     files.push(repo().join("docs/adr/0211-support-readiness-check.md"));
+    files.push(repo().join("docs/adr/0220-support-bundle-triage.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -408,5 +409,46 @@ fn the_readiness_page_documents_every_option_field_and_placeholder() {
 
     for (name, needle) in [("README.md", "(readiness.md"), ("tam.md", "botctl support-readiness"), ("escalation.md", "botctl support-readiness"), ("support-report.md", "(readiness.md")] {
         assert!(read(name).contains(needle), "{name} doesn't point at support readiness");
+    }
+}
+
+/// The quoted names in `code` followed by `then`: `("api", api_health` gives `api`.
+fn quoted_before<'a>(code: &'a str, then: &str) -> Vec<&'a str> {
+    code.split("(\"").skip(1).filter_map(|r| r.split_once('"')).filter(|(_, rest)| rest.starts_with(then)).map(|(name, _)| name).collect()
+}
+
+#[test]
+fn the_triage_page_documents_every_option_and_finding() {
+    let full = fs::read_to_string(repo().join("server/src/support_triage.rs")).unwrap();
+    let code = full.split("#[cfg(test)]\nmod tests").next().unwrap();
+    let page = read("triage.md");
+    let usage = code.split("pub const USAGE: &str = \"").nth(1).unwrap().split("\";").next().unwrap();
+    let options: HashSet<&str> = usage.split(|c: char| c.is_whitespace() || "[]|".contains(c)).filter(|w| w.starts_with("--")).collect();
+    assert!(options.len() >= 6, "the usage's options: {options:?}");
+    for o in options {
+        assert!(page.contains(&format!("`{o}")), "triage.md doesn't explain {o}");
+    }
+    let mut ids: HashSet<String> = code.split("Finding::new(\"").skip(1).map(|r| r.split('"').next().unwrap().to_string()).collect();
+    assert!(ids.len() >= 20, "the findings: {ids:?}");
+    let groups = code.split("fn audit_group").nth(1).unwrap().split("\n}\n").next().unwrap();
+    let groups = quoted_before(groups, ", \"");
+    assert!(groups.len() >= 9, "the audit groups: {groups:?}");
+    ids.extend(groups.iter().map(|g| format!("audit.{g}")));
+    let status = fs::read_to_string(repo().join("server/src/status.rs")).unwrap();
+    let components = quoted_before(status.split("pub fn checks").nth(1).unwrap().split("\n}\n").next().unwrap(), ", ");
+    assert_eq!(components, ["api", "database", "machines", "runners", "notifications"], "the status page's components");
+    for c in &components {
+        assert!(code.contains(&format!("\"{c}\"")), "support_triage doesn't place the {c} component");
+    }
+    ids.extend(components.iter().map(|c| format!("status.{c}")));
+    let score = fs::read_to_string(repo().join("server/src/health_score.rs")).unwrap();
+    ids.extend(score.split("Signal { id: \"").skip(1).map(|r| format!("signal.{}", r.split('"').next().unwrap())));
+    let check = fs::read_to_string(repo().join("server/src/support_check.rs")).unwrap();
+    ids.extend(check.split("Finding::new(\"").skip(1).map(|r| format!("check.{}", r.split('"').next().unwrap())));
+    for id in &ids {
+        assert!(page.contains(&format!("`{id}`")), "triage.md doesn't explain the {id} finding");
+    }
+    for (name, needle) in [("README.md", "(triage.md"), ("support-bundle.md", "botctl support-triage"), ("escalation.md", "botctl support-triage")] {
+        assert!(read(name).contains(needle), "{name} doesn't point at bundle triage");
     }
 }

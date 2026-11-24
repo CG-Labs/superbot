@@ -6,7 +6,7 @@ Who works a ticket, who it goes to next, and when. Roles, not people: the Provid
 
 | Level | Role | Takes the ticket when | Reached through |
 |---|---|---|---|
-| 1 | Support engineer | Every new ticket: triage, severity, first response, the [runbooks](README.md#the-playbooks) | `<support-email>`, `<support-portal-url>` |
+| 1 | Support engineer | Every new ticket: triage (a bundle with `botctl support-triage`, [bundle triage](triage.md)), severity, first response, the [runbooks](README.md#the-playbooks) | `<support-email>`, `<support-portal-url>` |
 | 2 | On-call engineer | Severity 1 at once; Severity 2 that a runbook doesn't fix within 2 hours; any page alert ([SLO alerts](../slo.md#alerts)) | `<on-call-pager>` |
 | 3 | Engineering owner of the component (server, machines, harness adapters, sign-in, billing) | Level 2 needs a code change, a data repair, or a decision outside the runbooks | `<engineering-escalation>` |
 | Incident commander | One named person for each Severity 1, usually the on-call engineer until handed over | Every Severity 1, from the first minute | `<incident-channel>` |
