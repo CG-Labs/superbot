@@ -524,12 +524,15 @@ pub fn assess(probe: &Probe, windows: &[Window], p: &Period, objective: u32) -> 
         .map(|(a, b)| {
             let from = minute_ms(p, a);
             let mins = (b - a) as u64;
+            let needs_review = mins as f64 > review_minutes;
             json!({
                 "id": format!("outage-{}", chrono::DateTime::from_timestamp_millis(from).map(|t| t.format("%Y%m%dT%H%MZ").to_string()).unwrap_or_default()),
                 "from": rfc3339(from), "to": rfc3339(minute_ms(p, b)), "minutes": mins,
                 "windowBudgetSpentPercent": round(mins as f64 * 100.0 / budget(WINDOW_MINUTES, objective), 1),
-                "needsReview": mins as f64 > review_minutes,
+                "needsReview": needs_review,
+                "downAtStart": a == 0,
                 "ongoingAtEnd": b == total,
+                "reviewUndecided": (a == 0 || b == total) && !needs_review,
             })
         })
         .collect();
@@ -590,13 +593,15 @@ pub fn assess(probe: &Probe, windows: &[Window], p: &Period, objective: u32) -> 
         "objectiveMissed": months_where(&|v| v["objective"]["met"] == false),
         "budgetHalfSpent": months_where(&|v| v["objective"]["budgetSpentPercent"].as_f64().is_some_and(|x| x >= 50.0)),
         "outagesNeedingReview": outages.iter().filter(|o| o["needsReview"] == true).map(|o| o["id"].clone()).collect::<Vec<_>>(),
+        "downAtStart": outages.iter().filter(|o| o["downAtStart"] == true).map(|o| o["id"].clone()).collect::<Vec<_>>(),
         "ongoingAtEnd": outages.iter().filter(|o| o["ongoingAtEnd"] == true).map(|o| o["id"].clone()).collect::<Vec<_>>(),
+        "reviewUndecided": outages.iter().filter(|o| o["reviewUndecided"] == true).map(|o| o["id"].clone()).collect::<Vec<_>>(),
         "probeGaps": gaps.iter().map(|g| json!(format!("{}/{}", g["from"].as_str().unwrap_or_default(), g["to"].as_str().unwrap_or_default()))).collect::<Vec<_>>(),
         "probeGapsOverBudget": months_where(&|v| v["probeGapsWithinBudget"] == false),
         "maintenanceOverLimit": months_where(&|v| v["maintenanceOverLimitMinutes"].as_u64().is_some_and(|x| x > 0)),
     });
     json!({
-        "basis": format!("a minute is up when any check of the probe in it succeeded, down when it had checks and every one failed (no answer, a timeout, or anything but a 2xx; /status.json answers 503 in a major outage), and unmeasured when it had none; availability is the share of minutes that weren't down (docs/slo.md), so unmeasured minutes aren't down, and the period's evidence counts only while they fit in the objective's error budget; minutes starting in announced maintenance aren't down, up to {MAINTENANCE_MINUTES_A_MONTH} a calendar month; an outage needs a written review when it spent more than a quarter of the 30-day error budget ({} minutes at the objective)", round(review_minutes, 1)),
+        "basis": format!("a minute is up when any check of the probe in it succeeded, down when it had checks and every one failed (no answer, a timeout, or anything but a 2xx; /status.json answers 503 in a major outage), and unmeasured when it had none; availability is the share of minutes that weren't down (docs/slo.md), so unmeasured minutes aren't down, and the period's evidence counts only while they fit in the objective's error budget; minutes starting in announced maintenance aren't down, up to {MAINTENANCE_MINUTES_A_MONTH} a calendar month; an outage needs a written review when it spent more than a quarter of the 30-day error budget ({} minutes at the objective), and one at the period's start or end that doesn't in this period alone is left undecided, to be judged with the minutes it has in the bundle before or after", round(review_minutes, 1)),
         "objectivePercent": percent(objective),
         "plans": PLANS.iter().map(|(plan, bp)| json!({ "plan": plan, "objectivePercent": percent(*bp) })).collect::<Vec<_>>(),
         "source": probe.source,
@@ -670,7 +675,9 @@ pub fn summary(u: &Value) -> String {
         ("objectiveMissed", "Objective missed in"),
         ("budgetHalfSpent", "Half the error budget or more spent in"),
         ("outagesNeedingReview", "Outages needing a written review"),
+        ("downAtStart", "Down at the period's start"),
         ("ongoingAtEnd", "Down at the period's end"),
+        ("reviewUndecided", "Outages at the period's edge, needing a review if their minutes in the next or previous bundle bring them over the threshold"),
         ("probeGapsOverBudget", "Probe gaps longer than the error budget in (the bundle maps no controls)"),
         ("maintenanceOverLimit", "Maintenance past 4 hours, counted as usual, in"),
     ] {
@@ -691,7 +698,7 @@ pub fn summary(u: &Value) -> String {
 pub fn parse_objective(s: &str) -> Result<u32, String> {
     let hint = format!("--objective takes a percentage such as 99.9 (at least 90, under 100, two decimals at most), not {s}");
     let (whole, frac) = s.trim().split_once('.').unwrap_or((s.trim(), "0"));
-    if whole.is_empty() || !whole.bytes().all(|c| c.is_ascii_digit()) || frac.is_empty() || frac.len() > 2 || !frac.bytes().all(|c| c.is_ascii_digit()) {
+    if whole.is_empty() || whole.len() > 2 || !whole.bytes().all(|c| c.is_ascii_digit()) || frac.is_empty() || frac.len() > 2 || !frac.bytes().all(|c| c.is_ascii_digit()) {
         return Err(hint);
     }
     let bp = whole.parse::<u32>().map_err(|_| hint.clone())? * 100 + format!("{frac:0<2}").parse::<u32>().map_err(|_| hint.clone())?;
@@ -890,6 +897,12 @@ mod tests {
         assert_eq!(u["exceptions"]["maintenanceOverLimit"], json!(["2026-10"]));
         assert_eq!(u["exceptions"]["ongoingAtEnd"], json!(["outage-20261031T2358Z"]));
         assert_eq!(u["outages"][0]["id"], "outage-20261014T0500Z", "the outage starts where the excuse ends");
+        assert_eq!((u["exceptions"]["reviewUndecided"].clone(), u["exceptions"]["downAtStart"].clone()), (json!(["outage-20261031T2358Z"]), json!([])), "two minutes now may be more than 10.8 with the next month's");
+        let next = Period { from: day("2026-11-01"), to: day("2026-12-01") };
+        let n = assess(&probe(&next, &[("2026-11-01T00:00:00Z", "2026-11-01T00:10:00Z")]), &[], &next, DEFAULT_OBJECTIVE);
+        assert_eq!((n["outages"][0]["downAtStart"].as_bool(), n["outages"][0]["needsReview"].as_bool(), n["exceptions"]["reviewUndecided"].clone()), (Some(true), Some(false), json!(["outage-20261101T0000Z"])), "12 minutes across the month end: each bundle says to add the other's");
+        let long = assess(&probe(&next, &[("2026-11-01T00:00:00Z", "2026-11-01T00:20:00Z")]), &[], &next, DEFAULT_OBJECTIVE);
+        assert_eq!((long["exceptions"]["outagesNeedingReview"].clone(), long["exceptions"]["reviewUndecided"].clone()), (json!(["outage-20261101T0000Z"]), json!([])), "over the threshold within the period: decided");
         for bad in ["2026-10-14T01:00:00Z", "2026-10-14T02:00:00Z/2026-10-14T01:00:00Z", "2026-11-02T00:00:00Z/2026-11-02T01:00:00Z", "yesterday/today"] {
             assert!(parse_window(bad, &p).is_err(), "{bad}");
         }
@@ -1007,7 +1020,7 @@ mod tests {
         assert_eq!(shown_query(r#"probe_success{job="superbot-status",instance="https://bots.example.com/status.json",location=~"lon|fra"}"#), r#"probe_success{job="superbot-status",instance="<not recorded>",location=~"lon|fra"}"#, "never the target's address");
         assert_eq!(shown_query(r#"probe_success{location=~"lon[12]"}"#), r#"probe_success{location=~"<not recorded>"}"#);
         assert_eq!((parse_objective("99.9"), parse_objective("99.95"), parse_objective("99"), parse_objective("90")), (Ok(9990), Ok(9995), Ok(9900), Ok(9000)));
-        for bad in ["100", "89.99", "99.999", "99,9", "-99", "", "99.", "abc"] {
+        for bad in ["100", "89.99", "99.999", "99,9", "-99", "", "99.", "abc", "42949772", "099.9", "99999999999999999999"] {
             assert!(parse_objective(bad).is_err(), "{bad}");
         }
         assert!(meets(43, 43_200, 9990) && !meets(44, 43_200, 9990));
