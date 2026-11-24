@@ -240,13 +240,7 @@ pub fn fetch(api: &mut dyn Api, selector: &str, p: &Period) -> Result<Probe, Str
         }
         for r in data["result"].as_array().into_iter().flatten() {
             let labels = r["metric"].as_object().cloned().unwrap_or_default();
-            targets.insert(target_of(&labels));
             let key = serde_json::to_string(&labels.iter().collect::<BTreeMap<_, _>>()).unwrap_or_default();
-            let n = keys.len();
-            let series = *keys.entry(key).or_insert_with(|| {
-                probe.series.push(series_view(&labels));
-                n
-            });
             for v in r["values"].as_array().into_iter().flatten() {
                 let Some(secs) = v[0].as_f64() else { continue };
                 let at_ms = (secs * 1000.0).round() as i64;
@@ -254,6 +248,12 @@ pub fn fetch(api: &mut dyn Api, selector: &str, p: &Period) -> Result<Probe, Str
                     continue;
                 }
                 let Some(value) = v[1].as_str().and_then(|s| s.parse::<f64>().ok()).filter(|x| !x.is_nan()) else { continue };
+                let n = keys.len();
+                let series = *keys.entry(key.clone()).or_insert_with(|| {
+                    targets.insert(target_of(&labels));
+                    probe.series.push(series_view(&labels));
+                    n
+                });
                 probe.checks.push(Check { at_ms, ok: value > 0.0, series });
             }
         }
@@ -983,6 +983,14 @@ mod tests {
         let mut both = Fake { answers: HashMap::from([(d1, two.clone()), (d2, two)]), asked: Vec::new() };
         let e = fetch(&mut both, DEFAULT_QUERY, &p).unwrap_err();
         assert!(e.contains("probe of 2 servers") && e.contains("instance=") && !e.contains("example.com"), "one server's answers never hide another's: {e}");
+        let one = |extra: Vec<Value>| {
+            let result: Vec<Value> = std::iter::once(series(server("https://a.example.com/status.json"), vec![(d1 - 30, "1")])).chain(extra).collect();
+            json!({ "resultType": "matrix", "result": result })
+        };
+        let moved = series(server("https://b.example.com/status.json"), vec![(d2, "1")]);
+        let mut renamed = Fake { answers: HashMap::from([(d1, one(vec![])), (d2, one(vec![moved]))]), asked: Vec::new() };
+        let pr = fetch(&mut renamed, DEFAULT_QUERY, &p).unwrap();
+        assert_eq!((pr.series.len(), pr.checks.len()), (1, 1), "a target first seen at the period's end isn't in it");
         let pr = fetch(&mut f, r#"probe_success{job="superbot-status",instance="https://bots.example.com/status.json"}"#, &p).unwrap();
         assert_eq!(pr.source["query"], r#"probe_success{job="superbot-status",instance="<not recorded>"}"#);
     }
