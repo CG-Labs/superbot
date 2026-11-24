@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod chats;
-pub use chats::{ChatMove, ChatStore, Held};
+pub use chats::{ChatMove, ChatStore, Held, drop_from_copy, held_in_copy};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 

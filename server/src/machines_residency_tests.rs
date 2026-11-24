@@ -762,6 +762,31 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert_eq!(r["status"].as_str(), Some("kept"), "old backups are disclosed, not unkept: {r}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
     assert_eq!(me["chats"], json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1 }), "the move is done; only old backups are left: {me}");
+
+    // Left there for hours (a check that keeps failing), admins are warned.
+    app.db.conn_for_tests().execute("UPDATE main.chat_moves_out SET moved_at = moved_at - 4 * 3600000 WHERE region = 'gb-lon'", []).unwrap();
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert!(regions["residency"]["warnings"].to_string().contains("gb-lon's chat store's backups may still hold the rows of 1 Bot that left it"), "{regions}");
+
+    // The next check takes them out of London's backup, which stays a restore point; the
+    // report, the app and the audit log say so (ADR 0238).
+    let cleared = chat_stores::clear_pass(&app.db, crate::db::now());
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    let done = cleared[0].1.as_ref().unwrap();
+    assert_eq!((cleared[0].0.as_str(), done.backups, done.held.messages), ("gb-lon", 1, 3), "{cleared:?}");
+    let old = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(old.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(old.query_row("SELECT region FROM chat_store", [], |r| r.get::<_, String>(0)).unwrap(), "gb-lon");
+    let entry = audit(port, &admin, chat_stores::CLEARED).await;
+    assert_eq!((entry[0]["details"]["region"].as_str(), entry[0]["details"]["backups"].as_i64(), entry[0]["details"]["messages"].as_i64(), entry[0]["actorId"].as_str()), (Some("gb-lon"), Some(1), Some(3), Some("residency")), "{entry:?}");
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["chats"]["inRegion"].as_bool(), r["chats"]["earlierCopies"].as_array().map(Vec::len)), (Some(true), Some(0)), "{r}");
+    assert!(!r["warnings"].to_string().contains("backups of gb-lon's chat store"), "{r}");
+    assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()));
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0 }), "{me}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert!(!regions["residency"]["warnings"].to_string().contains("may still hold the rows"), "{regions}");
 }
 
 #[tokio::test]
