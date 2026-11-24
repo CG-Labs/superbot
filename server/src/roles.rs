@@ -452,13 +452,21 @@ pub async fn assign_in_team(State(app): State<AppState>, Extension(by): Extensio
     give_in_team(&app, &by, &r, &t, &u, giving, None).map(Json)
 }
 
+/// Why a team's owner or admin can't change someone's role in the team (ADR 0254).
+pub(crate) fn idp_held() -> ApiError {
+    conflict("Their role in the team comes from your identity provider (a SCIM group). A server admin changes that mapping.")
+}
+
 /// Gives `r` to `u` within `t`, for a server admin or, `via: "team"`, for the team's own
 /// owners and admins (ADR 0254), who checked first whom and what they may give.
 pub(crate) fn give_in_team(app: &AppState, by: &Who, r: &CustomRole, t: &crate::db::Team, u: &User, giving: Giving, via: Option<&str>) -> Res<Value> {
     if u.role == Role::Readonly {
         return Err(conflict("They're read-only, so they change nothing, in a team too. Make them a member first."));
     }
-    let g = app.db.give_team_custom_role_until(&t.id, &u.id, &r.id, giving.until).ok_or_else(|| match app.db.team_member(&u.id).filter(|m| m.team_id == t.id) {
+    // A team's own owners and admins never write over a role SCIM gives (ADR 0254); a server admin does.
+    let g = if via.is_some() { app.db.give_team_custom_role_unless_idp(&t.id, &u.id, &r.id, giving.until) } else { app.db.give_team_custom_role_until(&t.id, &u.id, &r.id, giving.until) };
+    let g = g.ok_or_else(|| match app.db.team_member(&u.id).filter(|m| m.team_id == t.id) {
+        Some(_) if via.is_some() && scim_source(app, &u.id, "team").is_some() => idp_held(),
         Some(_) => gone_or_changed(app, &r.id),
         None => not_found("Team member"),
     })?;
@@ -488,7 +496,11 @@ pub async fn unassign_in_team(State(app): State<AppState>, Extension(by): Extens
 /// Takes `r` away from `u` within `t`, as `give_in_team` gives it.
 pub(crate) fn take_in_team(app: &AppState, by: &Who, r: &CustomRole, t: &crate::db::Team, u: &User, via: Option<&str>) -> Res<Value> {
     let scim = scim_source(app, &u.id, "team");
-    if !app.db.set_team_custom_role(&t.id, &u.id, None) {
+    let taken = if via.is_some() { app.db.take_team_custom_role_unless_idp(&t.id, &u.id) } else { app.db.set_team_custom_role(&t.id, &u.id, None) };
+    if !taken {
+        if via.is_some() && scim_source(app, &u.id, "team").is_some() {
+            return Err(idp_held());
+        }
         return Err(ApiError(StatusCode::NOT_FOUND, "They don't have this role in the team.".into()));
     }
     let mut d = json!({ "name": r.name, "user": u.id, "scope": "team", "team": t.id, "scimMapping": scim });

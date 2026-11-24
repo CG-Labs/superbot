@@ -758,7 +758,7 @@ fn role_target(app: &AppState, c: &Caller, key: &str) -> Res<(User, TeamMember, 
         return Err(conflict("You can't change your own role in the team. Ask another of its owners or admins."));
     }
     if crate::roles::scim_source(app, &u.id, "team").is_some() {
-        return Err(conflict("Their role in the team comes from your identity provider (a SCIM group). A server admin changes that mapping."));
+        return Err(crate::roles::idp_held());
     }
     Ok((u, m, t))
 }

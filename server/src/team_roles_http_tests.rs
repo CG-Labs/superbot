@@ -157,4 +157,21 @@ async fn a_role_from_the_identity_provider_stays_with_its_mapping() {
     assert!(v["error"].as_str().unwrap().contains("identity provider"), "{v}");
     assert_eq!(call(port, "DELETE", &path(&fay), &ada_auth, "").await.0, 409);
     assert_eq!(app.db.team_member(&fay).unwrap().role_id.as_deref(), Some(billing.as_str()), "unchanged");
+
+    // Checked again in the write's transaction, so a SCIM grant landing after the route's own
+    // check still keeps the team's owners and admins off it.
+    assert!(app.db.give_team_custom_role_unless_idp(&alpha, &fay, &people, None).is_none());
+    assert!(!app.db.take_team_custom_role_unless_idp(&alpha, &fay));
+    let (t, u, r) = (app.db.team(&alpha).unwrap(), app.db.user(&fay).unwrap(), app.db.custom_role(&people).unwrap());
+    let by = audit::Who::system("test");
+    let giving = roles::parse_giving(&json!({}), &r).unwrap();
+    assert_eq!(roles::give_in_team(&app, &by, &r, &t, &u, giving, Some("team")).unwrap_err().0, StatusCode::CONFLICT);
+    assert_eq!(roles::take_in_team(&app, &by, &r, &t, &u, Some("team")).unwrap_err().0, StatusCode::CONFLICT);
+    assert_eq!(app.db.team_member(&fay).unwrap().role_id.as_deref(), Some(billing.as_str()), "still unchanged");
+
+    // A server admin still overrides it, as before.
+    let (code, _) = json_call(port, "PUT", &format!("/api/roles/{people}/teams/{alpha}/users/{fay}"), &admin, "").await;
+    assert_eq!(code, 200);
+    let given = events(port, &admin, "role.assigned").await;
+    assert_eq!(given[0]["details"]["takenFromScim"].as_str(), Some(m.id.as_str()), "{:?}", given[0]);
 }

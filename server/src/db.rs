@@ -5963,8 +5963,43 @@ impl Db {
     /// Gives a role within the team `user_id` is on, ending at `until` (ADR 0197) or not at
     /// all. None as `give_user_custom_role_until` is, or when they aren't on that team.
     pub fn give_team_custom_role_until(&self, team_id: &str, user_id: &str, role_id: &str, until: Option<i64>) -> Option<ByHand<(Option<String>, Option<i64>)>> {
+        self.give_team_role(team_id, user_id, role_id, until, false)
+    }
+
+    /// `give_team_custom_role_until`, but None too while SCIM gives them their role in the
+    /// team (ADR 0254), checked in the same transaction as the write.
+    pub fn give_team_custom_role_unless_idp(&self, team_id: &str, user_id: &str, role_id: &str, until: Option<i64>) -> Option<ByHand<(Option<String>, Option<i64>)>> {
+        self.give_team_role(team_id, user_id, role_id, until, true)
+    }
+
+    /// Takes away the custom role `user_id` holds in `team_id`, unless SCIM gave it (ADR
+    /// 0254), in one transaction. False when it did, or they aren't on that team.
+    pub fn take_team_custom_role_unless_idp(&self, team_id: &str, user_id: &str) -> bool {
         let held = |c: &Connection| Self::team_role_held(c, team_id, user_id);
         self.by_hand(user_id, "team", held, |c| {
+            if Self::idp_team_role_in(c, user_id)? {
+                return Ok(0);
+            }
+            c.execute("UPDATE team_members SET role_id = NULL WHERE team_id = ?1 AND user_id = ?2", params![team_id, user_id])
+        })
+        .is_some()
+    }
+
+    /// Whether a SCIM mapping or team role group gave `user_id` their role in a team (ADR 0138, ADR 0206).
+    fn idp_team_role_in(c: &Connection, user_id: &str) -> rusqlite::Result<bool> {
+        c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM scim_role_grants WHERE user_id = ?1 AND scope = 'team') OR EXISTS (SELECT 1 FROM scim_role_group_team_grants WHERE user_id = ?1)",
+            [user_id],
+            |r| r.get(0),
+        )
+    }
+
+    fn give_team_role(&self, team_id: &str, user_id: &str, role_id: &str, until: Option<i64>, keep_idp: bool) -> Option<ByHand<(Option<String>, Option<i64>)>> {
+        let held = |c: &Connection| Self::team_role_held(c, team_id, user_id);
+        self.by_hand(user_id, "team", held, |c| {
+            if keep_idp && Self::idp_team_role_in(c, user_id)? {
+                return Ok(0);
+            }
             let n = c.execute(
                 &format!("UPDATE team_members SET role_id = ?1 WHERE team_id = ?6 AND user_id = ?3 AND {GIVABLE}"),
                 params![role_id, now(), user_id, until, crate::roles::DAY, team_id],
