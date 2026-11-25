@@ -252,6 +252,24 @@ jobs:
           [[ $(stat -c '%U %a' /usr/local/bin/botd) == 'root 755' ]]
           if sudo test -e /home/superbot/superbot/.git; then echo "an offline install has no checkout" >&2; exit 1; fi
           sudo journalctl -u superbot --no-pager | tail -n 20
+      - name: The running server's check reads its saved secrets (ADR 0266)
+        run: |
+          set -euo pipefail
+          pass=$(sudo cat /home/superbot/.superbot-admin-password)
+          botctl() { sudo ip netns exec offline env SUPERBOT_PASSWORD="$pass" /usr/local/bin/botctl "$@"; }
+          botctl offline check | tee /tmp/offline-live.log
+          grep -Fq "botctl offline check: what the running botd reaches" /tmp/offline-live.log
+          grep -Fqx "Nothing botd's settings name is on the internet." /tmp/offline-live.log
+          hook='https://hooks.slack.com/services/T000/B000/offline-ci-not-real'
+          botctl secret set NOTIFY_WEBHOOK_URL <<<"$hook"
+          if botctl offline check >/tmp/offline-live.log; then
+            echo "botctl offline check passed a saved webhook on the internet" >&2; exit 1
+          fi
+          cat /tmp/offline-live.log
+          grep -Eq '^  internet +Approval webhooks +NOTIFY_WEBHOOK_URL \(saved in botd\): .*hooks\.slack\.com' /tmp/offline-live.log
+          if grep -Fq offline-ci-not-real /tmp/offline-live.log; then echo "the check showed the webhook" >&2; exit 1; fi
+          botctl secret rm NOTIFY_WEBHOOK_URL
+          botctl offline check --json | jq -e '.offline == true and .settings.running == true' >/dev/null
       - name: Upgrade from a newer bundle with no network; refuse the older one again
         run: |
           set -euo pipefail
