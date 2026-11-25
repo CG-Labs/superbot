@@ -264,7 +264,9 @@ fn may_hold(kind: &str, b: &Period, p: &Period) -> bool {
 /// kind that check; an item in more than one bundle is taken from the newest.
 pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population {
     let mut pop = Population::default();
-    let mut covered = BTreeSet::new();
+    // Days covered per repository (none for kinds whose files name none): one
+    // repository's bundles can't stand in for another's missing month.
+    let mut covered: BTreeMap<Option<String>, BTreeSet<NaiveDate>> = BTreeMap::new();
     for (f, files) in store {
         let (Some(kind), Some(bp)) = (f.kind, f.period) else {
             // A damaged tar, or a bundle whose name gives no period, could be of any kind
@@ -286,7 +288,8 @@ pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population 
             continue;
         };
         let days = bp.from.iter_days().take_while(|d| *d < bp.to).filter(|d| *d >= p.from && *d < p.to);
-        covered.extend(days.clone());
+        let repo = v["repository"].as_str().filter(|r| !r.is_empty()).map(String::from);
+        covered.entry(repo.clone()).or_default().extend(days.clone());
         pop.bundles.insert(f.name.clone());
         for (source, s) in v["sources"].as_object().into_iter().flatten() {
             if s["available"] == false {
@@ -294,7 +297,7 @@ pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population 
             }
         }
         // Ids are unique within one repository, so a store of several keeps each apart.
-        let scope = v["repository"].as_str().filter(|r| !r.is_empty()).map(|r| format!("{r}#"));
+        let scope = repo.map(|r| format!("{r}#"));
         let created = f.created.clone().unwrap_or_default();
         let mut add = |id: String, fields: Value| {
             let newer = pop.items.get(&id).is_none_or(|old| (created.as_str(), f.name.as_str()) > (old.created.as_str(), old.bundle.as_str()));
@@ -324,7 +327,17 @@ pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population 
             }
         }
     }
-    pop.missing = coverage::gaps(p, &covered);
+    if covered.is_empty() {
+        covered.insert(None, BTreeSet::new());
+    }
+    for (repo, days) in &covered {
+        for mut gap in coverage::gaps(p, days) {
+            if let Some(r) = repo {
+                gap["repository"] = json!(r);
+            }
+            pop.missing.push(gap);
+        }
+    }
     pop
 }
 
@@ -1041,6 +1054,10 @@ mod tests {
         let both = population(&TESTS[0], &repos, &p("2027-01-01", "2027-02-01"));
         assert_eq!(both.items.len(), 43, "another repository's #1 to #3 are other pull requests");
         assert!(both.items.contains_key("o/other#1") && both.items.contains_key("1"));
+        assert_eq!(both.missing, Vec::<Value>::new());
+        let quarter = population(&TESTS[0], &repos, &p("2027-01-01", "2027-03-01"));
+        assert_eq!(quarter.missing, vec![json!({ "from": "2027-02-01", "to": "2027-03-01", "days": 28, "repository": "o/other" })], "the other repository's February isn't covered by this one's");
+        assert!(!quarter.complete());
 
         let prs = population(&TESTS[0], &st, &p("2027-01-15", "2027-02-15"));
         assert!(prs.items.values().all(|i| i.fields["mergedAt"].as_str().unwrap() >= "2027-01-15" && i.fields["mergedAt"].as_str().unwrap() < "2027-02-15"));
