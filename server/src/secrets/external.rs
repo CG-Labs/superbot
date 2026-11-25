@@ -904,7 +904,7 @@ pub(crate) mod tests {
 
     #[test]
     fn cloud_credentials_never_reach_bots() {
-        for name in ["AZURE_CLIENT_SECRET", "AZURE_FEDERATED_TOKEN", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY"] {
+        for name in ["AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY"] {
             assert!(super::super::check_name(name).is_err(), "{name} is reserved");
             assert_eq!(scope_of(name), None, "{name} is never read from an external store");
             let s = super::super::Secrets::new(vec![Box::new(super::super::env::EnvStore::fixed(&[(name, "cloud-credential-0123456789")]))]);
@@ -913,12 +913,12 @@ pub(crate) mod tests {
         // Files too: `NAME_FILE` is offered to Bots as `NAME`, read from the file.
         let file = crate::db::temp_path("cloud-creds").join("token");
         std::fs::write(&file, "federated-assertion-0123456789\n").unwrap();
-        for var in ["AZURE_FEDERATED_TOKEN_FILE", "AZURE_CLIENT_SECRET_FILE", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
+        for var in ["AZURE_FEDERATED_TOKEN_FILE", "AZURE_CLIENT_SECRET_FILE", "AZURE_CLIENT_CERTIFICATE_PASSWORD_FILE", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
             let s = super::super::Secrets::new(vec![Box::new(super::super::env::EnvStore::fixed(&[(var, file.to_str().unwrap())]))]);
             assert!(s.try_harness_env().unwrap().is_empty() && s.try_inherited_harness_env().unwrap().is_empty(), "{var}");
         }
         let host = crate::adapters::local_host();
-        for k in ["AZURE_CLIENT_SECRET", "AZURE_CLIENT_SECRET_FILE", "AZURE_FEDERATED_TOKEN_FILE", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
+        for k in ["AZURE_CLIENT_SECRET", "AZURE_CLIENT_SECRET_FILE", "AZURE_FEDERATED_TOKEN_FILE", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_CLIENT_CERTIFICATE_PASSWORD_FILE", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
             assert!(host.remove.iter().any(|r| r == k), "{k} removed from local jobs");
         }
     }

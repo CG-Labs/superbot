@@ -142,7 +142,7 @@ pub struct Guard {
 /// forge Stripe's webhook or call Stripe's API, or sign in to the Vault, Key Vault or
 /// Secret Manager botd reads its secrets from (ADR 0125, ADR 0136, ADR 0159, ADR 0269).
 /// botd's AWS credentials depend on its settings, so `secrets::sign_in_env` adds them (ADR 0146).
-pub(crate) const SECRET_ENV: [&str; 32] = [
+pub(crate) const SECRET_ENV: [&str; 33] = [
     "AUTH_PASSWORD",
     "AUTH_PASSWORD_FILE",
     "SUPERBOT_PASSWORD",
@@ -172,6 +172,7 @@ pub(crate) const SECRET_ENV: [&str; 32] = [
     "AZURE_FEDERATED_TOKEN_FILE",
     "AZURE_CLIENT_CERTIFICATE_PATH",
     "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD_FILE",
     "IDENTITY_HEADER",
     "GCP_SERVICE_ACCOUNT_KEY",
     "GCP_SERVICE_ACCOUNT_KEY_FILE",
