@@ -44,7 +44,7 @@ A bundle's botd from before this subcommand would take `machines check` as a nor
 
 ### `--machine-hermes-bundle` and `--machine-harness-bundle`
 
-They name this release's bundles for users' machines. The check takes them with `--set`. The upgrade writes them to `.env`, after the database encryption step, only once it goes ahead. So the new values reach `.env` together with the botd that wants them, and the old botd never sees them. They need `--offline --upgrade`. Online upgrades say to edit `.env`, since an online server can fetch harnesses itself.
+They name this release's bundles for users' machines. The check takes them with `--set`. The upgrade writes them to `.env`, after the database encryption step, only once it goes ahead. So the new values reach `.env` together with the botd that wants them, and the old botd never sees them. They need `--offline --upgrade`. A path under `/tmp` or `/var/tmp` is refused before anything changes: the check runs outside botd's service, but the service has `PrivateTmp=true`, so botd would find nothing there. Online upgrades say to edit `.env`, since an online server can fetch harnesses itself.
 
 Machine bundles without `MACHINE_CONTROL_URL` are ignored by botd, so the check passes them too.
 
@@ -63,7 +63,7 @@ Machine bundles without `MACHINE_CONTROL_URL` are ignored by botd, so the check 
 - Tested:
   - `machines::settings_check::tests`: the lines for no control plane, a provider without enrollment, and enrollment with bundles; a Hermes bundle at another commit refused as at start, with the plan from `MACHINE_HARNESSES` and defaulted from the tiers; `MACHINE_APT_MIRROR`, `MACHINE_REGIONS` and `MACHINE_CONTROL_URL` refused with their area's prefix; the options, including `--set` names and `--home` with `--env-file`.
   - `support_check::tests`: `.env` lines ending in `\` are joined to the next, as systemd does, and an escaped `\` or a comment isn't; a two-arch bundle list split over two lines passes the check.
-  - `deploy/test-offline.sh`, with a stand-in botd: the check runs as botd's user with only `PATH` and `HOME`, from `/`, with `--set` for the new flags; a refusal stops the upgrade with its reason, or warns in a dry run; an older botd is never run; a check that fails to run warns; nothing runs online or without a `.env`. The flags need `--offline --upgrade`, and write and replace their `.env` lines.
+  - `deploy/test-offline.sh`, with a stand-in botd: the check runs as botd's user with only `PATH` and `HOME`, from `/`, with `--set` for the new flags; a refusal stops the upgrade with its reason, or warns in a dry run; an older botd is never run; a check that fails to run warns; nothing runs online or without a `.env`. The flags need `--offline --upgrade`, refuse paths under `/tmp` and `/var/tmp`, and write and replace their `.env` lines.
   - `offline.yml`, with no network: the installed botd passes the real harness bundle as botd's user and refuses it against another claude pin. An upgrade with `--machine-harness-bundle` checks and writes it. An upgrade over a `.env` botd would refuse stops with "Nothing has changed", and botd isn't restarted.
 - Not covered:
   - Docker Compose (`offline-bundle.sh load`): Compose's `.env` and volumes are the operator's, and the container shows the refusal at start.

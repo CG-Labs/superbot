@@ -1808,6 +1808,18 @@ check_offline_flags() {
   fi
   [[ -z "$MACHINE_HERMES_BUNDLE_VALUE$MACHINE_HARNESS_BUNDLE_VALUE" || "$UPGRADE" == true ]] \
     || die "--machine-hermes-bundle and --machine-harness-bundle change an installed server's .env: use them with --upgrade"
+  local flag item path items
+  for flag in "--machine-hermes-bundle=$MACHINE_HERMES_BUNDLE_VALUE" "--machine-harness-bundle=$MACHINE_HARNESS_BUNDLE_VALUE"; do
+    IFS=, read -ra items <<<"${flag#*=}"
+    for item in "${items[@]}"; do
+      path=$(sed -E 's/=[0-9a-f]{64}$//; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$item")
+      # superbot.service has PrivateTmp: botd sees its own empty /tmp and /var/tmp, not these.
+      case $path in
+        /tmp | /tmp/* | /var/tmp | /var/tmp/*)
+          die "${flag%%=*}: $path is under /tmp or /var/tmp, which botd's service can't see (PrivateTmp): put the bundle and its .sha256 where $SUPERBOT_USER can read them, such as /var/lib/superbot" ;;
+      esac
+    done
+  done
   [[ -z "$HARNESS_BUNDLE_SHA256" || -n "$HARNESS_BUNDLE" ]] || die "--harness-bundle-sha256 needs --harness-bundle"
   [[ -z "$HARNESS_BUNDLE" || ( -f "$HARNESS_BUNDLE" && -r "$HARNESS_BUNDLE" ) ]] || die "--harness-bundle: can't read $HARNESS_BUNDLE"
   [[ -z "$HARNESS_BUNDLE_SHA256" || "$HARNESS_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--harness-bundle-sha256 must be 64 lowercase hex digits"

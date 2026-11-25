@@ -1148,6 +1148,13 @@ grep -Fq "are for --offline --upgrade" <<<"$out" || fail "--machine-hermes-bundl
 if out=$(flags --offline "$B" --machine-harness-bundle /srv/b/n.tar.gz); then fail "--machine-harness-bundle was taken on a new install: $out"; fi
 grep -Fq "use them with --upgrade" <<<"$out" || fail "--machine-harness-bundle without --upgrade didn't say why: $out"
 flags --offline "$B" --upgrade --machine-harness-bundle /srv/b/n.tar.gz >/dev/null || fail "--machine-harness-bundle with --offline --upgrade was refused"
+flags --offline "$B" --upgrade --machine-hermes-bundle "/srv/tmp/h.tar.gz,/srv/b/a.tar.gz=$(printf 'a%.0s' {1..64})" >/dev/null \
+  || fail "a bundle under /srv/tmp with a pinned SHA-256 was refused"
+for p in /tmp/h.tar.gz /var/tmp/h.tar.gz "/tmp/h.tar.gz=$(printf 'b%.0s' {1..64})"; do
+  if out=$(flags --offline "$B" --upgrade --machine-hermes-bundle "/srv/b/x.tar.gz, $p"); then fail "--machine-hermes-bundle took $p, which botd's PrivateTmp hides: $out"; fi
+  grep -Fq "is under /tmp or /var/tmp, which botd's service can't see (PrivateTmp)" <<<"$out" || fail "$p under /tmp wasn't said: $out"
+done
+if out=$(flags --offline "$B" --upgrade --machine-harness-bundle /var/tmp/n.tar.gz); then fail "--machine-harness-bundle took /var/tmp: $out"; fi
 printf 'A=1\nMACHINE_HERMES_BUNDLE=/srv/b/old.tar.gz\n' >"$T/menv"
 (MACHINE_HERMES_BUNDLE_VALUE=/srv/b/new.tar.gz=abc MACHINE_HARNESS_BUNDLE_VALUE=/srv/b/n.tar.gz; configure_machine_bundles "$T/menv") >/dev/null
 [[ $(cat "$T/menv") == $'A=1\nMACHINE_HERMES_BUNDLE=/srv/b/new.tar.gz=abc\nMACHINE_HARNESS_BUNDLE=/srv/b/n.tar.gz' ]] || fail "the new bundles weren't written to .env: $(cat "$T/menv")"
