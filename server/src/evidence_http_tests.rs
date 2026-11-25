@@ -604,7 +604,7 @@ async fn secrets_are_evidence_only_while_every_start_used_an_external_manager() 
     let (_, app, _, _) = serve_app().await;
     let p = Period { from: today(), to: today().succ_opt().unwrap() };
     let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
-    let secrets = |app: &AppState| {
+    let manager_file = |app: &AppState| {
         let (_, f) = files(&evidence::build(app, &inputs, &p, db::now(), false).tar);
         (parse(file(&f, "secrets.json")), listed(&parse(file(&f, "manifest.json")), "secrets.json"))
     };
@@ -620,7 +620,7 @@ async fn secrets_are_evidence_only_while_every_start_used_an_external_manager() 
     app.db.record(&started(Some("vault")));
     app.db.record(&Event::new(Actor::system("secrets"), "secret.read").target("secret", "OPENAI_API_KEY").details(json!({ "store": "vault", "scope": "bots", "found": true })));
     app.db.record(&Event::new(Actor::system("secrets"), "secret.backend_login").outcome(Outcome::Failure).target("secrets_backend", "vault").details(json!({ "store": "vault", "method": "kubernetes", "error": "unavailable" })));
-    let (v, (c, rows)) = secrets(&app);
+    let (v, (c, rows)) = manager_file(&app);
     assert_eq!((c, rows), (json!(["CC6.1"]), json!(["CC6.1-4"])), "{v}");
     assert_eq!((v["summary"]["reads"].as_u64(), v["summary"]["signInFailures"].as_u64()), (Some(1), Some(1)), "{v}");
     assert_eq!(v["starts"].as_array().map(Vec::len), Some(2), "{v}");
@@ -628,21 +628,21 @@ async fn secrets_are_evidence_only_while_every_start_used_an_external_manager() 
 
     // A restart on local secrets in the period: a gap, listed.
     app.db.record(&started(Some("local")));
-    let (v, (_, rows)) = secrets(&app);
+    let (v, (_, rows)) = manager_file(&app);
     assert_eq!(rows, json!([]), "{v}");
     assert_eq!(v["exceptions"]["startsWithoutExternalManager"][0]["backend"], "local", "{v}");
 
     // The start before the period from a botd that didn't record its backend: unknown.
     let (_, app, _, _) = serve_app().await;
     app.db.record_at(&started(None), p.start_ms() - 3_600_000).unwrap();
-    let (v, (_, rows)) = secrets(&app);
+    let (v, (_, rows)) = manager_file(&app);
     assert_eq!((rows, v["exceptions"]["startsWithoutExternalManager"][0]["backend"].as_str()), (json!([]), Some("unknown")), "{v}");
 
     // No start before the period on record (pruned, or never): what ran until the first
     // one in it is unknown, so a Vault start halfway through doesn't make the month.
     let (_, app, _, _) = serve_app().await;
     app.db.record(&started(Some("vault")));
-    let (v, (_, rows)) = secrets(&app);
+    let (v, (_, rows)) = manager_file(&app);
     assert_eq!(rows, json!([]), "{v}");
     let gap = &v["exceptions"]["startsWithoutExternalManager"][0];
     assert_eq!((gap["backend"].as_str(), gap["startedAt"].is_null()), (Some("unknown"), true), "{v}");
