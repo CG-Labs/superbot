@@ -934,7 +934,7 @@ pub fn read_description(file: Option<&str>) -> Result<Policy, String> {
     Ok(Policy { id: SYSTEM_DESCRIPTION.into(), approver, sha256: Some(sha256) })
 }
 
-fn plain_id(s: &str) -> bool {
+pub fn plain_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
 }
 
