@@ -10,6 +10,8 @@
 mod support_report;
 #[path = "../support_readiness.rs"]
 mod support_readiness;
+#[path = "../support_updates.rs"]
+mod support_updates;
 #[path = "../support_triage.rs"]
 mod support_triage;
 #[path = "../audit_line.rs"]
@@ -324,9 +326,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl support-report <tickets.csv | -> [--plan <plan>] [--customer <name>] [--from <YYYY-MM> --to <YYYY-MM>]
     [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>] [--holidays <dates>]
     [--target <sev>=<30m|1h|4bh|1bd>]... [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
+    [--updates <updates.csv | -> [--update-target <sev>=<1h|4bh|3bd>]... [--update-column <field>=<header>]...]
                                                    The Provider's support report (ADR 0167), offline, from a
                                                    ticket system's CSV export: tickets by month and severity,
-                                                   response targets met and missed, and what's still open.
+                                                   response targets met and missed, and what's still open;
+                                                   with --updates, a replies export, whether Severity 1 to 3
+                                                   tickets were updated as often as promised (ADR 0286).
                                                    Reads only ids, severities, plans and times
   botctl support-readiness [--docs <dir>] [--rota <rota.csv | ->] [--tams <tams.csv | ->] [--plan <plan>]...
     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>]
@@ -2709,19 +2714,36 @@ fn offline_hint(e: String) -> String {
     }
 }
 
-/// `botctl support-report`: needs no botd, only the ticket system's export.
+/// `botctl support-report`: needs no botd, only the ticket system's exports.
 fn support_report(rest: &[&str], mut stdin: impl Read) -> Result<String, String> {
-    let (file, options, format) = support_report::parse_args(rest, chrono::Utc::now())?;
-    let mut csv = String::new();
-    match file.as_str() {
-        "-" => stdin.read_to_string(&mut csv).map(drop).map_err(|e| format!("stdin: {e}"))?,
-        _ => csv = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?,
+    let (rest, updates) = support_updates::split_args(rest)?;
+    let (file, options, format) = support_report::parse_args(&rest, chrono::Utc::now())?;
+    if file == "-" && updates.file.as_deref() == Some("-") {
+        return Err("Only one of the tickets export and --updates can be stdin (-)".into());
     }
-    let report = support_report::report(&csv, &options)?;
+    let mut read = |file: &str| -> Result<String, String> {
+        let mut csv = String::new();
+        match file {
+            "-" => stdin.read_to_string(&mut csv).map(drop).map_err(|e| format!("stdin: {e}"))?,
+            _ => csv = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?,
+        }
+        Ok(csv)
+    };
+    let report = support_report::report(&read(&file)?, &options)?;
+    let updates = match &updates.file {
+        Some(f) => Some(support_updates::judge(report.tickets(), &read(f).map_err(|e| format!("--updates: {e}"))?, &options, &updates).map_err(|e| format!("--updates: {e}"))?),
+        None => None,
+    };
     Ok(match format {
-        support_report::Format::Text => report.text(),
-        support_report::Format::Markdown => report.markdown(),
-        support_report::Format::Json => pretty(report.json().to_string()),
+        support_report::Format::Text => report.text() + &updates.map_or(String::new(), |u| format!("\n{}", u.text())),
+        support_report::Format::Markdown => report.markdown() + &updates.map_or(String::new(), |u| format!("\n{}", u.markdown())),
+        support_report::Format::Json => {
+            let mut v = report.json();
+            if let Some(u) = updates {
+                v["updates"] = u.json();
+            }
+            pretty(v.to_string())
+        }
     })
 }
 
@@ -3509,6 +3531,31 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(support_report(&["/nonexistent/tickets.csv", "--plan", "pro"], std::io::empty()).unwrap_err().contains("/nonexistent/tickets.csv"));
         assert!(support_report(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl support-report"));
+    }
+
+    #[test]
+    fn support_report_judges_update_targets_from_a_second_export() {
+        let tickets = "id,severity,opened,first response,resolved\nT-9,1,2026-09-01T10:00:00Z,2026-09-01T10:10:00Z,2026-09-01T13:00:00Z\n";
+        let updates = "Ticket ID,Created at,Public,Body\nT-9,2026-09-01T11:00:00Z,true,Still looking\n";
+        let file = std::env::temp_dir().join(format!("botctl-support-updates-{}.csv", std::process::id()));
+        std::fs::write(&file, tickets).unwrap();
+        let path = file.to_str().unwrap();
+        let args = [path, "--plan", "pro", "--from", "2026-09", "--to", "2026-09", "--updates", "-"];
+        let text = support_report(&args, updates.as_bytes()).unwrap();
+        assert!(text.contains("1 of 1 answered within target") && text.contains("0 of 1 tickets kept every update target (0%)."), "{text}");
+        assert!(text.contains("T-9  Sev 1 (pro)  opened 2026-09-01 10:00 UTC  1 gap over target, the longest 2 h; target 1 h, 24×7"), "{text}");
+        assert!(!text.contains("Still looking"));
+        let md = support_report(&[&args[..], &["--markdown"]].concat(), updates.as_bytes()).unwrap();
+        assert!(md.contains("\n### Update targets\n") && md.contains("| 1 | 1 h, 24×7 | 1 | 0 | 1 |"), "{md}");
+        let json: Value = serde_json::from_str(&support_report(&[&args[..], &["--json"]].concat(), updates.as_bytes()).unwrap()).unwrap();
+        assert_eq!(json["updates"]["late"][0]["longestGapMinutes"], 120);
+        let plain: Value = serde_json::from_str(&support_report(&[path, "--plan", "pro", "--json"], std::io::empty()).unwrap()).unwrap();
+        assert!(plain.get("updates").is_none(), "no update section without --updates");
+        let e = support_report(&["-", "--plan", "pro", "--updates", "-"], std::io::empty()).unwrap_err();
+        assert!(e.contains("Only one"), "{e}");
+        let e = support_report(&[path, "--plan", "pro", "--updates", "/nonexistent/updates.csv"], std::io::empty()).unwrap_err();
+        assert!(e.starts_with("--updates: /nonexistent/updates.csv"), "{e}");
+        std::fs::remove_file(&file).unwrap();
     }
 
     #[test]
