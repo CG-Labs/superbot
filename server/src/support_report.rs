@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 pub const USAGE: &str = "Usage: botctl support-report <tickets.csv | -> [--plan <plan>] [--customer <name>]
     [--from <YYYY-MM> --to <YYYY-MM>] [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>]
     [--utc-offset <+HH:MM>] [--holidays <YYYY-MM-DD,...>] [--target <severity>=<30m|1h|4bh|1bd>]...
-    [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]";
+    [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
+    [--updates <updates.csv | -> [--update-target <severity>=<1h|4bh|3bd>]... [--update-column <field>=<header>]...]";
 
 /// The plans of docs/support/severity.md's response targets table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,14 +113,14 @@ impl Target {
         }
     }
 
-    fn limit_secs(self, cal: &Calendar) -> i64 {
+    pub fn limit_secs(self, cal: &Calendar) -> i64 {
         match self {
             Target::Clock(m) | Target::Business(m) => m * 60,
             Target::BusinessDays(n) => n * cal.day_secs(),
         }
     }
 
-    fn elapsed_secs(self, cal: &Calendar, from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
+    pub fn elapsed_secs(self, cal: &Calendar, from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
         match self {
             Target::Clock(_) => (to - from).num_seconds().max(0),
             Target::Business(_) | Target::BusinessDays(_) => cal.business_secs(from, to),
@@ -525,6 +526,17 @@ struct Miss {
     target: Target,
 }
 
+/// A ticket opened in the period (and the customer's, with `--customer`), as read.
+#[derive(Clone, Debug)]
+pub struct Ticket {
+    pub id: String,
+    pub severity: u8,
+    pub plan: Plan,
+    pub opened: DateTime<Utc>,
+    pub responded: Option<DateTime<Utc>>,
+    pub resolved: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug)]
 pub struct Report {
     o: Options,
@@ -533,6 +545,7 @@ pub struct Report {
     open_at_end: Option<[u32; 4]>,
     plans: BTreeSet<Plan>,
     skipped: Vec<(usize, &'static str)>,
+    tickets: Vec<Ticket>,
 }
 
 /// The report on `csv`'s tickets, as `o` says.
@@ -572,7 +585,7 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
         months.insert(m, Default::default());
         m = m + Months::new(1);
     }
-    let (mut missed, mut plans, mut skipped) = (Vec::new(), BTreeSet::new(), Vec::new());
+    let (mut missed, mut plans, mut skipped, mut tickets) = (Vec::new(), BTreeSet::new(), Vec::new(), Vec::new());
     let mut open_at_end = col.contains_key("resolved").then_some([0u32; 4]);
     let wanted = o.customer.as_deref().map(normalize);
     if wanted.as_deref() == Some("") {
@@ -624,6 +637,7 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
             continue;
         }
         plans.insert(plan);
+        tickets.push(Ticket { id: id.to_string(), severity, plan, opened, responded, resolved });
         let target = o.targets.get(&severity).copied().unwrap_or_else(|| Target::default_for(plan, severity));
         let limit = target.limit_secs(&o.calendar);
         let c = &mut months.get_mut(&month_of(opened)).unwrap()[s];
@@ -645,7 +659,7 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
         }
     }
     missed.sort_by(|a, b| a.opened.cmp(&b.opened).then(a.id.cmp(&b.id)));
-    Ok(Report { o: o.clone(), months: months.into_iter().collect(), missed, open_at_end, plans, skipped })
+    Ok(Report { o: o.clone(), months: months.into_iter().collect(), missed, open_at_end, plans, skipped, tickets })
 }
 
 fn percent(met: u32, missed: u32) -> Option<u32> {
@@ -654,6 +668,11 @@ fn percent(met: u32, missed: u32) -> Option<u32> {
 }
 
 impl Report {
+    /// The tickets opened in the period, in the export's order, for the update targets.
+    pub fn tickets(&self) -> &[Ticket] {
+        &self.tickets
+    }
+
     fn totals(&self) -> [Counts; 4] {
         let mut t: [Counts; 4] = Default::default();
         for (_, m) in &self.months {

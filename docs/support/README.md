@@ -19,7 +19,7 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist, judged from botd's records by `botctl health-check` |
 | [Quarterly business review](qbr-template.md) | The template for the review with the customer's owner and sponsor, drafted from botd's records by `botctl business-review` |
 | [Incidents and their reviews](incident-review.md) | `botctl incident`: posting and updating the status page from the server, and `botctl incident review`, a draft of the post-incident review from botd's records |
-| [Support report](support-report.md) | `botctl support-report`: tickets by month and severity from the ticket system's export, response targets met and missed, and what's still open |
+| [Support report](support-report.md) | `botctl support-report`: tickets by month and severity from the ticket system's export, response targets met and missed, what's still open, and with `--updates` whether tickets were updated as often as promised |
 | [Support readiness](readiness.md) | `botctl support-readiness`: contact placeholders left, gaps in the on-call rota for the hours the plans sell, and every Enterprise customer with a TAM and a different backup |
 
 Runbooks for the incidents support sees most:
@@ -63,6 +63,6 @@ Check `<status-page-url>` (the server's `/status`) first: a known incident there
 - Check all three with `botctl support-readiness` before selling a plan and each month ([support readiness](readiness.md#when-to-run-it)): the contacts filled in, the rota without gaps, and the TAM list.
 - Check each new customer's server with `botctl onboarding` ([onboarding check](onboarding-check.md#where-it-fits)) at kickoff, weekly until go-live, and before confirming go-live: nothing open, and every item to confirm confirmed.
 - Triage each bundle a ticket brings with `botctl support-triage` ([bundle triage](triage.md#where-it-fits)) before the first response, and paste it into the ticket's internal note.
-- Run the [support report](support-report.md#each-month) each month, and look into every missed response target.
+- Run the [support report](support-report.md#each-month) each month, with the replies export for its [update targets](support-report.md#update-targets), and look into every missed response target and late update.
 - Draft each Severity 1's review with `botctl incident review` ([incident reviews](incident-review.md#finishing-the-review)), and look into every missed status page target it flags.
 - Review this folder with the rest of the [security pack](../security/README.md) at least once a year, and after any incident whose review changes a runbook.
