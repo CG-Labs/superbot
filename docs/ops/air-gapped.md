@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md), Hermes Agent with Docker Compose from the Hermes bundle in [ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md), and Ubuntu's packages on users' machines from your apt mirror in [ADR 0284](../adr/0284-ubuntu-packages-on-machines-from-an-apt-mirror.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md), Hermes Agent with Docker Compose from the Hermes bundle in [ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md), Ubuntu's packages on users' machines from your apt mirror in [ADR 0284](../adr/0284-ubuntu-packages-on-machines-from-an-apt-mirror.md), and upgrades checked against machines' settings first in [ADR 0294](../adr/0294-offline-upgrades-checked-against-machines-settings.md).
 
 ## What a bundle holds
 
@@ -124,6 +124,22 @@ sudo bash install.sh --offline superbot-offline-0.2.0-x86_64.tar.gz --upgrade \
 ```
 
 The same checks run, then the binaries, client, site and templates are replaced and botd restarts; `.env`, the database, the master key, the license and per-user accounts stay. Back up first (`botctl backups`, [backup-restore.md](backup-restore.md)) and read the release's notes in the [changelog](../../CHANGELOG.md). The installed version is recorded in `/usr/local/share/superbot/offline-release`; a bundle **older** than it is refused, because a database a newer botd changed may not open with an older one. To go back, restore a backup made on the older version.
+
+**Machines' settings are checked first** ([ADR 0294](../adr/0294-offline-upgrades-checked-against-machines-settings.md)). A release can move the Hermes and harness pins, and botd won't start while `.env` names [machines' bundles](#claude-code-codex-and-pi-from-botds-harness-bundle) that don't hold them. So before anything changes, the bundle's botd runs `botd machines check` as botd's user, over the server's `.env` and its secrets manager, as the unit would start it. If botd wouldn't start, the upgrade stops, says why, and changes nothing. Carry in this release's Hermes or harness bundles for your machines' arches, put them where botd's user can read them, and name them:
+
+```sh
+sudo bash install.sh --offline superbot-offline-0.2.0-x86_64.tar.gz --upgrade ... \
+  --machine-harness-bundle /var/lib/superbot/superbot-harnesses-0.2.0-x86_64.tar.gz,/var/lib/superbot/superbot-harnesses-0.2.0-aarch64.tar.gz \
+  --machine-hermes-bundle /var/lib/superbot/superbot-hermes-v0.24.0-x86_64.tar.gz
+```
+
+The check takes them over `.env`, and the upgrade writes them to `.env` as `MACHINE_HARNESS_BUNDLE` and `MACHINE_HERMES_BUNDLE` only once it goes ahead. Editing `.env` first would also work, but the running botd would refuse the new bundles if it restarted before the upgrade. `--dry-run` says what the check found and goes on. To check by hand, with any setting over `.env`:
+
+```sh
+sudo -u superbot /usr/local/bin/botd machines check --home ~superbot --set MACHINE_HARNESS_BUNDLE=<path>,<path>
+```
+
+It prints what machines get (the control plane, their upkeep, each bundle and what it holds) and exits 0, or names the setting botd would refuse and exits 1. It starts and serves nothing. A bundle's botd from before this check is skipped with a warning.
 
 ## Hermes Agent
 
@@ -338,7 +354,7 @@ MACHINE_HARNESS_BUNDLE=/var/lib/superbot/superbot-harnesses-0.2.0-x86_64.tar.gz,
 ```
 
 - Each is an absolute path, readable by botd's user, at most one per arch. Instead of the `.sha256` file, give the SHA-256 you recorded: `<path>=<sha-256>`. It needs `MACHINE_CONTROL_URL`.
-- At start, botd checks each bundle in full as `install.sh` does: its SHA-256, its files against `SHA256SUMS`, its `MANIFEST` (for `/opt/superbot-harnesses`), and every entry of its tree. Each must hold every npm harness in `MACHINE_HARNESSES` at the version and hash machines' plan pins, on the plan's Node.js. botd won't start otherwise, and names the file and the pin. So after an upgrade, name that release's harness bundles.
+- At start, botd checks each bundle in full as `install.sh` does: its SHA-256, its files against `SHA256SUMS`, its `MANIFEST` (for `/opt/superbot-harnesses`), and every entry of its tree. Each must hold every npm harness in `MACHINE_HARNESSES` at the version and hash machines' plan pins, on the plan's Node.js. botd won't start otherwise, and names the file and the pin. So name that release's harness bundles when you [upgrade](#upgrading) (`--machine-harness-bundle`); an offline upgrade checks them first.
 - botd serves them to enrolled machines only, over the machine port's mutual TLS. Machines reach that port anyway, so no firewall changes.
 - Each machine's agent downloads its arch's bundle once and checks its SHA-256. It unpacks and checks the tree in a root-only folder beside `/opt/superbot-harnesses`, writes the same wrappers `install.sh` writes, and moves it in. Claude Code, Codex and Pi run from that one tree, each on its own Node.js. If anything fails, it puts the previous tree back. A machine needs about 400 MB free for the download and 1.1 GB under `/opt`, twice that while it replaces an earlier one.
 - The mirror settings still apply to anything the bundle doesn't cover. With every npm harness from the bundle, machines fetch nothing from them.
@@ -354,7 +370,7 @@ MACHINE_HERMES_BUNDLE=/var/lib/superbot/superbot-hermes-v0.23.3-x86_64.tar.gz,/v
 ```
 
 - Each is an absolute path, readable by botd's user, at most one per arch. Instead of the `.sha256` file, give the SHA-256 you recorded: `<path>=<sha-256>`. It needs `MACHINE_CONTROL_URL`.
-- At start, botd checks each bundle in full as `install.sh` does: its SHA-256, its files against `SHA256SUMS`, its `MANIFEST` (for `/opt/hermes`), and every entry of its tree. Each must hold the Hermes commit machines' plan pins, the same one the server's bundle holds. botd won't start otherwise, and names the file.
+- At start, botd checks each bundle in full as `install.sh` does: its SHA-256, its files against `SHA256SUMS`, its `MANIFEST` (for `/opt/hermes`), and every entry of its tree. Each must hold the Hermes commit machines' plan pins, the same one the server's bundle holds. botd won't start otherwise, and names the file. When a release moves the pin, name its Hermes bundles when you [upgrade](#upgrading) (`--machine-hermes-bundle`); an offline upgrade checks them first.
 - botd serves them to enrolled machines only, over the machine port's mutual TLS. Machines reach that port anyway, so no firewall changes.
 - Each machine's agent downloads its arch's bundle and checks its SHA-256. It unpacks and checks the tree in a root-only folder beside `/opt/hermes`, moves it in, and runs `hermes-share.sh` there. If anything fails, it puts the previous `/opt/hermes` back. A machine needs about 1 GB free for the download and 2.7 GB under `/opt`, twice that while it replaces an earlier one.
 - `botctl machine mirror` reads each bundle again and checks it against its SHA-256. After you replace a bundle file (for a release that moves the Hermes pin), restart botd.

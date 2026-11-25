@@ -105,6 +105,7 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 | `--backup-off-host auto\|on\|off` | `SERVER_BACKUP_OFF_HOST`: copy when a store is set, refuse to start without one, or never copy |
 | `--with-hermes` | Also install Hermes Agent ([below](#hermes-agent)) |
 | `--hermes-bundle`, `--hermes-bundle-sha256` | With `--offline --with-hermes`: install Hermes Agent from a Hermes bundle, checked against its SHA-256 ([air-gapped guide](../docs/ops/air-gapped.md#hermes-agent)) |
+| `--machine-hermes-bundle`, `--machine-harness-bundle` | With `--offline --upgrade`: the release's Hermes or harness bundles for users' machines, checked with `.env` by the bundle's botd before anything changes, then written to `.env` as `MACHINE_HERMES_BUNDLE` and `MACHINE_HARNESS_BUNDLE` ([air-gapped guide](../docs/ops/air-gapped.md#upgrading)) |
 | `--license-file` | Install the license key CG-Labs sent ([below](#license)) |
 | `--isolation` / `--no-isolation` | Each user's Bots run as their own Unix account, or not ([below](#one-unix-account-per-user)). On for new installs; upgrades keep what they had |
 | `--no-client` | Skip building the web client |
