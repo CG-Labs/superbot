@@ -668,6 +668,7 @@ impl App {
     /// Saves botd's copy of a Bot's memory where it belongs now (`kept_memory`), and drops
     /// the copy kept in the other place.
     pub(crate) fn keep_memory_text(&self, bot_id: &str, text: &str) -> Result<(), String> {
+        let _held = crate::machines::chat_stores::memory_lock();
         let file = self.data_memory_file(bot_id);
         if self.db.memory_in_store(bot_id) {
             self.db.set_memory(bot_id, text).map_err(|e| format!("saving the Bot's memory in its region's chat store: {e}"))?;
@@ -679,7 +680,7 @@ impl App {
         let file = file.ok_or("the Bot has no memory file")?;
         // A row still in a store leaves it by a move, so that store's backups are cleared of it.
         if self.db.memory(bot_id).is_some() {
-            crate::machines::chat_stores::place(&self.db, &self.cfg.data_dir);
+            crate::machines::chat_stores::place_held(&self.db, &self.cfg.data_dir);
         }
         write_memory_file(&file, text).map_err(|e| format!("writing the Bot's memory: {e}"))?;
         self.db.delete_memory(bot_id).map_err(|e| format!("deleting the Bot's memory from the database: {e}"))?;

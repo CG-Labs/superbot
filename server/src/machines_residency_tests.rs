@@ -931,6 +931,16 @@ async fn a_pinned_persons_bots_memory_is_kept_in_their_regions_chat_store_not_in
     assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
     assert_eq!((count(), std::fs::read_to_string(&file).unwrap().as_str()), (0, "learned on the machine"));
     assert!(app.db.memory(&bot).is_none());
+
+    // A run that saves after an unpin, before any pass moves the memory back, isn't
+    // overwritten by the older copy in the store.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-2")).await.0, 200);
+    assert_eq!((count(), file.exists()), (1, false));
+    app.db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+    app.keep_memory_text(&bot, "saved after the unpin").unwrap();
+    chat_stores::place(&app.db, &app.cfg.data_dir);
+    assert_eq!((count(), std::fs::read_to_string(&file).unwrap().as_str()), (0, "saved after the unpin"));
+    assert!(app.db.memory(&bot).is_none());
 }
 
 #[tokio::test]

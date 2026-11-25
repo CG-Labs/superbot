@@ -229,6 +229,20 @@ fn place_name(region: &Option<String>) -> String {
 /// there like any other row; one that came back out of a store is written to its file, then
 /// deleted from botd's table.
 pub fn place(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
+    let _held = memory_lock();
+    place_held(db, data_dir)
+}
+
+/// Held while botd's copy of a Bot's memory is moved or saved (`place`,
+/// `App::keep_memory_text`), so a save can't land between a move reading a memory and
+/// writing it to its file, only to be overwritten with the older text.
+pub(crate) fn memory_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `place`, with `memory_lock` already held.
+pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
     memories_from_files(db, data_dir);
     let moves = match db.place_chats() {
         Ok(m) => m,
