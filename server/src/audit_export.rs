@@ -717,9 +717,41 @@ fn known(app: &App, id: &str) -> Value {
     json!({ "kind": kind, "sink": shown })
 }
 
-fn save_record(app: &App, id: &str, record: &Value) {
-    if !app.db.write_settings(&[(&record_key(id), Some(&record.to_string()))]) {
-        log_warn!("Audit export: couldn't save what {id} is; a later audit.export_stopped names only its kind.");
+/// Saves a sink's record and, for a new sink, its cursor with it, in one transaction, so
+/// a start is never saved without the event that records it (ADR 0264). Logs the address
+/// the record shows, never the id: a webhook's id holds its path.
+fn save_record(app: &App, id: &str, record: &Value, cursor: Option<i64>) -> bool {
+    let (key, value) = (record_key(id), record.to_string());
+    let (cursor_key, at) = (format!("audit_export:{id}"), cursor.map(|c| c.to_string()));
+    let mut writes = vec![(key.as_str(), Some(value.as_str()))];
+    if let Some(at) = &at {
+        writes.push((cursor_key.as_str(), Some(at.as_str())));
+    }
+    let saved = app.db.write_settings(&writes);
+    if !saved {
+        log_warn!("Audit export: couldn't save the record of {}; a later audit.export_stopped names only its kind.", record["sink"].as_str().unwrap_or("a sink"));
+    }
+    saved
+}
+
+fn change(action: &str, details: Value) -> Event {
+    Event::new(Actor::system("audit_export"), action).target("audit", "export").details(details)
+}
+
+/// Records the event a record holds as `unrecorded`: a start saved before botd stopped or
+/// failed to write it. False while it still can't be.
+fn flush(app: &App, record: &mut Value) -> bool {
+    let Some(u) = record.get("unrecorded").filter(|u| u.is_object()).cloned() else { return true };
+    let action = u["action"].as_str().unwrap_or("audit.export_started");
+    match app.db.try_record(&change(action, u["details"].clone())) {
+        Ok(_) => {
+            record.as_object_mut().map(|o| o.remove("unrecorded"));
+            true
+        }
+        Err(e) => {
+            log_warn!("Audit export: couldn't record {action} for {} ({e}); trying again when botd next starts.", record["sink"].as_str().unwrap_or("a sink"));
+            false
+        }
     }
 }
 
@@ -739,6 +771,9 @@ fn note_stopped(app: &App, sinks: &[Sink], head: i64) {
             continue;
         }
         let mut record = known(app, &id);
+        if record.get("unrecorded").is_some_and(Value::is_object) && flush(app, &mut record) {
+            save_record(app, &id, &record, None);
+        }
         if record["stopped"].is_i64() {
             continue;
         }
@@ -752,19 +787,19 @@ fn note_stopped(app: &App, sinks: &[Sink], head: i64) {
         d["pending"] = json!(pending);
         let shown = record["sink"].as_str().unwrap_or("a sink").to_string();
         log_warn!("WARNING: audit export to {shown} has stopped: AUDIT_EXPORT no longer lists it. It last took event {delivered}, {pending} behind; recorded as audit.export_stopped.");
-        match app.db.try_record(&Event::new(Actor::system("audit_export"), "audit.export_stopped").target("audit", "export").details(d)) {
+        match app.db.try_record(&change("audit.export_stopped", d)) {
             Ok(event) => {
                 record["stopped"] = json!(event);
-                save_record(app, &id, &record);
+                save_record(app, &id, &record, None);
             }
             Err(e) => log_warn!("Audit export: couldn't record that {shown} stopped ({e}); trying again when botd next starts."),
         }
     }
 }
 
-/// `audit.export_started` for a sink with no cursor (ADR 0264): how it started, the last
-/// event it won't get, and how many kept events that leaves out.
-fn note_started(app: &App, sink: &Sink, start: Start, after: i64) {
+/// `audit.export_started`'s details for a sink with no cursor (ADR 0264): how it started,
+/// the last event it won't get, and how many kept events that leaves out.
+fn started(app: &App, sink: &Sink, start: Start, after: i64) -> Value {
     let mut d = sink.about();
     d["start"] = json!(match start {
         Start::All => "all",
@@ -772,16 +807,16 @@ fn note_started(app: &App, sink: &Sink, start: Start, after: i64) {
     });
     d["after"] = json!(after);
     d["skipped"] = json!(if after > 0 { app.db.audit_kept_through(after) } else { 0 });
-    app.db.record(&Event::new(Actor::system("audit_export"), "audit.export_started").target("audit", "export").details(d));
+    d
 }
 
-/// `audit.export_resumed` for a sink back after `audit.export_stopped`, or whose cursor
-/// retention has passed (ADR 0264): `missed` names the events deleted before it took them.
-fn note_resumed(app: &App, sink: &Sink, after: i64) {
-    let stopped = app.db.setting(&record_key(&sink.id)).and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|r| r["stopped"].as_i64());
+/// `audit.export_resumed`'s details, for a sink back after `audit.export_stopped` or whose
+/// cursor retention has passed (ADR 0264): `missed` names the events deleted before it
+/// took them. None when it simply carries on.
+fn resumed(app: &App, sink: &Sink, after: i64, stopped: Option<i64>) -> Option<Value> {
     let pruned = app.db.audit_chain_anchor().map(|a| a.id).filter(|&through| through > after);
     if stopped.is_none() && pruned.is_none() {
-        return;
+        return None;
     }
     let mut d = sink.about();
     d["after"] = json!(after);
@@ -790,7 +825,7 @@ fn note_resumed(app: &App, sink: &Sink, after: i64) {
         log_warn!("WARNING: audit export to {} resumes after event {after}, but retention has deleted events up to {through}: it never gets those.", sink.label());
         d["missed"] = json!({ "after": after, "through": through });
     }
-    app.db.record(&Event::new(Actor::system("audit_export"), "audit.export_resumed").target("audit", "export").details(d));
+    Some(d)
 }
 
 /// Sinks recorded as stopped and not set now, for `GET /api/audit/siem`.
@@ -859,9 +894,25 @@ fn open(app: &App, settings: Settings) -> Option<Exports> {
         .sinks
         .into_iter()
         .map(|sink| {
+            // What a crash or a failed write left: a stop not yet cleared, a start not yet recorded.
+            let old = app.db.setting(&record_key(&sink.id)).and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+            let mut record = json!({ "kind": sink.kind(), "name": sink.name, "sink": sink.shown });
+            for k in ["stopped", "unrecorded"] {
+                if !old[k].is_null() {
+                    record[k] = old[k].clone();
+                }
+            }
             let delivered = match app.db.audit_export_cursor(&sink.id) {
                 Some(at) => {
-                    note_resumed(app, &sink, at);
+                    flush(app, &mut record);
+                    if let Some(d) = resumed(app, &sink, at, record["stopped"].as_i64()) {
+                        match app.db.try_record(&change("audit.export_resumed", d)) {
+                            Ok(_) => {
+                                record.as_object_mut().map(|o| o.remove("stopped"));
+                            }
+                            Err(e) => log_warn!("Audit export: couldn't record that {} resumed ({e}); trying again when botd next starts.", sink.label()),
+                        }
+                    }
                     at
                 }
                 None => {
@@ -870,14 +921,15 @@ fn open(app: &App, settings: Settings) -> Option<Exports> {
                         Start::All => 0,
                         Start::New => head,
                     };
-                    if let Err(e) = app.db.set_audit_export_cursor(&sink.id, from) {
-                        log_warn!("Audit export: couldn't save where {} starts ({e}); trying again after the first delivery.", sink.label());
+                    record["unrecorded"] = json!({ "action": "audit.export_started", "details": started(app, &sink, start, from) });
+                    if !save_record(app, &sink.id, &record, Some(from)) {
+                        log_warn!("Audit export: couldn't save where {} starts; trying again after the first delivery.", sink.label());
                     }
-                    note_started(app, &sink, start, from);
+                    flush(app, &mut record);
                     from
                 }
             };
-            save_record(app, &sink.id, &json!({ "kind": sink.kind(), "name": sink.name, "sink": sink.shown }));
+            save_record(app, &sink.id, &record, None);
             Arc::new(Exporter::new(sink, delivered))
         })
         .collect();
@@ -1754,6 +1806,31 @@ pub(crate) mod tests {
         assert_eq!(stopped(&app, app.db.audit_head()).iter().filter(|s| s["kind"] == "syslog").count(), 0, "no longer stopped");
         open(&app, settings(&[("AUDIT_EXPORT", soc)]).unwrap()).unwrap();
         assert_eq!(changes().len(), c.len() + 1, "only retention's gap is recorded again: the stop is cleared");
+    }
+
+    #[test]
+    fn a_start_saved_but_never_recorded_is_recorded_on_the_next_start() {
+        let app = crate::runner::test_app();
+        let starts = || app.db.audit_events(&Filter { actions: vec!["audit.export_started".into()], ..Default::default() }, 100, true);
+        let unrecorded = |name: &str, shown: &str| {
+            json!({ "kind": "webhook", "name": name, "sink": shown, "unrecorded": { "action": "audit.export_started", "details": { "kind": "webhook", "name": name, "sink": shown, "start": "all", "after": 0, "skipped": 0 } } }).to_string()
+        };
+        // As botd leaves them when it stops between saving a start and recording it.
+        for (name, id) in [("late", "https://late.example.net:443/in"), ("gone", "https://gone.example.net:443/in")] {
+            app.db.set_audit_export_cursor(id, 0).unwrap();
+            app.db.set_setting(&record_key(id), &unrecorded(name, &format!("https://{name}.example.net:443")));
+        }
+        let xs = open(&app, settings(&[("AUDIT_EXPORT", "late=https://late.example.net/in")]).unwrap()).unwrap();
+        assert_eq!(xs.sinks[0].delivered(), 0);
+        let s = starts();
+        assert_eq!(s.iter().map(|e| e.details["name"].as_str().unwrap()).collect::<Vec<_>>(), ["gone", "late"], "each recorded; the one taken out before its stop");
+        let gone = app.db.audit_events(&Filter { actions: vec!["audit.export_stopped".into()], ..Default::default() }, 10, true);
+        assert_eq!((gone.len(), gone[0].id > s[0].id), (1, true), "its stop after its start");
+        for id in ["https://late.example.net:443/in", "https://gone.example.net:443/in"] {
+            assert!(!app.db.setting(&record_key(id)).unwrap().contains("unrecorded"), "{id}");
+        }
+        open(&app, settings(&[("AUDIT_EXPORT", "late=https://late.example.net/in")]).unwrap()).unwrap();
+        assert_eq!(starts().len(), 2, "not again");
     }
 
     #[test]

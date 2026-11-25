@@ -119,6 +119,17 @@ fn change_of(e: &AuditEvent) -> Value {
     })
 }
 
+/// Whether a start left out the event `first` or later: that sink never had it.
+fn skipped_from(start: &Value, first: i64) -> bool {
+    start["skipped"].as_i64().unwrap_or(0) > 0 && start["after"].as_i64().is_some_and(|after| after >= first)
+}
+
+/// Whether a return's missed ids reach into `first..=last`.
+fn missed_within(back: &Value, first: i64, last: i64) -> bool {
+    let m = &back["missed"];
+    m["after"].as_i64().zip(m["through"].as_i64()).is_some_and(|(after, through)| after < last && through >= first)
+}
+
 fn check_of(e: &AuditEvent) -> Check {
     Check { id: e.id, at: e.at, ok: e.outcome == "success" && e.details["ok"] != false, reason: code(&e.details["reason"]) }
 }
@@ -204,11 +215,9 @@ impl Integrity {
             EXPORT_STARTED | EXPORT_STOPPED | EXPORT_RESUMED => {
                 let v = change_of(e);
                 self.export_changes.push(v.clone());
-                // Started past an event of this period: that sink never had it.
-                let skipped = v["skipped"].as_i64().unwrap_or(0) > 0 && v["after"].as_i64().zip(self.first_id).is_some_and(|(after, first)| after >= first);
                 match action {
                     EXPORT_STOPPED => self.export_stopped.push(v),
-                    EXPORT_STARTED if skipped => self.export_skipped.push(v),
+                    EXPORT_STARTED if self.first_id.is_some_and(|first| skipped_from(&v, first)) => self.export_skipped.push(v),
                     EXPORT_RESUMED if !v["missed"].is_null() => self.export_missed.push(v),
                     _ => {}
                 }
@@ -228,10 +237,27 @@ impl Integrity {
         }
     }
 
+    /// Starts and returns recorded after the period that still left out its events (ADR
+    /// 0264): a sink set with `new` next month never had this month's, though its cursor is
+    /// past them now.
+    fn after_period(&mut self, app: &App, last_id: Option<i64>) {
+        let (Some(first), Some(last)) = (self.first_id, last_id) else { return };
+        let actions = vec![EXPORT_STARTED.to_string(), EXPORT_RESUMED.to_string()];
+        for e in app.db.audit_events(&Filter { actions, after: Some(last), ..Default::default() }, 1000, true) {
+            let v = change_of(&e);
+            match e.action.as_str() {
+                EXPORT_STARTED if skipped_from(&v, first) => self.export_skipped.push(v),
+                EXPORT_RESUMED if missed_within(&v, first, last) => self.export_missed.push(v),
+                _ => {}
+            }
+        }
+    }
+
     /// The file, and the criteria and rows its manifest entry names. `last_id` is the
     /// period's last event, which every export must have taken; `read_all` is false when
     /// the scan stopped before the period's end, which leaves both unproven.
-    pub fn finish(self, app: &App, last_id: Option<i64>, read_all: bool, snapshot_ms: i64) -> (Value, Vec<&'static str>, Vec<&'static str>) {
+    pub fn finish(mut self, app: &App, last_id: Option<i64>, read_all: bool, snapshot_ms: i64) -> (Value, Vec<&'static str>, Vec<&'static str>) {
+        self.after_period(app, last_id);
         let now = audit_checkpoint::view(app).unwrap_or_else(|e| json!({ "error": e.to_string() }));
         // A later check that fails says the period's rows may have changed since.
         let latest = app.db.audit_events(&Filter { actions: vec![VERIFIED.to_string()], ..Default::default() }, 50, false).iter().find(|e| whole(e)).map(check_of);
@@ -481,5 +507,12 @@ mod tests {
         i.feed(&event(20, H, EXPORT_STARTED, "success", json!({ "kind": "webhook", "start": "new", "after": 19, "skipped": 19 })));
         i.feed(&event(21, H, "user.created", "success", json!({})));
         assert!(i.export_skipped.is_empty() && i.export_changes.len() == 1);
+
+        // Starts and returns after a period are held to its ids.
+        let missed = json!({ "missed": { "after": 3, "through": 9 } });
+        assert!(missed_within(&missed, 5, 20) && missed_within(&missed, 1, 4), "reaches into the period");
+        assert!(!missed_within(&missed, 10, 20) && !missed_within(&missed, 1, 3), "wholly before or after it");
+        assert!(skipped_from(&json!({ "after": 30, "skipped": 30 }), 20) && !skipped_from(&json!({ "after": 30, "skipped": 30 }), 31));
+        assert!(!skipped_from(&json!({ "after": 0, "skipped": 0 }), 1), "started with all");
     }
 }
