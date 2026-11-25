@@ -9,7 +9,7 @@
 //! (ADR 0221); then the run stops when the lease ends.
 
 use crate::acl::Visibility;
-use crate::secrets::leases::tests::{fake, set_for_owner, wait_for};
+use crate::secrets::leases::tests::{fake, set_for_owner, wait_for, Fake};
 use crate::secrets::leases::{parse, RunCredentials};
 use crate::tests::{audit_list, call, serve_app};
 use crate::tiers::Tiers;
@@ -73,6 +73,13 @@ async fn run(port: u16, app: &AppState, who: &str, bot: &str) -> String {
     panic!("no reply from {bot}");
 }
 
+/// `wait_for` off the test's one runtime thread: the run that revokes its leases as it
+/// ends shares that thread, and may still be finishing after its reply is saved.
+async fn revoked(f: &Arc<Fake>, n: usize) {
+    let f = f.clone();
+    tokio::task::spawn_blocking(move || wait_for(|| f.revoked.lock().unwrap().len() == n)).await.unwrap();
+}
+
 async fn refusals(port: u16, admin: &str, bot: &str) -> Vec<Value> {
     let (code, body) = call(port, "GET", &format!("/api/audit?action=bot.run_refused&bot={bot}&limit=50"), admin, "").await;
     assert_eq!(code, 200, "{body}");
@@ -92,10 +99,10 @@ async fn a_run_gets_a_new_lease_revoked_when_it_ends_and_none_refuses_it() {
 
     let reply = run(port, &app, &ada, &bot.id).await;
     assert_eq!(reply, "lease=[redacted] session=none", "the run got the lease's value, its reply doesn't show it, and the empty field took the saved one out");
-    wait_for(|| f.revoked.lock().unwrap().len() == 1);
+    revoked(&f, 1).await;
     assert_eq!(*f.revoked.lock().unwrap(), [format!("{path}/lease0")], "revoked once the run ended");
     assert_eq!(run(port, &app, &ada, &bot.id).await, "lease=[redacted] session=none");
-    wait_for(|| f.revoked.lock().unwrap().len() == 2);
+    revoked(&f, 2).await;
     assert_eq!(f.issued.load(Ordering::SeqCst), 2, "a new lease for each run");
     assert_eq!(*f.run_for.lock().unwrap(), [app.cfg.run_timeout; 2], "asked to outlast the longest run");
 
@@ -122,7 +129,7 @@ async fn a_plans_provider_key_may_come_only_from_a_lease() {
     let f = fake(&[(path.as_str(), &[("key", Some("sk-leased-e2e-7a8b"))])]);
     set_for_owner(&ada_id, RunCredentials::new(f.clone(), parse(wanted).unwrap()));
     assert_eq!(run(port, &app, &ada, &bot.id).await, "provider=superbot-leased key=[redacted]", "no saved key, so only the lease gave it");
-    wait_for(|| f.revoked.lock().unwrap().len() == 1);
+    revoked(&f, 1).await;
     assert!(refusals(port, &admin, &bot.id).await.is_empty());
 
     // The lease gives the key empty: refused before the harness starts, and revoked.
@@ -136,7 +143,7 @@ async fn a_plans_provider_key_may_come_only_from_a_lease() {
     let refused = refusals(port, &admin, &bot.id).await;
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0]["details"]["reason"], "secrets_unavailable");
-    wait_for(|| f.revoked.lock().unwrap().len() == 1);
+    revoked(&f, 1).await;
 }
 
 /// A stand-in `claude` that takes longer than its STS session lasts.
@@ -193,7 +200,7 @@ async fn a_run_outlives_its_leases_ttl_by_renewing_them_until_the_max_ttl_stops_
     assert!(reply.contains("short-lived credentials for this task expired"), "{reply}");
     let took = started.elapsed();
     assert!(took > Duration::from_secs(3) && took < Duration::from_secs(12), "past its first TTL, stopped with its last renewal: {took:?}");
-    wait_for(|| f.revoked.lock().unwrap().len() == 1);
+    revoked(&f, 1).await;
     assert_eq!(*f.revoked.lock().unwrap(), [format!("{path}/lease0")], "revoked as the run ended");
     let renewals = f.renewals.lock().unwrap().clone();
     assert!(renewals.len() >= 3 && renewals.iter().all(|(id, n)| *id == format!("{path}/lease0") && *n == 2), "{renewals:?}");
