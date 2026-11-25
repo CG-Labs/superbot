@@ -13,7 +13,21 @@ use crate::*;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const FILES: [&str; 11] = ["README.txt", "access-review.json", "changes.json", "backups.json", "retention.json", "sign-ins-and-alerts.json", "audit-summary.json", "baseline.json", "audit-integrity.json", "manifest.json", "SHA256SUMS"];
+const FILES: [&str; 13] = [
+    "README.txt",
+    "access-review.json",
+    "changes.json",
+    "backups.json",
+    "retention.json",
+    "sign-ins-and-alerts.json",
+    "audit-summary.json",
+    "baseline.json",
+    "audit-integrity.json",
+    "egress.json",
+    "secrets.json",
+    "manifest.json",
+    "SHA256SUMS",
+];
 
 /// A `GET`'s status, response head and body bytes.
 async fn fetch(port: u16, path: &str, auth: &str) -> (u16, String, Vec<u8>) {
@@ -94,7 +108,7 @@ async fn only_admins_get_it_and_its_digests_are_audited() {
         assert_eq!(x["sha256"].as_str().unwrap(), hex(file(&f, x["name"].as_str().unwrap()).as_bytes()), "{x}");
     }
     let access = manifest["files"].as_array().unwrap().iter().find(|x| x["name"] == "access-review.json").unwrap();
-    assert_eq!(access["checklist"], json!(["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2"]));
+    assert_eq!(access["checklist"], json!(["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2", "CC6.3-3"]));
 
     let manifest_digest = hex(file(&f, "manifest.json").as_bytes());
     assert!(lower.contains(&format!("x-evidence-manifest-sha256: {manifest_digest}")), "{head}");
@@ -514,4 +528,129 @@ async fn a_sink_started_past_the_periods_events_is_a_gap() {
         assert_eq!(v["exceptions"]["exportSkipped"].as_array().map(Vec::len), Some(usize::from(!held)), "an earlier period, start {start}: {v}");
         assert_eq!(v["summary"]["exportedEveryEvent"], held, "{v}");
     }
+}
+
+/// Machines' outbound allow-lists (ADR 0285): `egress.json` names CC6.8-2 only while a
+/// machine was running and every run in the period was held to an allow-list. Open by
+/// default, so no; with the server's list set before the period, yes, even while a
+/// machine hasn't loaded it yet (its runs wait); a user let out on their own in the
+/// period, no. Never a host or an address from the list.
+#[tokio::test]
+async fn egress_is_evidence_only_while_every_run_was_held_to_an_allow_list() {
+    use crate::machines::provider::MachineProvider;
+    let provider: Arc<dyn MachineProvider> = Arc::new(crate::machines::fake::Fake::default());
+    let cp = Arc::new(crate::machines::ControlPlane::for_tests(provider));
+    let (port, app, admin, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
+    let (uid, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let p = Period { from: today(), to: today().succ_opt().unwrap() };
+    let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+    let egress = |app: &AppState| {
+        let (_, f) = files(&evidence::build(app, &inputs, &p, db::now(), false).tar);
+        (parse(file(&f, "egress.json")), listed(&parse(file(&f, "manifest.json")), "egress.json"))
+    };
+    let criteria = json!(["CC6.6", "CC6.8"]);
+
+    // No machine running: nothing to show.
+    let (v, (c, rows)) = egress(&app);
+    assert_eq!((v["machinesOn"].as_bool(), c, rows), (Some(true), criteria.clone(), json!([])), "{v}");
+
+    // A running machine on the default, open: its runs reach the whole internet.
+    let new = db::NewMachine { user_id: &uid, provider: "fake", label_prefix: "superbot", tier: "small", plan: "p", region: "r", created_by: None };
+    let mut m = app.db.add_machine(&new).unwrap();
+    let was = m.state;
+    m.state = crate::machines::State::Running;
+    assert!(app.db.save_machine(&m, was));
+    app.db.machine_set_enrolled(&m.id);
+    let (v, (_, rows)) = egress(&app);
+    assert_eq!(rows, json!([]), "{v}");
+    assert_eq!((v["exceptions"]["machinesOpen"].clone(), v["exceptions"]["serverOpen"].as_array().map(Vec::len)), (json!([m.id]), Some(1)), "{v}");
+    assert_eq!(v["everyRunHeldToAnAllowList"], false);
+
+    // The server's allow-list, set before the period: held all through, though the
+    // machine hasn't loaded it yet, since botd holds its runs back until it has.
+    let list = json!({ "mode": "allow_list", "allow": ["203.0.113.0/24", "api.example.com"] });
+    app.db.set_setting("machine_egress_policy", &list.to_string());
+    let changed = Event::new(Actor::operator(), "server.egress_policy_changed").details(json!({ "from": { "mode": "open", "allow": [] }, "to": list }));
+    app.db.record_at(&changed, p.start_ms() - 60_000).unwrap();
+    let (v, (c, rows)) = egress(&app);
+    assert_eq!((c, rows), (criteria.clone(), json!(["CC6.8-2"])), "{v}");
+    assert_eq!((v["server"]["mode"].as_str(), v["server"]["entries"].as_u64()), (Some("allow_list"), Some(2)), "{v}");
+    assert_eq!(v["exceptions"]["notInPlace"], json!([m.id]), "{v}");
+    let policy = crate::machines::egress_policy::effective(&app, &uid);
+    assert!(app.db.machine_upkeep_swap(&m.id, None, &json!({ "egressPolicy": { "id": policy.id, "mode": "allow_list", "state": "on", "addresses": 3 } })));
+    let (v, (_, rows)) = egress(&app);
+    assert_eq!((rows, v["machines"][0]["inPlace"].as_bool(), v["machines"][0]["loaded"]["addresses"].as_u64()), (json!(["CC6.8-2"]), Some(true), Some(3)), "{v}");
+    assert!(v["exceptions"].as_object().unwrap().values().all(|x| x.as_array().is_some_and(Vec::is_empty)), "{v}");
+    for leak in ["203.0.113", "api.example.com"] {
+        assert!(!v.to_string().contains(leak), "{leak} in {v}");
+    }
+
+    // Ada let out on her own for part of the period: her runs weren't held to it then.
+    let user_changed = |from: &str, to: &str| Event::new(Actor::operator(), "user.egress_policy_changed").target("user", &uid).details(json!({ "from": { "mode": from, "allow": [] }, "to": { "mode": to, "allow": [] }, "userEmail": "ada@example.com" }));
+    app.db.record(&user_changed("inherit", "open"));
+    app.db.record(&user_changed("open", "inherit"));
+    let (v, (_, rows)) = egress(&app);
+    assert_eq!(rows, json!([]), "{v}");
+    assert_eq!(v["exceptions"]["usersOpen"][0]["user"].as_str(), Some(uid.as_str()), "{v}");
+    assert!(!v.to_string().contains("ada@example.com"), "{v}");
+    assert_eq!(v["period"]["counts"]["user.egress_policy_changed"]["success"], 2, "{v}");
+}
+
+/// The secrets manager (ADR 0285): `secrets.json` names CC6.1-4 only while every botd
+/// start in force in the period recorded an external manager: the start before it and
+/// each one in it. A start on local secrets, or from before botd recorded which, is a gap.
+#[tokio::test]
+async fn secrets_are_evidence_only_while_every_start_used_an_external_manager() {
+    let (_, app, _, _) = serve_app().await;
+    let p = Period { from: today(), to: today().succ_opt().unwrap() };
+    let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+    let secrets = |app: &AppState| {
+        let (_, f) = files(&evidence::build(app, &inputs, &p, db::now(), false).tar);
+        (parse(file(&f, "secrets.json")), listed(&parse(file(&f, "manifest.json")), "secrets.json"))
+    };
+    let started = |backend: Option<&str>| {
+        let mut d = json!({ "version": "0.1.0" });
+        if let Some(b) = backend {
+            d["vaultBackend"] = json!(b);
+        }
+        Event::new(Actor::system("server"), "server.started").details(d)
+    };
+    // Started on Vault before the period, and again in it: held.
+    app.db.record_at(&started(Some("vault")), p.start_ms() - 3_600_000).unwrap();
+    app.db.record(&started(Some("vault")));
+    app.db.record(&Event::new(Actor::system("secrets"), "secret.read").target("secret", "OPENAI_API_KEY").details(json!({ "store": "vault", "scope": "bots", "found": true })));
+    app.db.record(&Event::new(Actor::system("secrets"), "secret.backend_login").outcome(Outcome::Failure).target("secrets_backend", "vault").details(json!({ "store": "vault", "method": "kubernetes", "error": "unavailable" })));
+    let (v, (c, rows)) = secrets(&app);
+    assert_eq!((c, rows), (json!(["CC6.1"]), json!(["CC6.1-4"])), "{v}");
+    assert_eq!((v["summary"]["reads"].as_u64(), v["summary"]["signInFailures"].as_u64()), (Some(1), Some(1)), "{v}");
+    assert_eq!(v["starts"].as_array().map(Vec::len), Some(2), "{v}");
+    assert_eq!(v["now"]["backend"], "local", "this test's botd has none");
+
+    // A restart on local secrets in the period: a gap, listed.
+    app.db.record(&started(Some("local")));
+    let (v, (_, rows)) = secrets(&app);
+    assert_eq!(rows, json!([]), "{v}");
+    assert_eq!(v["exceptions"]["startsWithoutExternalManager"][0]["backend"], "local", "{v}");
+
+    // The start before the period from a botd that didn't record its backend: unknown.
+    let (_, app, _, _) = serve_app().await;
+    app.db.record_at(&started(None), p.start_ms() - 3_600_000).unwrap();
+    let (v, (_, rows)) = secrets(&app);
+    assert_eq!((rows, v["exceptions"]["startsWithoutExternalManager"][0]["backend"].as_str()), (json!([]), Some("unknown")), "{v}");
+}
+
+/// Custom roles (ADR 0285): `access-review.json` lists each one's definition and how
+/// many hold it, by id, without its name, and names CC6.3-3.
+#[tokio::test]
+async fn custom_role_definitions_are_in_the_access_review_file() {
+    let (port, app, admin, _) = serve_app().await;
+    let auditor = crate::service_accounts_http_tests::role(port, &admin, "Night auditor", "readonly", &["audit.view"]).await;
+    let p = Period { from: today(), to: today().succ_opt().unwrap() };
+    let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+    let (_, f) = files(&evidence::build(&app, &inputs, &p, db::now(), false).tar);
+    let v = parse(file(&f, "access-review.json"));
+    let r = &v["customRoles"][0];
+    assert_eq!((r["id"].as_str(), r["base"].as_str(), r["permissions"].clone(), r["holders"]["server"].as_u64()), (Some(auditor.as_str()), Some("readonly"), json!(["audit.view"]), Some(0)), "{v}");
+    assert!(!v.to_string().contains("Night auditor"), "{v}");
+    assert!(listed(&parse(file(&f, "manifest.json")), "access-review.json").1.as_array().unwrap().contains(&json!("CC6.3-3")));
 }
