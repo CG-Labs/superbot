@@ -540,6 +540,53 @@ pub fn push_tokens_in(c: &Connection, table: &str, current: &Cipher, previous: O
     Ok(done)
 }
 
+/// Brings people's own secrets in `table` (a regional store's `<schema>.user_secrets`, ADR
+/// 0293) under `current`, as `approvals_in` does approvals' inputs: plaintext sealed, values
+/// `previous` opens sealed again, and, with `forget`, secrets neither opens deleted, so their
+/// owners save them again. A value neither key opens, outside a rotation and without
+/// `forget`, refuses (nothing changed).
+pub fn user_secrets_in(c: &Connection, table: &str, current: &Cipher, previous: Option<&Cipher>, forget: bool) -> Result<StoreApprovals, String> {
+    let db = |e: rusqlite::Error| e.to_string();
+    let tx = c.unchecked_transaction().map_err(db)?;
+    let rows: Vec<(String, String, String)> = {
+        let mut s = tx.prepare(&format!("SELECT user_id, name, value FROM {table}")).map_err(db)?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
+    };
+    let mut done = StoreApprovals::default();
+    let mut refused = 0;
+    for (user, name, v) in &rows {
+        let context = user_context(user, name);
+        let value = if !is_sealed(v) {
+            done.sealed += 1;
+            current.seal(&context, v.as_bytes())
+        } else if current.open(&context, v).is_ok() {
+            continue;
+        } else if let Some(plain) = previous.and_then(|p| p.open(&context, v).ok()) {
+            done.resealed += 1;
+            current.seal(&context, &plain)
+        } else if forget {
+            done.discarded += 1;
+            tx.execute(&format!("DELETE FROM {table} WHERE user_id = ?1 AND name = ?2"), [user, name]).map_err(db)?;
+            continue;
+        } else if previous.is_some() {
+            done.unreadable += 1;
+            continue;
+        } else {
+            refused += 1;
+            continue;
+        };
+        tx.execute(&format!("UPDATE {table} SET value = ?1 WHERE user_id = ?2 AND name = ?3"), params![value, user, name]).map_err(db)?;
+    }
+    if refused > 0 {
+        return Err(format!(
+            "{refused} people's own secrets in it don't open with the master key. If the key was rotated, set SUPERBOT_MASTER_KEY_PREVIOUS back to the key before \
+             (docs/ops/master-key-rotation.md); if that key is lost for good, start once with SUPERBOT_FORGET_SEALED=1 to drop them, and their owners save them again (ADR 0293)."
+        ));
+    }
+    tx.commit().map_err(db)?;
+    Ok(done)
+}
+
 /// Whether `cipher` opens what this database has sealed. True when nothing is sealed yet.
 fn opens(c: &Connection, cipher: &Cipher) -> rusqlite::Result<bool> {
     if let Some(v) = key_check(c)? {
@@ -684,24 +731,54 @@ impl SecretStore for SealedStore {
 
 /// The associated data names the user too, so a value copied to another user's row
 /// doesn't open as theirs.
-fn user_context(user_id: &str, name: &str) -> String {
+pub(crate) fn user_context(user_id: &str, name: &str) -> String {
     format!("user-secrets/{user_id}/{name}")
 }
 
 /// Each user's own secrets (ADR 0029): API keys and tokens that reach only that user's
-/// Bots. Every query names the user.
+/// Bots. Every query names the user. A pinned person's are kept in their region's chat
+/// store (ADR 0293) once the stores are attached to this connection (`attach_stores`):
+/// reads see every place through its view, a new secret goes to the place of its owner's
+/// pin, and changes and deletes reach every place that holds it, so a move cut off between
+/// its copy and its delete loses nothing. botd's passes move them as the pin changes.
 pub struct UserSecrets {
     c: Mutex<Connection>,
     cipher: Arc<Cipher>,
+    stores: OnceLock<Vec<crate::db::ChatStore>>,
 }
 
 impl UserSecrets {
     pub fn new(c: Connection, cipher: Arc<Cipher>) -> UserSecrets {
-        UserSecrets { c: Mutex::new(c), cipher }
+        UserSecrets { c: Mutex::new(c), cipher, stores: OnceLock::new() }
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.c.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn stores(&self) -> &[crate::db::ChatStore] {
+        self.stores.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Attaches the regional chat stores botd's database has attached (`Db::chat_stores`),
+    /// keyed with its database key, once, at startup (ADR 0293).
+    pub fn attach_stores(&self, stores: &[crate::db::ChatStore], key: Option<&str>) -> Result<(), String> {
+        if self.stores.get().is_some() {
+            return Err("users' secrets attach the chat stores once, at startup".into());
+        }
+        crate::db::attach_to(&self.c(), stores, key, crate::db::SECRETS)?;
+        let _ = self.stores.set(stores.to_vec());
+        Ok(())
+    }
+
+    /// How many secrets the attached stores hold.
+    pub fn in_stores(&self) -> Result<usize, Error> {
+        let c = self.c();
+        let mut n = 0;
+        for s in crate::db::places(self.stores()).into_iter().filter(|s| *s != "main") {
+            n += c.query_row(&format!("SELECT COUNT(*) FROM {s}.user_secrets"), [], |r| r.get::<_, i64>(0)).map_err(store_err)? as usize;
+        }
+        Ok(n)
     }
 
     pub fn get(&self, user_id: &str, name: &str) -> Result<Option<Secret>, Error> {
@@ -729,19 +806,37 @@ impl UserSecrets {
         let mut c = self.c();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_err)?;
         let existed = tx.query_row("SELECT 1 FROM user_secrets WHERE user_id = ? AND name = ?", [user_id, name], |_| Ok(())).optional().map_err(store_err)?.is_some();
-        tx.execute(
-            "INSERT INTO user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(user_id, name) DO UPDATE SET value = ?3, updated_at = ?4",
-            params![user_id, name, sealed, crate::db::now()],
-        )
-        .map_err(store_err)?;
+        let p = params![user_id, name, sealed, crate::db::now()];
+        if existed {
+            for s in crate::db::places(self.stores()) {
+                tx.execute(&format!("UPDATE {s}.user_secrets SET value = ?3, updated_at = ?4 WHERE user_id = ?1 AND name = ?2"), p).map_err(store_err)?;
+            }
+        } else {
+            let s = crate::db::user_place(&tx, self.stores(), user_id).map_err(store_err)?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO {s}.user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+                     ON CONFLICT(user_id, name) DO UPDATE SET value = ?3, updated_at = ?4"
+                ),
+                p,
+            )
+            .map_err(store_err)?;
+        }
         tx.commit().map_err(store_err)?;
         Ok(existed)
     }
 
-    /// True if the user had it.
+    /// True if the user had it. Every place in one write transaction, so a move's copy
+    /// can't put it back in a place already cleared.
     pub fn delete(&self, user_id: &str, name: &str) -> Result<bool, Error> {
-        Ok(self.c().execute("DELETE FROM user_secrets WHERE user_id = ? AND name = ?", [user_id, name]).map_err(store_err)? == 1)
+        let mut c = self.c();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_err)?;
+        let mut n = 0;
+        for s in crate::db::places(self.stores()) {
+            n += tx.execute(&format!("DELETE FROM {s}.user_secrets WHERE user_id = ? AND name = ?"), [user_id, name]).map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(n > 0)
     }
 
     /// Every value, for the redactor at startup.

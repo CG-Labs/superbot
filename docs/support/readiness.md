@@ -82,7 +82,7 @@ What it checks:
 - **No TAM over `--max-accounts`** (a failure for each who is).
 - **Each customer once** (a warning for a customer listed twice, ignoring case and punctuation: which TAM is it?). It counts once towards each person's accounts. A row with no customer is skipped and named by its line, as a warning.
 
-Each person's accounts as TAM and as backup are listed beside the findings.
+Each person's accounts as TAM and as backup are listed beside the findings. Whether each account is getting the cadence its TAM owes it (kickoff, check-ins, health checks, reviews, drills) is the [TAM cadence check](tam-cadence.md)'s job, from the same CRM.
 
 ## What it doesn't do
 

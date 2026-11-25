@@ -16,6 +16,8 @@ mod support_updates;
 mod support_escalations;
 #[path = "../support_triage.rs"]
 mod support_triage;
+#[path = "../tam_cadence.rs"]
+mod tam_cadence;
 #[path = "../audit_line.rs"]
 #[allow(dead_code)]
 mod audit_line;
@@ -356,6 +358,14 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    on-call rota for the hours the plans sell, and every
                                                    Enterprise customer with a TAM and a different backup.
                                                    Exits 1 on a failure
+  botctl tam-cadence <accounts.csv | -> [--tam <name>] [--customer <name>] [--weekdays <mon-fri>]
+    [--utc-offset <+HH:MM>] [--holidays <dates>] [--warn-days <days>] [--renewal-days <days>]
+    [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
+                                                   The TAM cadence across accounts (ADR 0295), offline, from
+                                                   the CRM's export: kickoffs, check-ins, monthly health
+                                                   checks, quarterly reviews, restore drills, Severity 1
+                                                   review walk-throughs and renewals overdue or due soon,
+                                                   by account and by TAM. Exits 1 when anything is overdue
   botctl support-triage <bundle.tar | bundle.tar.gz | folder | -> [--plan <plan>] [--latest <version>]
     [--production] [--as-of <time>] [--markdown | --json]
                                                    The Provider's first read of a customer's support bundle
@@ -2444,6 +2454,15 @@ fn run(args: &[String]) -> Result<String, String> {
             }
             Ok(out)
         }
+        ["tam-cadence", rest @ ..] => {
+            let (out, overdue) = tam_cadence(rest, std::io::stdin())?;
+            if overdue {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["support-triage", rest @ ..] => {
             let (out, high) = support_triage(rest, std::io::stdin())?;
             if high {
@@ -2906,6 +2925,25 @@ fn support_readiness(rest: &[&str], mut stdin: impl Read) -> Result<(String, boo
         support_readiness::Format::Json => pretty(readiness.json().to_string()),
     };
     Ok((out, readiness.ready()))
+}
+
+/// `botctl tam-cadence`: needs no botd, only the CRM's export of the accounts. What's
+/// overdue or due soon, and whether anything is overdue: then it's still printed on stdout,
+/// and botctl exits 1, so a daily job can raise it with the TAMs.
+fn tam_cadence(rest: &[&str], mut stdin: impl Read) -> Result<(String, bool), String> {
+    let (file, options, format) = tam_cadence::parse_args(rest, chrono::Utc::now())?;
+    let mut csv = String::new();
+    match file.as_str() {
+        "-" => stdin.read_to_string(&mut csv).map(drop).map_err(|e| format!("stdin: {e}"))?,
+        _ => csv = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?,
+    }
+    let c = tam_cadence::check(&csv, &options)?;
+    let out = match format {
+        support_report::Format::Text => c.text(),
+        support_report::Format::Markdown => c.markdown(),
+        support_report::Format::Json => pretty(c.json().to_string()),
+    };
+    Ok((out, c.overdue()))
 }
 
 /// `botctl support-triage`: needs no botd, only the bundle the customer sent. The triage,
@@ -3717,6 +3755,28 @@ mod tests {
         assert!(e.starts_with("--updates: /nonexistent/updates.csv"), "{e}");
         assert!(support_escalations(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl support-escalations"));
         std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn tam_cadence_reads_a_file_or_stdin_and_says_whether_anything_is_overdue() {
+        let export = "Account,TAM,TAM email,Signed,Kickoff,Go-live,Last health check\nAcme,Ana,ana@example.com,2026-01-05,2026-01-07,2026-02-02,2026-10-01\nGlobex,Bo,,2026-01-05,2026-01-07,2026-02-02,2026-11-20\n";
+        let file = std::env::temp_dir().join(format!("botctl-tam-cadence-{}.csv", std::process::id()));
+        std::fs::write(&file, export).unwrap();
+        let path = file.to_str().unwrap();
+        let (text, overdue) = tam_cadence(&[path, "--as-of", "2026-11-25"], std::io::empty()).unwrap();
+        assert!(overdue);
+        assert!(text.contains("\nAcme  TAM Ana  live since 2026-02-02\n  OVERDUE  health_check: 24 days overdue (due 2026-11-01)"));
+        assert!(!text.contains("example.com") && !text.contains("\nGlobex  "));
+        let (md, _) = tam_cadence(&["-", "--as-of", "2026-11-25", "--markdown"], export.as_bytes()).unwrap();
+        assert!(md.starts_with("## TAM cadence as of 2026-11-25 (UTC+00:00)\n"));
+        let (json, _) = tam_cadence(&["-", "--as-of", "2026-11-25", "--json", "--tam", "ana"], export.as_bytes()).unwrap();
+        let json: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!((json["accounts"].clone(), json["counts"]["health_check"]["overdue"].clone()), (json!(1), json!(1)));
+        let (quiet, overdue) = tam_cadence(&[path, "--as-of", "2026-11-25", "--customer", "globex"], std::io::empty()).unwrap();
+        assert!(!overdue && quiet.contains("1 account: nothing due."));
+        std::fs::remove_file(&file).unwrap();
+        assert!(tam_cadence(&["/nonexistent/accounts.csv"], std::io::empty()).unwrap_err().starts_with("/nonexistent/accounts.csv"));
+        assert!(tam_cadence(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl tam-cadence"));
     }
 
     #[test]
