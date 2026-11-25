@@ -83,7 +83,8 @@ fn from_support(s: &str) -> Option<bool> {
     }
 }
 
-fn key(id: &str) -> String {
+/// A ticket id as both exports are matched on: ignoring case and a leading `#`.
+pub fn key(id: &str) -> String {
     id.trim().trim_start_matches('#').to_lowercase()
 }
 
@@ -163,8 +164,18 @@ pub struct Updates {
     skipped: Vec<(usize, &'static str)>,
 }
 
-/// Judges the update targets of `tickets` (the report's) from the updates export `csv`.
-pub fn judge(tickets: &[Ticket], csv: &str, o: &Options, u: &UpdateOptions) -> Result<Updates, String> {
+/// The updates export's rows for some tickets: each one's updates (public, from support),
+/// by `key`, the tickets with any row at all, and what wasn't read.
+#[derive(Debug, Default)]
+pub struct Replies {
+    pub times: HashMap<String, Vec<DateTime<Utc>>>,
+    pub seen: HashSet<String>,
+    pub unmatched: u32,
+    pub skipped: Vec<(usize, &'static str)>,
+}
+
+/// Reads the updates export `csv` for `tickets`; rows for other tickets are counted, not read.
+pub fn read_replies(tickets: &[Ticket], csv: &str, o: &Options, u: &UpdateOptions) -> Result<Replies, String> {
     let rows = parse_csv(csv)?;
     let ((_, header), body) = rows.split_first().ok_or("the updates CSV is empty")?;
     let headers: Vec<String> = header.iter().map(|h| normalize(h)).collect();
@@ -221,7 +232,12 @@ pub fn judge(tickets: &[Ticket], csv: &str, o: &Options, u: &UpdateOptions) -> R
             Ok((_, false)) => {}
         }
     }
+    Ok(Replies { times, seen, unmatched, skipped })
+}
 
+/// Judges the update targets of `tickets` (the report's) from the updates export `csv`.
+pub fn judge(tickets: &[Ticket], csv: &str, o: &Options, u: &UpdateOptions) -> Result<Updates, String> {
+    let Replies { times, seen, unmatched, skipped } = read_replies(tickets, csv, o, u)?;
     let target_for = |s: u8| u.targets.get(&s).copied().or_else(|| default_target(s));
     let (mut severities, mut late, mut not_answered, mut without_rows) = ([Counts::default(); 4], Vec::new(), 0, 0);
     let cal = &o.calendar;

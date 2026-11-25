@@ -12,6 +12,8 @@ mod support_report;
 mod support_readiness;
 #[path = "../support_updates.rs"]
 mod support_updates;
+#[path = "../support_escalations.rs"]
+mod support_escalations;
 #[path = "../support_triage.rs"]
 mod support_triage;
 #[path = "../audit_line.rs"]
@@ -336,6 +338,15 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    with --updates, a replies export, whether Severity 1 to 3
                                                    tickets were updated as often as promised (ADR 0286).
                                                    Reads only ids, severities, plans and times
+  botctl support-escalations <tickets.csv | -> [--plan <plan>] [--customer <name>] [--hours <HH:MM-HH:MM>]
+    [--weekdays <mon-fri>] [--utc-offset <+HH:MM>] [--holidays <dates>] [--target <sev>=<30m|1h|4bh|1bd>]...
+    [--column <field>=<header>]... [--warn <percent>] [--as-of <time>] [--markdown | --json]
+    [--updates <updates.csv | -> [--update-target <sev>=<1h|4bh|3bd>]... [--update-column <field>=<header>]...]
+                                                   Who to tell now (ADR 0289), offline, from the same exports:
+                                                   open tickets with a response target missed or about to be,
+                                                   Severity 1 for on-call and after 2 h management, Severity 2
+                                                   in the runbook over 2 h, and with --updates updates overdue
+                                                   or about to be. Exits 1 when anything needs escalating
   botctl support-readiness [--docs <dir>] [--rota <rota.csv | ->] [--tams <tams.csv | ->] [--plan <plan>]...
     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>]
     [--holidays <dates>] [--max-stretch <hours>] [--max-accounts <n>] [--column <field>=<header>]...
@@ -2369,6 +2380,15 @@ fn run(args: &[String]) -> Result<String, String> {
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["support-bundle", rest @ ..] => support_bundle(rest),
         ["support-report", rest @ ..] => support_report(rest, std::io::stdin()),
+        ["support-escalations", rest @ ..] => {
+            let (out, due) = support_escalations(rest, std::io::stdin())?;
+            if due {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["support-readiness", rest @ ..] => {
             let (out, ready) = support_readiness(rest, std::io::stdin())?;
             if !ready {
@@ -2780,6 +2800,33 @@ fn support_report(rest: &[&str], mut stdin: impl Read) -> Result<String, String>
             pretty(v.to_string())
         }
     })
+}
+
+/// `botctl support-escalations`: needs no botd, only the ticket system's exports. What's
+/// due, and whether anything is: then it's still printed on stdout, and botctl exits 1, so
+/// a job run every few minutes can page or post it.
+fn support_escalations(rest: &[&str], mut stdin: impl Read) -> Result<(String, bool), String> {
+    let (file, options, updates, warn, format) = support_escalations::parse_args(rest, chrono::Utc::now())?;
+    if file == "-" && updates.file.as_deref() == Some("-") {
+        return Err("Only one of the tickets export and --updates can be stdin (-)".into());
+    }
+    let mut read = |file: &str| -> Result<String, String> {
+        let mut csv = String::new();
+        match file {
+            "-" => stdin.read_to_string(&mut csv).map(drop).map_err(|e| format!("stdin: {e}"))?,
+            _ => csv = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?,
+        }
+        Ok(csv)
+    };
+    let tickets = read(&file)?;
+    let replies = updates.file.as_deref().map(|f| read(f).map_err(|e| format!("--updates: {e}"))).transpose()?;
+    let e = support_escalations::check(&tickets, replies.as_deref(), &options, &updates, warn)?;
+    let out = match format {
+        support_report::Format::Text => e.text(),
+        support_report::Format::Markdown => e.markdown(),
+        support_report::Format::Json => pretty(e.json().to_string()),
+    };
+    Ok((out, e.due()))
 }
 
 /// `botctl support-readiness`: needs no botd, only the Provider's playbooks, rota and TAM
@@ -3590,6 +3637,33 @@ mod tests {
         assert!(e.contains("Only one"), "{e}");
         let e = support_report(&[path, "--plan", "pro", "--updates", "/nonexistent/updates.csv"], std::io::empty()).unwrap_err();
         assert!(e.starts_with("--updates: /nonexistent/updates.csv"), "{e}");
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn support_escalations_reads_both_exports_and_says_whether_anything_is_due() {
+        let tickets = "id,severity,opened,first response,resolved\nT-1,1,2026-09-01T10:00:00Z,2026-09-01T10:10:00Z,\nT-2,3,2026-09-01T11:00:00Z,2026-09-01T11:30:00Z,\n";
+        let updates = "Ticket ID,Created at,Public,Body\nT-1,2026-09-01T11:30:00Z,true,Still looking\n";
+        let file = std::env::temp_dir().join(format!("botctl-support-escalations-{}.csv", std::process::id()));
+        std::fs::write(&file, tickets).unwrap();
+        let path = file.to_str().unwrap();
+        let args = [path, "--plan", "pro", "--as-of", "2026-09-01T12:45:00Z", "--updates", "-"];
+        let (text, due) = support_escalations(&args, updates.as_bytes()).unwrap();
+        assert!(due, "{text}");
+        assert!(text.contains("T-1  Sev 1 (pro)  opened 2026-09-01 10:00 UTC\n  management: "), "{text}");
+        assert!(text.contains("[update.overdue]") && !text.contains("Still looking") && !text.contains("T-2"), "{text}");
+        let (md, _) = support_escalations(&[&args[..], &["--markdown"]].concat(), updates.as_bytes()).unwrap();
+        assert!(md.starts_with("## Escalations as of 2026-09-01 12:45 UTC\n"), "{md}");
+        let (json, _) = support_escalations(&[&args[..], &["--json"]].concat(), updates.as_bytes()).unwrap();
+        let json: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["counts"]["update.overdue"], 1);
+        let (quiet, due) = support_escalations(&["-", "--plan", "pro", "--as-of", "2026-09-01T11:40:00Z"], "id,severity,opened,first response\nT-2,3,2026-09-01T11:00:00Z,2026-09-01T11:30:00Z\n".as_bytes()).unwrap();
+        assert!(!due && quiet.contains("Nothing to escalate."), "{quiet}");
+        let e = support_escalations(&["-", "--plan", "pro", "--updates", "-"], std::io::empty()).unwrap_err();
+        assert!(e.contains("Only one"), "{e}");
+        let e = support_escalations(&[path, "--plan", "pro", "--updates", "/nonexistent/updates.csv"], std::io::empty()).unwrap_err();
+        assert!(e.starts_with("--updates: /nonexistent/updates.csv"), "{e}");
+        assert!(support_escalations(&[], std::io::empty()).unwrap_err().starts_with("Usage: botctl support-escalations"));
         std::fs::remove_file(&file).unwrap();
     }
 

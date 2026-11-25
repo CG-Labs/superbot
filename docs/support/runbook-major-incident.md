@@ -27,7 +27,7 @@ The commands run on the server as an admin (`SUPERBOT_TOKEN` from `botctl login`
   botctl incident update <id> identified "We've found the cause and are rolling back a configuration change."
   ```
 
-- Update the tickets the same way, and the customer's TAM for Enterprise customers ([TAM](tam.md)).
+- Update the tickets the same way, and the customer's TAM for Enterprise customers ([TAM](tam.md)). `botctl support-escalations --updates <replies.csv>` on the open tickets names each one whose update is overdue or nearly so, and each Severity 1 past 2 hours ([escalation check](escalation-check.md)).
 - Change the impact as it changes: `botctl incident edit <id> --impact major`.
 - Keep a rough timeline in the channel: what was tried, decided and handed to whom, with times. The review needs it.
 
