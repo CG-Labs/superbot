@@ -320,6 +320,12 @@ pub struct IdpMetadata {
     /// The earliest `validUntil` over the entity, from signed metadata only: past it this copy
     /// vouches for nothing, even as the last good one (ADR 0281).
     pub valid_until: Option<i64>,
+    /// What people call the IdP: its `mdui:DisplayName`, else its organization's display
+    /// name, English first. Shown on the IdP chooser (ADR 0282), never trusted.
+    pub name: Option<String>,
+    /// The email domains the metadata says the IdP speaks for (`shibmd:Scope`, ADR 0282).
+    /// Regular-expression scopes are left out.
+    pub scopes: Vec<String>,
 }
 
 impl IdpMetadata {
@@ -327,7 +333,23 @@ impl IdpMetadata {
     pub fn valid_at(&self, now_ms: i64) -> bool {
         self.valid_until.is_none_or(|u| u > now_ms)
     }
+
+    /// Whether `email` is at one of the IdP's scopes, exactly: a scope doesn't cover its
+    /// subdomains, which federations list on their own.
+    pub fn in_scope(&self, email: &str) -> bool {
+        super::provider::email_in(email, &self.scopes)
+    }
 }
+
+/// The most IdPs one provider takes from a federation (`SSO_<ID>_IDP_ENTITY_IDS`, ADR 0282).
+pub const MAX_IDPS: usize = 100;
+/// The most scopes read from one IdP's metadata.
+const MAX_SCOPES: usize = 64;
+/// The longest IdP name shown, in characters.
+const MAX_NAME: usize = 100;
+const MDUI: &str = "urn:oasis:names:tc:SAML:metadata:ui";
+const SHIBMD: &str = "urn:mace:shibboleth:metadata:1.0";
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// Where the IdP takes logout messages: requests at `location`, our responses at `response`,
 /// both over `binding` (ADR 0248).
@@ -556,7 +578,42 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: Reques
     if response == ResponseBinding::Artifact && artifact_resolution.is_empty() {
         return Err("the metadata has no SOAP ArtifactResolutionService on https: set SSO_<ID>_RESPONSE_BINDING=post for this provider, or turn on artifact resolution at the IdP".into());
     }
-    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution, valid_until: None })
+    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution, valid_until: None, name: idp_name(entity, idp), scopes: scopes(entity, idp) })
+}
+
+/// The `Extensions` children of `n`.
+fn extensions<'a, 'i>(n: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
+    elements(n).into_iter().filter(|e| is(*e, METADATA, "Extensions")).flat_map(elements).collect()
+}
+
+/// The IdP's `mdui:DisplayName`, else its `OrganizationDisplayName`: the English one, else the
+/// first. Whitespace is collapsed and it's cut to `MAX_NAME` characters.
+fn idp_name(entity: Node, idp: Node) -> Option<String> {
+    let pick = |names: Vec<Node>| {
+        let english = names.iter().find(|n| n.attribute((XML_NS, "lang")).is_some_and(|l| l.eq_ignore_ascii_case("en") || l.to_ascii_lowercase().starts_with("en-")));
+        english.or(names.first()).map(|n| all_text(*n).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_NAME).collect::<String>()).filter(|s| !s.is_empty())
+    };
+    let ui = extensions(idp).into_iter().filter(|n| is(*n, MDUI, "UIInfo")).flat_map(elements).filter(|n| is(*n, MDUI, "DisplayName")).collect();
+    let org = elements(entity).into_iter().filter(|n| is(*n, METADATA, "Organization")).flat_map(elements).filter(|n| is(*n, METADATA, "OrganizationDisplayName")).collect();
+    pick(ui).or_else(|| pick(org))
+}
+
+/// The IdP's `shibmd:Scope`s, on its `IDPSSODescriptor` or its entity, as domains. A
+/// `regexp="true"` scope is a pattern, not a domain, and isn't read.
+fn scopes(entity: Node, idp: Node) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in extensions(idp).into_iter().chain(extensions(entity)).filter(|n| is(*n, SHIBMD, "Scope")) {
+        if n.attribute("regexp").is_some_and(|r| r.trim() == "true" || r.trim() == "1") {
+            continue;
+        }
+        if let Some(d) = super::domain(&all_text(n)).filter(|d| !out.contains(d)) {
+            out.push(d);
+        }
+        if out.len() == MAX_SCOPES {
+            break;
+        }
+    }
+    out
 }
 
 /// Whether a native provider takes encrypted assertions (`SSO_<ID>_ENCRYPTED_ASSERTIONS`,
@@ -883,6 +940,27 @@ pub fn post_csp(url: &str) -> String {
     let hash = STANDARD.encode(Sha256::digest(POST_SCRIPT.as_bytes()));
     let to = if url.starts_with("http:") { "https: http:" } else { "https:" };
     format!("default-src 'none'; script-src 'sha256-{hash}'; form-action {to}; base-uri 'none'; frame-ancestors 'none'")
+}
+
+/// The one style sheet the IdP chooser has. `chooser_csp` allows only it, by hash.
+const CHOOSER_STYLE: &str = "body{font:16px system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem}ul{list-style:none;padding:0}li{margin:.5rem 0}a{display:block;padding:.75rem 1rem;border:1px solid #ccc;border-radius:.5rem;text-decoration:none;color:inherit}a:hover,a:focus{border-color:#555}";
+
+/// The page that asks which of a provider's IdPs to sign in at (ADR 0282): `choices` are
+/// each IdP's name and the start URL that signs in there, in the order shown. No script.
+pub fn chooser_page(label: &str, choices: &[(String, String)]) -> String {
+    let items: String = choices.iter().map(|(name, href)| format!(r#"<li><a href="{}">{}</a></li>"#, escape(href), escape(name))).collect();
+    format!(
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>SuperBot</title><style>{CHOOSER_STYLE}</style><h1>Sign in with {}</h1><p>Choose your organization.</p><ul>{items}</ul>"#,
+        escape(label)
+    )
+}
+
+/// The Content-Security-Policy of the IdP chooser: its style sheet, and nothing else loads or
+/// runs. Its links are plain navigation.
+pub fn chooser_csp() -> String {
+    use sha2::{Digest, Sha256};
+    let hash = STANDARD.encode(Sha256::digest(CHOOSER_STYLE.as_bytes()));
+    format!("default-src 'none'; style-src 'sha256-{hash}'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'")
 }
 
 /// `base` with `query` after any query it has.
@@ -1490,6 +1568,14 @@ pub mod test_idp {
         s.sign(&with_id, "_md1")
     }
 
+    /// `xml` with what a federation adds to its IdPs (ADR 0282): an `mdui:DisplayName` and
+    /// `shibmd:Scope`s, in the IDPSSODescriptor's Extensions.
+    pub fn with_ui(xml: &str, name: &str, scopes: &[&str]) -> String {
+        let scopes: String = scopes.iter().map(|s| format!(r#"<shibmd:Scope regexp="false">{s}</shibmd:Scope>"#)).collect();
+        let ext = format!(r#"<md:Extensions xmlns:mdui="{MDUI}" xmlns:shibmd="{SHIBMD}">{scopes}<mdui:UIInfo><mdui:DisplayName xml:lang="en">{name}</mdui:DisplayName></mdui:UIInfo></md:Extensions>"#);
+        xml.replacen("<md:KeyDescriptor", &format!("{ext}<md:KeyDescriptor"), 1)
+    }
+
     pub const SLO_URL: &str = "https://idp.example/saml/slo";
 
     /// `xml` with an HTTP-Redirect SingleLogoutService added.
@@ -1934,6 +2020,46 @@ pub(crate) mod tests {
         assert!(csp.contains(&format!("script-src 'sha256-{}';", STANDARD.encode(Sha256::digest(script.as_bytes())))), "{csp}");
         assert!(csp.starts_with("default-src 'none';") && csp.contains("form-action https:;") && csp.contains("frame-ancestors 'none'"), "{csp}");
         assert!(post_csp("http://localhost:8080/sso").contains("form-action https: http:;"), "a loopback IdP");
+    }
+
+    #[test]
+    fn reads_an_idps_name_and_email_scopes_from_federation_metadata() {
+        let m = parse_idp_metadata(&with_ui(&metadata(), "  Uni   A &amp; Co ", &["Uni-A.example", "staff.uni-a.example", "uni-a.example", "not a domain"]), IDP, false).unwrap();
+        assert_eq!(m.name.as_deref(), Some("Uni A & Co"), "whitespace collapsed");
+        assert_eq!(m.scopes, ["uni-a.example", "staff.uni-a.example"], "lowercase, once each, domains only");
+        assert!(m.in_scope("ada@uni-a.example") && m.in_scope("ADA@Staff.Uni-A.example"));
+        assert!(!m.in_scope("ada@evil.example") && !m.in_scope("ada@sub.uni-a.example") && !m.in_scope("uni-a.example"), "exact domains only");
+        let plain = idp();
+        assert_eq!((plain.name.as_deref(), plain.scopes.len()), (None, 0));
+        assert!(!plain.in_scope("ada@uni-a.example"), "no scope: no email");
+
+        // English first; a pattern scope is no domain; the organization's name stands in.
+        let ext = |inner: &str| metadata().replacen("<md:KeyDescriptor", &format!(r#"<md:Extensions xmlns:mdui="{MDUI}" xmlns:shibmd="{SHIBMD}">{inner}</md:Extensions><md:KeyDescriptor"#), 1);
+        let m = parse_idp_metadata(&ext(r#"<shibmd:Scope regexp="true">^.*\.uni\.example$</shibmd:Scope><shibmd:Scope>uni.example</shibmd:Scope><mdui:UIInfo><mdui:DisplayName xml:lang="de">Uni B</mdui:DisplayName><mdui:DisplayName xml:lang="en-GB">University B</mdui:DisplayName></mdui:UIInfo>"#), IDP, false).unwrap();
+        assert_eq!((m.name.as_deref(), m.scopes.as_slice()), (Some("University B"), &["uni.example".to_string()][..]));
+        let m = parse_idp_metadata(&ext(r#"<mdui:UIInfo><mdui:DisplayName xml:lang="fr">Université C</mdui:DisplayName></mdui:UIInfo>"#), IDP, false).unwrap();
+        assert_eq!(m.name.as_deref(), Some("Université C"), "else the first");
+        let org = metadata().replace("</md:EntityDescriptor>", r#"<md:Organization><md:OrganizationName xml:lang="en">uni-d</md:OrganizationName><md:OrganizationDisplayName xml:lang="en">University D</md:OrganizationDisplayName><md:OrganizationURL xml:lang="en">https://uni-d.example</md:OrganizationURL></md:Organization></md:EntityDescriptor>"#);
+        assert_eq!(parse_idp_metadata(&org, IDP, false).unwrap().name.as_deref(), Some("University D"));
+        let long = "x".repeat(300);
+        assert_eq!(parse_idp_metadata(&with_ui(&metadata(), &long, &[]), IDP, false).unwrap().name.map(|n| n.chars().count()), Some(MAX_NAME));
+        let many: Vec<String> = (0..100).map(|i| format!("d{i}.example")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(parse_idp_metadata(&with_ui(&metadata(), "U", &many), IDP, false).unwrap().scopes.len(), MAX_SCOPES);
+    }
+
+    #[test]
+    fn the_idp_chooser_is_escaped_and_runs_nothing() {
+        use sha2::{Digest, Sha256};
+        let page = chooser_page("Uni <SSO>", &[("A & <b>".into(), "/api/auth/sso/fed/start?idp=https%3A%2F%2Fa&x=\"1".into()), ("B".into(), "/api/auth/sso/fed/start?idp=b".into())]);
+        assert!(page.contains("Sign in with Uni &lt;SSO&gt;") && page.contains("A &amp; &lt;b&gt;"), "{page}");
+        assert!(page.contains(r#"href="/api/auth/sso/fed/start?idp=https%3A%2F%2Fa&amp;x=&quot;1""#), "{page}");
+        assert!(page.find(">A &amp;").unwrap() < page.find(">B<").unwrap(), "in the order given");
+        assert!(!page.contains("<script") && !page.contains("<form"));
+        let style = page.split("<style>").nth(1).unwrap().split("</style>").next().unwrap();
+        let csp = chooser_csp();
+        assert!(csp.starts_with("default-src 'none';") && csp.contains(&format!("style-src 'sha256-{}';", STANDARD.encode(Sha256::digest(style.as_bytes())))), "{csp}");
+        assert!(csp.contains("form-action 'none'") && csp.contains("frame-ancestors 'none'") && !csp.contains("script-src"), "{csp}");
     }
 
     #[test]

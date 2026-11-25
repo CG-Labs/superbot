@@ -2952,3 +2952,212 @@ async fn only_our_idps_artifacts_for_its_endpoints_are_sent_and_posts_are_refuse
     assert_eq!(res.headers()["location"], "/login?error=sso_failed");
     assert_eq!(sp.last_failure().await["reason"], "missing_response");
 }
+
+// Several IdPs of a federation (ADR 0282)
+
+const IDP_B: &str = "https://login.uni-b.example/saml";
+
+/// A federation's MDQ server for IdP `IDP` (University A, scope example.com, signer 0) and
+/// `IDP_B` (Beta Institute, scope uni-b.example, signer `b_signer`), both with SLO URLs, each
+/// answer signed by test signer 1; and botd with one provider for both, plus `extra` settings.
+async fn serve_federation(extra: &[(&str, &str)], b_signer: usize) -> (Sp, std::path::PathBuf, Vec<Arc<crate::sso::Provider>>) {
+    use crate::sso::saml_sp::{mdq_url, test_instant};
+    let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
+    let until = test_instant(db::now() + 7 * 86_400_000);
+    let entry = |xml: String| test_idp::signed_metadata(&xml.replacen("<md:EntityDescriptor ", &format!(r#"<md:EntityDescriptor validUntil="{until}" "#), 1), signer(1));
+    let a = entry(test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata(), "University A", &["example.com"])));
+    let b = entry(test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata_with(IDP_B, &[signer(b_signer)], ""), "Beta Institute", &["uni-b.example"])).replace("https://idp.example/", "https://login.uni-b.example/"));
+    let answers: HashMap<String, String> = HashMap::from([(mdq_url("/mdq", IDP), a), (mdq_url("/mdq", IDP_B), b)]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mdq_port = listener.local_addr().unwrap().port();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let answer = answers.get(uri.path()).cloned();
+        std::future::ready(answer.map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), |a| a.into_response()))
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = std::env::temp_dir().join(format!("saml-fed-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let anchor = dir.join("federation.pem");
+    std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signer(1).cert)).unwrap();
+    let id = format!("n{}", random_hex(4));
+    let up = id.to_ascii_uppercase();
+    let mut vars = HashMap::from([
+        ("SSO_PROVIDERS".into(), id.clone()),
+        (format!("SSO_{up}_TYPE"), "saml".into()),
+        (format!("SSO_{up}_LABEL"), "Uni Federation".into()),
+        (format!("SSO_{up}_IDP_ENTITY_IDS"), format!("{IDP},{IDP_B}")),
+        (format!("SSO_{up}_IDP_MDQ_URL"), format!("http://127.0.0.1:{mdq_port}/mdq")),
+        (format!("SSO_{up}_METADATA_SIGNING_CERT_FILE"), anchor.to_string_lossy().into_owned()),
+    ]);
+    vars.extend(extra.iter().map(|(k, v)| (format!("SSO_{up}_{k}"), v.to_string())));
+    let mut providers = Vec::new();
+    let (port, app, admin) = serve_vars_with(vars, |a| providers = a.sso.providers.clone()).await;
+    let sp = Sp { port, app, admin, id, sp_entity: None };
+    // Loads every IdP's metadata, as the startup expiry check does.
+    assert_eq!(call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await.0, 200);
+    (sp, dir, providers)
+}
+
+impl Sp {
+    /// Starts a web sign-in at IdP `idp`: the AuthnRequest's ID, the RelayState, the binder
+    /// cookie, and where the AuthnRequest went.
+    async fn start_at(&self, idp: &str) -> (String, String, String, String) {
+        let path = format!("/api/auth/sso/{}/start?idp={}", self.id, url::form_urlencoded::byte_serialize(idp.as_bytes()).collect::<String>());
+        let (code, head, body) = crate::tests::call_with(self.port, "GET", &path, "", "", "").await;
+        assert_eq!(code, 303, "{head}\n{body}");
+        let to_idp = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+        let q: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+        let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+        let id = request.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_saml=")).expect("binder cookie");
+        (id, q["RelayState"].clone(), binder.split(';').next().unwrap().to_string(), format!("{}://{}{}", to_idp.scheme(), to_idp.host_str().unwrap(), to_idp.path()))
+    }
+
+    /// A whole sign-in started at `idp`, answered with the response `tweak` makes.
+    async fn sign_in_at(&self, idp: &str, tweak: impl FnOnce(&mut Response)) -> (u16, String, String) {
+        let (request, relay, cookie, _) = self.start_at(idp).await;
+        let mut r = Response::new(&self.acs(), &self.entity(), &request, db::now());
+        tweak(&mut r);
+        self.post(Some(&r.posted()), Some(&relay), &cookie).await
+    }
+}
+
+/// IdP B's answer: its issuer, signed with its key.
+fn from_b(r: &mut Response) {
+    r.issuer = IDP_B.into();
+    r.signer = 2;
+}
+
+#[tokio::test]
+async fn one_provider_signs_people_in_at_each_idp_of_a_federation() {
+    let (sp, dir, _) = serve_federation(&[], 2).await;
+
+    // The chooser: both IdPs by name, sorted, each a start at that IdP; no script.
+    let (code, head, page) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start?session=cookie", sp.id), "", "", "").await;
+    assert_eq!(code, 200, "{head}");
+    let csp = header(&head, "content-security-policy").unwrap();
+    assert!(csp.starts_with("default-src 'none';") && csp.contains("style-src 'sha256-") && !csp.contains("script-src"), "{csp}");
+    assert_eq!(header(&head, "cache-control").as_deref(), Some("no-store"));
+    assert!(page.contains("Sign in with Uni Federation") && !page.contains("<script"), "{page}");
+    let (beta, uni) = (page.find(">Beta Institute<").expect("B's name"), page.find(">University A<").expect("A's name"));
+    assert!(beta < uni, "sorted by name");
+    let b_link = format!("idp={}", url::form_urlencoded::byte_serialize(IDP_B.as_bytes()).collect::<String>());
+    assert!(page.contains(&b_link) && page.contains("session=cookie&amp;idp="), "{page}");
+
+    // Each choice goes to that IdP only.
+    assert_eq!(sp.start_at(IDP).await.3, SSO_URL);
+    assert_eq!(sp.start_at(IDP_B).await.3, "https://login.uni-b.example/saml/sso");
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start?idp=https%3A%2F%2Fidp.other.example", sp.id), "", "", "").await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_failed")));
+    assert_eq!((sp.last_failure().await["reason"].as_str(), sp.last_failure().await["entityId"].as_str()), (Some("unknown_idp"), Some("https://idp.other.example")));
+
+    // Linking says which IdP's NameID it is.
+    let link = |body: Value| {
+        let (port, admin) = (sp.port, sp.admin.clone());
+        async move { call(port, "POST", "/api/users/bob@uni-b.example/identities", &admin, &body.to_string()).await }
+    };
+    let bob = sp.app.db.create_user(None, Some("bob@uni-b.example"), "Bob", Role::Member).unwrap();
+    let (code, e) = link(json!({ "provider": sp.id, "subject": NAME_ID })).await;
+    assert!(code == 400 && e.contains("--idp"), "{code} {e}");
+    let (code, e) = link(json!({ "provider": sp.id, "subject": NAME_ID, "idp": "https://idp.other.example" })).await;
+    assert!(code == 400 && e.contains("not one of this provider's IdPs"), "{code} {e}");
+    let (code, i) = link(json!({ "provider": sp.id, "subject": NAME_ID, "idp": IDP_B })).await;
+    assert_eq!(code, 201, "{i}");
+    assert_eq!(serde_json::from_str::<Value>(&i).unwrap()["issuer"], IDP_B);
+
+    // Signed in at B: B's person, under B. The email isn't at B's scope, so it's dropped.
+    let (code, _, head) = sp.sign_in_at(IDP_B, from_b).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(bob.id.clone()));
+    let login = &sp.audit("auth.login").await[0];
+    assert_eq!((login["details"]["issuer"].as_str(), login["actorSubject"].as_str()), (Some(IDP_B), Some(format!("{IDP_B}|{STORED}").as_str())));
+    assert_eq!(sp.app.db.identity(IDP_B, STORED).unwrap().0.email, None, "ada@example.com isn't B's to vouch for");
+    let (code, _, _) = sp.sign_in_at(IDP_B, |r| {
+        from_b(r);
+        r.attributes[0].1 = "bob@uni-b.example".into();
+    })
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(sp.app.db.identity(IDP_B, STORED).unwrap().0.email.as_deref(), Some("bob@uni-b.example"), "in scope");
+
+    // Started at B, only B's answer counts: not A's, nor one naming B signed by A. (Their
+    // audit events are throttled behind the unknown IdP's.)
+    for tweak in [(|_: &mut Response| {}) as fn(&mut Response), |r| r.issuer = IDP_B.into()] {
+        let (code, to, _) = sp.sign_in_at(IDP_B, tweak).await;
+        assert_eq!((code, to.as_str()), (303, "/login?error=sso_failed"));
+    }
+
+    // The same NameID at A is someone else, and A vouches for example.com.
+    let ada = sp.link();
+    let (code, _, head) = sp.sign_in_at(IDP, |r| r.session_index = "_ada".into()).await;
+    assert_eq!(code, 200);
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(ada.id.clone()));
+    assert_eq!(sp.app.db.identity(IDP, STORED).unwrap().0.email.as_deref(), Some("ada@example.com"));
+    let ada_cookie = format!("Cookie: {}\r\n", set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=")).unwrap().split(';').next().unwrap());
+
+    // B signs Bob out: checked against B's metadata, answered at B, and only B's sessions end.
+    let (code, _, head) = sp.sign_in_at(IDP_B, |r| {
+        from_b(r);
+        r.session_index = "_bob".into();
+    })
+    .await;
+    assert_eq!(code, 200);
+    let bob_cookie = format!("Cookie: {}\r\n", set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=")).unwrap().split(';').next().unwrap());
+    let mut l = Logout::request(&sp.slo(), NAME_ID, Some("_bob"), db::now());
+    l.issuer = IDP_B.into();
+    l.signer = Some(2);
+    let (code, to) = sp.slo_get(&l.redirect()).await;
+    assert!(code == 303 && to.starts_with("https://login.uni-b.example/saml/slo?SAMLResponse="), "{code} {to}");
+    assert_eq!((sp.who(&bob_cookie).await, sp.who(&ada_cookie).await), (None, Some(ada.id.clone())));
+    let slo = &sp.audit("auth.slo").await[0];
+    assert_eq!((slo["details"]["issuer"].as_str(), slo["details"]["revoked"].as_u64()), (Some(IDP_B), Some(1)));
+
+    // A logout naming an IdP that isn't listed, or naming B but signed by A, is refused.
+    let mut l = Logout::request(&sp.slo(), NAME_ID, None, db::now());
+    l.issuer = "https://idp.other.example".into();
+    assert_eq!(sp.slo_get(&l.redirect()).await.0, 400);
+    assert_eq!(sp.audit("auth.slo_failed").await[0]["details"]["reason"], "unknown_idp");
+    l.issuer = IDP_B.into();
+    assert_eq!(sp.slo_get(&l.redirect()).await.0, 400);
+    assert_eq!(sp.who(&ada_cookie).await, Some(ada.id.clone()));
+
+    // botctl's view lists each IdP with its name and email domains.
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((v["idpEntityIds"].clone(), v["idpEntityId"].clone(), v["idp"].clone()), (json!([IDP, IDP_B]), Value::Null, Value::Null));
+    assert_eq!((v["idps"][1]["name"].as_str(), v["idps"][1]["scopes"].clone(), v["idps"][1]["ssoUrl"].as_str()), (Some("Beta Institute"), json!(["uni-b.example"]), Some("https://login.uni-b.example/saml/sso")));
+    assert!(v["from"].as_str().unwrap().ends_with("/mdq") && v["singleLogout"] == true, "{v}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn with_allowed_domains_an_email_out_of_the_idps_scope_is_refused() {
+    let (sp, dir, _) = serve_federation(&[("ALLOWED_DOMAINS", "example.com,uni-b.example"), ("JIT_ROLE", "member")], 2).await;
+    let (code, to, _) = sp.sign_in_at(IDP_B, from_b).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_wrong_account"), "B can't vouch for example.com");
+    assert_eq!(sp.last_failure().await["reason"], "email_out_of_scope");
+    assert!(sp.app.db.identity(IDP_B, STORED).is_none(), "nobody made just in time");
+    let (code, _, head) = sp.sign_in_at(IDP_B, |r| {
+        from_b(r);
+        r.attributes[0].1 = "bob@uni-b.example".into();
+    })
+    .await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(sp.app.db.identity(IDP_B, STORED).unwrap().1.email.as_deref(), Some("bob@uni-b.example"));
+    let (code, _, _) = sp.sign_in_at(IDP, |_| {}).await;
+    assert_eq!(code, 200, "A vouches for example.com");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn idps_sharing_a_certificate_are_each_warned_about_it() {
+    use crate::sso::saml_expiry;
+    let (sp, dir, providers) = serve_federation(&[], 0).await;
+    let late = (crate::sso::xmldsig::test_signer::signer(0).cert().not_after - 10 * 86_400) * 1000;
+    saml_expiry::check(&sp.app, &providers, &reqwest::Client::new(), std::time::Duration::ZERO, late).await;
+    let mut warned: Vec<String> = sp.audit("sso.saml_certificate_expiring").await.iter().filter(|e| e["details"]["role"] == "idp_signing").map(|e| e["details"]["entityId"].as_str().unwrap().to_string()).collect();
+    warned.sort();
+    assert_eq!(warned, [IDP, IDP_B], "one notice each, not one for both");
+    std::fs::remove_dir_all(dir).ok();
+}
