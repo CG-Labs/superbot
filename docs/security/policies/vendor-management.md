@@ -19,8 +19,8 @@ The security owner keeps an inventory of every vendor the service uses, starting
 | Tier | Which vendors | Examples from the subprocessor list |
 |------|---------------|-------------------------------------|
 | Critical | Holds or can read customer content, or runs the service | The hosting provider for machines and the server (Linode/Akamai, or the Incus hosts' provider); object storage for backups; model providers in the tiers file |
-| High | Receives personal data or could interrupt the service | Stripe; the SMTP provider; Expo, APNs and FCM for push; the identity providers the provider itself signs in with; an error tracker |
-| Low | Receives no customer data | Certificate authorities through Caddy; GitHub; image and package registries; app stores |
+| High | Receives personal data, could interrupt the service, or runs a control the service relies on | Stripe; the SMTP provider; Expo, APNs and FCM for push; the identity providers the provider itself signs in with; an error tracker; GitHub, which holds the code and runs the CI and releases change management relies on |
+| Low | Receives no customer data | Certificate authorities through Caddy; image and package registries; app stores |
 
 ## Before using a vendor
 
@@ -35,7 +35,7 @@ Low vendors are added to the inventory with no assessment.
 
 ## Yearly review
 
-Every Critical and High vendor is reviewed yearly: the newest assurance report, read for exceptions and for the **complementary user entity controls** it expects of its customers, with a note of how the provider meets each; any incidents; whether the data it gets has changed. The hosting providers' reports also cover physical and environmental security, which the service inherits from them (checklist CC6.4-1), so a hosting provider's must be a SOC 2 Type II report or an ISO 27001 certificate, not a questionnaire. Findings go in the register: a SOC 2 report with deviations in its tests, or an opinion other than unqualified, is treated as a risk.
+Every Critical and High vendor is reviewed yearly: the newest assurance report, read for exceptions and for the **complementary user entity controls** it expects of its customers, with a note of how the provider meets each; any incidents; whether the data it gets has changed. The hosting providers' reports also cover physical and environmental security, which the service inherits from them (checklist CC6.4-1), so a hosting provider's must be a SOC 2 Type II report or an ISO 27001 certificate, not a questionnaire. For a subservice organisation carved out in the [system description](../soc2-system-description.md#dc7-subservice-organisations-and-complementary-subservice-organisation-controls), the review also checks that the report covers the controls the description expects of it, and records any it doesn't as a risk. Findings go in the register: a SOC 2 report with deviations in its tests, or an opinion other than unqualified, is treated as a risk.
 
 A report must still speak for the vendor: if a SOC 2 report's period ended more than 92 days ago, the security owner asks the vendor for a bridge letter covering the time since, or for its next report; an ISO 27001 certificate must not have expired. Each report review is recorded in the [policy register](../policy-register.md#vendors-assurance-reports), with the report, the note of complementary controls and any bridge letter kept in the evidence store.
 

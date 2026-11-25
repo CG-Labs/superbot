@@ -165,6 +165,8 @@ An unsolicited response is checked as fully as any other: the IdP's signature, i
 
 If the IdP answers SuperBot's request with another unsolicited response, it ignores AuthnRequests. Restarting again would loop, so the sign-in fails with `idp_initiated_loop` in the audit log. Fix the app at the IdP so it takes SP-initiated sign-ins. `botctl sso saml corp` shows the setting.
 
+With [several IdPs of a federation](#several-idps-of-a-federation), the setting covers each of them: a tile is checked against the IdP its `Issuer` names (if listed), and the browser goes to `/api/auth/sso/<id>/start?idp=<that IdP>`, so the restarted sign-in goes to the same IdP without the chooser ([ADR 0290](../adr/0290-saml-idp-initiated-sign-in-at-several-idps.md)). A loop is that IdP answering its own restart unsolicited; another IdP's tile soon after restarts as usual.
+
 ## All settings
 
 `<ID>` is the provider id in capitals.
@@ -378,7 +380,8 @@ SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
 - **Logout reaches the right IdP.** Signing out goes to the IdP that signed the session in; a logout message from an IdP is checked against that IdP's metadata, and one naming an IdP that isn't listed is refused as `unknown_idp`.
 - **Each IdP's metadata is its own.** It's fetched when first needed and daily after, a refusal is audited with its `entityId`, and [certificate warnings](#certificates-that-are-ending) name the IdP. `botctl sso saml uni` lists every IdP with its name, email domains and certificates, and `botctl offline check` lists each MDQ URL.
 - **Groups are each IdP's.** Groups work, but with rules of their own ([below](#groups-with-several-idps)).
-- **Not with these settings:** `IDP_INITIATED=restart` (each sign-in starts at the chooser). SCIM can't link a provider with several IdPs either: link people by hand or with just in time. botd won't start with them, and lists at most 100 IdPs. Entity IDs with a comma or a `|` can't be listed: sessions keep `<entity ID>|<NameID>`, and a `|` in the entity ID could make one IdP's person look like another's at logout.
+- **Each IdP's tiles restart at that IdP.** With `IDP_INITIATED=restart`, an IdP's portal link (Shibboleth's `/idp/profile/SAML2/Unsolicited/SSO?providerId=…`, a library or LMS link) restarts the sign-in at the IdP that signed it, skipping the chooser ([ADR 0290](../adr/0290-saml-idp-initiated-sign-in-at-several-idps.md)). The response's `Issuer` (an artifact's `SourceID`) only says which listed IdP's keys to check it with; one naming an IdP that isn't listed is refused as `unknown_idp`, and one naming another IdP than signed it fails that IdP's signature check. [Below](#idp-initiated-sign-in-app-tiles) for the rest.
+- **Not with SCIM.** SCIM can't link a provider with several IdPs: link people by hand or with just in time. botd lists at most 100 IdPs. Entity IDs with a comma or a `|` can't be listed: sessions keep `<entity ID>|<NameID>`, and a `|` in the entity ID could make one IdP's person look like another's at logout.
 
 #### Groups with several IdPs
 
@@ -514,7 +517,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `transient_subject`, `missing_subject` | Use a persistent NameID. |
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
 | `email_out_of_scope` | With [several IdPs](#several-idps-of-a-federation) and `ALLOWED_DOMAINS`: the IdP sent an email at a domain the federation doesn't list for it (`botctl sso saml <id>` shows each IdP's email domains). Its operators must add the scope in the federation's registry. |
-| `unknown_idp` | With several IdPs: the start URL's `idp` isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was). |
+| `unknown_idp` | With several IdPs: the start URL's `idp`, or an app tile's `Issuer` (`idpInitiated: true`; an artifact's `SourceID`), isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was, when it could be read). |
 | `idp_metadata_expired` | The IdP's signed metadata in use has passed its `validUntil`, and no fresh copy loaded. From a file or an import, give botd a fresh signed copy; from a URL or MDQ, look for `sso.saml_metadata_refused` or an unreachable server in the log ([above](#signed-idp-metadata)). |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
 | `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |

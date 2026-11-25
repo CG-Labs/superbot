@@ -45,6 +45,10 @@ fn policies() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/policies")
 }
 
+fn description() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/soc2-system-description.md")
+}
+
 fn register() -> Value {
     let mut approvals = Vec::new();
     for e in fs::read_dir(policies()).unwrap() {
@@ -54,6 +58,7 @@ fn register() -> Value {
             approvals.push(json!({ "policy": name, "sha256": hex(&fs::read(&path).unwrap()), "commit": "abc1234", "approvedBy": "p-a", "approvedAt": "2026-09-01" }));
         }
     }
+    approvals.push(json!({ "policy": "soc2-system-description", "sha256": hex(&fs::read(description()).unwrap()), "commit": "abc1234", "approvedBy": "p-a", "approvedAt": "2026-09-01" }));
     let role = |r: &str, h: &str, d: &str| json!({ "role": r, "holder": h, "deputy": d, "from": "2025-12-01" });
     let mut acks = Vec::new();
     let mut training = Vec::new();
@@ -182,13 +187,14 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     write(&dir, "baseline-b.json", &baseline("2026-11-01T00:00:05Z", &["AUTH_MFA"]));
     write(&dir, "access-review.json", &access_review("2026-10-12T15:00:00Z"));
     let pol = policies();
-    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "--access-review", "botd-1=access-review.json", "-o", "register.tar"][..], &PERIOD].concat());
+    let desc = description();
+    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--description", desc.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "--access-review", "botd-1=access-review.json", "-o", "register.tar"][..], &PERIOD].concat());
     let out = text(&o);
     assert!(o.status.success(), "{out}");
     for want in [
-        "against the policy files given",
+        "against the policy files and system description given",
         "roles.json: no exceptions; evidence for CC1.3-1",
-        "policies.json: no exceptions; evidence for CC3.1-1, CC5.3-1",
+        "policies.json: no exceptions; evidence for CC2.3-4, CC3.1-1, CC5.3-1",
         "people.json: no exceptions; evidence for CC1.4-1, CC2.2-1",
         "risks.json: no exceptions; evidence for CC3.2-1, CC3.3-1",
         "management-reviews.json: no exceptions; evidence for CC1.2-1",
@@ -215,7 +221,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     }
     let folder = unpack(&dir, &tar);
     let manifest = json_in(&folder, "manifest.json");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(7), Some(true), Some(2)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(8), Some(true), Some(2)));
     assert_eq!(manifest["source"]["accessReviewFiles"], 1);
     assert_eq!(manifest["source"]["registerSha256"].as_str(), Some(hex(&fs::read(dir.join("register.json")).unwrap()).as_str()), "identifies the register kept beside it");
     let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
@@ -249,6 +255,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     assert_eq!((conduct["codeOfConduct"]["acknowledgedWithinAYear"].as_u64(), conduct["summary"]["closedInPeriodByOutcome"]["substantiated"].as_u64()), (Some(3), Some(1)), "{conduct:#}");
     let pols = json_in(&folder, "policies.json");
     assert!(pols["policies"].as_array().unwrap().iter().all(|p| p["textApproved"] == true), "{pols:#}");
+    assert_eq!((pols["systemDescription"]["policy"].as_str(), pols["systemDescription"]["textApproved"].as_bool(), pols["summary"]["systemDescriptionCurrent"].as_bool()), (Some("soc2-system-description"), Some(true), Some(true)), "{pols:#}");
 
     // The coverage report reads it as a fifth kind of bundle.
     let store = dir.join("store");
@@ -259,7 +266,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     let r: Value = serde_json::from_slice(&o.stdout).unwrap();
     let kind = r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "policy-register").unwrap();
     assert_eq!((kind["complete"].as_bool(), r["bundles"][0]["verified"].as_bool()), (Some(true), Some(true)), "{r:#}");
-    for row in ["CC1.1-1", "CC1.2-1", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1", "CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1", "CC6.1-2", "CC6.2-2", "CC6.3-2", "CC2.3-1", "CC3.2-2", "CC4.2-1", "CC8.1-2"] {
+    for row in ["CC1.1-1", "CC1.2-1", "CC2.3-4", "CC1.3-1", "CC3.3-1", "CC6.4-1", "CC9.2-1", "CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1", "CC6.1-2", "CC6.2-2", "CC6.3-2", "CC2.3-1", "CC3.2-2", "CC4.2-1", "CC8.1-2"] {
         let x = r["rows"].as_array().unwrap().iter().find(|x| x["row"] == row).unwrap_or_else(|| panic!("{row}: {r:#}"));
         assert_eq!(x["complete"], true, "{row}");
     }
@@ -286,6 +293,12 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     fs::write(&ac, fs::read_to_string(&ac).unwrap() + "\nA change after approval.\n").unwrap();
     let o = evidence(&dir, &[&["register", "register.json", "--policies", changed.to_str().unwrap(), "-o", "changed.tar"][..], &PERIOD].concat());
     assert!(o.status.success() && text(&o).contains("policies.json: changedSinceApproval 1"), "{}", text(&o));
+    let edited = dir.join("description.md");
+    fs::write(&edited, fs::read_to_string(description()).unwrap() + "\nA change after approval.\n").unwrap();
+    let o = evidence(&dir, &[&["register", "register.json", "--description", edited.to_str().unwrap(), "-o", "edited.tar"][..], &PERIOD].concat());
+    assert!(o.status.success() && text(&o).contains("policies.json: changedSinceApproval 1"), "the description is checked like a policy: {}", text(&o));
+    let o = evidence(&dir, &[&["register", "register.json", "--description", pol.join("access-control.md").to_str().unwrap(), "-o", "wrong.tar"][..], &PERIOD].concat());
+    assert!(!o.status.success() && text(&o).contains("isn't the SOC 2 system description"), "{}", text(&o));
     let o = evidence(&dir, &[&["register", "register.json", "-o", "register.tar"][..], &PERIOD].concat());
     assert!(!o.status.success() && text(&o).contains("register.tar"), "never over an existing file: {}", text(&o));
     let _ = fs::remove_dir_all(&dir);

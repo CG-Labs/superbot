@@ -786,9 +786,6 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 None => IdpInitiated::Off,
                 Some(v) => IdpInitiated::parse(&v).ok_or_else(|| format!("{} must be off or restart", key("IDP_INITIATED")))?,
             };
-            if several && idp_initiated != IdpInitiated::Off {
-                return Err(format!("{} can't be used with {}: each sign-in starts at the IdP chooser", key("IDP_INITIATED"), key("IDP_ENTITY_IDS")));
-            }
             let authn_context = authn_context(&key, var, list, &attributes)?;
             let freshness = freshness(&key, var)?;
             (
@@ -1678,7 +1675,18 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     if a.limiter.blocked(&ip, at).is_some() {
         return see("/login?error=sso_too_many");
     }
-    let Some(idp) = p.idps().first() else { return expired() };
+    let idp = match unsolicited_idp(p, &msg) {
+        Ok(idp) => idp,
+        Err(claimed) => {
+            a.limiter.fail(&ip, at);
+            let mut extra = json!({ "idpInitiated": true });
+            if let Some(e) = claimed {
+                extra["entityId"] = json!(crate::audit::clip(&e, 256));
+            }
+            failed(a, source, id, "unknown_idp", None, extra);
+            return see("/login?error=sso_failed");
+        }
+    };
     let checked = match check_saml(a, app, p, idp, &msg, None, at).await {
         Ok(c) => c,
         // It answers a request: a sign-in that expired, or another browser's.
@@ -1703,7 +1711,8 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     }
     // The IdP answered the sign-in this browser was just sent to start with another unsolicited
     // response: it ignores our AuthnRequests, and restarting again would go round forever.
-    if read_cookie(headers, SAML_RESTART) == Some(id) {
+    let marker = restart_marker(p, idp);
+    if read_cookie(headers, SAML_RESTART) == Some(marker.as_str()) {
         failed(a, source, id, "idp_initiated_loop", Some(&checked.claims), json!({ "idpInitiated": true }));
         return see("/login?error=sso_failed");
     }
@@ -1711,9 +1720,40 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     claim_details(&mut d, &checked.claims);
     let actor = Actor { kind: ActorKind::User, subject: Some(checked.claims.key()), method: Some("sso".into()), idp: Some("saml".into()), idp_provider: Some(id.into()), ..Default::default() };
     a.record(Who { actor, source: source.clone() }.event("auth.saml_idp_initiated").target("sso_provider", id).details(d));
-    let mut res = see(&format!("{}/api/auth/sso/{id}/start", a.sso.public_url));
-    res.headers_mut().insert(header::SET_COOKIE, saml_restart_cookie(id, RESTART_TTL_S));
+    // With several IdPs, straight to the one that signed it, not the chooser.
+    let mut start = format!("{}/api/auth/sso/{id}/start", a.sso.public_url);
+    if p.several_idps() {
+        start = with_query(&start, &[("idp", idp)]);
+    }
+    let mut res = see(&start);
+    res.headers_mut().insert(header::SET_COOKIE, saml_restart_cookie(&marker, RESTART_TTL_S));
     res
+}
+
+/// The IdP an unsolicited response is checked against: the provider's one, or with several
+/// (ADR 0290) the one its Issuer names (an artifact's SourceID), if that's one of them.
+/// `check_saml` then checks it was signed by that IdP, so the claim is never trusted. Err
+/// holds the entity ID it named, if one could be read.
+fn unsolicited_idp<'a>(p: &'a Provider, msg: &Message) -> Result<&'a str, Option<String>> {
+    if !p.several_idps() {
+        return p.idps().first().map(String::as_str).ok_or(None);
+    }
+    match msg.binding {
+        ResponseBinding::Artifact => saml_artifact::claimed_source(msg.value, p.idps()).ok_or(None),
+        ResponseBinding::Post => {
+            let claimed = saml_sp::claimed_issuer(msg.value).ok_or(None)?;
+            p.idps().iter().find(|e| **e == claimed).map(String::as_str).ok_or(Some(claimed))
+        }
+    }
+}
+
+/// What the restart marker holds: the provider, and with several IdPs which one, so a loop is
+/// an IdP answering its own restart unsolicited, not another IdP's tile soon after.
+fn restart_marker(p: &Provider, idp: &str) -> String {
+    match p.several_idps() {
+        false => p.id.clone(),
+        true => format!("{}.{}", p.id, &hash(idp)[..16]),
+    }
 }
 
 /// `GET /api/auth/sso/{id}/metadata`: our SAML SP metadata, for the IdP to import. With our
@@ -3428,7 +3468,8 @@ mod tests {
         assert!(err(&[two, ("SSO_CORP_GROUPS_ATTRIBUTE", "groups"), ("SSO_CORP_REQUIRED_GROUPS", "member@localhost")]).contains("isn't scoped"));
         let s = several(&[two, ("SSO_CORP_GROUPS_ATTRIBUTE", "groups"), ("SSO_CORP_REQUIRED_GROUPS", "member@a.example, faculty@b.example")]).unwrap();
         assert!(matches!(&s.providers[0].kind, Kind::SamlSp { required_groups, .. } if required_groups == &["member@a.example", "faculty@b.example"]));
-        assert!(err(&[two, ("SSO_CORP_IDP_INITIATED", "restart")]).contains("IdP chooser"));
+        let s = several(&[two, ("SSO_CORP_IDP_INITIATED", "restart")]).unwrap();
+        assert!(matches!(&s.providers[0].kind, Kind::SamlSp { idp_initiated: IdpInitiated::Restart, .. }), "each IdP's tile restarts at that IdP (ADR 0290)");
         assert!(native(&[("SSO_CORP_IDP_ENTITY_ID", ""), two]).err().unwrap().contains("needs SSO_CORP_IDP_MDQ_URL"));
         assert!(saml(&[("SSO_ADFS_IDP_ENTITY_IDS", "https://a.example/idp,https://b.example/idp")]).is_err(), "a native setting on the bridge");
         let _ = std::fs::remove_dir_all(dir);
