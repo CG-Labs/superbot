@@ -373,6 +373,18 @@ describe("TeamView", () => {
       expect(section.queryByLabelText("Deny Ada's request")).toBeNull();
     });
 
+    it("says when the requests couldn't be loaded, and loads them again", async () => {
+      const api = fakeApi({ ...teamAs("owner"), roleRequests: 1 }, [], [request("rq1", al)]);
+      api.teamRoleRequests.mockRejectedValueOnce(new Error("Server busy"));
+      const user = userEvent.setup();
+      await render(<TeamView api={api as unknown as SuperBotApi} meId="ada" canWrite onBack={jest.fn()} />);
+      expect(await screen.findByText("Couldn't load requests for team roles: Server busy")).toBeOnTheScreen();
+      expect(screen.getByText("People")).toBeOnTheScreen();
+      await user.press(screen.getByLabelText("Load requests again"));
+      expect(await screen.findByTestId("team-role-requests")).toBeOnTheScreen();
+      expect(screen.queryByText(/Couldn't load requests/)).toBeNull();
+    });
+
     it("asks for none when the team has none waiting, and shows them to nobody who can't decide", async () => {
       const { api } = await open(teamAs("owner"));
       expect(api.teamRoleRequests).not.toHaveBeenCalled();

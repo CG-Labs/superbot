@@ -234,6 +234,7 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
   const [role, setRole] = useState<Exclude<TeamRole, "owner">>("member");
 
   const [requests, setRequests] = useState<RoleRequest[]>([]);
+  const [requestsError, setRequestsError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -241,7 +242,17 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
       setTeam(t);
       setInvites(i);
       // Only owners and admins get a count, so nobody else asks (nor an older server, without one).
-      setRequests(t?.roleRequests ? await api.teamRoleRequests("pending").then((v) => v.requests, () => []) : []);
+      let waiting: RoleRequest[] = [];
+      let failed: string | null = null;
+      if (t?.roleRequests) {
+        try {
+          waiting = (await api.teamRoleRequests("pending")).requests;
+        } catch (e) {
+          failed = message(e, "Couldn't load them");
+        }
+      }
+      setRequests(waiting);
+      setRequestsError(failed);
     } catch (e) {
       setError(message(e, "Couldn't load your team"));
       setTeam((t) => t ?? null);
@@ -432,6 +443,14 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
               </View>
             ) : null}
 
+            {manage && requestsError ? (
+              <View style={styles.section}>
+                <Text style={styles.error} accessibilityRole="alert">{`Couldn't load requests for team roles: ${requestsError}`}</Text>
+                <Pressable style={[styles.btn, styles.self]} disabled={busy} onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Load requests again">
+                  <Text style={styles.btnText}>Try again</Text>
+                </Pressable>
+              </View>
+            ) : null}
             {manage && requests.length ? (
               <View style={styles.section} testID="team-role-requests">
                 <Text style={styles.sectionTitle}>Requests for team roles ({requests.length})</Text>
