@@ -57,7 +57,7 @@ Ubuntu's archive (`ubuntu.com`) joins the internet services the offline check kn
 - **Baking the sources into the Incus image.** Operators import images by hand (`INCUS_IMAGE_SERVER=local`) or mirror an image server; asking them to rebuild images for a URL is harder than a setting, and Linode's images can't be changed.
 - **A proxy (`Acquire::http::Proxy`) to a caching apt proxy.** It keeps `archive.ubuntu.com` in the sources and needs the proxy to rewrite or reach upstream. A mirror URL works for both a proxy-style remote (Artifactory, Nexus) and a static mirror.
 - **Serving Ubuntu's packages from botd.** botd would have to carry and refresh Ubuntu's archive, and security updates would be only as fresh as the last bundle. Operators already run apt mirrors for their other Ubuntu hosts.
-- **Telling the agent to switch sources on existing machines.** That would rewrite a running machine's sources over the control plane, a new privileged action. Machines are rebuilt from backups often enough; this slice covers new ones.
+- **Telling the agent to switch sources on existing machines.** That would rewrite a running machine's sources over the control plane, a new privileged action. This slice covers new ones.
 
 ## Consequences
 
@@ -65,13 +65,13 @@ Ubuntu's archive (`ubuntu.com`) joins the internet services the offline check kn
 - `botctl machine mirror` tells an operator before any machine needs it whether the mirror is complete and current, and `botd offline check` says when it's missing.
 - Servers that set neither see no change: user data, first boot and the check are as before.
 - Tested:
-  - `machines::apt::tests`: settings are refused for `http`, a login, a query, a quote, an IPv6 address with a CA, and without `MACHINE_CONTROL_URL`; the CA is trusted for each mirror's host alone. The first-boot step, run with a stub `dpkg` against a stand-in root, writes sources for its arch only, blanks a filled `sources.list`, writes cloud-init's drop-in, and leaves everything alone for another arch or no codename, never failing. The check, against a stand-in HTTPS archive with a CA of its own, passes a good mirror, warns on a stale one, and names a changed package list, a missing package, another codename or suite, a missing arch or component, an expired `Valid-Until`, a file that isn't clearsigned and a mirror that isn't there.
+  - `machines::apt::tests`: settings are refused for `http`, a login, a query, a quote, an IPv6 address with a CA, and without `MACHINE_CONTROL_URL`; the CA is trusted for each mirror's host alone. The first-boot step, run with a stub `dpkg` against a stand-in root, writes sources for its arch only, blanks a filled `sources.list`, writes cloud-init's drop-in, and leaves everything alone for another arch or no codename, never failing. The check, against a stand-in HTTPS archive with a CA of its own, passes a good mirror, warns on a stale one, and names a changed package list, a missing package, another codename or suite, a missing arch or component, an expired or unreadable `Valid-Until`, a file that isn't clearsigned and a mirror that isn't there.
   - The real apt: with the sources and CA setting the first-boot step writes, `apt-get update` and `apt-get download` take a package from a stand-in archive signed with a throwaway key, over HTTPS with its own CA. apt refuses the mirror without the CA setting, a Release signed by another key, and a package changed after its index.
   - `machines::enroll::tests`: the user data carries the CA and its apt setting, and the step runs before hardening and screens; without the settings, user data is unchanged.
   - `machines_upkeep_tests`: `GET /api/machines/harness-mirror` with no harness plan checks both arches' mirrors, and fails on one broken suite alone.
   - `offline_check::tests`: Ubuntu's archive is `internet` until `MACHINE_APT_MIRROR` is set, and an Incus host with only one arch's mirror is a `check` for the other.
 - Not covered:
-  - Existing machines: they keep their sources until rebuilt or made again.
+  - Existing machines: they keep their sources until made again from the base image. A restore keeps the sources in the backup, so one taken before the mirror was set still uses Ubuntu's archive.
   - Mirrors re-signed with the operator's own key, which would need that key on every machine.
   - Ubuntu releases other than 24.04: the step lists the machine's own codename, but the check reads `noble`'s suites.
   - Reporting a machine's apt sources in its heartbeat. A failed install still shows as the hardening or screen step failing.
