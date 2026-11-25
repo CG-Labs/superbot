@@ -306,6 +306,45 @@ async fn machines_install_harnesses_from_the_operators_mirrors_with_their_own_ca
 }
 
 #[tokio::test]
+async fn the_mirror_check_reads_the_apt_mirror_with_no_harness_plan() {
+    use crate::machines::apt::{Settings, tests::publish, tests::unsigned};
+    use crate::machines::standin_mirror::Mirror;
+    let mirror = Mirror::serve().await;
+    let debs: Vec<(&str, &[u8])> = crate::machines::hardening::PACKAGES.iter().chain(enroll::SCREEN_PACKAGES).map(|p| (*p, b"a stand-in package" as &[u8])).collect();
+    publish(&mirror, "/ubuntu", "amd64", &debs, 0, &unsigned);
+    publish(&mirror, "/ubuntu-ports", "arm64", &debs, 0, &unsigned);
+    let apt = Settings {
+        amd64: Some(format!("{}/ubuntu", mirror.url)),
+        arm64: Some(format!("{}/ubuntu-ports", mirror.url)),
+        ca: Some((mirror.ca_pem(), "/etc/superbot/mirror-ca.pem".into())),
+    };
+    let shown = apt.shown();
+    let env = serve_with(move |mut e| {
+        e.upkeep.plan = None;
+        e.upkeep.mirrors = None;
+        e.apt = Some(apt);
+        e
+    })
+    .await;
+
+    let (code, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.iter().filter(|i| i["name"] == "ubuntu").count(), 6, "three suites for each arch: {v}");
+    assert_eq!(items.iter().filter(|i| i["name"] == "ubuntu-packages").count(), 2, "{v}");
+    assert_eq!((v["mirrors"]["apt"].clone(), v["mirrors"]["caFile"].clone()), (shown, json!("/etc/superbot/mirror-ca.pem")), "{v}");
+
+    mirror.file("/ubuntu-ports/dists/noble-security/InRelease", b"Suite: noble-security\n");
+    let (_, v) = json_call(&env, "GET", "/api/machines/harness-mirror", "").await;
+    assert_eq!(v["ok"], false, "{v}");
+    let bad: Vec<&Value> = v["items"].as_array().unwrap().iter().filter(|i| i["ok"] != true).collect();
+    assert_eq!(bad.len(), 1, "{v}");
+    assert_eq!((bad[0]["arch"].as_str(), bad[0]["suite"].as_str()), (Some("arm64"), Some("noble-security")), "{v}");
+    assert!(bad[0]["error"].as_str().unwrap().contains("clearsigned"), "{v}");
+}
+
+#[tokio::test]
 async fn machines_sign_in_to_the_operators_registry_with_botds_login() {
     use crate::machines::mirror::{Login, Mirrors};
     use crate::machines::standin_mirror::Mirror;

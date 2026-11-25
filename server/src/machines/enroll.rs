@@ -121,6 +121,9 @@ pub struct Enrollment {
     /// Each Bot run in a cgroup of its own, held to its tier's run limits
     /// (MACHINE_RUN_LIMITS, ADR 0135): systemd delegates the controllers to the agent.
     pub run_limits: bool,
+    /// Where new machines' apt takes Ubuntu's packages from (MACHINE_APT_MIRROR,
+    /// ADR 0284). None: Ubuntu's archive, as the image says.
+    pub apt: Option<super::apt::Settings>,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -174,6 +177,8 @@ impl Enrollment {
                 "MACHINE_HARDENING",
                 "MACHINE_EGRESS_DENY",
                 "MACHINE_RUN_LIMITS",
+                "MACHINE_APT_MIRROR",
+                "MACHINE_APT_PORTS_MIRROR",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -257,6 +262,7 @@ impl Enrollment {
         e.teammate_users = super::teammate::from_env(var, e.bot_user)?;
         e.offboard = super::offboard::Settings::from_env(var)?;
         e.hardening = super::hardening::Settings::from_env(var)?;
+        e.apt = super::apt::Settings::from_env(var)?;
         e.run_limits = match var("MACHINE_RUN_LIMITS").trim() {
             "" | "on" => true,
             "off" => false,
@@ -308,6 +314,7 @@ impl Enrollment {
             voxl: None,
             hardening: None,
             run_limits: false,
+            apt: None,
         })
     }
 
@@ -434,7 +441,7 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}; teammates' own users {}, {}; screens {}){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}; teammates' own users {}, {}; screens {}; {}){}",
             self.url,
             self.listen,
             self.agent_port,
@@ -454,6 +461,7 @@ impl Enrollment {
                     if v.is_some() { "" } else { ", no voxl to give new machines" }
                 ),
             },
+            self.apt.as_ref().map_or(format!("Ubuntu's packages on machines from {}", super::apt::ARCHIVE), |a| a.describe()),
             match (&self.agent, &self.botctl) {
                 (Some(_), Some(_)) => "",
                 (None, _) =>
@@ -577,7 +585,19 @@ impl Enrollment {
                 }
                 super::hardening::FIRSTBOOT.to_string()
             });
+            let apt = self.apt.as_ref().map_or(String::new(), |a| {
+                for (path, mode, content) in a.files() {
+                    out.push_str(&format!(
+                        "\x20 - path: {path}\n\
+                         \x20   permissions: \"{mode}\"\n\
+                         \x20   content: |\n{}",
+                        indent(&content),
+                    ));
+                }
+                a.firstboot()
+            });
             let script = FIRSTBOOT
+                .replace("{apt}\n", &apt)
                 .replace("{hardening}\n", &hardening)
                 .replace("{botctl}\n", &botctl)
                 .replace("{bot_user}\n", &bots)
@@ -758,7 +778,8 @@ fn control_cert(ca: &Ca, host: &str) -> Result<ControlCert, String> {
 const FIRSTBOOT_PATH: &str = "/usr/local/lib/superbot/firstboot";
 const GUARD_PATH: &str = "/usr/local/lib/superbot/agent-guard";
 
-/// Run once by cloud-init (ADR 0035): hardens the machine first (ADR 0126), installs
+/// Run once by cloud-init (ADR 0035): points apt at the operator's mirror (ADR 0284)
+/// before anything installs a package, hardens the machine (ADR 0126), installs
 /// the agent botd ships (and botctl, when botd ships it), each checked against the
 /// SHA-256 botd pinned, enrolls, and starts the agent. Its output goes to the cloud-init log, so nothing in it may print the
 /// token. Both live in /usr/local/lib/superbot, which the unit lets the agent write,
@@ -766,6 +787,7 @@ const GUARD_PATH: &str = "/usr/local/lib/superbot/agent-guard";
 const FIRSTBOOT: &str = r#"#!/bin/sh
 set -eu
 dir=/usr/local/lib/superbot
+{apt}
 {hardening}
 {botctl}
 {bot_user}
@@ -801,6 +823,9 @@ const FIRSTBOOT_SCREENS: &str = r#"if DEBIAN_FRONTEND=noninteractive apt-get upd
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xvfb openbox dbus-daemon dbus-x11 x11-utils fonts-noto-core libx264-164 libyuv0 libopus0 >/dev/null{voxl}
 then echo "superbot: screen programs installed"; else rm -f /usr/local/bin/.voxl.new; echo "superbot: screen programs didn't install" >&2; fi
 "#;
+
+/// What FIRSTBOOT_SCREENS installs, which an apt mirror must carry (ADR 0284).
+pub const SCREEN_PACKAGES: &[&str] = &["xvfb", "openbox", "dbus-daemon", "dbus-x11", "x11-utils", "fonts-noto-core", "libx264-164", "libyuv0", "libopus0"];
 
 /// FIRSTBOOT_SCREENS's voxl step: botd's own build, checked like the agent.
 const FIRSTBOOT_VOXL: &str = r#" &&
@@ -1885,6 +1910,9 @@ mod tests {
             let err = Enrollment::from_env(&|_| String::new(), &crate::secrets::env::EnvStore::fixed(&[(k, v)]), &cipher, &bin).err();
             assert!(err.as_deref().is_some_and(|e| e.ends_with("needs MACHINE_CONTROL_URL")), "{k}: {err:?}");
         }
+        for vars in [&[("MACHINE_APT_MIRROR", "https://mirror.corp.example/ubuntu")], &[("MACHINE_APT_PORTS_MIRROR", "https://mirror.corp.example/ubuntu-ports")]] {
+            assert_eq!(with(vars).err(), Some(format!("{} needs MACHINE_CONTROL_URL", vars[0].0)));
+        }
         assert!(
             with(&[("MACHINE_AGENT_PORT", "7000")]).is_err(),
             "agent settings alone are a mistake"
@@ -2233,6 +2261,54 @@ mod tests {
         assert!(!dir.join("superbot-machine.prev").exists());
         start();
         assert_eq!(read("superbot-machine"), "old", "nothing left to put back");
+    }
+
+    /// MACHINE_APT_MIRROR (ADR 0284): first boot points apt at the mirror before anything
+    /// installs a package, the CA goes beside it, and without it nothing changes.
+    #[test]
+    fn first_boot_takes_ubuntus_packages_from_the_apt_mirror_first() {
+        let app = crate::runner::test_app();
+        let u = app.db.create_user(None, Some("apt@example.com"), "U", crate::rbac::Role::Member).unwrap();
+        let m = app
+            .db
+            .add_machine(&crate::db::NewMachine {
+                user_id: &u.id,
+                provider: "fake",
+                label_prefix: "superbot",
+                tier: "starter",
+                plan: "g6-standard-1",
+                region: "gb-lon",
+                created_by: None,
+            })
+            .unwrap();
+        let mut e = Enrollment::for_tests(7, 1, 7443).with_agent(b"agent").with_hardening();
+        e.screens = Some(super::super::screens::Settings { ports: (6960, 6999), width: 1280, height: 800, idle_ms: 600_000 });
+        let before = e.user_data(&m, "sbe_tok");
+        assert!(!before.contains("apt_mirror") && !before.contains(super::super::apt::CA_PATH), "nothing without a mirror");
+        assert!(firstboot_in(&before).starts_with("#!/bin/sh\nset -eu\ndir=/usr/local/lib/superbot\nst=/etc/superbot/hardening\n"), "{before}");
+
+        let pem = crate::machines::standin_mirror::Mirror::ca_only().ca_pem();
+        e.apt = Some(super::super::apt::Settings {
+            amd64: Some("https://mirror.corp.example/ubuntu".into()),
+            arm64: Some("https://mirror.corp.example/ubuntu-ports".into()),
+            ca: Some((pem.clone(), "/etc/ssl/corp.pem".into())),
+        });
+        let ud = e.user_data(&m, "sbe_tok");
+        let script = firstboot_in(&ud);
+        let at = |s: &str| script.find(s).unwrap_or_else(|| panic!("{s}\n{script}"));
+        assert!(at("apt_mirror='https://mirror.corp.example/ubuntu'") < at("apt-get -o DPkg::Lock::Timeout=300 update"), "before hardening's packages");
+        assert!(at("preserve_sources_list") < at("apt-get install -y -qq xvfb"), "before the screens'");
+        assert!(ud.contains(&format!("path: {}", super::super::apt::CA_CONF_PATH)) && ud.contains("Acquire::https::mirror.corp.example::CAInfo"), "{ud}");
+        assert!(ud.contains(&format!("path: {}", super::super::apt::CA_PATH)) && ud.contains(&indent_lines(&pem)), "the CA, as written");
+        assert!(e.describe().contains("Ubuntu's packages on machines from https://mirror.corp.example/ubuntu (amd64)"), "{}", e.describe());
+        let check = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
+        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+
+        for p in super::super::hardening::PACKAGES {
+            assert!(super::super::hardening::FIRSTBOOT.contains(&format!("need=\"$need {p}\"")), "{p}");
+        }
+        let installs = FIRSTBOOT_SCREENS.split("install -y -qq ").nth(1).unwrap().split(" >").next().unwrap();
+        assert_eq!(installs.split(' ').collect::<Vec<_>>(), SCREEN_PACKAGES, "the check looks for what first boot installs");
     }
 
     /// The first-boot script as cloud-init will write it.

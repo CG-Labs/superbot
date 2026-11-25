@@ -1,7 +1,8 @@
 //! A stand-in for an operator's mirrors, for tests (ADR 0186): HTTPS on loopback with a
 //! CA of its own, Node.js tarballs laid out as nodejs.org/dist and npm packages as a
 //! registry serves them (a package document per name, scoped names as `@scope%2fname`,
-//! tarballs under `<name>/-/`). Every path asked for is recorded.
+//! tarballs under `<name>/-/`), and any other file a test puts there, such as an Ubuntu
+//! archive's (ADR 0284). Every path asked for is recorded.
 
 use super::wire::{Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
 use axum::http::{StatusCode, Uri};
@@ -213,6 +214,11 @@ impl Mirror {
             ca: Some(self.ca_pem()),
             npm_login: self.world.lock().unwrap().login.is_some(),
         }
+    }
+
+    /// Serves `body` at `path`, replacing what was there.
+    pub fn file(&self, path: &str, body: &[u8]) {
+        self.world.lock().unwrap().files.insert(path.into(), body.to_vec());
     }
 
     pub fn calls(&self) -> Vec<String> {
