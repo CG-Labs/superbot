@@ -155,12 +155,12 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
     })))
 }
 
-/// What the app says about your chats, routines, approvals, Bots' memory and facts (ADR 0215, ADR 0228, ADR 0276, ADR 0277): whether
+/// What the app says about your chats, routines, approvals, Bots' memory, facts and sign-ins (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283): whether
 /// the region has a store, whether they are all in the region, whether some are still to
 /// move there, and how many backups of another region's store still hold them from before
 /// they moved out.
 fn chats_view(c: &Value) -> Value {
-    let n = |k: &str| -> i64 { ["messages", "routines", "approvals", "memories", "facts"].iter().filter_map(|t| c[t][k].as_i64()).sum() };
+    let n = |k: &str| -> i64 { super::chat_stores::KINDS.iter().filter_map(|t| c[t][k].as_i64()).sum() };
     let moving = n("elsewhere") > 0 || (c["store"] == true && n("inServerDatabase") > 0);
     let earlier: i64 = c["earlierCopies"].as_array().into_iter().flatten().filter_map(|e| e["backups"].as_i64()).sum();
     json!({ "store": c["store"], "inRegion": c["inRegion"], "moving": moving, "earlierBackups": earlier })

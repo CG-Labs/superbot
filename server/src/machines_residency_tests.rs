@@ -1039,6 +1039,61 @@ async fn a_pinned_persons_facts_are_kept_in_their_regions_chat_store_not_in_data
 }
 
 #[tokio::test]
+async fn a_pinned_persons_sign_ins_are_kept_in_their_regions_chat_store() {
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let count = || rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(count(), 0, "unpinned: in botd's own database");
+
+    // A pin moves her session into London's store, audited, and it still signs her in.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    assert_eq!(count(), 1);
+    let moved = audit(port, &admin, chat_stores::MOVED).await;
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["sessions"].as_i64()), (Some("gb-lon"), Some(1)), "{moved:?}");
+    let (_, hers) = call_json(port, "GET", &format!("/api/sessions?user={ada}"), &admin, "").await;
+    assert_eq!(hers.as_array().map(Vec::len), Some(1), "{hers}");
+    assert_eq!(call(port, "GET", "/api/me/residency", &ada_s, "").await.0, 200);
+    // Signing in again lands there too.
+    let again = crate::users_http_tests::signed_in(port, &admin, &ada).await.unwrap();
+    assert_eq!(count(), 2);
+
+    // The report counts them.
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["status"].as_str(), r["chats"]["sessions"]["inStore"].as_i64(), r["chats"]["sessions"]["inServerDatabase"].as_i64()), (Some("kept"), Some(2), Some(0)), "{r}");
+    assert!(r["notCovered"][0].as_str().unwrap().contains("owners' facts and sign-ins, which are in the region's chat store (accounts, the audit log"), "{r}");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("- **Sign-in sessions in it:** 2"), "{md}");
+
+    // One left in botd's own database makes the pin unkept until reconcile moves it.
+    app.db.conn_for_tests().execute_batch("INSERT INTO main.sessions SELECT * FROM chats_0.sessions LIMIT 1; DELETE FROM chats_0.sessions WHERE id IN (SELECT id FROM main.sessions);").unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert!(r["outside"].to_string().contains("they have 1 sign-in session in botd's own database, not gb-lon's chat store (ADR 0283)"), "{r}");
+    assert_eq!(reconcile_as(port, &admin).await["sessionsMoved"].as_i64(), Some(1));
+    assert_eq!(count(), 2);
+
+    // Revoked where it is kept: signing out ends it.
+    assert_eq!(call(port, "POST", "/api/auth/logout", &again, "").await.0, 200);
+    assert_eq!(call(port, "GET", "/api/me/residency", &again, "").await.0, 401);
+    assert_eq!(call(port, "GET", "/api/me/residency", &ada_s, "").await.0, 200, "her other session still works");
+    let (_, hers) = call_json(port, "GET", &format!("/api/sessions?user={ada}"), &admin, "").await;
+    assert_eq!(hers.as_array().map(Vec::len), Some(1), "{hers}");
+
+    // Unpinned, they come back to botd's own database.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!(count(), 0);
+    assert_eq!(call(port, "GET", "/api/me/residency", &ada_s, "").await.0, 200);
+}
+
+#[tokio::test]
 async fn a_pinned_persons_store_backups_are_copied_off_the_host_into_a_bucket_in_their_region() {
     use crate::machines::chat_store_copies::{self, COPIED, Copies};
     use crate::machines::chat_stores::{self, CLEARED, Settings};

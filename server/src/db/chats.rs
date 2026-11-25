@@ -1,19 +1,22 @@
-//! Pinned people's chats, routines, approvals, Bots' memory and owners' facts in a database
-//! in their region (ADR 0215, ADR 0228, ADR 0276, ADR 0277), the first part of splitting
-//! botd's database by region. Each region in REGION_DATA_DIRS has a SQLite file of its own
-//! (`chats.sqlite`, keyed like botd's database), attached to botd's connection. A Bot's
-//! messages, routines, approvals and memory are kept in the store of its owner's residency
-//! pin (their team's, else their own, as `residency::of_user`), and a person's facts in the
-//! store of their own pin by the same rule, or in botd's own database when that region has
-//! no store or the person isn't pinned. botd's own copy of a Bot's memory is a file in
-//! DATA_DIR (`DATA_DIR/bots/<id>/MEMORY.md`), and of a person's facts too
-//! (`DATA_DIR/users/<id>/USER.md`); its `memories` and `facts` tables only hold one on its
-//! way between that file and a store (`machines::chat_stores::place`).
+//! Pinned people's chats, routines, approvals, Bots' memory, owners' facts and sign-in
+//! sessions in a database in their region (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR
+//! 0283), the first part of splitting botd's database by region. Each region in
+//! REGION_DATA_DIRS has a SQLite file of its own (`chats.sqlite`, keyed like botd's
+//! database), attached to botd's connection. A Bot's messages, routines, approvals and
+//! memory are kept in the store of its owner's residency pin (their team's, else their own,
+//! as `residency::of_user`), and a person's facts and sessions (with each session's SAML
+//! sign-in and push device) in the store of their own pin by the same rule, or in botd's own
+//! database when that region has no store or the person isn't pinned. botd's own copy of a
+//! Bot's memory is a file in DATA_DIR (`DATA_DIR/bots/<id>/MEMORY.md`), and of a person's
+//! facts too (`DATA_DIR/users/<id>/USER.md`); its `memories` and `facts` tables only hold
+//! one on its way between that file and a store (`machines::chat_stores::place`).
 //!
 //! Reads see every place at once: a TEMP view per table (`messages`, `routines`,
-//! `approvals`, `memories`, `facts`) puts botd's own table and each store's together, and unqualified names
-//! find TEMP objects first. Writes name the table they change: new rows go where their
-//! Bot's data belongs, and updates and deletes by id run on each place. Ids stay unique
+//! `approvals`, `memories`, `facts`, `sessions`, `saml_sessions`, `push_devices`) puts
+//! botd's own table and each store's together, and unqualified names find TEMP objects
+//! first. Writes name the table they change: new rows go where their Bot's or person's data
+//! belongs (a session's SAML sign-in and push device where the session is), and updates
+//! and deletes by id run on each place. Ids stay unique
 //! across all of them: a store's messages take the next id after botd's own sequence and
 //! every store's highest, and bump that sequence, so botd's table never hands the same id
 //! out again; a routine's or approval's id is drawn again while any place has it.
@@ -54,21 +57,59 @@ impl Key {
 struct Kept {
     name: &'static str,
     key: Key,
+    /// Its primary key, unique across places.
+    pk: &'static str,
     /// The indexes a store's copy gets, as `(name, columns)`.
     indexes: &'static [(&'static str, &'static str)],
+    /// The unique indexes a store's copy gets, for the constraints botd's own table has.
+    unique: &'static [(&'static str, &'static str)],
+    /// The row of another kept table each row belongs to, as `(column, table)`: always in
+    /// the same place. botd's own table deletes it with that row; a store's, on each pass.
+    parent: Option<(&'static str, &'static str)>,
     /// Reads order by its rowid, which a view has only as a column of that name.
     rowid: bool,
 }
 
-const KEPT: [Kept; 5] = [
-    Kept { name: "messages", key: Key::Bot, indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], rowid: false },
-    Kept { name: "routines", key: Key::Bot, indexes: &[("routines_bot", "bot_id")], rowid: false },
-    Kept { name: "approvals", key: Key::Bot, indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], rowid: true },
-    Kept { name: "memories", key: Key::Bot, indexes: &[("memories_bot", "bot_id")], rowid: false },
-    Kept { name: "facts", key: Key::User, indexes: &[("facts_user", "user_id")], rowid: false },
+/// A parent comes before the tables that point at it, so a move into botd's own database
+/// copies it first, and deletes run in reverse.
+const KEPT: [Kept; 8] = [
+    Kept { name: "messages", key: Key::Bot, pk: "id", indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], unique: &[], parent: None, rowid: false },
+    Kept { name: "routines", key: Key::Bot, pk: "id", indexes: &[("routines_bot", "bot_id")], unique: &[], parent: None, rowid: false },
+    Kept { name: "approvals", key: Key::Bot, pk: "id", indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], unique: &[], parent: None, rowid: true },
+    Kept { name: "memories", key: Key::Bot, pk: "id", indexes: &[("memories_bot", "bot_id")], unique: &[], parent: None, rowid: false },
+    Kept { name: "facts", key: Key::User, pk: "id", indexes: &[("facts_user", "user_id")], unique: &[], parent: None, rowid: false },
+    Kept { name: "sessions", key: Key::User, pk: "id", indexes: &[("sessions_user", "user_id, created_at")], unique: &[("sessions_token", "token_hash")], parent: None, rowid: false },
+    Kept {
+        name: "saml_sessions",
+        key: Key::User,
+        pk: "session_id",
+        indexes: &[("saml_sessions_user", "user_id")],
+        unique: &[],
+        parent: Some(("session_id", "sessions")),
+        rowid: false,
+    },
+    Kept {
+        name: "push_devices",
+        key: Key::User,
+        pk: "id",
+        indexes: &[("push_devices_user", "user_id, updated_at")],
+        unique: &[("push_devices_session", "session_id"), ("push_devices_token", "token_hash")],
+        parent: Some(("session_id", "sessions")),
+        rowid: false,
+    },
 ];
+const N: usize = KEPT.len();
 const MESSAGES: usize = 0;
 const APPROVALS: usize = 2;
+const PUSH_DEVICES: usize = 7;
+
+/// The tables of a person's sign-ins (ADR 0283): their sessions, and each one's SAML
+/// sign-in and push device.
+const SIGN_INS: [&str; 3] = ["sessions", "saml_sessions", "push_devices"];
+
+fn kept(table: &str) -> Option<&'static Kept> {
+    KEPT.iter().find(|k| k.name == table)
+}
 
 /// botd's table for Bots' memory on its way between a store and the Bot's file in DATA_DIR
 /// (ADR 0276): one row per Bot, whose id is the Bot's.
@@ -190,28 +231,38 @@ pub struct Held {
     pub approvals: i64,
     pub memories: i64,
     pub facts: i64,
+    pub sessions: i64,
+    pub saml_sessions: i64,
+    pub push_devices: i64,
 }
 
 impl Held {
-    fn of(n: [i64; 5]) -> Held {
-        Held { messages: n[0], routines: n[1], approvals: n[2], memories: n[3], facts: n[4] }
+    fn of(n: [i64; N]) -> Held {
+        Held { messages: n[0], routines: n[1], approvals: n[2], memories: n[3], facts: n[4], sessions: n[5], saml_sessions: n[6], push_devices: n[7] }
+    }
+
+    fn each(&self) -> [i64; N] {
+        [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices]
     }
 
     pub fn total(&self) -> i64 {
-        self.messages + self.routines + self.approvals + self.memories + self.facts
+        self.each().iter().sum()
     }
 
     pub fn add(&mut self, o: Held) {
-        self.messages += o.messages;
-        self.routines += o.routines;
-        self.approvals += o.approvals;
-        self.memories += o.memories;
-        self.facts += o.facts;
+        let (a, b) = (self.each(), o.each());
+        *self = Held::of(std::array::from_fn(|i| a[i] + b[i]));
     }
 
-    /// What of it is kept by Bot: all but people's facts.
+    /// What of it is kept by Bot: all but people's facts and sign-ins.
     pub fn of_bots(&self) -> Held {
-        Held { facts: 0, ..*self }
+        Held { messages: self.messages, routines: self.routines, approvals: self.approvals, memories: self.memories, ..Held::default() }
+    }
+
+    /// A person's sign-ins (ADR 0283): their sessions, with each one's SAML sign-in and
+    /// push device.
+    pub fn sign_ins(&self) -> Held {
+        Held { sessions: self.sessions, saml_sessions: self.saml_sessions, push_devices: self.push_devices, ..Held::default() }
     }
 
     /// "3 chat messages, 1 routine, 2 approvals, 1 Bot memory and 1 person's facts", leaving
@@ -223,6 +274,9 @@ impl Held {
             (self.approvals, "approval", "approvals"),
             (self.memories, "Bot memory", "Bot memories"),
             (self.facts, "person's facts", "people's facts"),
+            (self.sessions, "sign-in session", "sign-in sessions"),
+            (self.saml_sessions, "SAML sign-in", "SAML sign-ins"),
+            (self.push_devices, "push device", "push devices"),
         ]
         .into_iter()
         .filter(|(n, _, _)| *n > 0)
@@ -249,6 +303,18 @@ pub struct ChatMove {
     pub memories: usize,
     /// People whose facts moved (one row each).
     pub facts: usize,
+    /// Sign-in sessions, and their SAML sign-ins and push devices (ADR 0283).
+    pub sessions: usize,
+    pub saml_sessions: usize,
+    pub push_devices: usize,
+}
+
+impl ChatMove {
+    /// What moved, as counts.
+    pub fn held(&self) -> Held {
+        let n = [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices];
+        Held::of(n.map(|n| n as i64))
+    }
 }
 
 /// One place chats are kept, and what of theirs is there.
@@ -279,13 +345,14 @@ fn columns(c: &Connection, schema: &str, table: &str) -> rusqlite::Result<Vec<Co
     s.query_map([], |r| Ok(Col { name: r.get(0)?, ty: r.get(1)?, notnull: r.get(2)?, default: r.get(3)? }))?.collect()
 }
 
-/// Makes the store's copy of `k` match botd's own table: the same columns, `id` its primary
-/// key (without AUTOINCREMENT: message ids come from botd's sequence), and its indexes. No
-/// foreign key to `bots`, which is in another file: deleting a Bot deletes its rows here.
+/// Makes the store's copy of `k` match botd's own table: the same columns, its primary key
+/// (without AUTOINCREMENT: message ids come from botd's sequence), and its indexes. No
+/// foreign key to `bots` or `users`, which are in another file: deleting a Bot deletes its
+/// rows here, and each pass deletes those of people gone and of sessions gone.
 fn ensure_table(c: &Connection, schema: &str, k: &Kept, main: &[Col]) -> rusqlite::Result<()> {
     let def = |col: &Col, adding: bool| {
-        if col.name == "id" {
-            return format!("\"id\" {} PRIMARY KEY", col.ty);
+        if col.name == k.pk {
+            return format!("{} {} PRIMARY KEY", quote(&col.name), col.ty);
         }
         let default = col.default.as_ref().map(|d| format!(" DEFAULT {d}")).unwrap_or_default();
         // A column added to a table with rows can be NOT NULL only with a default.
@@ -300,6 +367,9 @@ fn ensure_table(c: &Connection, schema: &str, k: &Kept, main: &[Col]) -> rusqlit
     }
     for (index, cols) in k.indexes {
         c.execute_batch(&format!("CREATE INDEX IF NOT EXISTS {schema}.{index} ON {}({cols})", k.name))?;
+    }
+    for (index, cols) in k.unique {
+        c.execute_batch(&format!("CREATE UNIQUE INDEX IF NOT EXISTS {schema}.{index} ON {}({cols})", k.name))?;
     }
     Ok(())
 }
@@ -349,6 +419,19 @@ fn pinned_region_of(user: &str) -> String {
     )
 }
 
+/// Deletes the rows of kept tables in `schema` whose parent row isn't there (ADR 0283).
+/// How many.
+fn orphans_in(c: &Connection, schema: &str) -> rusqlite::Result<usize> {
+    let mut n = 0;
+    for k in KEPT.iter() {
+        if let Some((col, parent)) = k.parent {
+            let pk = kept(parent).map_or("id", |p| p.pk);
+            n += c.execute(&format!("DELETE FROM {schema}.{} WHERE {col} NOT IN (SELECT {pk} FROM {schema}.{parent})", k.name), [])?;
+        }
+    }
+    Ok(n)
+}
+
 /// An SQL condition on a kept table's columns, with its parameters.
 #[derive(Clone, Copy)]
 struct Filter<'a>(&'a str, &'a [&'a dyn ToSql]);
@@ -358,7 +441,7 @@ const ALL: Filter<'static> = Filter("1", &[]);
 /// How many rows of each kept table in `schema` (where they exist) match `bots` (tables kept
 /// by Bot) or `users` (kept by person).
 fn held_in(c: &Connection, schema: &str, bots: Filter, users: Filter) -> rusqlite::Result<Held> {
-    let mut n = [0; 5];
+    let mut n = [0; N];
     for (i, k) in KEPT.iter().enumerate() {
         let Filter(filter, p) = if k.key == Key::Bot { bots } else { users };
         if has_table(c, schema, k.name)? {
@@ -527,8 +610,8 @@ impl Db {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| {
-                        let t = k.name;
-                        let earlier: Vec<String> = places[..i].iter().map(|e| format!(" AND NOT EXISTS (SELECT 1 FROM {e}.{t} WHERE id = x.id)")).collect();
+                        let (t, pk) = (k.name, k.pk);
+                        let earlier: Vec<String> = places[..i].iter().map(|e| format!(" AND NOT EXISTS (SELECT 1 FROM {e}.{t} WHERE {pk} = x.{pk})")).collect();
                         format!("SELECT {cols}{rowid} FROM {s}.{t} AS x WHERE true{}", earlier.concat())
                     })
                     .collect();
@@ -595,6 +678,44 @@ impl Db {
         let schema = self.place_for(c, bot_id)?;
         let marks = vec!["?"; vals.len()].join(", ");
         c.execute(&format!("INSERT INTO {schema}.{table} ({}) VALUES ({marks})", cols.join(", ")), vals).map(|_| ())
+    }
+
+    /// The schema a new row of `user_id`'s sign-ins goes to (ADR 0283).
+    pub(super) fn place_for_user(&self, c: &Connection, user_id: &str) -> rusqlite::Result<&str> {
+        self.place_by(c, Key::User, user_id)
+    }
+
+    /// The schema holding row `id` of kept `table`, botd's own first. None: no place has it.
+    pub(super) fn place_holding(&self, c: &Connection, table: &str, id: &str) -> rusqlite::Result<Option<&str>> {
+        let pk = kept(table).map_or("id", |k| k.pk);
+        for s in schemas(self.chat_stores_set()) {
+            if c.query_row(&format!("SELECT 1 FROM {s}.{table} WHERE {pk} = ?1"), [id], |_| Ok(())).optional()?.is_some() {
+                return Ok(Some(s));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Runs `sql` (with `RETURNING`, naming kept tables as `on_places` does) on every place,
+    /// and reads the rows it returned with `f`, together.
+    pub(super) fn returning_on_places<T>(&self, c: &Connection, sql: &str, p: &[&dyn ToSql], f: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>) -> rusqlite::Result<Vec<T>> {
+        let mut out = Vec::new();
+        for s in schemas(self.chat_stores_set()) {
+            let q = KEPT.iter().fold(sql.to_string(), |q, k| q.replace(&token(k.name), &format!("{s}.{}", k.name)));
+            let mut st = c.prepare(&q)?;
+            out.extend(st.query_map(p, &f)?.collect::<rusqlite::Result<Vec<T>>>()?);
+        }
+        Ok(out)
+    }
+
+    /// Deletes the rows of a store whose parent row (a session) isn't in it any more, as
+    /// botd's own tables do by their foreign keys (ADR 0283). How many.
+    pub(super) fn drop_orphans(&self, c: &Connection) -> rusqlite::Result<usize> {
+        let mut n = 0;
+        for s in self.chat_stores_set() {
+            n += orphans_in(c, &s.schema)?;
+        }
+        Ok(n)
     }
 
     /// A new id for a row of `table` that no place uses: each place's primary key holds only
@@ -669,7 +790,7 @@ impl Db {
             let mut moves = Vec::new();
             let at = now();
             for &(from, to) in &pairs {
-                let copied = |k: &Kept| format!("{} AND id IN (SELECT id FROM {to}.{t})", here(k, to), t = k.name);
+                let copied = |k: &Kept| format!("{} AND {pk} IN (SELECT {pk} FROM {to}.{t})", here(k, to), t = k.name, pk = k.pk);
                 // Whose rows move, by key: the Bots' (`chat_moves_out`) and the people's (`facts_moves_out`).
                 let theirs = |key: Key| {
                     let col = key.column();
@@ -693,12 +814,26 @@ impl Db {
                         )?;
                     }
                 }
-                let mut n = [0; 5];
-                for (i, k) in KEPT.iter().enumerate() {
+                // Children first: botd's own tables would delete them with their session
+                // otherwise, uncounted.
+                let mut n = [0; N];
+                for (i, k) in KEPT.iter().enumerate().rev() {
                     n[i] = tx.execute(&format!("DELETE FROM {from}.{} WHERE {}", k.name, copied(k)), [])?;
                 }
                 let to = region_of(&set.stores, to).map(str::to_string);
-                moves.push(ChatMove { from: from_region, to, bots: bots as usize, messages: n[0], routines: n[1], approvals: n[2], memories: n[3], facts: n[4] });
+                moves.push(ChatMove {
+                    from: from_region,
+                    to,
+                    bots: bots as usize,
+                    messages: n[0],
+                    routines: n[1],
+                    approvals: n[2],
+                    memories: n[3],
+                    facts: n[4],
+                    sessions: n[5],
+                    saml_sessions: n[6],
+                    push_devices: n[PUSH_DEVICES],
+                });
             }
             for s in &set.stores {
                 for k in &KEPT {
@@ -708,6 +843,7 @@ impl Db {
                     };
                     tx.execute(&format!("DELETE FROM {}.{} WHERE {col} NOT IN (SELECT id FROM {owners})", s.schema, k.name), [])?;
                 }
+                orphans_in(&tx, &s.schema)?;
             }
             tx.commit()?;
             Ok(moves)
@@ -964,11 +1100,22 @@ impl Db {
     /// don't linger in its free pages. Refuses when an input opens with neither key and
     /// nothing says what to do about it.
     pub fn seal_store_approvals(&self, current: &Cipher, previous: Option<&Cipher>, forget: bool) -> Result<StoreApprovals, String> {
+        self.seal_in_stores("approvals", |c, table| sealed::approvals_in(c, table, current, previous, forget))
+    }
+
+    /// Brings the push tokens in the stores' devices (ADR 0283) under the master key, as
+    /// `seal_store_approvals` does approvals' inputs; with `forget`, a device whose token
+    /// neither key opens is deleted, so its phone registers again.
+    pub fn seal_store_push_tokens(&self, current: &Cipher, previous: Option<&Cipher>, forget: bool) -> Result<StoreApprovals, String> {
+        self.seal_in_stores("push_devices", |c, table| sealed::push_tokens_in(c, table, current, previous, forget))
+    }
+
+    fn seal_in_stores(&self, table: &str, seal: impl Fn(&Connection, &str) -> Result<StoreApprovals, String>) -> Result<StoreApprovals, String> {
         let c = self.c();
         let mut done = StoreApprovals::default();
         for s in self.chat_stores_set() {
-            let table = format!("{}.approvals", s.schema);
-            let r = zeroing(&c, || Ok(sealed::approvals_in(&c, &table, current, previous, forget)))
+            let table = format!("{}.{table}", s.schema);
+            let r = zeroing(&c, || Ok(seal(&c, &table)))
                 .map_err(|e| e.to_string())
                 .and_then(|r| r)
                 .map_err(|e| format!("{}'s chat store: {e}", s.region))?;
@@ -1064,7 +1211,7 @@ fn delete_in_copy(c: &Connection, op: &str, whose: &Whose) -> rusqlite::Result<H
     let (bots, users) = whose.lists();
     c.execute_batch("PRAGMA secure_delete = ON")?;
     let tx = c.unchecked_transaction()?;
-    let mut n = [0; 5];
+    let mut n = [0; N];
     for (i, k) in KEPT.iter().enumerate() {
         let list = if k.key == Key::Bot { &bots } else { &users };
         if has_table(&tx, "main", k.name)? {
@@ -1073,6 +1220,34 @@ fn delete_in_copy(c: &Connection, op: &str, whose: &Whose) -> rusqlite::Result<H
     }
     tx.commit()?;
     Ok(Held::of(n))
+}
+
+/// Puts the sign-ins (ADR 0283) of the people in `keep` from the store attached as `now`
+/// (None: it is missing or unreadable) into a copy of it opened on `c`, a backup about to be
+/// restored, in place of the copy's own: a session revoked after the backup was made would
+/// otherwise work again, and one made since would end. The caller has `secure_delete` on
+/// and VACUUMs. What of the copy's own was dropped, and what was taken from `now`.
+pub fn sign_ins_from(c: &Connection, now: Option<&str>, keep: &Whose) -> rusqlite::Result<(Held, Held)> {
+    let users = keep.lists().1;
+    let tx = c.unchecked_transaction()?;
+    let (mut dropped, mut taken) = ([0; N], [0; N]);
+    for (i, k) in KEPT.iter().enumerate().filter(|(_, k)| SIGN_INS.contains(&k.name)) {
+        let t = k.name;
+        if !has_table(&tx, "main", t)? {
+            continue;
+        }
+        dropped[i] = tx.execute(&format!("DELETE FROM main.{t}"), [])? as i64;
+        let Some(now) = now else { continue };
+        if !has_table(&tx, now, t)? {
+            continue;
+        }
+        let theirs: Vec<String> = columns(&tx, now, t)?.into_iter().map(|col| col.name).collect();
+        let cols: Vec<String> = columns(&tx, "main", t)?.into_iter().filter(|col| theirs.contains(&col.name)).map(|col| quote(&col.name)).collect();
+        let cols = cols.join(", ");
+        taken[i] = tx.execute(&format!("INSERT INTO main.{t} ({cols}) SELECT {cols} FROM {now}.{t} WHERE user_id IN (SELECT value FROM json_each(?1))"), [&users])? as i64;
+    }
+    tx.commit()?;
+    Ok((Held::of(dropped), Held::of(taken)))
 }
 
 /// Brings a copy of a store opened on `c` (a backup from an older botd, perhaps without
@@ -1104,11 +1279,11 @@ pub fn kept_in_region(c: &Connection, region: &str) -> rusqlite::Result<Whose> {
 /// (it would come back), and what that store holds that the copy doesn't (it would go),
 /// by id. Either may be from before botd kept a table.
 pub fn compare_copy(c: &Connection, schema: &str) -> rusqlite::Result<(Held, Held)> {
-    let (mut back, mut gone) = ([0; 5], [0; 5]);
+    let (mut back, mut gone) = ([0; N], [0; N]);
     for (i, k) in KEPT.iter().enumerate() {
-        let t = k.name;
+        let (t, pk) = (k.name, k.pk);
         let count = |from: &str, other: Option<&str>| {
-            let not_in = other.map(|o| format!(" WHERE id NOT IN (SELECT id FROM {o}.{t})")).unwrap_or_default();
+            let not_in = other.map(|o| format!(" WHERE {pk} NOT IN (SELECT {pk} FROM {o}.{t})")).unwrap_or_default();
             c.query_row(&format!("SELECT COUNT(*) FROM {from}.{t}{not_in}"), [], |r| r.get(0))
         };
         match (has_table(c, "main", t)?, has_table(c, schema, t)?) {
@@ -1209,7 +1384,7 @@ mod tests {
     }
 
     fn mv(from: Option<&str>, to: Option<&str>, bots: usize, n: [usize; 3]) -> ChatMove {
-        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2], memories: 0, facts: 0 }
+        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2], memories: 0, facts: 0, sessions: 0, saml_sessions: 0, push_devices: 0 }
     }
 
     fn rows_in(path: &Path) -> i64 {
@@ -1566,7 +1741,7 @@ mod tests {
         assert_eq!(db.routine(&before.id).unwrap().instruction, "made before the pin");
         assert_eq!(db.approval(&asked).unwrap().input["command"], "ls before", "sealed by its id, so it opens wherever it is kept");
         let held = db.chat_counts(std::slice::from_ref(&ada));
-        assert_eq!(held, vec![ChatCount { region: Some("gb-lon".into()), held: Held { messages: 0, routines: 2, approvals: 2, memories: 0, facts: 0 } }]);
+        assert_eq!(held, vec![ChatCount { region: Some("gb-lon".into()), held: Held { messages: 0, routines: 2, approvals: 2, ..Default::default() } }]);
         db.unpin_residency(PinOn::User, &ada).unwrap();
         assert_eq!(db.place_chats().unwrap(), vec![mv(Some("gb-lon"), None, 1, [0, 2, 2])]);
         assert_eq!((count(&db, "chats_0", "routines"), count(&db, "chats_0", "approvals")), (0, 0));
@@ -1900,15 +2075,16 @@ mod tests {
         }
         let bot = bot_of(&db, &ada);
         db.set_memory(&bot, "memory").unwrap();
+        signed_in(&db, &ada, "ua-1");
         let copy = d.dir.path().join("copy.sqlite");
         db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
         std::fs::copy(d.lon.join("chats.sqlite"), &copy).unwrap();
         let c = Connection::open(&copy).unwrap();
         let only_cy = Whose { bots: Vec::new(), users: vec![cy.clone()] };
         assert_eq!(held_in_copy(&c, &only_cy).unwrap(), Held { facts: 1, ..Held::default() });
-        assert_eq!(held_apart_from(&db.c(), "chats_0", &only_cy).unwrap(), Held { memories: 1, facts: 1, ..Held::default() });
+        assert_eq!(held_apart_from(&db.c(), "chats_0", &only_cy).unwrap(), Held { memories: 1, facts: 1, sessions: 1, ..Held::default() });
         assert_eq!(keep_only_in_copy(&c, &Whose { bots: vec![bot.clone()], users: vec![ada.clone()] }).unwrap(), Held { facts: 1, ..Held::default() });
-        assert_eq!(drop_from_copy(&c, &Whose { bots: vec![bot], users: vec![ada.clone()] }).unwrap(), Held { memories: 1, facts: 1, ..Held::default() });
+        assert_eq!(drop_from_copy(&c, &Whose { bots: vec![bot], users: vec![ada.clone()] }).unwrap(), Held { memories: 1, facts: 1, sessions: 1, ..Held::default() });
         assert_eq!(held_in_copy(&c, &Whose { bots: Vec::new(), users: vec![ada, cy] }).unwrap(), Held::default());
     }
 
@@ -1980,5 +2156,184 @@ mod tests {
         assert_eq!(db.seal_store_approvals(&current, None, false).unwrap(), StoreApprovals { sealed: 1, ..Default::default() });
         let raw: String = db.c().query_row("SELECT input FROM chats_0.approvals WHERE id = ?1", [&fresh], |r| r.get(0)).unwrap();
         assert!(sealed::is_sealed(&raw) && db.approval(&fresh).unwrap().input["command"] == "ls");
+    }
+
+    const LONG: i64 = 30 * 86_400_000;
+
+    fn signed_in(db: &Db, user: &str, ua: &str) -> String {
+        let s = crate::db::NewSession {
+            user_id: user,
+            token_hash: ua,
+            kind: "cookie",
+            method: "password",
+            idp_subject: None,
+            idp_provider: None,
+            label: None,
+            ip: Some("192.0.2.58"),
+            user_agent: Some(ua),
+            expires_at: now() + LONG,
+            mfa: None,
+        };
+        db.create_session(&s).id
+    }
+
+    fn saml(index: &str) -> crate::db::SamlLogin {
+        crate::db::SamlLogin { name_id: "ada@idp".into(), format: None, name_qualifier: None, sp_name_qualifier: None, session_index: Some(index.into()) }
+    }
+
+    fn sign_ins_move(from: Option<&str>, to: Option<&str>, n: [usize; 3]) -> ChatMove {
+        ChatMove { sessions: n[0], saml_sessions: n[1], push_devices: n[2], ..mv(from, to, 0, [0, 0, 0]) }
+    }
+
+    fn sign_ins(db: &Db, schema: &str) -> [i64; 3] {
+        SIGN_INS.map(|t| count(db, schema, t))
+    }
+
+    #[test]
+    fn a_pinned_persons_sessions_saml_sign_ins_and_push_devices_are_kept_in_their_store_and_move_with_the_pin() {
+        use crate::db::PushPut;
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let ua = "ua-58d1-adas-phone";
+        let s1 = signed_in(&db, &ada, ua);
+        db.add_saml_session(&s1, &saml("idx-1"));
+        db.put_push_device(&ada, &s1, "fcm", "push-58e2-adas-token", "android", true, true);
+        assert_eq!(sign_ins(&db, "main"), [1, 1, 1]);
+
+        // Pinned, they move to the store together; the session still signs Ada in.
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![sign_ins_move(None, Some("gb-lon"), [1, 1, 1])]);
+        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([0, 0, 0], [1, 1, 1]));
+        let (s, u) = db.live_session(ua, now(), LONG, LONG).unwrap();
+        assert_eq!((s.id.as_str(), u.id.as_str(), s.ip.as_deref()), (s1.as_str(), ada.as_str(), Some("192.0.2.58")));
+        assert_eq!(db.session_push_device(&s1).unwrap().token, "push-58e2-adas-token");
+        assert_eq!(db.saml_session(&s1).unwrap().session_index.as_deref(), Some("idx-1"));
+        let app = d.dir.path().join("app.sqlite");
+        let holds = |path: &Path, w: &str| std::fs::read(path).is_ok_and(|b| b.windows(w.len()).any(|x| x == w.as_bytes()));
+        assert!(!holds(&app, ua) && !holds(&d.dir.path().join("app.sqlite-wal"), ua), "no copy left in botd's own database");
+
+        // Made, touched and revoked where they are kept; someone unpinned stays in botd's own.
+        let s2 = signed_in(&db, &ada, "ua-58f3-adas-laptop");
+        db.add_saml_session(&s2, &saml("idx-2"));
+        let (_, put) = db.put_push_device(&ada, &s2, "fcm", "push-58e2-adas-token", "android", true, false);
+        assert_eq!(put, PushPut::Moved, "the token moves from the first session to the second");
+        assert_eq!(sign_ins(&db, "chats_0"), [2, 2, 1]);
+        let later = now() + 120_000;
+        db.touch_session(&s2, later);
+        assert_eq!(db.session(&s2).unwrap().last_seen_at, later);
+        let cys = signed_in(&db, &cy, "ua-58a4-cys");
+        assert_eq!(sign_ins(&db, "main"), [1, 0, 0]);
+        assert!(db.revoke_session(&s1, &ada, "signed_out"));
+        assert!(db.session(&s1).unwrap().revoked_at.is_some() && db.live_session(ua, now(), LONG, LONG).is_none());
+        assert!(!db.revoke_session(&s1, &ada, "signed_out"), "already revoked");
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), held: Held { sessions: 2, saml_sessions: 2, push_devices: 1, ..Held::default() } }]);
+
+        // Unpinned, they come back, and the move is recorded for the store's earlier backups.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![sign_ins_move(Some("gb-lon"), None, [2, 2, 1])]);
+        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([3, 2, 1], [0, 0, 0]));
+        let lon = db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
+        assert_eq!(db.moves_out_to_clear(&lon).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert!(!holds(&d.lon.join("chats.sqlite"), ua));
+        let revoked = db.revoke_user_sessions(&ada, "ops", "offboarded");
+        assert_eq!(revoked.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), [s2.as_str()]);
+        assert!(db.session(&cys).unwrap().revoked_at.is_none());
+    }
+
+    #[test]
+    fn sessions_in_a_store_are_pruned_and_erased_with_their_saml_sign_ins_and_push_devices() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let s1 = signed_in(&db, &ada, "ua-1");
+        db.add_saml_session(&s1, &saml("idx-1"));
+        db.put_push_device(&ada, &s1, "fcm", "push-1", "ios", true, true);
+        assert_eq!(sign_ins(&db, "chats_0"), [1, 1, 1]);
+        assert!(db.revoke_session(&s1, &ada, "signed_out"));
+        assert_eq!(sign_ins(&db, "chats_0"), [1, 1, 0], "its push device goes with it");
+        // A store has no foreign keys, so pruning sweeps what a deleted session leaves.
+        assert_eq!(db.prune_sessions(now() + 1, LONG, LONG), 1);
+        assert_eq!(sign_ins(&db, "chats_0"), [0, 0, 0]);
+
+        let s2 = signed_in(&db, &ada, "ua-2");
+        db.add_saml_session(&s2, &saml("idx-2"));
+        db.put_push_device(&ada, &s2, "fcm", "push-2", "ios", true, true);
+        let copy = d.dir.path().join("copy.sqlite");
+        db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        std::fs::copy(d.lon.join("chats.sqlite"), &copy).unwrap();
+        let c = Connection::open(&copy).unwrap();
+        let erased = crate::db::erase_in_copy(&c, &ada, "erased-01", &[]).unwrap();
+        assert_eq!((erased.sessions, erased.saml_sessions, erased.push_devices), (1, 1, 1));
+        let out = db.erase_user(&ada, "erased-01", None, &[]).unwrap();
+        assert_eq!(out.sessions, 1);
+        assert_eq!(sign_ins(&db, "chats_0"), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_move_cut_off_after_its_copy_leaves_sessions_that_still_revoke_once() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let s = signed_in(&db, &ada, "ua-1");
+        db.put_push_device(&ada, &s, "fcm", "push-1", "ios", true, true);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([1, 0, 1], [1, 0, 1]), "in both places");
+        assert_eq!(db.revoke_user_sessions(&ada, "ops", "offboarded").len(), 1, "told to the IdP once");
+        assert_eq!(db.place_chats().unwrap(), vec![sign_ins_move(None, Some("gb-lon"), [1, 0, 0])]);
+        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([0, 0, 0], [1, 0, 0]));
+        assert!(db.session(&s).unwrap().revoked_at.is_some());
+    }
+
+    #[test]
+    fn startup_seals_a_stores_push_tokens_under_the_current_master_key() {
+        use crate::secrets::key::MasterKey;
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let s = signed_in(&db, &ada, "ua-1");
+        let (dev, _) = db.put_push_device(&ada, &s, "fcm", "push-under-the-old-key", "ios", true, true);
+        let (current, previous) = (sealed::cipher(), Cipher::new(&MasterKey::generate()));
+        let stale = previous.seal(crate::db::PUSH_TOKEN_CONTEXT, b"push-under-the-old-key");
+        db.c().execute("UPDATE chats_0.push_devices SET token = ?1 WHERE id = ?2", params![stale, dev.id]).unwrap();
+        assert!(db.session_push_device(&s).is_none(), "a token the key doesn't open isn't sent to");
+        let e = db.seal_store_push_tokens(&current, None, false).unwrap_err();
+        assert!(e.contains("gb-lon's chat store") && e.contains("SUPERBOT_FORGET_SEALED=1"), "{e}");
+        assert_eq!(db.seal_store_push_tokens(&current, Some(&previous), false).unwrap(), StoreApprovals { resealed: 1, ..Default::default() });
+        assert_eq!(db.session_push_device(&s).unwrap().token, "push-under-the-old-key");
+        assert_eq!(db.seal_store_push_tokens(&current, Some(&previous), false).unwrap(), StoreApprovals::default());
+        let lost = Cipher::new(&MasterKey::generate()).seal(crate::db::PUSH_TOKEN_CONTEXT, b"x");
+        db.c().execute("UPDATE chats_0.push_devices SET token = ?1 WHERE id = ?2", params![lost, dev.id]).unwrap();
+        assert_eq!(db.seal_store_push_tokens(&current, Some(&previous), false).unwrap(), StoreApprovals { unreadable: 1, ..Default::default() });
+        assert_eq!(db.seal_store_push_tokens(&current, None, true).unwrap(), StoreApprovals { discarded: 1, ..Default::default() });
+        assert_eq!(count(&db, "chats_0", "push_devices"), 0, "the phone registers again");
+        let (dev, _) = db.put_push_device(&ada, &s, "fcm", "push-2", "ios", true, true);
+        db.c().execute("UPDATE chats_0.push_devices SET token = 'push-plain' WHERE id = ?1", [&dev.id]).unwrap();
+        assert_eq!(db.seal_store_push_tokens(&current, None, false).unwrap(), StoreApprovals { sealed: 1, ..Default::default() });
+        let raw: String = db.c().query_row("SELECT token FROM chats_0.push_devices WHERE id = ?1", [&dev.id], |r| r.get(0)).unwrap();
+        assert!(sealed::is_sealed(&raw) && db.session_push_device(&s).unwrap().token == "push-plain");
+    }
+
+    #[test]
+    fn a_store_gains_unique_indexes_for_sessions_and_push_devices() {
+        let d = Dirs::new();
+        let db = d.up();
+        let unique: Vec<String> = {
+            let c = db.c();
+            let mut s = c.prepare("SELECT name FROM chats_0.sqlite_master WHERE type = 'index' AND sql LIKE 'CREATE UNIQUE%' ORDER BY name").unwrap();
+            s.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(unique, ["push_devices_session", "push_devices_token", "sessions_token"]);
+    }
+
+    #[test]
+    fn describing_what_a_place_holds_names_sign_ins() {
+        assert_eq!(Held { sessions: 2, saml_sessions: 1, push_devices: 1, ..Held::default() }.describe(), "2 sign-in sessions, 1 SAML sign-in and 1 push device");
+        assert_eq!(Held { messages: 1, sessions: 1, ..Held::default() }.sign_ins(), Held { sessions: 1, ..Held::default() });
+        assert_eq!(Held { messages: 1, sessions: 1, ..Held::default() }.of_bots(), Held { messages: 1, ..Held::default() });
     }
 }
