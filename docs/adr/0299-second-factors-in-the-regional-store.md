@@ -43,7 +43,9 @@ Recovery codes are keyed hashes under a key derived from the master key. When a 
 
 A backup holds second factors as they were when it was made. Restored as they were, one turned off or reset since would come back, and a recovery code spent since would work again. So a restore puts the store's second factors and codes now, for the people kept in it, in place of the backup's.
 
-With the store missing or unreadable, the backup's are kept, as own secrets are: dropping them would let anyone with a person's password sign in as them without the second step, and would turn off a factor their admin may require. Kept ones neither master key opens would stop botd at start, so the restore refuses them unless `SUPERBOT_FORGET_SEALED=1` says botd drops them and their owners set them up again. The restore says which it did.
+With the store missing or unreadable, the backup's are kept, as own secrets are: dropping them would let anyone with a person's password sign in as them without the second step, and would turn off a factor their admin may require.
+
+Kept alone, that still loses a second factor set up after the backup, or every one in a backup from before this ADR (which has none): the store was its only copy. The person would then sign in with their password alone. botd's own database has no other record of who has one (the audit log can be archived, and not every way a factor ends is audited). So with the store missing or unreadable, the restore is refused while anyone kept in it has no second factor in the backup, unless the operator adds `--second-factors-from-backup`, which says so in the result and asks them to have those people check theirs. A restore over a store that opens needs no flag: it takes the store's. Kept ones neither master key opens would stop botd at start, so the restore refuses them unless `SUPERBOT_FORGET_SEALED=1` says botd drops them and their owners set them up again. The restore says which it did.
 
 Erasure deletes them in every place and, when a backup is restored, in the backup too.
 
@@ -68,7 +70,7 @@ Erasure deletes them in every place and, when a backup is restored, in the backu
 ## Tests
 
 - `db::chats`: a pinned person's second factor and recovery codes move to the store and back with the pin; enrolment, confirmation, spent codes, new codes and turning it off reach the store, and someone unpinned stays in botd's own; a move cut off after its copy keeps changes made meanwhile and a spent code stays spent; second factors in a store are sealed at startup, resealed in a rotation (dropping codes when derived keys are renewed) and dropped with `SUPERBOT_FORGET_SEALED=1`; an erasure deletes them in the store and in a copy of it; a place's summary names them.
-- `machines::chat_store_restore`: a restore takes second factors from the store it replaces, so one turned off since stays off and a code spent since stays spent; with the store gone, the backup's are kept; kept ones under a lost key are refused unless botd drops them.
+- `machines::chat_store_restore`: a restore takes second factors from the store it replaces, so one turned off since stays off and a code spent since stays spent; with the store gone, the backup's are kept, and the restore is refused while someone kept in it has none in the backup (or the backup is from before this) unless `--second-factors-from-backup` is added; kept ones under a lost key are refused unless botd drops them.
 - `main`: the rotation lines count second factors in stores.
 - HTTP (`machines_residency_tests.rs`): a pin moves an enrolled second factor and its codes into London's store, audited; sign-in still asks for it and takes a code; new recovery codes are written there; the report and `GET /api/me/residency` say so; one left outside makes the pin unkept until reconcile; unpinned, it comes back.
 - Client (`residency.test.ts`): Settings names the second factor with the rest, and not on a server from before this.

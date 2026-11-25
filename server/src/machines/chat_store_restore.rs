@@ -36,7 +36,7 @@ const ACTOR: &str = "residency";
 const DOC: &str = "docs/support/runbook-residency.md#restoring-a-regional-chat-store";
 
 const USAGE: &str = "Usage: botd chat-store list <region> [--home <dir> | --env-file <file>]
-       botd chat-store restore <region> <backup | newest> [--identity <file>] [--replace-unreadable] [--yes]
+       botd chat-store restore <region> <backup | newest> [--identity <file>] [--replace-unreadable] [--second-factors-from-backup] [--yes]
                                [--home <dir> | --env-file <file>]
 
 Run on the server with botd stopped, as the user botd runs as (the owner of DATA_DIR and
@@ -46,6 +46,8 @@ the region's folder): sudo -u superbot botd chat-store ...
                         newest: the folder's newest backup, else the bucket's newest copy
   --identity <file>     the age identity that opens the bucket's encrypted copies
   --replace-unreadable  delete a store that doesn't open, rather than refuse
+  --second-factors-from-backup  with the store missing or not opening, take people's second
+                        factors from the backup though one set up since is lost, rather than refuse
   --yes                 restore; without it, say what a restore would do and change nothing
   --home <dir>          the installer's layout: settings from <dir>/superbot/.env
   --env-file <file>     settings from this file, over botd's environment
@@ -534,6 +536,9 @@ pub struct Plan {
     /// People's second factors kept from it (the store now missing, ADR 0299) that neither
     /// master key opens, which botd drops at start.
     unopened_factors: usize,
+    /// People kept in it with no second factor in the backup, counted only when the store
+    /// now is missing or doesn't open: one they set up since is lost (ADR 0299).
+    without_factor: usize,
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
@@ -661,6 +666,9 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
         ));
     }
     plan.unopened_factors = unopened_factors(&c, &place.ciphers).map_err(err)?;
+    if !matches!(current, Current::Readable(_)) {
+        plan.without_factor = without_factor(&c, &kept.users).map_err(err)?;
+    }
     if plan.unopened_factors > 0 && !place.forget_sealed {
         return Err(format!(
             "{} people's second factors in that backup don't open with the master key or the previous one, so botd wouldn't start with it. \
@@ -746,6 +754,23 @@ fn unopened_factors(c: &Connection, ciphers: &[Arc<Cipher>]) -> rusqlite::Result
     Ok(n)
 }
 
+/// How many of `users` (the people kept in the store) have no confirmed second factor in
+/// the copy on `c`, whose tables `upgrade_copy` has made.
+fn without_factor(c: &Connection, users: &[String]) -> rusqlite::Result<usize> {
+    let mut s = c.prepare("SELECT EXISTS (SELECT 1 FROM main.user_mfa WHERE user_id = ?1 AND confirmed_at IS NOT NULL)")?;
+    let mut n = 0;
+    for u in users {
+        if !s.query_row([u], |r| r.get::<_, bool>(0))? {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+fn people_without(n: usize) -> String {
+    if n == 1 { "1 person kept in it has".to_string() } else { format!("{n} people kept in it have") }
+}
+
 /// Keeps the store now as a backup made at `at` in its folder's `backups/`, as one file,
 /// so it is cleared and copied off the host like any other: a second link to it, so the
 /// store stays in place until the restored one replaces it in one rename. Its name.
@@ -798,6 +823,9 @@ pub struct Options<'a> {
     pub backup: &'a str,
     pub identities: Vec<age::x25519::Identity>,
     pub replace_unreadable: bool,
+    /// With the store missing or not opening, restore even though people kept in it have
+    /// no second factor in the backup (ADR 0299).
+    pub second_factors_from_backup: bool,
     pub yes: bool,
 }
 
@@ -826,6 +854,13 @@ pub async fn restore(place: &Place, o: &Options<'_>, at: i64) -> Result<Restore,
     let work = fetch(place, &chosen, &o.identities).await?;
     let r = (|| {
         let plan = prepare(place, &work, chosen.at, &now)?;
+        if plan.without_factor > 0 && !o.second_factors_from_backup {
+            return Err(format!(
+                "the store now is missing or doesn't open, so nothing says who set up a second factor since the backup, and {} none in the backup: \
+                 restored, anyone who set one up since would sign in without it. Restore a newer backup, or add --second-factors-from-backup and ask them to check theirs in Settings (ADR 0299)",
+                people_without(plan.without_factor)
+            ));
+        }
         if !o.yes {
             std::fs::remove_file(&work).map_err(io(&work))?;
             return Ok(Restore { chosen: chosen.clone(), plan, kept: None, done: false });
@@ -972,6 +1007,12 @@ impl Restore {
                 p.unopened_secrets
             ));
         }
+        if p.without_factor > 0 {
+            out.push_str(&format!(
+                "  {} no second factor in it, and with the store now gone nothing says who set one up since; ask them to check theirs in Settings (--second-factors-from-backup).\n",
+                people_without(p.without_factor)
+            ));
+        }
         if p.unopened_factors > 0 {
             out.push_str(&format!(
                 "  {} people's second factors in it don't open with the master key; botd drops them at start with their recovery codes, and their owners set them up again (SUPERBOT_FORGET_SEALED=1).\n",
@@ -1013,6 +1054,7 @@ struct Args<'a> {
     backup: &'a str,
     identity: Option<&'a str>,
     replace_unreadable: bool,
+    second_factors_from_backup: bool,
     yes: bool,
     home: Option<&'a str>,
     env_file: Option<&'a str>,
@@ -1027,6 +1069,7 @@ fn parse<'a>(args: &[&'a str]) -> Result<Args<'a>, String> {
         match arg {
             "--identity" => a.identity = Some(value()?),
             "--replace-unreadable" => a.replace_unreadable = true,
+            "--second-factors-from-backup" => a.second_factors_from_backup = true,
             "--yes" => a.yes = true,
             "--home" => a.home = Some(value()?),
             "--env-file" => a.env_file = Some(value()?),
@@ -1039,7 +1082,7 @@ fn parse<'a>(args: &[&'a str]) -> Result<Args<'a>, String> {
         ["restore", region, backup] => (a.cmd, a.region, a.backup) = ("restore", region, backup),
         _ => return Err(USAGE.to_string()),
     }
-    if a.cmd == "list" && (a.identity.is_some() || a.replace_unreadable || a.yes) {
+    if a.cmd == "list" && (a.identity.is_some() || a.replace_unreadable || a.second_factors_from_backup || a.yes) {
         return Err(format!("list takes only --home or --env-file\n{USAGE}"));
     }
     if a.home.is_some() && a.env_file.is_some() {
@@ -1081,7 +1124,7 @@ async fn run(a: &Args<'_>) -> Result<String, String> {
         Some(f) => super::backup::identities(&std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?)?,
         None => Vec::new(),
     };
-    let o = Options { backup: a.backup, identities, replace_unreadable: a.replace_unreadable, yes: a.yes };
+    let o = Options { backup: a.backup, identities, replace_unreadable: a.replace_unreadable, second_factors_from_backup: a.second_factors_from_backup, yes: a.yes };
     restore(&place, &o, crate::db::now()).await.map(|r| r.text(&place.region))
 }
 
@@ -1163,6 +1206,11 @@ mod tests {
 
     fn opts(backup: &str, yes: bool) -> Options<'_> {
         Options { backup, yes, ..Options::default() }
+    }
+
+    /// `opts`, for a store that is gone, whose people have no second factor to keep.
+    fn opts_gone(backup: &str, yes: bool) -> Options<'_> {
+        Options { second_factors_from_backup: true, ..opts(backup, yes) }
     }
 
     fn notes(dir: &Path) -> Vec<PathBuf> {
@@ -1394,7 +1442,7 @@ mod tests {
         assert!(e.contains("doesn't open this copy"), "{e}");
         assert!(!w.store().exists() && work_files(&w.lon).is_empty(), "nothing changed, nothing left");
 
-        let right = Options { identities: vec![id], ..opts("newest", true) };
+        let right = Options { identities: vec![id], second_factors_from_backup: true, ..opts("newest", true) };
         let r = restore(&place, &right, now()).await.unwrap();
         assert!(matches!(r.chosen.source, Source::Bucket(_)) && r.kept.is_none(), "{r:?}");
         let text = r.text("gb-lon");
@@ -1435,7 +1483,7 @@ mod tests {
         std::fs::write(w.store(), vec![7u8; 8192]).unwrap();
         let e = restore(&place, &opts("newest", true), now()).await.unwrap_err();
         assert!(e.contains("--replace-unreadable"), "{e}");
-        let o = Options { replace_unreadable: true, ..opts("newest", true) };
+        let o = Options { replace_unreadable: true, second_factors_from_backup: true, ..opts("newest", true) };
         let r = restore(&place, &o, now()).await.unwrap();
         assert!(r.plan.unreadable.is_some() && r.kept.is_none() && r.text("gb-lon").contains("was deleted, not kept"), "{r:?}");
         assert_eq!(texts(&w.store()), ["chat-10j"]);
@@ -1574,7 +1622,7 @@ mod tests {
         for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
             let _ = std::fs::remove_file(w.lon.join(f));
         }
-        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        let r = restore(&w.place(), &opts_gone("newest", true), now()).await.unwrap();
         assert_eq!((r.plan.sign_ins_replaced.sessions, r.plan.signed_in.total()), (2, 0), "{r:?}");
         assert!(r.text("gb-lon").contains("Its sign-ins (2 sign-in sessions) are dropped, so their people sign in again"), "{}", r.text("gb-lon"));
         let db = Db::open(&w.app).unwrap();
@@ -1622,7 +1670,7 @@ mod tests {
         for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
             let _ = std::fs::remove_file(w.lon.join(f));
         }
-        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        let r = restore(&w.place(), &opts_gone("newest", true), now()).await.unwrap();
         assert_eq!((r.plan.held.user_secrets, r.plan.sign_ins_replaced.user_secrets, r.plan.signed_in.user_secrets), (1, 0, 0), "{r:?}");
         assert!(!r.text("gb-lon").contains("own secrets"), "{}", r.text("gb-lon"));
         let db = Db::open(&w.app).unwrap();
@@ -1651,7 +1699,7 @@ mod tests {
         assert!(!w.store().exists() && work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
 
         let place = Place { forget_sealed: true, ..w.place() };
-        let r = restore(&place, &opts("newest", true), now()).await.unwrap();
+        let r = restore(&place, &opts_gone("newest", true), now()).await.unwrap();
         assert_eq!(r.plan.unopened_secrets, 1);
         assert!(r.text("gb-lon").contains("1 people's own secrets in it don't open with the master key; botd drops them at start"), "{}", r.text("gb-lon"));
     }
@@ -1698,16 +1746,40 @@ mod tests {
         backup_pass(&db, 8, now());
         drop(db);
 
-        // With the store gone, the backup's are the only copy left, so they are kept.
+        // With the store gone, the backup's are the only copy left, so they are kept. But
+        // nothing says whether bob, with none in it, set one up since, so that needs saying.
         for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
             let _ = std::fs::remove_file(w.lon.join(f));
         }
-        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
-        assert_eq!((r.plan.held.second_factors, r.plan.sign_ins_replaced.second_factors, r.plan.signed_in.second_factors), (1, 0, 0), "{r:?}");
-        assert!(!r.text("gb-lon").contains("second factors"), "{}", r.text("gb-lon"));
+        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("1 person kept in it has none in the backup") && e.contains("--second-factors-from-backup"), "{e}");
+        assert!(!w.store().exists() && work_files(&w.lon).is_empty(), "nothing changed");
+        let r = restore(&w.place(), &opts_gone("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.second_factors, r.plan.sign_ins_replaced.second_factors, r.plan.signed_in.second_factors, r.plan.without_factor), (1, 0, 0, 1), "{r:?}");
+        let text = r.text("gb-lon");
+        assert!(!text.contains("Its people's second factors") && text.contains("1 person kept in it has no second factor in it"), "{text}");
         let db = Db::open(&w.app).unwrap();
         db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
         assert!(db.mfa(&ada).is_some() && db.mfa_recovery_left(&ada) == 1);
+    }
+
+    #[tokio::test]
+    async fn a_backup_from_before_second_factors_were_kept_is_refused_with_the_store_gone() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        backup_pass(&db, 7, now() - DAY);
+        assert!(db.mfa_enable(&ada, &factor(&ada, "totp"), 1, &hashes(&["a1"])));
+        drop(db);
+        let (_, backup) = chat_stores::backups_strictly(&w.place().store).unwrap().pop().unwrap();
+        Connection::open(&backup).unwrap().execute_batch("DROP TABLE mfa_recovery_codes; DROP TABLE user_mfa;").unwrap();
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+
+        // Her second factor was only in the store; restored as it is, she'd sign in without one.
+        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("1 person kept in it has none in the backup"), "{e}");
+        assert!(!w.store().exists());
     }
 
     #[tokio::test]
@@ -1749,8 +1821,9 @@ mod tests {
         let p = parse;
         assert_eq!(p(&["list", "gb-lon"]).unwrap(), Args { cmd: "list", region: "gb-lon", ..Args::default() });
         let a = p(&["restore", "gb-lon", "newest", "--identity", "/k", "--yes", "--home", "/h"]).unwrap();
-        assert_eq!((a.backup, a.identity, a.yes, a.home, a.replace_unreadable), ("newest", Some("/k"), true, Some("/h"), false));
-        for bad in [&["restore", "gb-lon"][..], &["list"], &["list", "gb-lon", "--yes"], &["restore", "a", "b", "--home", "x", "--env-file", "y"], &["restore", "a", "b", "--force"], &["restore", "a", "b", "--identity"]] {
+        assert_eq!((a.backup, a.identity, a.yes, a.home, a.replace_unreadable, a.second_factors_from_backup), ("newest", Some("/k"), true, Some("/h"), false, false));
+        assert!(p(&["restore", "gb-lon", "newest", "--second-factors-from-backup"]).unwrap().second_factors_from_backup);
+        for bad in [&["restore", "gb-lon"][..], &["list"], &["list", "gb-lon", "--yes"], &["list", "gb-lon", "--second-factors-from-backup"], &["restore", "a", "b", "--home", "x", "--env-file", "y"], &["restore", "a", "b", "--force"], &["restore", "a", "b", "--identity"]] {
             assert!(p(bad).is_err(), "{bad:?}");
         }
         assert!(p(&[]).unwrap_err().starts_with("Usage: botd chat-store"));
