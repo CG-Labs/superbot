@@ -35,7 +35,9 @@ Low vendors are added to the inventory with no assessment.
 
 ## Yearly review
 
-Every Critical and High vendor is reviewed yearly: the newest assurance report, read for exceptions and for the **complementary user entity controls** it expects of its customers, with a note of how the provider meets each; any incidents; whether the data it gets has changed. The hosting providers' reports also cover physical and environmental security, which the service inherits from them (checklist CC6.4-1). Findings go in the register.
+Every Critical and High vendor is reviewed yearly: the newest assurance report, read for exceptions and for the **complementary user entity controls** it expects of its customers, with a note of how the provider meets each; any incidents; whether the data it gets has changed. The hosting providers' reports also cover physical and environmental security, which the service inherits from them (checklist CC6.4-1), so a hosting provider's must be a SOC 2 Type II report or an ISO 27001 certificate, not a questionnaire. Findings go in the register: a SOC 2 report with deviations in its tests, or an opinion other than unqualified, is treated as a risk.
+
+A report must still speak for the vendor: if a SOC 2 report's period ended more than 92 days ago, the security owner asks the vendor for a bridge letter covering the time since, or for its next report; an ISO 27001 certificate must not have expired. Each report review is recorded in the [policy register](../policy-register.md#vendors-assurance-reports), with the report, the note of complementary controls and any bridge letter kept in the evidence store.
 
 ## Telling customers
 

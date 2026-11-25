@@ -1019,7 +1019,6 @@ mod tests {
     /// format 5 without it still checks, one of format 6 must have it, and its exceptions count.
     #[test]
     fn register_bundles_have_production_changes_json_from_format_6() {
-        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 6);
         let old = register_bundle_with(5, "production-changes.json", None);
         assert!(old.verified(), "made before production-changes.json: {:?}", old.problems);
         let missing = register_bundle_with(6, "production-changes.json", None);
@@ -1030,6 +1029,20 @@ mod tests {
         assert!(f.verified(), "{:?}", f.problems);
         assert_eq!((f.exceptions["production-changes.json"]["notApproved"], f.exceptions["production-changes.json"]["reviewOverdue"]), (1, 2));
         assert!(f.files.iter().any(|(n, _, r)| n == "production-changes.json" && r == &["CC8.1-2".to_string()]));
+    }
+
+    /// Format 7 put vendors' assurance reports in `vendors.json` (ADR 0279) and added no
+    /// file, so a format-6 bundle still has every file it needs, and its vendor
+    /// exceptions count.
+    #[test]
+    fn register_bundles_of_format_7_add_no_file() {
+        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 7);
+        let body = json_file(&json!({ "exceptions": { "reportStale": ["linode: AR-1 (soc2-type2) covers to 2026-09-30"], "noAssuranceReport": [] } }));
+        for n in [6, 7] {
+            let f = register_bundle_with(n, "vendors.json", Some((&body, &["CC9.2"], &["CC9.2-1"])));
+            assert!(f.verified(), "format {n}: {:?}", f.problems);
+            assert_eq!(f.exceptions["vendors.json"]["reportStale"], 1);
+        }
     }
 
     #[test]
