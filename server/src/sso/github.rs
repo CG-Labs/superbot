@@ -80,7 +80,7 @@ impl GitHub<'_> {
             return Err(Invalid("wrong_org"));
         }
         let name = user["name"].as_str().map(|n| crate::audit::clip(n.trim(), 100)).filter(|n| !n.is_empty()).or_else(|| login.clone());
-        Ok(Claims { issuer: self.web.to_string(), subject, tenant: None, email: Some(email), name, username: login, authn_context: None, encryption: None })
+        Ok(Claims { issuer: self.web.to_string(), subject, tenant: None, email: Some(email), name, username: login, authn_context: None, encryption: None, response_binding: None })
     }
 
     /// The primary address, only if verified: GitHub lets people add any address

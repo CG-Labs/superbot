@@ -82,6 +82,10 @@ async fn serve(extra: &[(&str, &str)]) -> Sp {
 }
 
 async fn serve_with(extra: &[(&str, &str)], tweak: impl FnOnce(&mut Auth)) -> Sp {
+    serve_importing(extra, tweak, &test_idp::metadata()).await
+}
+
+async fn serve_importing(extra: &[(&str, &str)], tweak: impl FnOnce(&mut Auth), metadata: &str) -> Sp {
     let id = format!("n{}", random_hex(4));
     let up = id.to_ascii_uppercase();
     let mut vars: HashMap<String, String> = HashMap::from([("SSO_PROVIDERS".into(), id.clone()), (format!("SSO_{up}_TYPE"), "saml".into()), (format!("SSO_{up}_IDP_ENTITY_ID"), IDP.into())]);
@@ -93,7 +97,7 @@ async fn serve_with(extra: &[(&str, &str)], tweak: impl FnOnce(&mut Auth)) -> Sp
     let setup: Value = serde_json::from_str(&call(port, "GET", "/api/setup", &sp.admin, "").await.1).unwrap();
     let detail = setup["checklist"].as_array().unwrap().iter().find(|c| c["id"] == "signin").unwrap()["detail"].as_str().unwrap().to_string();
     assert!(detail.starts_with("Waiting for IdP metadata:") && !detail.contains("secret"), "{detail}");
-    let (code, view) = call(port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": test_idp::metadata() }).to_string()).await;
+    let (code, view) = call(port, "PUT", &format!("/api/sso/{}/saml/idp-metadata", sp.id), &sp.admin, &json!({ "xml": metadata }).to_string()).await;
     assert_eq!(code, 200, "{view}");
     sp
 }
@@ -2727,4 +2731,141 @@ async fn requests_over_http_post_by_choice_take_logout_over_it_too() {
     assert_eq!(plain.view().await["idp"]["sloBinding"], "redirect", "HTTP-Redirect first, as before");
     let imported = plain.audit("sso.saml_metadata_imported").await;
     assert_eq!(imported[0]["details"]["sloBinding"], "redirect");
+}
+
+// The HTTP-Artifact binding (ADR 0268)
+
+/// A stand-in for the IdP's ArtifactResolutionService: the ArtifactResolves it got, and the
+/// response XML it holds for each artifact. An artifact it doesn't hold is answered with none.
+#[derive(Clone, Default)]
+struct ArtifactIdp {
+    got: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    held: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+impl ArtifactIdp {
+    async fn start() -> (ArtifactIdp, String) {
+        let idp = ArtifactIdp::default();
+        let state = idp.clone();
+        let app = axum::Router::new().route(
+            "/ars",
+            axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                let state = state.clone();
+                async move {
+                    let action = headers.get("soapaction").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                    state.got.lock().unwrap().push((action, body.clone()));
+                    let id = body.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+                    let artifact = body.split("<samlp:Artifact>").nth(1).unwrap().split('<').next().unwrap();
+                    let message = state.held.lock().unwrap().remove(artifact);
+                    crate::sso::saml_artifact::test_idp::Answer::new(&id, message, db::now()).soap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}/ars", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (idp, url)
+    }
+}
+
+impl Sp {
+    /// The IdP's redirect to our ACS with `artifact`: the status, where it goes next, the head.
+    async fn send_artifact(&self, artifact: &str, relay: &str, cookie: &str) -> (u16, String, String) {
+        let url = url::Url::parse_with_params(&self.acs(), [("SAMLart", artifact), ("RelayState", relay)]).unwrap();
+        let res = http().get(url).header("cookie", cookie).send().await.unwrap();
+        let head: String = res.headers().iter().map(|(k, v)| format!("{k}: {}\n", v.to_str().unwrap())).collect();
+        let to = res.headers().get("location").map(|l| l.to_str().unwrap().to_string()).unwrap_or_default();
+        (res.status().as_u16(), to, head)
+    }
+
+    /// A sign-in answered with an artifact `ars` holds a response for: the artifact, and how it went.
+    async fn sign_in_by_artifact(&self, ars: &ArtifactIdp, index: u16) -> (String, (u16, String, String)) {
+        let (request, relay, cookie) = self.start().await;
+        let artifact = crate::sso::saml_artifact::test_idp::artifact(IDP, index);
+        ars.held.lock().unwrap().insert(artifact.clone(), Response::new(&self.acs(), &self.entity(), &request, db::now()).xml());
+        let went = self.send_artifact(&artifact, &relay, &cookie).await;
+        (artifact, went)
+    }
+}
+
+#[tokio::test]
+async fn an_artifact_is_resolved_over_soap_into_a_sign_in_once() {
+    let (ars, ars_url) = ArtifactIdp::start().await;
+    let md = test_idp::with_artifact_resolution(&test_idp::with_artifact_resolution(&test_idp::metadata(), &ars_url, 1), "http://127.0.0.1:9/ars", 2);
+    let sp = serve_importing(&[("RESPONSE_BINDING", "artifact")], |_| {}, &md).await;
+    let view = sp.view().await;
+    assert_eq!((view["responseBinding"].as_str(), &view["idp"]["artifactResolutionUrls"]), (Some("artifact"), &json!([{ "index": 1, "url": ars_url }, { "index": 2, "url": "http://127.0.0.1:9/ars" }])));
+    let ours = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    assert!(ours.contains(&format!(r#"<md:AssertionConsumerService Binding="{}" Location="{}""#, crate::sso::saml_sp::ARTIFACT, sp.acs())) && ours.matches("<md:AssertionConsumerService").count() == 1, "{ours}");
+    let u = sp.link();
+    let cert = sp.sp_cert().await;
+
+    let (artifact, (code, to, head)) = sp.sign_in_by_artifact(&ars, 1).await;
+    assert_eq!((code, to.as_str()), (200, ""), "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id.clone()));
+    let (action, sent) = ars.got.lock().unwrap()[0].clone();
+    assert_eq!(action, crate::sso::saml_slo::SOAP_ACTION);
+    let doc = crate::sso::xmldsig::parse(&sent).unwrap();
+    let m = doc.descendants().find(|n| crate::sso::xmldsig::is(*n, crate::sso::saml_sp::PROTOCOL, "ArtifactResolve")).expect("an ArtifactResolve");
+    assert!(crate::sso::xmldsig::is(m.parent().unwrap(), crate::sso::saml_slo::SOAP11, "Body"));
+    assert_eq!(crate::sso::xmldsig::verify_enveloped(m, std::slice::from_ref(&cert)), Ok(true), "signed by our key");
+    assert_eq!(m.attribute("Destination"), Some(ars_url.as_str()));
+    assert!(sent.contains(&format!("<samlp:Artifact>{artifact}</samlp:Artifact>")) && sent.contains(&format!("<saml:Issuer>{}</saml:Issuer>", sp.entity())), "{sent}");
+    let login = &sp.audit("auth.login").await[0];
+    assert_eq!((login["actorId"].as_str(), login["details"]["responseBinding"].as_str()), (Some(u.id.as_str()), Some("artifact")));
+
+    // The same artifact again, for a new sign-in: refused without asking the IdP again.
+    let (_, relay, cookie) = sp.start().await;
+    let (_, to, _) = sp.send_artifact(&artifact, &relay, &cookie).await;
+    assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_failed", Some("replayed")));
+    assert_eq!(ars.got.lock().unwrap().len(), 1);
+
+    // Metadata without an ArtifactResolutionService can't be used for it.
+    let (code, body) = sp.import(&test_idp::metadata()).await;
+    assert!(code == 400 && body.contains("no SOAP ArtifactResolutionService"), "{code} {body}");
+    assert_eq!(sp.view().await["idp"]["artifactResolutionUrls"].as_array().map(Vec::len), Some(2), "the last good metadata stays");
+}
+
+#[tokio::test]
+async fn only_our_idps_artifacts_for_its_endpoints_are_sent_and_posts_are_refused() {
+    let (ars, ars_url) = ArtifactIdp::start().await;
+    let md = test_idp::with_artifact_resolution(&test_idp::with_artifact_resolution(&test_idp::metadata(), &ars_url, 1), "http://127.0.0.1:9/ars", 2);
+    // Each on a server of its own: refusals nobody vouched for are audited once a minute.
+    for (artifact, reason, asks) in [
+        (crate::sso::saml_artifact::test_idp::artifact("https://evil.example/idp", 1), "wrong_artifact_source", false),
+        (crate::sso::saml_artifact::test_idp::artifact(IDP, 7), "no_artifact_resolution", false),
+        ("AAQ=".to_string(), "bad_artifact", false),
+        (crate::sso::saml_artifact::test_idp::artifact(IDP, 1), "artifact_unknown", true),
+        (crate::sso::saml_artifact::test_idp::artifact(IDP, 2), "artifact_unreachable", false),
+    ] {
+        let sp = serve_importing(&[("RESPONSE_BINDING", "artifact")], |_| {}, &md).await;
+        let before = ars.got.lock().unwrap().len();
+        let (_, relay, cookie) = sp.start().await;
+        let (_, to, _) = sp.send_artifact(&artifact, &relay, &cookie).await;
+        assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_failed", Some(reason)));
+        assert_eq!(ars.got.lock().unwrap().len(), before + usize::from(asks), "{reason}");
+    }
+
+    // A posted response, even one signed by the IdP, isn't how this provider takes them.
+    let sp = serve_importing(&[("RESPONSE_BINDING", "artifact")], |_| {}, &md).await;
+    sp.link();
+    let (request, relay, cookie) = sp.start().await;
+    let posted = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    let (_, to, _) = sp.post(Some(&posted.posted()), Some(&relay), &cookie).await;
+    assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_failed", Some("wrong_binding")));
+
+    // And the other way round: a provider taking posts refuses an artifact unresolved.
+    let sp = serve(&[]).await;
+    assert_eq!(sp.view().await["responseBinding"], "post");
+    let (_, relay, cookie) = sp.start().await;
+    let (_, to, _) = sp.send_artifact(&crate::sso::saml_artifact::test_idp::artifact(IDP, 1), &relay, &cookie).await;
+    assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_failed", Some("wrong_binding")));
+    // A response in the query isn't taken: the ACS reads only artifacts there.
+    let sp = serve(&[]).await;
+    let (request, relay, cookie) = sp.start().await;
+    let r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    let url = url::Url::parse_with_params(&sp.acs(), [("SAMLResponse", r.posted().as_str()), ("RelayState", relay.as_str())]).unwrap();
+    let res = http().get(url).header("cookie", cookie).send().await.unwrap();
+    assert_eq!(res.headers()["location"], "/login?error=sso_failed");
+    assert_eq!(sp.last_failure().await["reason"], "missing_response");
 }

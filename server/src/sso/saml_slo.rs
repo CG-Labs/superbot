@@ -202,7 +202,7 @@ pub fn logout_response(sp_entity_id: &str, id: &str, destination: Option<&str>, 
 /// The one message in a SOAP 1.1 envelope (ADR 0208): an `Envelope` with an optional `Header`,
 /// then a `Body` with exactly one element. A header block marked `mustUnderstand` is refused
 /// (`must_understand`), since botd acts on none; others are ignored, as SOAP allows.
-fn soap_body<'a, 'i>(doc: &'a Document<'i>) -> Result<Node<'a, 'i>, Refused> {
+pub(super) fn soap_body<'a, 'i>(doc: &'a Document<'i>) -> Result<Node<'a, 'i>, Refused> {
     let bad = || Refused("bad_message", None);
     let envelope = doc.root_element();
     if !is(envelope, SOAP11, "Envelope") {
@@ -288,7 +288,7 @@ fn incomplete(code: Node) -> Option<String> {
 }
 
 /// A status's codes, top level first, without their URN prefix: `Responder/PartialLogout`.
-fn status_codes(code: Node) -> String {
+pub(super) fn status_codes(code: Node) -> String {
     let codes: Vec<&str> = std::iter::successors(Some(code), |c| only(*c, PROTOCOL, "StatusCode")).filter_map(|c| c.attribute("Value")).map(|v| v.rsplit(':').next().unwrap_or(v)).collect();
     crate::audit::clip(&codes.join("/"), 128)
 }

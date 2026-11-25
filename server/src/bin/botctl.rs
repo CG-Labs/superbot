@@ -1943,6 +1943,9 @@ fn saml_summary(v: &Value) -> String {
         (None, _) => "HTTP-Redirect, or HTTP-POST if that's all the IdP offers",
     };
     out += &format!("  AuthnRequests over:       {binding} (REQUEST_BINDING={setting})\n");
+    let response = v["responseBinding"].as_str().unwrap_or("post");
+    let how = if response == "artifact" { "HTTP-Artifact, resolved over SOAP" } else { "HTTP-POST" };
+    out += &format!("  Responses over:           {how} (RESPONSE_BINDING={response})\n");
     let yes = |b: bool| if b { "yes" } else { "no" };
     out += &format!(
         "  Signs AuthnRequests:      {}\n  Single logout:            {}\n",
@@ -2007,6 +2010,9 @@ fn saml_summary(v: &Value) -> String {
     }
     if let Some(slo) = idp["sloSoapUrl"].as_str() {
         out += &format!("    SOAP logout URL:  {slo}\n");
+    }
+    for a in idp["artifactResolutionUrls"].as_array().into_iter().flatten() {
+        out += &format!("    Artifact resolution URL {}:  {}\n", a["index"], a["url"].as_str().unwrap_or_default());
     }
     for c in idp["certificates"].as_array().into_iter().flatten() {
         out += &format!("    Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
@@ -4442,6 +4448,17 @@ mod tests {
         assert!(saml_summary(&v).contains("  AuthnRequests over:       HTTP-POST (REQUEST_BINDING=auto)\n"), "the IdP offers only POST");
         v["idp"]["ssoBinding"] = json!("redirect");
         assert!(saml_summary(&v).contains("  AuthnRequests over:       HTTP-Redirect (REQUEST_BINDING=auto)\n"));
+    }
+
+    #[test]
+    fn saml_summary_shows_how_responses_come() {
+        let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null });
+        assert!(saml_summary(&v).contains("  Responses over:           HTTP-POST (RESPONSE_BINDING=post)\n"), "posted by default");
+        v["responseBinding"] = json!("artifact");
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [], "artifactResolutionUrls": [{ "index": 1, "url": "https://idp.example/ars" }] });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Responses over:           HTTP-Artifact, resolved over SOAP (RESPONSE_BINDING=artifact)\n"), "{out}");
+        assert!(out.contains("    Artifact resolution URL 1:  https://idp.example/ars\n"), "{out}");
     }
 
     #[test]

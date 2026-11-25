@@ -1154,7 +1154,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso", get(sso::list))
         .route("/auth/sso/{id}/start", get(sso::start))
         .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
-        .route("/auth/sso/{id}/acs", post(sso::acs))
+        .route("/auth/sso/{id}/acs", post(sso::acs).get(sso::acs_get))
         .route("/auth/sso/{id}/metadata", get(sso::saml_metadata))
         .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/auth/sso/{id}/slo/soap", post(sso::slo_soap))
