@@ -68,7 +68,7 @@ With `--updates`, each open, answered ticket with an update target (Severity 1 t
 - **Security incidents.** A suspected breach goes to `<security-email>` and the incident commander at once, whatever this says ([security incidents](escalation.md#security-incidents)).
 - **Pauses.** Time waiting on the customer counts, as in the support report.
 
-It reads ticket ids, severities, plans and times, the customer column only to pick one with `--customer`, and from the replies only ticket ids, times, visibility and author roles. Subjects, bodies, requesters, authors and emails are never read, and the output names no customer except the one asked for. Ticket ids from the export are put on one line, and escaped in Markdown so they can't add a link or a cell.
+It reads ticket ids, severities, plans and times, the customer column only to pick one with `--customer`, and from the replies only ticket ids, times, visibility and author roles. Subjects, bodies, requesters, authors and emails are never read, and the output names no customer except the one asked for. Ticket ids from the export are put on one line, and shown as code in Markdown, so they can't add a link (a bare URL included), emphasis or a cell.
 
 ## Where it fits
 

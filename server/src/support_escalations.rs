@@ -246,15 +246,15 @@ fn one_line(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
-/// A ticket id for a Markdown table: on one line, and unable to add a link, tag or cell.
+/// A ticket id for a Markdown table: a code span on one line, so nothing in it becomes a
+/// link (bare URLs included), a tag or emphasis. Its fence is longer than any run of
+/// backticks in it, and `|` stays escaped, since GitHub splits cells even inside code.
 fn md_cell(s: &str) -> String {
-    one_line(s).chars().fold(String::new(), |mut out, c| {
-        if "\\|[]<>`*_".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-        out
-    })
+    let id = one_line(s).replace('|', "\\|");
+    let run = id.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(run + 1);
+    let pad = if id.starts_with('`') || id.ends_with('`') { " " } else { "" };
+    format!("{fence}{pad}{id}{pad}{fence}")
 }
 
 impl Escalations {
@@ -453,7 +453,7 @@ E-10,Slow runs,jo@example.com,Acme,High,2026-09-01 10:30,2026-09-01 10:45,,enter
         assert!(text.starts_with("Escalations as of 2026-09-01 12:00 UTC\nBusiness hours 09:00-17:30 mon,tue,wed,thu,fri at UTC+00:00; about to be missed at 75% of a target\n\nOpen: Sev 1: 2, Sev 2: 3, Sev 3: 1, Sev 4: 1, 3 waiting for a first answer.\n5 tickets need escalating now.\n"), "{text}");
         assert!(text.contains("\nE-1  Sev 1 (enterprise)  opened 2026-09-01 09:30 UTC\n  management: Tell management, unless there's a workaround (open 2 h 30 min, past 2 h) [sev1.management]\n"), "{text}");
         let md = e.markdown();
-        assert!(md.contains("| P-3 | 2 (pro) | 2026-08-31 13:00 UTC | on-call engineer | Hand it to the on-call engineer, unless the runbook is getting somewhere | 7 h of business time since its first answer, past 2 h (`sev2.on_call`) |"), "{md}");
+        assert!(md.contains("| `P-3` | 2 (pro) | 2026-08-31 13:00 UTC | on-call engineer | Hand it to the on-call engineer, unless the runbook is getting somewhere | 7 h of business time since its first answer, past 2 h (`sev2.on_call`) |"), "{md}");
         let all = format!("{v}{text}{md}");
         for never in ["example.com", "Acme", "Globex", "Initech", "Everything down", "Can't sign in", "Someday", "X-7", "F-8"] {
             assert!(!all.contains(never), "the escalations leak {never}");
@@ -550,8 +550,13 @@ c10,E-10,Jo,agent,true,2026-09-01 12:30,after --as-of
         let csv = "id,severity,opened,first response\n\"[x](https://evil.example)|\nNew line\",1,2026-09-01T10:00:00Z,\n";
         let e = check(csv, None, &Options { plan: Some(Plan::Max), ..at("2026-09-01T12:00:00Z") }, &UpdateOptions::default(), DEFAULT_WARN_PERCENT).unwrap();
         let md = e.markdown();
-        assert!(md.contains("| \\[x\\](https://evil.example)\\| New line | 1 (max) |"), "{md}");
+        assert!(md.contains("| `[x](https://evil.example)\\| New line` | 1 (max) |"), "{md}");
         assert!(e.text().contains("\n[x](https://evil.example)| New line  Sev 1 (max)"), "{}", e.text());
+        let csv = "id,severity,opened,first response\nhttps://evil.example,1,2026-09-01T10:00:00Z,\n`a``b`,1,2026-09-01T10:00:00Z,\n";
+        let md = check(csv, None, &Options { plan: Some(Plan::Max), ..at("2026-09-01T12:00:00Z") }, &UpdateOptions::default(), DEFAULT_WARN_PERCENT).unwrap().markdown();
+        assert!(md.contains("| `https://evil.example` | 1 (max) |"), "a bare URL is code, not a link: {md}");
+        assert!(md.contains("| ``` `a``b` ``` | 1 (max) |"), "backticks can't close the span: {md}");
+        assert_eq!(md.matches("https://evil.example").count(), md.matches("| `https://evil.example` |").count(), "only ever inside its code span: {md}");
     }
 
     #[test]
