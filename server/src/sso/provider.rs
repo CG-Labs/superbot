@@ -646,13 +646,14 @@ impl Provider {
             return Err(Invalid("not_configured"));
         };
         let now = crate::db::now();
-        let (stale, fresh, missing) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some((m, _)) if !m.valid_at(now) => (None, false, Invalid("idp_metadata_expired")),
-            Some((m, at)) => (Some(m.clone()), at.elapsed() < META_TTL, Invalid("not_configured")),
-            None => (None, false, Invalid("not_configured")),
+        let (stale, fresh, expired) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some((m, _)) if !m.valid_at(now) => (None, false, true),
+            Some((m, at)) => (Some(m.clone()), at.elapsed() < META_TTL, false),
+            None => (None, false, false),
         };
+        let missing = Invalid(if expired { "idp_metadata_expired" } else { "not_configured" });
         let Some(url) = source.url() else {
-            if missing.0 == "idp_metadata_expired" {
+            if expired {
                 crate::obs::log::log_warn!("SSO {}: the IdP metadata in use has passed its validUntil: give botd a fresh signed copy", self.id);
             }
             return stale.ok_or(missing);
@@ -668,7 +669,6 @@ impl Provider {
         {
             return Ok(m.clone());
         }
-        let expired = missing.0 == "idp_metadata_expired";
         if let Some((at, e)) = c.idp_failed
             && at.elapsed() < gap
         {
