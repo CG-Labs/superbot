@@ -1353,16 +1353,18 @@ if command -v age-keygen >/dev/null 2>&1; then
 fi
 
 # A rollback checks machines' settings against the .env it puts back, which botd's user reads
-# from a pipe, in the folder the unit runs botd in.
+# from a copy of its own, in the folder the unit runs botd in.
 rb_host
 rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "the backup before an upgrade failed"
 rb_upgraded
 cat >"$RB/bundle/bin/botd" <<EOF
 #!/bin/sh
 # Usage: botd machines check
-[ "\$*" = "machines check --env-file /dev/stdin" ] || { echo "botd \$*"; exit 2; }
+[ \$# = 4 ] && [ "\$1 \$2 \$3" = "machines check --env-file" ] || { echo "botd \$*"; exit 2; }
+case "\$4" in "$RB/dir/"*) echo "botd read root's copy"; exit 2 ;; esac
+echo "\$4" >"$RB/copy"
 [ "\$(pwd)" = "$RH/superbot" ] || { echo "botd ran in \$(pwd)"; exit 2; }
-cat >"$RB/checked"
+cat -- "\$4" >"$RB/checked"
 grep -q old.tar.gz "$RB/checked" && { echo "Machines: incus, enrolling at https://10.0.0.5:8443"; exit 0; }
 echo "botd wouldn't start with these settings: Machine enrollment: MACHINE_HARNESS_BUNDLE: can't read it"; exit 1
 EOF
@@ -1370,12 +1372,13 @@ chmod 0755 "$RB/bundle/bin/botd"
 out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; machine_settings_check") || fail "a rollback's machine check failed: $out"
 grep -Fq "Machines' settings: the bundle's botd would start with them" <<<"$out" || fail "a rollback's machine check wasn't said: $out"
 cmp -s "$RB/checked" "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")" || fail "the rollback's machine check didn't read the .env from before the upgrade"
+[[ ! -e $(cat "$RB/copy") ]] || fail "the rollback's machine check left botd's user's copy of the .env behind"
 sed -i 's/old.tar.gz/gone.tar.gz/' "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")"
 if out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; machine_settings_check"); then fail "a rollback went on with machine settings its botd refuses: $out"; fi
 grep -Fq "Nothing has changed. The .env from before the upgrade names something $VERSION's botd can't use now" <<<"$out" \
   || fail "a rollback's refused machine check didn't say why: $out"
 cp "$T/bin/botd" "$RB/bundle/bin/botd"
-ok "a rollback checks machines' settings in the .env it puts back, read by botd's user from a pipe"
+ok "a rollback checks machines' settings in the .env it puts back, read by botd's user from a copy it removes"
 
 # A dry run of the whole offline install, as main runs it, without root. With unprivileged
 # namespaces, it runs with no network at all.

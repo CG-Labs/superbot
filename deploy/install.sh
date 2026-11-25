@@ -1790,11 +1790,16 @@ machine_settings_check() {
   [[ -z "$MACHINE_HERMES_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HERMES_BUNDLE=$MACHINE_HERMES_BUNDLE_VALUE")
   [[ -z "$MACHINE_HARNESS_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HARNESS_BUNDLE=$MACHINE_HARNESS_BUNDLE_VALUE")
   if [[ "$ROLLBACK_RESTORE" == true ]]; then
-    # A rollback puts back the .env from before the upgrade, which root alone reads: botd's user
-    # gets it through a pipe, in the folder the unit runs botd in.
+    # A rollback puts back the .env from before the upgrade, which root alone reads. botd's user
+    # gets a copy of its own, as it owns the live .env: a pipe root made can't be reopened as
+    # /dev/stdin by another user. botd runs in the folder the unit runs it in.
     env_file="$(rollback_dir)/$(manifest_value "$(rollback_dir)/record" env)"
     doc="docs/ops/air-gapped.md#going-back"
-    out=$(cat -- "$env_file" | (cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --env-file /dev/stdin) 2>&1) || rc=$?
+    local copy
+    copy=$(cat -- "$env_file" | (cd / && sudo -u "$SUPERBOT_USER" sh -c 'f=$(mktemp) && cat >"$f" && echo "$f"')) \
+      || die "Couldn't hand $SUPERBOT_USER the .env from before the upgrade to check. Nothing has changed."
+    out=$(cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --env-file "$copy" 2>&1) || rc=$?
+    rm -f -- "$copy"
   else
     out=$(cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --home "$home" "${args[@]}" 2>&1) || rc=$?
   fi

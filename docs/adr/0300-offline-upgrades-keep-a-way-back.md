@@ -35,7 +35,7 @@ If the backup fails (a full disk, `SUPERBOT_BACKUP_ENCRYPTION=required` with no 
 
 Otherwise it stops, says which, and says that nothing has changed. Without `--rollback`, the downgrade refusal says to add it when a backup that fits is there.
 
-Before anything changes, the bundle's `superbot-restore --check` reads the backup, decrypted by root with `BACKUP_IDENTITY_FILE` when it is encrypted, as botd's user from a pipe. botd's user can't read the rollback folder or the backup key. Machines' settings are checked as in ADR 0294, against the `.env` that will be put back, fed to `botd machines check --env-file /dev/stdin` through a pipe in botd's working directory.
+Before anything changes, the bundle's `superbot-restore --check` reads the backup, decrypted by root with `BACKUP_IDENTITY_FILE` when it is encrypted, as botd's user from a pipe. botd's user can't read the rollback folder or the backup key. Machines' settings are checked as in ADR 0294, against the `.env` that will be put back, handed to botd's user as a temporary copy of its own (a pipe root made can't be reopened as `/dev/stdin` by another user) and read with `botd machines check --env-file` in botd's working directory.
 
 Then the installer stops botd, puts the `.env` back (keeping the current one as `.env.before-rollback-<stamp>`) and restores DATA_DIR with the bundle's `superbot-restore`. That script keeps what it replaces in `DATA_DIR/.pre-restore-<stamp>/`. If the restore fails, the current `.env` goes back and botd starts again as it was. Once the restore succeeds, the bundle's release is recorded and the backup is removed. The install then goes on as for any bundle: binaries, client, units, and a restart.
 
@@ -62,7 +62,7 @@ A rollback that stops after the restore is run again with the same command. The 
     - it is refused, with nothing changed, for another release's or build's backup, a host upgraded since, a changed, incomplete, broken or missing backup, a newer bundle and no recorded release;
     - a failed restore puts the `.env` back and starts botd;
     - an encrypted backup needs the backup key, and restores with it;
-    - machines' settings are checked against the old `.env` through a pipe;
+    - machines' settings are checked against the old `.env`, from a copy botd's user owns and that is removed after;
     - the flags need `--offline` and `--upgrade`, and refuse each other where they conflict.
   - `offline.yml`, with no network, an encrypted database and encrypted backups: the upgrade records a backup of the older release. The downgrade refusal offers `--rollback`. `--rollback` then removes a secret saved after the upgrade and keeps one saved before, puts back the `.env` from before the upgrade, and serves HTTPS again. Upgrading again takes a new backup.
 - Not covered:
