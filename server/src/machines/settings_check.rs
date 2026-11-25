@@ -237,13 +237,17 @@ mod tests {
 
     /// A stand-in Hermes bundle for x86_64 at `commit`, with its `.sha256` beside it.
     fn hermes_file(dir: &Path, tag: &str, commit: &str) -> PathBuf {
-        let name = format!("superbot-hermes-{tag}-x86_64");
+        hermes_file_for(dir, tag, commit, "x86_64")
+    }
+
+    fn hermes_file_for(dir: &Path, tag: &str, commit: &str, arch: &str) -> PathBuf {
+        let name = format!("superbot-hermes-{tag}-{arch}");
         let body = standin::bundle(
             &name,
             &[
                 (
                     "MANIFEST",
-                    standin::manifest(commit, "x86_64", "/opt/hermes").into_bytes(),
+                    standin::manifest(commit, arch, "/opt/hermes").into_bytes(),
                 ),
                 ("hermes.tar", standin::tree("#!/bin/sh\necho hermes\n")),
             ],
@@ -340,6 +344,32 @@ mod tests {
             "Machines would install hermes from botd's bundles, and claude from the internet or the operator's mirrors",
             "{out:?}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // systemd joins a line ending in `\` to the next, so a long list may be split.
+    #[test]
+    fn a_bundle_list_continued_on_the_next_line_of_env_is_read_as_botd_gets_it() {
+        let dir = temp("continued");
+        let x = hermes_file_for(&dir, "v0.23.3", &pinned_commit(), "x86_64");
+        let a = hermes_file_for(&dir, "v0.23.3", &pinned_commit(), "aarch64");
+        let env = crate::support_check::parse_env_file(&format!(
+            "MACHINE_HERMES_BUNDLE={},\\\n  {}\n",
+            x.display(),
+            a.display()
+        ));
+        let out = run(&machines(&[(
+            "MACHINE_HERMES_BUNDLE",
+            env["MACHINE_HERMES_BUNDLE"].clone(),
+        )]))
+        .unwrap();
+        for (arch, f) in [("x86_64", &x), ("aarch64", &a)] {
+            assert!(
+                out.iter()
+                    .any(|l| l.starts_with(&format!("{arch} Hermes bundle {}:", f.display()))),
+                "{out:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
