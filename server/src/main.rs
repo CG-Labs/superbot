@@ -155,6 +155,8 @@ mod machines_residency_tests;
 #[cfg(test)]
 mod residency_routes_http_tests;
 #[cfg(test)]
+mod residency_run_place_http_tests;
+#[cfg(test)]
 mod residency_report_http_tests;
 #[cfg(test)]
 mod residency_me_http_tests;

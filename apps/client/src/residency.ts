@@ -57,6 +57,10 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
   } else if (v.modelRoutes?.inRegion) {
     lines.push(`Your Bots use AI models in ${p.region} only.`);
   }
+  if (v.runs?.on === "server") {
+    if (v.runs.inRegion) lines.push(`Your Bots run on SuperBot's own server, in ${p.region}.`);
+    else warnings.push(`Your Bots run on SuperBot's own server, which isn't in ${p.region}, so they don't run until your admin gives you a computer there. Nothing runs outside the region instead.`);
+  }
   return { lines, warnings };
 }
 
