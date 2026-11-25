@@ -530,6 +530,120 @@ fn the_type_ii_evidence_plan_covers_every_criterion() {
     }
 }
 
+/// The rows of a table whose first cell is `prefix` and a number (`CUEC-1`), as cells.
+fn id_rows(md: &str, prefix: &str) -> Vec<Vec<String>> {
+    md.lines()
+        .filter_map(|l| {
+            let cells: Vec<String> = l.strip_prefix('|')?.trim_end().strip_suffix('|')?.split('|').map(|c| c.trim().to_string()).collect();
+            cells.first()?.strip_prefix(prefix)?.parse::<u32>().ok().map(|_| cells)
+        })
+        .collect()
+}
+
+/// The text from the heading starting `from` to the next `## ` heading.
+fn section<'a>(md: &'a str, from: &str) -> &'a str {
+    let start = md.find(&format!("\n{from}")).unwrap_or_else(|| panic!("no `{from}` section"));
+    let rest = &md[start + 1..];
+    rest[3..].find("\n## ").map_or(rest, |end| &rest[..end + 3])
+}
+
+/// The criteria in a comma-separated cell, each checked to be one the mapping covers.
+fn criteria_cell(id: &str, cell: &str) -> Vec<String> {
+    let out: Vec<String> = cell.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+    assert!(!out.is_empty(), "{id}: names no criteria");
+    for c in &out {
+        assert!(criterion(c).is_some_and(|(_, n)| n.is_some()), "{id}: `{c}` isn't a criterion the mapping covers");
+    }
+    out
+}
+
+#[test]
+fn the_soc2_system_description_covers_the_description_criteria() {
+    let md = fs::read_to_string(pack().join("soc2-system-description.md")).expect("docs/security/soc2-system-description.md exists");
+    assert!(md.contains("not SOC 2 certified") && md.contains("Draft, not adopted"), "the system description must say plainly that it is a draft and SuperBot is not certified");
+    assert_eq!(certification_claims(&md), Vec::<usize>::new(), "the system description must not claim a certification (lines listed)");
+    assert_eq!(emails(&md), Vec::<String>::new(), "the system description must name roles, never people");
+    let h = header(&md);
+    let field = |f: &str| h.get(f).unwrap_or_else(|| panic!("its header table needs a `{f}` row")).clone();
+    assert!(OWNERS.contains(&field("Owner").as_str()) && OWNERS.contains(&field("Approver").as_str()), "its owner and approver must be roles, one of {OWNERS:?}");
+    assert!(field("Review").to_lowercase().contains("yearly"), "it is reviewed yearly, as `superbot-evidence register` checks");
+    assert!(field("Status").starts_with("Draft") || field("Status").starts_with("Approved"));
+    let mut at = 0;
+    for n in 1..=9 {
+        let found = md[at..].find(&format!("\n## DC{n} ")).unwrap_or_else(|| panic!("it needs a `## DC{n} ` section, after DC{}", n - 1));
+        at += found + 1;
+    }
+
+    let mapping = fs::read_to_string(pack().join("soc2-control-mapping.md")).unwrap();
+    let customer: HashSet<String> = criterion_rows(&mapping).into_iter().filter(|(_, s)| s.split(';').any(|p| p.trim() == "Customer")).map(|(id, _)| id).collect();
+    let cuecs = id_rows(&md, "CUEC-");
+    assert!(cuecs.len() >= 5, "DC6 lists the complementary user entity controls: {cuecs:?}");
+    let (mut ids, mut by_cuecs) = (HashSet::new(), HashSet::new());
+    for r in &cuecs {
+        assert_eq!(r.len(), 4, "{}: a row has 4 cells: ID, what the customer does, criteria, why", r[0]);
+        assert!(ids.insert(r[0].clone()), "{}: duplicate ID", r[0]);
+        assert!(!links(&r[3]).is_empty(), "{}: must link the control it complements", r[0]);
+        by_cuecs.extend(criteria_cell(&r[0], &r[2]));
+    }
+    for c in &customer {
+        assert!(by_cuecs.contains(c), "the mapping says the customer must do something for {c}, but no CUEC names it");
+    }
+    for c in &by_cuecs {
+        assert!(customer.contains(c), "a CUEC names {c}, but the mapping doesn't mark {c} Customer");
+    }
+
+    let subprocessors = fs::read_to_string(pack().join("subprocessors.md")).unwrap();
+    let csocs = id_rows(&md, "CSOC-");
+    let mut by_csocs = HashSet::new();
+    for r in &csocs {
+        assert_eq!(r.len(), 5, "{}: a row has 5 cells: ID, subservice organisation, what it does, controls expected, criteria", r[0]);
+        assert!(ids.insert(r[0].clone()), "{}: duplicate ID", r[0]);
+        assert!(subprocessors.contains(&r[1]), "{}: `{}` isn't on the subprocessor list", r[0], r[1]);
+        by_csocs.extend(criteria_cell(&r[0], &r[4]));
+    }
+    let names: Vec<&str> = csocs.iter().map(|r| r[1].as_str()).collect();
+    for want in ["Linode (Akamai)", "Incus hosts", "S3-compatible object storage", "Model providers", "GitHub"] {
+        assert!(names.contains(&want), "DC7 must carve out {want}: {names:?}");
+    }
+    for want in ["CC6.4", "A1.2", "CC8.1"] {
+        assert!(by_csocs.contains(want), "no subservice organisation's control covers {want}");
+    }
+    let vm = fs::read_to_string(policies().join("vendor-management.md")).unwrap();
+    let tier = |t: &str| vm.lines().find(|l| l.starts_with(&format!("| {t} |"))).unwrap_or_else(|| panic!("vendor management has no {t} tier")).to_string();
+    assert!(tier("High").contains("GitHub") && !tier("Low").contains("GitHub"), "a subservice organisation is a Critical or High vendor, so its report is reviewed yearly");
+    assert!(linked_from(&policies().join("vendor-management.md")).contains("../soc2-system-description.md"), "the vendor review checks the CSOCs, so vendor management links the description");
+
+    let dc2 = section(&md, "## DC2 ");
+    let slo = fs::read_to_string(repo().join("docs/slo.md")).unwrap();
+    for pct in ["99.5%", "99.9%", "99.95%"] {
+        assert!(slo.contains(pct) && dc2.contains(pct), "DC2 commits to the SLO's {pct}");
+    }
+    assert!(slo.contains("within 15 minutes") && dc2.contains("within 15 minutes"));
+    let dpa = fs::read_to_string(pack().join("dpa-template.md")).unwrap();
+    assert!(dpa.contains("within [48] hours") && dc2.contains("[48] hours"), "DC2's breach notice is the DPA's");
+
+    let dc3 = section(&md, "## DC3 ");
+    let arch = fs::read_to_string(pack().join("architecture.md")).unwrap();
+    let components: Vec<&str> = section(&arch, "## Components").lines().filter_map(|l| l.strip_prefix("| **")?.split("**").next()).collect();
+    assert!(components.len() >= 8, "found too few components: {components:?}");
+    for c in components {
+        assert!(dc3.contains(&format!("**{c}**")), "DC3 must name the architecture's {c}");
+    }
+    for role in OWNERS {
+        assert!(dc3.contains(role), "DC3's people must name the {role} role");
+    }
+    for class in ["Restricted", "Confidential", "Internal", "Public"] {
+        assert!(dc3.contains(class), "DC3's data must name the {class} class");
+    }
+
+    assert!(md.contains("`soc2-system-description`") && md.contains("--description"), "it says how its approval is recorded and checked");
+    let template = fs::read_to_string(pack().join("policy-register-template.json")).unwrap();
+    assert!(template.contains("\"policy\": \"soc2-system-description\""), "the register template approves the description");
+    let checklist = fs::read_to_string(pack().join("soc2-readiness-checklist.md")).unwrap();
+    let row = checklist_rows(&checklist).into_iter().find(|r| r[0] == "CC2.3-4").expect("the checklist has a CC2.3-4 row for the description");
+    assert!(links(&row[6]).iter().any(|(_, t)| t == "soc2-system-description.md"), "CC2.3-4 links the description");
+}
+
 /// The settings in the first column of the configuration baseline's table, in backticks.
 fn baseline_settings(md: &str) -> Vec<String> {
     md.lines()
@@ -584,4 +698,9 @@ fn the_checker_catches_what_it_should() {
     let h = header("# P\n\n| Field | Value |\n|-------|-------|\n| Owner | Security owner |\n| Controls | CC5.3-1, CC7.4-1 |\n\n## Scope\n| Owner | Nobody |\n");
     assert_eq!(h.get("Owner").map(String::as_str), Some("Security owner"));
     assert_eq!(h.get("Controls").map(String::as_str), Some("CC5.3-1, CC7.4-1"));
+    let rows = id_rows("| ID | x |\n| CUEC-1 | a | CC6.1 |\n| CUEC-x | b |\n| CSOC-2 | c |\nCUEC-3 | d |\n| CUEC-4 d |", "CUEC-");
+    assert_eq!(rows, vec![vec!["CUEC-1".to_string(), "a".to_string(), "CC6.1".to_string()]]);
+    assert_eq!(section("# T\n## A\none\n## B\ntwo\n### B.1\n## C\n", "## B"), "## B\ntwo\n### B.1");
+    assert_eq!(section("# T\n## A\none\n", "## A"), "## A\none\n");
+    assert_eq!(criteria_cell("x", "CC6.2, CC6.3"), vec!["CC6.2", "CC6.3"]);
 }
