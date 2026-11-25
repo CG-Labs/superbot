@@ -77,7 +77,7 @@ For each signal at watch or at risk this quarter: what it was, what was done, an
 
 ### 4. Support and incidents
 
-- Tickets opened and closed by severity; response targets met and missed: `botctl support-report <export> --customer "<customer>" --from <first month> --to <last month> --markdown` on the ticket system's export, with the customer's agreed `--target`s ([support report](support-report.md)).
+- Tickets opened and closed by severity; response targets met and missed: `botctl support-report <export> --customer "<customer>" --from <first month> --to <last month> --markdown` on the ticket system's export, with the customer's agreed `--target`s ([support report](support-report.md)); and update targets kept and late, with `--updates <replies export>` and any agreed `--update-target`s ([update targets](support-report.md#update-targets)).
 - Severity 1 and 2 incidents: ticket, date, impact, cause, and the review's actions with their state. Each review's "Status page targets" section ([incident reviews](incident-review.md#what-it-holds)) says whether the first post and the hourly updates were on time.
 - Tickets on the same thing more than once, and what would stop them.
 

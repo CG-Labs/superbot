@@ -31,19 +31,26 @@ pub struct Expected {
 
 /// botd's evidence bundle (ADR 0142). botd's `evidence::SECTIONS` isn't reachable from
 /// this binary; a test checks this against the evidence plan's table, as botd's does.
-pub const EVIDENCE: [Expected; 7] = [
-    Expected { file: "access-review.json", criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2"] },
+pub const EVIDENCE: [Expected; 9] = [
+    Expected { file: "access-review.json", criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2", "CC6.3-3"] },
     Expected { file: "changes.json", criteria: &["CC5.1", "CC5.2", "CC8.1"], rows: &["CC5.1-1", "CC8.1-2"] },
     Expected { file: "backups.json", criteria: &["A1.2", "A1.3", "CC6.7", "CC7.5", "CC9.1"], rows: &["A1.2-1", "A1.2-2", "CC6.7-2"] },
     Expected { file: "retention.json", criteria: &["C1.2", "CC6.5"], rows: &["C1.2-1", "CC6.5-1", "CC6.5-2"] },
     Expected { file: "sign-ins-and-alerts.json", criteria: &["CC6.1", "CC6.6", "CC7.2"], rows: &["CC6.1-1", "CC7.2-1"] },
     Expected { file: "audit-summary.json", criteria: &["CC2.1", "CC4.1", "CC7.2"], rows: &[] },
     Expected { file: AUDIT_INTEGRITY, criteria: &["CC2.1", "CC7.2"], rows: &["CC2.1-2", "CC7.2-2"] },
+    Expected { file: EGRESS, criteria: &["CC6.6", "CC6.8"], rows: &["CC6.8-2"] },
+    Expected { file: SECRETS, criteria: &["CC6.1"], rows: &["CC6.1-4"] },
 ];
 
 /// botd's `audit-integrity.json` (ADR 0261): in every bundle from format 3. Its manifest
 /// names each row only while the period shows it held, so a row's days come from there.
 pub const AUDIT_INTEGRITY: &str = "audit-integrity.json";
+
+/// botd's `egress.json` and `secrets.json` (ADR 0285): in every bundle from format 4, each
+/// naming its row only while the period shows the control held.
+pub const EGRESS: &str = "egress.json";
+pub const SECRETS: &str = "secrets.json";
 
 /// Files of botd's bundle that bundles made before them lack (ADR 0195): checked like
 /// the rest when listed, never required, so only the test against the evidence plan
@@ -65,7 +72,7 @@ pub struct Kind {
 }
 
 pub const KINDS: [Kind; 6] = [
-    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 3, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
+    Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 4, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
     Kind {
         id: "change-management",
         prefix: changes::PREFIX,
@@ -126,12 +133,13 @@ fn since_format(kind: &str, file: &str) -> u64 {
     match kind {
         "policy-register" => register::SINCE_FORMAT.iter().find(|(f, _)| *f == file).map_or(1, |(_, n)| *n),
         "evidence" if file == AUDIT_INTEGRITY => 3,
+        "evidence" if file == EGRESS || file == SECRETS => 4,
         _ => 1,
     }
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 19] = [
+const EXCEPTION_FILES: [&str; 21] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -151,6 +159,8 @@ const EXCEPTION_FILES: [&str; 19] = [
     "production-changes.json",
     "uptime.json",
     AUDIT_INTEGRITY,
+    EGRESS,
+    SECRETS,
 ];
 
 /// A bundle file larger than this isn't read: no bundle comes near it.
@@ -934,6 +944,40 @@ mod tests {
         assert!(f.files.iter().any(|(n, _, rows)| n == AUDIT_INTEGRITY && rows.is_empty()), "names no row while neither held");
     }
 
+    /// botd's bundles have `egress.json` and `secrets.json` from format 4 (ADR 0285): one
+    /// of format 3 without them still checks, one of format 4 must have both, their
+    /// exceptions count, and a row a file doesn't name for the month isn't covered by it.
+    #[test]
+    fn botds_egress_and_secrets_files_are_required_from_format_4() {
+        let with = |n: u64, bodies: &[(&str, &[u8], &[&str], &[&str])]| {
+            let (name, mut fs) = bundle(&KINDS[0], p("2027-01-01", "2027-02-01"), "2027-02-01T00:05:00Z");
+            let mut m: Value = serde_json::from_slice(&fs["manifest.json"]).unwrap();
+            m["format"] = json!(n);
+            m["files"].as_array_mut().unwrap().retain(|f| f["name"] != EGRESS && f["name"] != SECRETS);
+            fs.remove(EGRESS);
+            fs.remove(SECRETS);
+            for (file, body, criteria, rows) in bodies {
+                m["files"].as_array_mut().unwrap().push(json!({ "name": file, "sha256": sha256(body), "criteria": criteria, "checklist": rows }));
+                fs.insert(file.to_string(), body.to_vec());
+            }
+            fs.insert("manifest.json".into(), json_file(&m));
+            seal(&mut fs);
+            check(format!("{name}.tar"), &name, &fs)
+        };
+        let old = with(3, &[]);
+        assert!(old.verified(), "made before them: {:?}", old.problems);
+        let egress = json_file(&json!({ "exceptions": { "serverOpen": [{ "from": "2027-01-03T00:00:00Z", "to": "2027-01-05T00:00:00Z" }], "usersOpen": [], "machinesOpen": ["m1"], "notInPlace": [], "loadFailures": [7, 9] } }));
+        let secrets = json_file(&json!({ "exceptions": { "startsWithoutExternalManager": [], "readEventsDropped": [] } }));
+        let half = with(4, &[(EGRESS, &egress, &["CC6.6", "CC6.8"], &[])]);
+        assert!(!half.verified() && half.problems.iter().any(|x| x.contains("it has no secrets.json")), "{:?}", half.problems);
+        let f = with(4, &[(EGRESS, &egress, &["CC6.6", "CC6.8"], &[]), (SECRETS, &secrets, &["CC6.1"], &["CC6.1-4"])]);
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!((f.exceptions[EGRESS]["serverOpen"], f.exceptions[EGRESS]["machinesOpen"], f.exceptions[EGRESS]["loadFailures"]), (1, 1, 2));
+        assert_eq!(f.exceptions[SECRETS]["readEventsDropped"], 0);
+        assert!(f.files.iter().any(|(n, _, rows)| n == EGRESS && rows.is_empty()), "names no row while allow-lists didn't hold");
+        assert!(f.files.iter().any(|(n, _, rows)| n == SECRETS && rows == &["CC6.1-4".to_string()]));
+    }
+
     /// A register bundle of manifest format `n` with `file` taken out, then put back with
     /// `body` mapped to `rows` when given, consistently sealed, and checked.
     fn register_bundle_with(n: u64, file: &str, body: Option<(&[u8], &[&str], &[&str])>) -> Found {
@@ -1387,6 +1431,9 @@ mod tests {
         assert!(botd.contains("pub const BASELINE_FILE: &str = \"baseline.json\";") && botd.contains("BASELINE_CRITERIA: [&str; 1] = [\"CC5.1\"]") && botd.contains("BASELINE_ROWS: [&str; 1] = [\"CC5.1-1\"]"));
         let integrity = include_str!("../../evidence_integrity.rs");
         assert!(integrity.contains(&format!("pub const FILE: &str = \"{AUDIT_INTEGRITY}\";")) && integrity.contains("CRITERIA: [&str; 2] = [\"CC2.1\", \"CC7.2\"]") && integrity.contains("ROWS: [&str; 2] = [\"CC2.1-2\", \"CC7.2-2\"]"));
+        let controls = include_str!("../../evidence_controls.rs");
+        assert!(controls.contains(&format!("pub const EGRESS_FILE: &str = \"{EGRESS}\";")) && controls.contains("EGRESS_CRITERIA: [&str; 2] = [\"CC6.6\", \"CC6.8\"]") && controls.contains("EGRESS_ROWS: [&str; 1] = [\"CC6.8-2\"]"));
+        assert!(controls.contains(&format!("pub const SECRETS_FILE: &str = \"{SECRETS}\";")) && controls.contains("SECRETS_CRITERIA: [&str; 1] = [\"CC6.1\"]") && controls.contains("SECRETS_ROWS: [&str; 1] = [\"CC6.1-4\"]"));
         assert!(botd.contains(&format!("pub const FORMAT: u32 = {};", KINDS[0].format)));
         assert!(botd.contains(&format!("const PREFIX: &str = \"{}\";", KINDS[0].prefix)));
     }

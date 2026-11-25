@@ -11,7 +11,7 @@
 //! Each certificate in use is judged on its own: `expiring` within [`WARN_DAYS`] of its end,
 //! then `expired`. A certificate is *covered* when another of the same kind isn't ending: an
 //! IdP's next certificate already in its metadata, or botd's next key. Each notice is audited
-//! once per certificate, claimed in the transaction that records it.
+//! once per certificate (and IdP, with several), claimed in the transaction that records it.
 
 use super::provider::{Kind, Provider};
 use super::saml_keys::{self, Stage};
@@ -64,6 +64,8 @@ pub struct InUse {
     /// Where it comes from: `generated` or `secret` for botd's; the metadata's source for the
     /// IdP's (`url`, `file`, `botctl`); `file` for a metadata signing certificate.
     pub from: &'static str,
+    /// For the IdP's: which IdP's metadata lists it (ADR 0282).
+    pub idp: Option<String>,
     pub cert: Cert,
 }
 
@@ -107,7 +109,8 @@ pub struct Finding<'a> {
     pub cert: &'a InUse,
     pub state: State,
     pub days_left: i64,
-    /// Another certificate of the same role that isn't ending (its SHA-256), if any.
+    /// Another certificate of the same role, and the same IdP's, that isn't ending (its
+    /// SHA-256), if any.
     pub replacement: Option<&'a str>,
 }
 
@@ -120,7 +123,7 @@ pub fn findings(certs: &[InUse], now: i64) -> Vec<Finding<'_>> {
             if s == State::Ok {
                 return None;
             }
-            let replacement = certs.iter().find(|o| o.role == c.role && o.cert.sha256 != c.cert.sha256 && state(o.cert.not_after, now) == State::Ok).map(|o| o.cert.sha256.as_str());
+            let replacement = certs.iter().find(|o| o.role == c.role && o.idp == c.idp && o.cert.sha256 != c.cert.sha256 && state(o.cert.not_after, now) == State::Ok).map(|o| o.cert.sha256.as_str());
             Some(Finding { cert: c, state: s, days_left: days_left(c.cert.not_after, now), replacement })
         })
         .collect()
@@ -131,7 +134,7 @@ pub fn findings(certs: &[InUse], now: i64) -> Vec<Finding<'_>> {
 fn sp_certs(app: &AppState, p: &Provider, u: KeyUse, role: Role, out: &mut Vec<InUse>) {
     if let Some(cert) = p.sp_cert_for(u) {
         match Cert::from_base64(cert) {
-            Ok(cert) => out.push(InUse { role, stage: None, from: "secret", cert }),
+            Ok(cert) => out.push(InUse { role, stage: None, from: "secret", idp: None, cert }),
             Err(e) => crate::obs::log::log_warn!("SSO {}: the configured SP {} certificate: {e}", p.id, u.as_str()),
         }
         return;
@@ -147,7 +150,7 @@ fn sp_certs(app: &AppState, p: &Provider, u: KeyUse, role: Role, out: &mut Vec<I
             continue;
         };
         match Cert::from_base64(&cert) {
-            Ok(cert) => out.push(InUse { role, stage: Some(stage), from: "generated", cert }),
+            Ok(cert) => out.push(InUse { role, stage: Some(stage), from: "generated", idp: None, cert }),
             Err(e) => crate::obs::log::log_warn!("SSO {}: the generated SP {} certificate ({}): {e}", p.id, u.as_str(), stage.as_str()),
         }
     }
@@ -164,15 +167,15 @@ pub fn certificates(app: &AppState, p: &Provider) -> Vec<InUse> {
     if *encryption != Encryption::Off {
         sp_certs(app, p, KeyUse::Encryption, Role::SpEncryption, &mut out);
     }
-    if let Some(m) = p.idp_loaded() {
-        out.extend(m.certs.iter().map(|c| InUse { role: Role::IdpSigning, stage: None, from: source.name(), cert: c.clone() }));
+    for m in p.idps().iter().filter_map(|e| p.idp_loaded_for(e)) {
+        out.extend(m.certs.iter().map(|c| InUse { role: Role::IdpSigning, stage: None, from: source.name(), idp: Some(m.entity_id.clone()), cert: c.clone() }));
     }
     if let Some(t) = metadata_trust {
-        out.extend(t.certs.iter().map(|c| InUse { role: Role::MetadataSigning, stage: None, from: "file", cert: c.clone() }));
+        out.extend(t.certs.iter().map(|c| InUse { role: Role::MetadataSigning, stage: None, from: "file", idp: None, cert: c.clone() }));
     }
     // Metadata may list a certificate twice; it's still one certificate to warn about.
     let mut seen = std::collections::HashSet::new();
-    out.retain(|c| seen.insert((c.role, c.cert.sha256.clone())));
+    out.retain(|c| seen.insert((c.role, c.idp.clone(), c.cert.sha256.clone())));
     out
 }
 
@@ -223,7 +226,7 @@ pub fn warnings(app: &AppState, p: &Provider, now: i64) -> Vec<Value> {
 fn details(p: &Provider, f: &Finding) -> Value {
     let c = f.cert;
     json!({
-        "provider": p.id, "role": c.role.as_str(), "stage": c.stage.map(Stage::as_str), "from": c.from,
+        "provider": p.id, "role": c.role.as_str(), "stage": c.stage.map(Stage::as_str), "from": c.from, "entityId": c.idp,
         "certificate": c.cert.sha256, "subject": crate::audit::clip(&c.cert.subject, 256), "notAfter": c.cert.not_after.saturating_mul(1000),
         "state": f.state.as_str(), "daysLeft": f.days_left, "replacement": f.replacement,
     })
@@ -237,12 +240,14 @@ fn details(p: &Provider, f: &Finding) -> Value {
 pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::Client, gap: Duration, now: i64) -> usize {
     let mut n = 0;
     for p in providers.iter().filter(|p| p.saml_sp()) {
-        if matches!(&p.kind, Kind::SamlSp { source, .. } if source.url().is_some()) {
-            if let Err(e) = p.idp_metadata(http, gap).await {
-                crate::obs::log::log_warn!("SSO {}: IdP metadata: {e}", p.id);
+        if matches!(&p.kind, Kind::SamlSp { source, .. } if source.fetched()) {
+            for entity in p.idps() {
+                if let Err(e) = p.idp_metadata_for(http, gap, entity).await {
+                    crate::obs::log::log_warn!("SSO {}: IdP {entity} metadata: {e}", p.id);
+                }
             }
-            if let Some(e) = p.take_metadata_refusal() {
-                app.db.record(&super::metadata_refused(p, &e));
+            for (entity, e) in p.take_metadata_refusals() {
+                app.db.record(&super::metadata_refused(p, &entity, &e));
             }
         }
         let certs = certificates(app, p);
@@ -254,8 +259,14 @@ pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::
             let outcome = if f.state == State::Expired && f.replacement.is_none() { Outcome::Failure } else { Outcome::Success };
             let e = Event::new(Actor::system("sso"), name).target("sso_provider", &p.id).outcome(outcome);
             let c = f.cert;
+            // IdPs of a federation can share a certificate, yet one may have its replacement
+            // and another not: each IdP's is a notice of its own.
+            let role = match &c.idp {
+                Some(idp) if p.several_idps() => format!("{}|{idp}", c.role.as_str()),
+                _ => c.role.as_str().to_string(),
+            };
             let recorded = app.db.record_with(&e, |db, _, _| {
-                if !crate::db::claim_saml_cert_notice(db, &p.id, c.role.as_str(), &c.cert.sha256, notice, now)? {
+                if !crate::db::claim_saml_cert_notice(db, &p.id, &role, &c.cert.sha256, notice, now)? {
                     return Err(rusqlite::Error::QueryReturnedNoRows);
                 }
                 Ok(details(p, &f))
@@ -304,7 +315,7 @@ mod tests {
     }
 
     fn in_use(role: Role, sha: &str, not_after: i64) -> InUse {
-        InUse { role, stage: None, from: "url", cert: cert(sha, not_after) }
+        InUse { role, stage: None, from: "url", idp: None, cert: cert(sha, not_after) }
     }
 
     const NOW: i64 = 1_800_000_000_000;
@@ -354,9 +365,9 @@ mod tests {
         let p = &s.providers[0];
         let day = 86_400;
         let say = |role: Role, stage: Option<Stage>, from: &'static str, replaced: bool| {
-            let mut certs = vec![InUse { role, stage, from, cert: cert("ending", S + day) }];
+            let mut certs = vec![InUse { role, stage, from, idp: None, cert: cert("ending", S + day) }];
             if replaced {
-                certs.push(InUse { role, stage: Some(Stage::Next), from, cert: cert("after", S + 900 * day) });
+                certs.push(InUse { role, stage: Some(Stage::Next), from, idp: None, cert: cert("after", S + 900 * day) });
             }
             action(p, &findings(&certs, NOW)[0])
         };

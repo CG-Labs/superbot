@@ -89,6 +89,7 @@ mod deprovision;
 mod deprovision_http_tests;
 mod erasure;
 mod evidence;
+mod evidence_controls;
 mod evidence_integrity;
 mod evidence_period;
 #[cfg(test)]
@@ -542,6 +543,7 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     let db = Db::open(&db_path).expect("open database");
+    let secrets_backend = external.as_ref().map_or("local", |x| secrets::SecretStore::kind(x.as_ref()));
     let secrets_report = match secrets::init(&db_path, keys, external) {
         Ok(r) => {
             log_info!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
@@ -959,6 +961,8 @@ async fn main() {
         "statusPage": status_page,
         "serverBackups": server_backups_summary,
         "databaseEncryption": database_summary,
+        // Not `secrets…`: the audit log redacts detail keys that say secret.
+        "vaultBackend": secrets_backend,
     })));
     license::start(app.clone());
     scim::start(app.clone());
