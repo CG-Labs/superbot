@@ -420,6 +420,48 @@ jobs:
           grep -Fq "The harness CLIs this release pins are already installed in /opt/superbot-harnesses" /tmp/offline-harnesses-again.log
           sudo test -e /opt/superbot-harnesses/.ci-marker
           sudo systemctl is-active --quiet superbot
+      # The installed botd checks the server's .env, as botd's user, with --set over it (ADR 0294);
+      # the control plane's token is a stand-in, as the check reaches nothing.
+      - name: An offline upgrade checks machines' settings first, and stops on one botd would refuse
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          home=$(getent passwd superbot | cut -d: -f6)
+          upgrade() {
+            sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
+              --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC "$@"
+          }
+          sudo install -d -m 0755 /srv/superbot-bundles
+          sudo install -m 0644 "$NB" "$NB.sha256" /srv/superbot-bundles/
+          mb=/srv/superbot-bundles/$(basename "$NB")
+          check() {
+            sudo ip netns exec offline sudo -u superbot env -i PATH=/usr/bin:/bin HOME="$home" /usr/local/bin/botd machines check --home "$home" \
+              --set LINODE_TOKEN=offline-ci-not-real --set MACHINE_REGIONS=gb-lon --set MACHINE_CONTROL_URL=https://offline.test:8443 "$@"
+          }
+          check --set MACHINE_HARNESS_BUNDLE="$mb" --set MACHINE_HARNESSES=claude,codex,pi | tee /tmp/offline-machines.log
+          grep -Fq "Machines: linode, enrolling at https://offline.test:8443" /tmp/offline-machines.log
+          grep -Fq "$arch harness bundle $mb: claude" /tmp/offline-machines.log
+          grep -Fq "botd would start with these machine settings." /tmp/offline-machines.log
+          if check --set MACHINE_HARNESS_BUNDLE="$mb" --set MACHINE_HARNESSES=claude@0.0.1,codex,pi >/tmp/offline-machines-stale.log 2>&1; then
+            echo "botd machines check passed a bundle that doesn't hold the pinned claude" >&2; exit 1
+          fi
+          grep -Fq "botd wouldn't start with these settings: Machine enrollment: MACHINE_HARNESS_BUNDLE: $mb holds claude" /tmp/offline-machines-stale.log
+          grep -Fq "but machines' plan pins 0.0.1" /tmp/offline-machines-stale.log
+          upgrade --machine-harness-bundle "$mb" | tee /tmp/offline-machines-upgrade.log
+          grep -Fq "Machines' settings: the bundle's botd would start with them (botd machines check)" /tmp/offline-machines-upgrade.log
+          sudo grep -qx "MACHINE_HARNESS_BUNDLE=$mb" "$home/superbot/.env"
+          sudo systemctl is-active --quiet superbot
+          before=$(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot)
+          sudo cp -p "$home/superbot/.env" /tmp/offline-env.bak
+          echo "MACHINE_CONTROL_URL=https://offline.test:8443" | sudo tee -a "$home/superbot/.env" >/dev/null
+          if upgrade >/tmp/offline-machines-refused.log 2>&1; then
+            echo "an upgrade went ahead with machine settings botd would refuse" >&2; exit 1
+          fi
+          grep -Fq "wouldn't start with $home/superbot/.env: Machine enrollment: MACHINE_CONTROL_URL needs the control plane" /tmp/offline-machines-refused.log
+          grep -Fq "Nothing has changed." /tmp/offline-machines-refused.log
+          [[ $(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot) == "$before" ]]
+          sudo cp -p /tmp/offline-env.bak "$home/superbot/.env"
+          sudo systemctl is-active --quiet superbot
       - name: Load the bundle's images into Docker with no network
         run: |
           set -euo pipefail

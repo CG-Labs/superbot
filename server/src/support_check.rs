@@ -80,10 +80,26 @@ pub struct Settings {
 }
 
 /// A systemd `EnvironmentFile` or Compose `.env`: `KEY=value` lines, `#` comments, an
-/// optional `export`, and quotes around a value dropped.
+/// optional `export`, and quotes around a value dropped. A line ending in an unescaped `\`
+/// goes on in the next, as systemd joins them; a comment line never does (systemd 254 on).
 pub fn parse_env_file(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for line in text.lines() {
+    let (mut lines, mut cont) = (Vec::new(), String::new());
+    for raw in text.lines() {
+        if cont.is_empty() && raw.trim_start().starts_with(['#', ';']) {
+            continue;
+        }
+        if (raw.len() - raw.trim_end_matches('\\').len()) % 2 == 1 {
+            cont.push_str(&raw[..raw.len() - 1]);
+            continue;
+        }
+        cont.push_str(raw);
+        lines.push(std::mem::take(&mut cont));
+    }
+    if !cont.is_empty() {
+        lines.push(cont);
+    }
+    for line in &lines {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -1022,6 +1038,16 @@ mod tests {
         assert_eq!(m.get("EMPTY").map(String::as_str), Some(""));
         assert_eq!(m.get("URL").map(String::as_str), Some("https://x/?a=b"), "only the first = splits");
         assert_eq!(m.len(), 5, "{m:?}");
+
+        let m = parse_env_file("LIST=/a.tar.gz,\\\n  /b.tar.gz\r\nNEXT=1\nPATHS=C:\\\\\nLAST=x\\");
+        assert_eq!(m.get("LIST").map(String::as_str), Some("/a.tar.gz,  /b.tar.gz"), "{m:?}");
+        assert_eq!(m.get("NEXT").map(String::as_str), Some("1"));
+        assert_eq!(m.get("PATHS").map(String::as_str), Some("C:\\\\"), "an escaped \\ ends the line");
+        assert_eq!(m.get("LAST").map(String::as_str), Some("x"), "{m:?}");
+
+        let m = parse_env_file("# MACHINE_HARNESS_BUNDLE=/old.tar.gz,\\\nMACHINE_HARNESS_BUNDLE=/new.tar.gz\n; ends in \\\nNEXT=2\n");
+        assert_eq!(m.get("MACHINE_HARNESS_BUNDLE").map(String::as_str), Some("/new.tar.gz"), "a comment takes no line with it: {m:?}");
+        assert_eq!(m.get("NEXT").map(String::as_str), Some("2"), "{m:?}");
     }
 
     #[test]

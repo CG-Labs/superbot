@@ -284,27 +284,46 @@ pub fn check_files(files: &[String]) -> Result<String, String> {
     for kind in [BundleKind::Harnesses, BundleKind::Hermes] {
         let Some(b) = Bundles::from_env(&var, kind)? else { continue };
         plan = b.apply(plan)?;
-        for (arch, x) in &b.by_arch {
+        out.push_str(&b.holdings());
+    }
+    super::tools::check(&plan).map_err(|e| format!("machines couldn't install from these bundles: {e}"))?;
+    out.push_str(&from_where(&plan, "these bundles"));
+    Ok(out)
+}
+
+impl Bundles {
+    /// One line per arch: the bundle's file, what it holds, and its SHA-256.
+    pub fn holdings(&self) -> String {
+        let mut out = String::new();
+        for (arch, x) in &self.by_arch {
             let m = &x.manifest;
-            let holds = match kind {
+            let holds = match self.kind {
                 BundleKind::Hermes => format!("Hermes Agent {} ({})", m.tag, short(&m.commit)),
                 BundleKind::Harnesses => {
                     let each: Vec<String> = m.harnesses.iter().map(|(h, v)| format!("{h} {}", v.split(' ').next().unwrap_or_default())).collect();
                     format!("{} on Node.js {}", each.join(", "), m.node.split(' ').next().unwrap_or_default())
                 }
             };
-            out.push_str(&format!("{arch} {} {}: {holds}, SHA-256 {}\n", what(kind), x.file.display(), x.sha256));
+            out.push_str(&format!("{arch} {} {}: {holds}, SHA-256 {}\n", what(self.kind), x.file.display(), x.sha256));
         }
+        out
     }
-    super::tools::check(&plan).map_err(|e| format!("machines couldn't install from these bundles: {e}"))?;
+}
+
+/// Which of `plan`'s harnesses machines take from botd's bundles (`bundles`), and which
+/// from elsewhere, as a line.
+pub fn from_where(plan: &HarnessPlan, bundles: &str) -> String {
     let (from, rest): (Vec<_>, Vec<_>) = plan.harnesses.iter().partition(|h| matches!(h.source, InstallSource::Bundle { .. }));
     let names = |l: &[&super::wire::HarnessInstall]| l.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", ");
-    out.push_str(&format!("Machines would install {} from these bundles", names(&from)));
-    if !rest.is_empty() {
+    let mut out = match from.is_empty() {
+        true => format!("Machines would install {} from the internet or the operator's mirrors", names(&rest)),
+        false => format!("Machines would install {} from {bundles}", names(&from)),
+    };
+    if !from.is_empty() && !rest.is_empty() {
         out.push_str(&format!(", and {} from the internet or the operator's mirrors", names(&rest)));
     }
     out.push('\n');
-    Ok(out)
+    out
 }
 
 /// Whether only an agent that says `CAN_HARNESS_BUNDLES` can install `plan`.

@@ -86,6 +86,12 @@ HARNESS_WANTED=""
 HARNESS_PREVIOUS=""
 HARNESS_MOVED_IN=false
 HARNESS_LINKED=()
+# --machine-hermes-bundle/--machine-harness-bundle: MACHINE_HERMES_BUNDLE and
+# MACHINE_HARNESS_BUNDLE for .env on an --offline --upgrade, checked with the rest of machines'
+# settings by the bundle's botd before anything changes
+# (docs/adr/0294-offline-upgrades-checked-against-machines-settings.md).
+MACHINE_HERMES_BUNDLE_VALUE=""
+MACHINE_HARNESS_BUNDLE_VALUE=""
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
@@ -182,6 +188,11 @@ Usage: install.sh [options]
                       /opt/superbot-harnesses, checked like the bundle and against its pins
   --harness-bundle-sha256 HEX
                       The harness bundle's SHA-256, from where it was published (else FILE.sha256)
+  --machine-hermes-bundle LIST, --machine-harness-bundle LIST
+                      With --offline --upgrade: set MACHINE_HERMES_BUNDLE and MACHINE_HARNESS_BUNDLE
+                      in .env (as there: FILE or FILE=SHA-256, comma-separated, one per arch), the
+                      bundles users' machines take from botd. Before anything changes, the bundle's
+                      botd checks machines' settings with them (botd machines check)
   --tls-cert PATH, --tls-key PATH
                       Serve --domain with this certificate (PEM, full chain) and key instead of
                       getting one from Let's Encrypt
@@ -226,6 +237,8 @@ parse_args() {
       --hermes-bundle) HERMES_BUNDLE=$2; shift 2 ;;
       --hermes-bundle-sha256) HERMES_BUNDLE_SHA256=$2; shift 2 ;;
       --harness-bundle) HARNESS_BUNDLE=$2; shift 2 ;;
+      --machine-hermes-bundle) MACHINE_HERMES_BUNDLE_VALUE=$2; shift 2 ;;
+      --machine-harness-bundle) MACHINE_HARNESS_BUNDLE_VALUE=$2; shift 2 ;;
       --harness-bundle-sha256) HARNESS_BUNDLE_SHA256=$2; shift 2 ;;
       --tls-cert) TLS_CERT=$2; shift 2 ;;
       --tls-key) TLS_KEY=$2; shift 2 ;;
@@ -754,6 +767,7 @@ configure_env() {
     if [[ -z "$BACKUP_AGE_RECIPIENTS" && "$BACKUP_ENCRYPTION" != off ]] && { [[ ! -f "$env_file" ]] || [[ "$BACKUP_AGE_GENERATE" == true ]]; }; then
       log "[dry-run] would make a backup age key at $BACKUP_IDENTITY_FILE (root, 0600) and set SUPERBOT_BACKUP_AGE_RECIPIENTS, unless $env_file has recipients"
     fi
+    configure_machine_bundles "$env_file"
     return
   fi
 
@@ -798,6 +812,7 @@ configure_env() {
   configure_backup_target "$env_file"
   configure_backup_encryption "$env_file" "$fresh"
   configure_database_encryption "$env_file" "$fresh"
+  configure_machine_bundles "$env_file"
 
   chown "$SUPERBOT_USER:$SUPERBOT_USER" "$env_file"
   chmod 0600 "$env_file"
@@ -924,6 +939,22 @@ configure_database_encryption() {
   if [[ "$policy" == required ]] && plain_database "$(env_value "$env_file" DATA_DIR)/app.sqlite"; then
     log "Database: botd encrypts it when it starts, keeping a plain copy beside it until you delete it (docs/ops/database-encryption.md)"
   fi
+}
+
+# --machine-hermes-bundle and --machine-harness-bundle, as machine_settings_check checked them.
+configure_machine_bundles() {
+  local env_file=$1 key value
+  for key in MACHINE_HERMES_BUNDLE MACHINE_HARNESS_BUNDLE; do
+    value=${key}_VALUE
+    value=${!value}
+    [[ -n "$value" ]] || continue
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[dry-run] would set $key=$value in $env_file"
+    else
+      set_env_var "$env_file" "$key" "$value"
+      log "Machines: $key=$value in $env_file"
+    fi
+  done
 }
 
 # True if DB is an ordinary SQLite file: not encrypted (ADR 0116).
@@ -1722,6 +1753,47 @@ offline_settings_check() {
   esac
 }
 
+# Offline installs over an existing .env: whether the bundle's botd would start with machines'
+# settings in it, with --machine-*-bundle over them, before anything changes
+# (docs/adr/0294-offline-upgrades-checked-against-machines-settings.md). A release can move the
+# pins machines install, and botd won't start while .env names Hermes or harness bundles that
+# don't hold them. It runs as botd's user, who must read the bundles, with only the .env, as the
+# unit runs botd. An older botd would take the subcommand for a start and run as the server, so
+# the check runs only with a botd that has it.
+machine_settings_check() {
+  [[ -n "$OFFLINE_BUNDLE" ]] || return 0
+  local home env_file out rc=0 doc="docs/ops/air-gapped.md#upgrading" args=() why
+  id "$SUPERBOT_USER" &>/dev/null || return 0
+  home=$(user_home)
+  env_file="$home/superbot/.env"
+  [[ -f "$env_file" ]] || return 0
+  if ! grep -qaF "Usage: botd machines check" "$OFFLINE_DIR/bin/botd"; then
+    warn "The bundle's botd ($OFFLINE_VERSION) can't check machines' settings (botd machines check), so they weren't checked before the upgrade"
+    return 0
+  fi
+  [[ -z "$MACHINE_HERMES_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HERMES_BUNDLE=$MACHINE_HERMES_BUNDLE_VALUE")
+  [[ -z "$MACHINE_HARNESS_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HARNESS_BUNDLE=$MACHINE_HARNESS_BUNDLE_VALUE")
+  out=$(cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --home "$home" "${args[@]}" 2>&1) || rc=$?
+  case $rc in
+    0)
+      log "Machines' settings: the bundle's botd would start with them (botd machines check)"
+      grep -E '^(Machines:|Machine upkeep:|Machines would|x86_64 |aarch64 )' <<<"$out" | sed 's/^/    /' || true
+      ;;
+    1)
+      why=$(sed -n "s/^botd wouldn't start with these settings: //p;T;q" <<<"$out")
+      [[ -n "$why" ]] || why=$out
+      why="The bundle's botd ($OFFLINE_VERSION) wouldn't start with $env_file: $why"
+      if [[ "$DRY_RUN" == true ]]; then
+        warn "[dry-run] would stop here: $why"
+        return 0
+      fi
+      warn "$why"
+      die "Nothing has changed. If it names MACHINE_HERMES_BUNDLE or MACHINE_HARNESS_BUNDLE, carry in this release's Hermes or harness bundles for your machines' arches, put them on this server where $SUPERBOT_USER can read them, and re-run with --machine-hermes-bundle or --machine-harness-bundle naming them; else change $env_file ($doc)"
+      ;;
+    *) warn "botd machines check didn't run (status $rc), so machines' settings weren't checked before the upgrade: $(head -n 1 <<<"$out")" ;;
+  esac
+}
+
 # --- Offline installs (docs/adr/0128-air-gapped-self-host.md) ---------------------------------
 
 # The flags --offline can't work with, checked before anything changes.
@@ -1730,8 +1802,24 @@ check_offline_flags() {
     [[ -z "$OFFLINE_BUNDLE_SHA256" ]] || die "--bundle-sha256 needs --offline"
     [[ -z "$HERMES_BUNDLE$HERMES_BUNDLE_SHA256" ]] || die "--hermes-bundle is for --offline installs: online, --with-hermes runs Hermes Agent's own installer"
     [[ -z "$HARNESS_BUNDLE$HARNESS_BUNDLE_SHA256" ]] || die "--harness-bundle is for --offline installs: online, install the harness CLIs with npm"
+    [[ -z "$MACHINE_HERMES_BUNDLE_VALUE$MACHINE_HARNESS_BUNDLE_VALUE" ]] \
+      || die "--machine-hermes-bundle and --machine-harness-bundle are for --offline --upgrade: online, set MACHINE_HERMES_BUNDLE and MACHINE_HARNESS_BUNDLE in .env"
     return 0
   fi
+  [[ -z "$MACHINE_HERMES_BUNDLE_VALUE$MACHINE_HARNESS_BUNDLE_VALUE" || "$UPGRADE" == true ]] \
+    || die "--machine-hermes-bundle and --machine-harness-bundle change an installed server's .env: use them with --upgrade"
+  local flag item path items
+  for flag in "--machine-hermes-bundle=$MACHINE_HERMES_BUNDLE_VALUE" "--machine-harness-bundle=$MACHINE_HARNESS_BUNDLE_VALUE"; do
+    IFS=, read -ra items <<<"${flag#*=}"
+    for item in "${items[@]}"; do
+      path=$(sed -E 's/=[0-9a-f]{64}$//; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$item")
+      # superbot.service has PrivateTmp: botd sees its own empty /tmp and /var/tmp, not these.
+      case $path in
+        /tmp | /tmp/* | /var/tmp | /var/tmp/*)
+          die "${flag%%=*}: $path is under /tmp or /var/tmp, which botd's service can't see (PrivateTmp): put the bundle and its .sha256 where $SUPERBOT_USER can read them, such as /var/lib/superbot" ;;
+      esac
+    done
+  done
   [[ -z "$HARNESS_BUNDLE_SHA256" || -n "$HARNESS_BUNDLE" ]] || die "--harness-bundle-sha256 needs --harness-bundle"
   [[ -z "$HARNESS_BUNDLE" || ( -f "$HARNESS_BUNDLE" && -r "$HARNESS_BUNDLE" ) ]] || die "--harness-bundle: can't read $HARNESS_BUNDLE"
   [[ -z "$HARNESS_BUNDLE_SHA256" || "$HARNESS_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--harness-bundle-sha256 must be 64 lowercase hex digits"
@@ -2433,6 +2521,7 @@ main() {
     prepare_offline
     prepare_hermes_bundle
     prepare_harness_bundle
+    machine_settings_check
   else
     detect_source_dir
   fi

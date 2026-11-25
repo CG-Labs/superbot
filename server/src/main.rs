@@ -439,6 +439,9 @@ async fn main() {
     if args.first().is_some_and(|a| a == "offline") {
         std::process::exit(offline_check::cli(&args[1..]));
     }
+    if args.first().is_some_and(|a| a == "machines") {
+        std::process::exit(machines::settings_check::cli(&args[1..]));
+    }
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");
     let password = auth_password();
@@ -452,7 +455,7 @@ async fn main() {
     let process_env = secrets::env::EnvStore::process();
     let external = secrets::external::from_env(&|k| env(k, ""), &process_env).unwrap_or_else(|e| exit(format!("Secrets backend: {e}")));
     let external_names = external.as_ref().map(|x| x.check().unwrap_or_else(|e| exit(format!("Secrets backend: {e}. botd won't start without its secrets (ADR 0125)."))));
-    let external_shared = external.clone().map(secrets::external::Shared);
+    let external_shared = external.clone().map(secrets::external::Startup);
     let startup_store = secrets::external::Layered(std::iter::once(&process_env as &dyn secrets::SecretStore).chain(external_shared.as_ref().map(|s| s as &dyn secrets::SecretStore)).collect());
     offline_check::record_start(&startup_store.0);
     let observe = obs::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Observability: {e}")));
@@ -1148,6 +1151,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/evidence/bundle", get(evidence::bundle))
         .route("/evidence/baseline", get(baseline::get))
         .route("/secrets", get(list_secrets))
+        .route("/secrets/refresh", post(refresh_secrets).layer(DefaultBodyLimit::max(MAX_REFRESH_BODY)))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
         .route("/me/usage", get(usage::mine))
@@ -3668,6 +3672,38 @@ async fn delete_secret(State(app): State<AppState>, Extension(who): Extension<Pr
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Admin: reads the external store's cached answers again now (ADR 0291), so a value
+/// rotated in it reaches Bots without waiting out `SECRETS_CACHE_SECONDS`. Body, all
+/// optional: `{"names": ["OPENAI_API_KEY", ...]}`; none refreshes everything cached.
+async fn refresh_secrets(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, body: Option<Json<RefreshBody>>) -> Res {
+    need_user(who)?;
+    let Some(x) = secrets::external::active() else {
+        return Err(ApiError(StatusCode::CONFLICT, "SECRETS_BACKEND is local: botd reads the environment and the sealed store as they are, with nothing cached to refresh.".into()));
+    };
+    let names = body.and_then(|Json(b)| b.names);
+    let report = {
+        let x = Arc::clone(&x);
+        tokio::task::spawn_blocking(move || x.refresh(names.as_deref())).await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("The refresh stopped: {e}")))?
+    }
+    .map_err(|e| match e {
+        secrets::external::RefreshError::Busy => ApiError(StatusCode::CONFLICT, e.to_string()),
+        secrets::external::RefreshError::Invalid(m) => bad(m),
+    })?;
+    let outcome = if report.ok() { Outcome::Success } else { Outcome::Failure };
+    app.db.record(&by.event("secret.cache_refreshed").target("secret_store", report.store).outcome(outcome).details(report.audit_details()));
+    Ok(Json(report.view()))
+}
+
+/// `POST /api/secrets/refresh`'s body: only `names`, at most `MAX_REFRESH_NAMES` of them.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshBody {
+    names: Option<Vec<String>>,
+}
+
+/// Room for `MAX_REFRESH_NAMES` names of the longest kind, quoted and spaced.
+const MAX_REFRESH_BODY: usize = 32 * 1024;
+
 // Your own secrets (ADR 0029): harness logins and API keys that reach only your Bots,
 // over a server-wide one of the same name. A person's, never a Bot's: a Bot that could
 // read or change them could take its owner's keys elsewhere.
@@ -4266,6 +4302,52 @@ mod tests {
         assert_eq!(call(port, "DELETE", &path, &user, "").await.0, 200);
         assert_eq!(call(port, "DELETE", &path, &user, "").await.0, 404);
         assert!(secrets::global().get(&name).unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secrets_refresh_rereads_the_external_store_for_admins_only() {
+        use secrets::external::{tests::fake, Scope, TEST_ACTIVE};
+        use secrets::SecretStore;
+        let (port, app, user, key) = serve_app().await;
+        let bot_auth = key.auth(&app.db.create_bot("Z", "#fff", "waddle", "claude", None, false).id);
+        assert_eq!(call(port, "POST", "/api/secrets/refresh", "", "").await.0, 401);
+        assert_eq!(call(port, "POST", "/api/secrets/refresh", &bot_auth, "").await.0, 403);
+        let (code, local) = call(port, "POST", "/api/secrets/refresh", &user, "{}").await;
+        assert_eq!(code, 409, "local: nothing to refresh: {local}");
+
+        let (f, x) = fake(&[(Scope::Bots, "HTTP_REFRESH_TOKEN", "http-refresh-old-1")], Duration::from_secs(3600));
+        x.get("HTTP_REFRESH_TOKEN").unwrap();
+        f.values.lock().unwrap().insert((Scope::Bots, "HTTP_REFRESH_TOKEN".into()), "http-refresh-new-1".into());
+        *TEST_ACTIVE.lock().unwrap() = Some(Arc::clone(&x));
+        let huge = json!({ "names": vec!["A_TOKEN"; 5000] }).to_string();
+        for (bad, want) in [(r#"{"names":"HTTP_REFRESH_TOKEN"}"#, 422), (r#"{"names":[1]}"#, 422), (r#"{"names":null,"all":true}"#, 422), (r#"{"names":["PATH"]}"#, 400), (r#"{"names":[]}"#, 400), ("not json", 400), ("", 400), (&huge, 413)] {
+            assert_eq!(call(port, "POST", "/api/secrets/refresh", &user, bad).await.0, want, "{bad:.60}");
+        }
+        let (code, res) = call(port, "POST", "/api/secrets/refresh", &user, r#"{"names":["HTTP_REFRESH_TOKEN"]}"#).await;
+        *TEST_ACTIVE.lock().unwrap() = None;
+        assert_eq!(code, 200, "{res}");
+        let v: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!((v["ok"].as_bool(), v["store"].as_str(), v["counts"]["changed"].as_u64()), (Some(true), Some("fake"), Some(1)), "{v}");
+        assert_eq!(v["entries"][0]["result"], "changed");
+        assert!(!res.contains("http-refresh-"), "never a value: {res}");
+        assert_eq!(x.get("HTTP_REFRESH_TOKEN").unwrap().unwrap().expose(), "http-refresh-new-1");
+
+        let f = audit::Filter { actions: vec!["secret.cache_refreshed".into()], ..Default::default() };
+        let rows = app.db.audit_events(&f, 10, true);
+        assert_eq!(rows.len(), 1, "only the refresh that ran is audited");
+        let d = &rows[0].details;
+        assert_eq!((rows[0].target_id.as_deref(), d["counts"]["changed"].as_u64(), d["names"].clone()), (Some("fake"), Some(1), json!(["HTTP_REFRESH_TOKEN"])), "{d}");
+        assert!(!format!("{rows:?}").contains("http-refresh-"));
+        // No body and no Content-Type, as `curl -X POST` sends: refreshes everything.
+        *TEST_ACTIVE.lock().unwrap() = Some(Arc::clone(&x));
+        let mut raw = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        raw.write_all(format!("POST /api/secrets/refresh HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {user}\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+        let mut all = String::new();
+        raw.read_to_string(&mut all).await.unwrap();
+        *TEST_ACTIVE.lock().unwrap() = None;
+        assert!(all.starts_with("HTTP/1.0 200") && all.contains(r#""names":null"#), "{all}");
+        secrets::redact::forget("http-refresh-old-1");
+        secrets::redact::forget("http-refresh-new-1");
     }
 
     #[test]

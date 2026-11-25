@@ -468,6 +468,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl secrets                                   List secret names (never values)
   botctl secrets backend                           Where botd reads secrets from (local, Vault, Azure Key
                                                    Vault, GCP or AWS Secrets Manager) and whether it answers now
+  botctl secrets refresh [NAME ...]                Read the external store's cached answers again now, so a
+                                                   rotation lands at once; says what changed and what needs a restart
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
 
@@ -1870,6 +1872,50 @@ fn backend_summary(b: &Value) -> Result<String, String> {
     if b["ok"] == true { Ok(out) } else { Err(out) }
 }
 
+/// `POST /api/secrets/refresh`, for a terminal (ADR 0291): the names whose answer moved,
+/// failed or is held from startup, never the unchanged ones; an error when any read failed
+/// or botd needs a restart, so scripts can check it.
+fn refresh_summary(r: &Value) -> Result<String, String> {
+    let mut out = r["detail"].as_str().unwrap_or_default().to_string();
+    let c = &r["counts"];
+    let n = |k: &str| c[k].as_u64().unwrap_or(0);
+    out += &format!(
+        "\n  {} changed, {} added, {} removed, {} unchanged, {} found, {} not there, {} unavailable.",
+        n("changed"),
+        n("added"),
+        n("removed"),
+        n("unchanged"),
+        n("found"),
+        n("not_found"),
+        n("unavailable")
+    );
+    for e in r["entries"].as_array().into_iter().flatten() {
+        let result = e["result"].as_str().unwrap_or_default();
+        let restart = e["restart"] == true;
+        if matches!(result, "unchanged" | "found" | "not_found") && !restart {
+            continue;
+        }
+        let user = e["userId"].as_str().map(|u| format!(" (user {u})")).unwrap_or_default();
+        let held = if restart { ", restart botd: it read the old value at startup" } else { "" };
+        out += &format!("\n  {} in {}{user}: {}{held}", e["name"].as_str().unwrap_or_default(), e["scope"].as_str().unwrap_or_default(), result.replace('_', " "));
+    }
+    for f in r["folders"].as_array().into_iter().flatten() {
+        let folder = f["folder"].as_str().unwrap_or_default();
+        if f["ok"] != true {
+            out += &format!("\n  Folder {folder}: couldn't be listed.");
+            continue;
+        }
+        let names = |k: &str| f[k].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+        for (k, said) in [("added", "new"), ("removed", "gone")] {
+            if !names(k).is_empty() {
+                out += &format!("\n  Folder {folder}: {said} {}", names(k));
+            }
+        }
+    }
+    let restart = r["restart"].as_array().is_some_and(|a| !a.is_empty());
+    if r["ok"] == true && !restart { Ok(out) } else { Err(out) }
+}
+
 /// `GET /api/license`, for a terminal (ADR 0038).
 fn license_summary(l: &Value) -> String {
     let s = &l["seats"];
@@ -2677,6 +2723,12 @@ fn run(args: &[String]) -> Result<String, String> {
         ["secrets", "backend"] => {
             let res = api(Cred::Operator, "GET", "/api/setup", None)?;
             backend_summary(&serde_json::from_str::<Value>(&res).map_err(|e| e.to_string())?["secretsBackend"])
+        }
+        ["secrets", "refresh", names @ ..] => {
+            let names = names.iter().map(|n| env_name(n).map(str::to_string)).collect::<Result<Vec<_>, _>>()?;
+            let body = if names.is_empty() { json!({}) } else { json!({ "names": names }) };
+            let res = op("POST", "/api/secrets/refresh", Some(body.to_string()))?;
+            refresh_summary(&serde_json::from_str::<Value>(&res).map_err(|e| e.to_string())?)
         }
         ["secret", "set", name] => {
             let name = env_name(name)?;
@@ -4487,6 +4539,27 @@ mod tests {
         let down = json!({ "backend": "vault", "description": "HashiCorp Vault at https://v", "ok": false, "detail": "vault can't be read" });
         assert!(backend_summary(&down).unwrap_err().ends_with("vault can't be read"), "a failing backend is an error, for scripts");
         assert!(backend_summary(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn secrets_refresh_summary_lists_what_moved_and_fails_for_scripts() {
+        let counts = json!({ "changed": 1, "added": 0, "removed": 0, "unchanged": 4, "found": 0, "not_found": 2, "unavailable": 0 });
+        let ok = json!({ "ok": true, "detail": "vault read again: 7 names, 1 changed.", "counts": counts, "restart": [],
+            "entries": [{ "name": "OPENAI_API_KEY", "scope": "bots", "result": "changed", "restart": false }, { "name": "GH_TOKEN", "scope": "bots", "result": "unchanged", "restart": false }, { "name": "NPM_TOKEN", "scope": "users", "userId": "u1", "result": "not_found", "restart": false }],
+            "folders": [{ "folder": "bots", "ok": true, "names": 5, "added": ["NEW_TOKEN"], "removed": [] }] });
+        let out = refresh_summary(&ok).unwrap();
+        assert_eq!(out, "vault read again: 7 names, 1 changed.\n  1 changed, 0 added, 0 removed, 4 unchanged, 0 found, 2 not there, 0 unavailable.\n  OPENAI_API_KEY in bots: changed\n  Folder bots: new NEW_TOKEN");
+        let mut restart = ok.clone();
+        restart["restart"] = json!(["LINODE_TOKEN"]);
+        restart["entries"] = json!([{ "name": "LINODE_TOKEN", "scope": "server", "result": "found", "restart": true }]);
+        let err = refresh_summary(&restart).unwrap_err();
+        assert!(err.contains("LINODE_TOKEN in server: found, restart botd"), "a restart needed is an error, for scripts: {err}");
+        let mut down = ok.clone();
+        down["ok"] = json!(false);
+        down["entries"] = json!([{ "name": "OPENAI_API_KEY", "scope": "users", "userId": "u1", "result": "unavailable", "restart": false }]);
+        down["folders"] = json!([{ "folder": "bots", "ok": false, "names": null, "added": [], "removed": [] }]);
+        let err = refresh_summary(&down).unwrap_err();
+        assert!(err.contains("OPENAI_API_KEY in users (user u1): unavailable") && err.contains("Folder bots: couldn't be listed."), "{err}");
     }
 
     #[test]
