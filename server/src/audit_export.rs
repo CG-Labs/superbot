@@ -738,21 +738,26 @@ fn change(action: &str, details: Value) -> Event {
     Event::new(Actor::system("audit_export"), action).target("audit", "export").details(details)
 }
 
-/// Records the event a record holds as `unrecorded`: a start saved before botd stopped or
-/// failed to write it. False while it still can't be.
+/// Records, in order, the events a record holds as `unrecorded`: a start saved before botd
+/// stopped or failed to write it, or a return it failed to write. False while one still
+/// can't be; it and those after it stay held.
 fn flush(app: &App, record: &mut Value) -> bool {
-    let Some(u) = record.get("unrecorded").filter(|u| u.is_object()).cloned() else { return true };
-    let action = u["action"].as_str().unwrap_or("audit.export_started");
-    match app.db.try_record(&change(action, u["details"].clone())) {
-        Ok(_) => {
-            record.as_object_mut().map(|o| o.remove("unrecorded"));
-            true
-        }
-        Err(e) => {
+    let Some(held) = record.get("unrecorded").and_then(Value::as_array).cloned() else { return true };
+    let mut left = held.into_iter();
+    while let Some(u) = left.next() {
+        let action = u["action"].as_str().unwrap_or("audit.export_started");
+        if let Err(e) = app.db.try_record(&change(action, u["details"].clone())) {
             log_warn!("Audit export: couldn't record {action} for {} ({e}); trying again when botd next starts.", record["sink"].as_str().unwrap_or("a sink"));
-            false
+            record["unrecorded"] = Value::Array(std::iter::once(u).chain(left).collect());
+            return false;
         }
     }
+    record.as_object_mut().map(|o| o.remove("unrecorded"));
+    true
+}
+
+fn holds_unrecorded(record: &Value) -> bool {
+    record.get("unrecorded").and_then(Value::as_array).is_some_and(|u| !u.is_empty())
 }
 
 /// `audit.export_stopped` for each sink with a cursor that `AUDIT_EXPORT` no longer lists
@@ -771,7 +776,7 @@ fn note_stopped(app: &App, sinks: &[Sink], head: i64) {
             continue;
         }
         let mut record = known(app, &id);
-        if record.get("unrecorded").is_some_and(Value::is_object) && flush(app, &mut record) {
+        if holds_unrecorded(&record) && flush(app, &mut record) {
             save_record(app, &id, &record, None);
         }
         if record["stopped"].is_i64() {
@@ -906,12 +911,16 @@ fn open(app: &App, settings: Settings) -> Option<Exports> {
                 Some(at) => {
                     flush(app, &mut record);
                     if let Some(d) = resumed(app, &sink, at, record["stopped"].as_i64()) {
-                        match app.db.try_record(&change("audit.export_resumed", d)) {
-                            Ok(_) => {
-                                record.as_object_mut().map(|o| o.remove("stopped"));
-                            }
-                            Err(e) => log_warn!("Audit export: couldn't record that {} resumed ({e}); trying again when botd next starts.", sink.label()),
+                        // Held when it can't be written: a gap retention made isn't found
+                        // again once the cursor passes it.
+                        let recorded = !holds_unrecorded(&record) && app.db.try_record(&change("audit.export_resumed", d.clone())).is_ok();
+                        if !recorded {
+                            log_warn!("Audit export: couldn't record that {} resumed; trying again when botd next starts.", sink.label());
+                            let mut u = record["unrecorded"].as_array().cloned().unwrap_or_default();
+                            u.push(json!({ "action": "audit.export_resumed", "details": d }));
+                            record["unrecorded"] = Value::Array(u);
                         }
+                        record.as_object_mut().map(|o| o.remove("stopped"));
                     }
                     at
                 }
@@ -921,7 +930,7 @@ fn open(app: &App, settings: Settings) -> Option<Exports> {
                         Start::All => 0,
                         Start::New => head,
                     };
-                    record["unrecorded"] = json!({ "action": "audit.export_started", "details": started(app, &sink, start, from) });
+                    record["unrecorded"] = json!([{ "action": "audit.export_started", "details": started(app, &sink, start, from) }]);
                     if !save_record(app, &sink.id, &record, Some(from)) {
                         log_warn!("Audit export: couldn't save where {} starts; trying again after the first delivery.", sink.label());
                     }
@@ -1813,7 +1822,7 @@ pub(crate) mod tests {
         let app = crate::runner::test_app();
         let starts = || app.db.audit_events(&Filter { actions: vec!["audit.export_started".into()], ..Default::default() }, 100, true);
         let unrecorded = |name: &str, shown: &str| {
-            json!({ "kind": "webhook", "name": name, "sink": shown, "unrecorded": { "action": "audit.export_started", "details": { "kind": "webhook", "name": name, "sink": shown, "start": "all", "after": 0, "skipped": 0 } } }).to_string()
+            json!({ "kind": "webhook", "name": name, "sink": shown, "unrecorded": [{ "action": "audit.export_started", "details": { "kind": "webhook", "name": name, "sink": shown, "start": "all", "after": 0, "skipped": 0 } }] }).to_string()
         };
         // As botd leaves them when it stops between saving a start and recording it.
         for (name, id) in [("late", "https://late.example.net:443/in"), ("gone", "https://gone.example.net:443/in")] {
@@ -1831,6 +1840,31 @@ pub(crate) mod tests {
         }
         open(&app, settings(&[("AUDIT_EXPORT", "late=https://late.example.net/in")]).unwrap()).unwrap();
         assert_eq!(starts().len(), 2, "not again");
+    }
+
+    #[test]
+    fn a_return_that_couldnt_be_recorded_is_held_until_it_is() {
+        let app = crate::runner::test_app();
+        let resumes = || app.db.audit_events(&Filter { actions: vec!["audit.export_resumed".into()], ..Default::default() }, 100, true);
+        let (sink, id) = ("dd=https://dd.example.net/in", "https://dd.example.net:443/in");
+        open(&app, settings(&[("AUDIT_EXPORT", sink)]).unwrap()).unwrap();
+        let head = app.db.audit_head();
+        app.db.with_conn(|c| crate::audit_chain::set_anchor(c, &crate::audit_chain::Link { id: head + 5, hash: "00".repeat(32) })).unwrap();
+        app.db.set_audit_export_cursor(id, head).unwrap();
+        app.db.execute_raw("CREATE TRIGGER no_writes BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT, 'disk full'); END").unwrap();
+        open(&app, settings(&[("AUDIT_EXPORT", sink)]).unwrap()).unwrap();
+        app.db.execute_raw("DROP TRIGGER no_writes").unwrap();
+        assert!(resumes().is_empty());
+        assert!(app.db.setting(&record_key(id)).unwrap().contains("audit.export_resumed"), "held in the sink's record");
+
+        // Delivered past retention's gap before the next start, so only the held return names it.
+        app.db.set_audit_export_cursor(id, head + 9).unwrap();
+        open(&app, settings(&[("AUDIT_EXPORT", sink)]).unwrap()).unwrap();
+        let r = resumes();
+        assert_eq!((r.len(), &r[0].details["missed"]), (1, &json!({ "after": head, "through": head + 5 })));
+        assert!(!app.db.setting(&record_key(id)).unwrap().contains("unrecorded"));
+        open(&app, settings(&[("AUDIT_EXPORT", sink)]).unwrap()).unwrap();
+        assert_eq!(resumes().len(), 1, "not again");
     }
 
     #[test]
