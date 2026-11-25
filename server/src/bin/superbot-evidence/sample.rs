@@ -244,8 +244,11 @@ pub struct Population {
     pub without_file: Vec<String>,
 }
 
-fn overlaps(b: &Period, p: &Period) -> bool {
-    b.from < p.to && p.from < b.to
+/// Whether a bundle can hold items dated in the period: one of a later period still
+/// carries an item open at its start (a change checked or an alert closed after the
+/// month it is dated in), with its newer state.
+fn reaches(b: &Period, p: &Period) -> bool {
+    p.from < b.to
 }
 
 /// The population of one test: every item dated in the period, from the bundles of its
@@ -254,8 +257,15 @@ pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population 
     let mut pop = Population::default();
     let mut covered = BTreeSet::new();
     for (f, files) in store {
-        let (Some(kind), Some(bp)) = (f.kind, f.period) else { continue };
-        if kind.id != t.kind || !overlaps(&bp, p) {
+        let (Some(kind), Some(bp)) = (f.kind, f.period) else {
+            // A damaged tar, or a bundle whose name gives no period, could be of any kind
+            // or period, so every population it might belong to is incomplete.
+            if !f.verified() && f.kind.is_none_or(|k| k.id == t.kind) {
+                pop.failed.push(f.path.clone());
+            }
+            continue;
+        };
+        if kind.id != t.kind || !reaches(&bp, p) {
             continue;
         }
         if !f.verified() {
@@ -381,7 +391,7 @@ pub fn draw(store: &[(Found, Files)], d: &Draw) -> Samples {
         }));
     }
     let samples = json!({
-        "basis": "each test's population is every item dated in the period in the bundles of its kind that check against their digests, an item in more than one bundle taken from the newest; a population is complete only when those bundles cover every day of the period and none of its kind failed or lacked the file. Each item's rank is the SHA-256 of the seed, the test's id and the item's id, each followed by a newline, and the sample is the items with the lowest ranks, so anyone with the store and the seed can draw it again. Sizes follow the table unless --size was given; the auditor decides the sizes they rely on. Exceptions the bundles list are reviewed in full, not sampled",
+        "basis": "each test's population is every item dated in the period in the bundles of its kind that check against their digests, those of later periods included since they carry an item's later state, an item in more than one bundle taken from the newest; a population is complete only when those bundles cover every day of the period and none that could hold its items failed (a damaged bundle whose kind can't be told counts for every test) or lacked the file. Each item's rank is the SHA-256 of the seed, the test's id and the item's id, each followed by a newline, and the sample is the items with the lowest ranks, so anyone with the store and the seed can draw it again. Sizes follow the table unless --size was given; the auditor decides the sizes they rely on. Exceptions the bundles list are reviewed in full, not sampled",
         "periodCovered": { "from": p.from.to_string(), "to": p.to.to_string(), "days": p.days() },
         "seed": seed,
         "seedFrom": seed_from,
@@ -442,7 +452,7 @@ pub fn build(s: &Samples, store: &[(Found, Files)], p: &Period, now_ms: i64) -> 
     let files: Vec<(&str, Vec<u8>)> = vec![("README.txt", README.as_bytes().to_vec()), (SAMPLES_FILE, json_file(&s.samples)), (WORKSHEET_FILE, s.worksheet.clone().into_bytes())];
     let read: Vec<Value> = store
         .iter()
-        .filter(|(f, _)| f.verified() && f.period.is_some_and(|bp| overlaps(&bp, p)) && TESTS.iter().any(|t| f.kind.is_some_and(|k| k.id == t.kind)))
+        .filter(|(f, _)| f.verified() && f.period.is_some_and(|bp| reaches(&bp, p)) && TESTS.iter().any(|t| f.kind.is_some_and(|k| k.id == t.kind)))
         .map(|(f, _)| json!({ "name": f.name, "path": f.path, "kind": f.kind.map(|k| k.id), "manifestSha256": f.manifest_sha256 }))
         .collect();
     let manifest = json!({
@@ -602,6 +612,10 @@ pub fn read_worksheet(csv: &str, sampled: &BTreeSet<(String, String)>, today: Na
     let missing: Vec<&str> = need.iter().copied().filter(|n| col(n).is_none()).collect();
     if !missing.is_empty() {
         return Err(format!("the worksheet has no {} column: use the one in the samples bundle", missing.join(", ")));
+    }
+    let repeated: Vec<&str> = COLUMNS.iter().copied().filter(|c| head.iter().filter(|h| h.trim().eq_ignore_ascii_case(c)).count() > 1).collect();
+    if !repeated.is_empty() {
+        return Err(format!("the worksheet has more than one {} column, so which to read is unclear", repeated.join(", ")));
     }
     let at = |r: &Vec<String>, name: &str| col(name).and_then(|i| r.get(i)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let (mut out, mut problems, mut seen) = (Vec::new(), Vec::new(), BTreeSet::new());
@@ -974,6 +988,14 @@ mod tests {
         assert!(pop.items["CHG-1"].fields.get("notes").is_none(), "only the listed fields");
         assert!(pop.missing.is_empty() && pop.failed.is_empty());
 
+        let january = population(&TESTS[1], &st, &p("2027-01-01", "2027-02-01"));
+        assert_eq!(january.items.keys().collect::<Vec<_>>(), vec!["CHG-1", "CHG-2"]);
+        assert_eq!(january.items["CHG-2"].fields["checked"], "2027-02-01", "February's bundle carries January's change as later checked");
+        assert_eq!((january.bundles.len(), january.missing.len()), (2, 0));
+        let december = population(&TESTS[1], &st, &p("2026-12-01", "2027-01-01"));
+        assert_eq!(december.items.keys().collect::<Vec<_>>(), vec!["CHG-0"], "from a later bundle, though none covers December's days");
+        assert_eq!(december.missing.len(), 1);
+
         let pages = population(&TESTS[7], &st, &p("2027-01-01", "2027-03-01"));
         assert_eq!(pages.items.keys().collect::<Vec<_>>(), vec!["SuperBotDown-1"], "pages only");
         assert_eq!(pages.missing, vec![json!({ "from": "2027-02-01", "to": "2027-03-01", "days": 28 })], "no alerts bundle for February");
@@ -1001,6 +1023,11 @@ mod tests {
         assert_eq!(pop.items.len(), 40, "January's only");
         assert_eq!(pop.failed, vec![st[1].0.path.clone()]);
         assert_eq!(pop.missing.len(), 1);
+
+        st.push((Found { path: "renamed.tar".into(), name: "renamed".into(), problems: vec!["it can't be read as a tar".into()], ..Found::default() }, Files::new()));
+        for t in &TESTS {
+            assert!(population(t, &st, &p("2027-01-01", "2027-02-01")).failed.contains(&"renamed.tar".to_string()), "{}: a damaged tar could be of any kind", t.id);
+        }
     }
 
     #[test]
@@ -1100,6 +1127,7 @@ mod tests {
             (format!("test,item,result,tester,tested_on\nmerged-pull-requests,{},pass,p-e,\n", item(0)), "tested_on"),
             (format!("test,item,result,tester,tested_on,reference\nmerged-pull-requests,{},pass,p-e,2027-03-10,see the ticket\n", item(0)), "reference"),
             ("test,item,result\n".to_string(), "no tester, tested_on column"),
+            (format!("test,item,result,tester,tested_on,Result\nmerged-pull-requests,{},pass,p-e,2027-03-10,fail\n", item(0)), "more than one result column"),
         ] {
             let e = read_worksheet(&bad, &sampled, today).unwrap_err();
             assert!(e.contains(why), "{why}: {e}");
