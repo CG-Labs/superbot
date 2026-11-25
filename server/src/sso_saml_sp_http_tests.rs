@@ -1089,7 +1089,8 @@ async fn aes_cbc_assertions_sign_in_only_in_a_signed_response() {
     let off = serve(&[("ENCRYPTED_ASSERTIONS", "require")]).await;
     let cert = off.enc_cert().await;
     let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", off.port, off.id)).send().await.unwrap().text().await.unwrap();
-    assert!(!md.contains("cbc"), "{md}");
+    // The algorithm URIs only: a certificate's base64 may hold "cbc" by chance.
+    assert!(!md.contains("-cbc\""), "no CBC cipher offered");
     assert_eq!(off.view().await["aesCbc"], "off");
     off.link();
     let (_, to, head) = off.sign_in(cbc_to(&cert, true)).await;
