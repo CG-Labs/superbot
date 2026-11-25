@@ -210,6 +210,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl scim role map <team> <role> [--org]       The group <team> is gives its members <role> in the
                                                    team, or with --org across the server. Never admin
   botctl scim role show <id>                       A mapping and who it gave the role to
+  botctl scim role remap <id> <role>               The mapping gives <role> instead, in the same scope:
+                                                   whoever holds the old one from it gets it instead
   botctl scim role unmap <id>                      Takes the role from everyone the mapping gave it to
   botctl scim role-groups                          SCIM role groups: groups that give a custom role
                                                    and aren't teams
@@ -302,6 +304,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    item of the TAM's checklist done, open, to confirm or n/a,
                                                    from the health score and botd's records. Exits 1 while any
                                                    item is open
+  botctl offline check [--internal <suffix or range>,...] [--json]
+                                                   What the running botd reaches outside an air-gapped network
+                                                   (ADR 0266): botd offline check's settings, with secrets saved
+                                                   in botd or a secrets manager, IdP metadata saved with botctl
+                                                   and each OIDC provider's discovery document. Exits 1 while
+                                                   anything is on the internet
   botctl business-review [--to <YYYY-MM>] [--json] [-o <file>]
                                                    Draft the quarterly business review (ADR 0262) as Markdown:
                                                    the three months to --to (the last whole month by default),
@@ -1387,6 +1395,7 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             ("POST", "/api/scim/role-mappings".into(), Some(body.to_string()))
         }
         ["role", "show", id] => ("GET", format!("/api/scim/role-mappings/{}", encode(id)), None),
+        ["role", "remap", id, role] => ("PATCH", format!("/api/scim/role-mappings/{}", encode(id)), Some(json!({ "role": role }).to_string())),
         ["role", "unmap", id] => ("DELETE", format!("/api/scim/role-mappings/{}", encode(id)), None),
         ["role-groups"] | ["role-group", "list"] => ("GET", "/api/scim/role-groups".into(), None),
         ["role-group", "add", tenant, group, role, rest @ ..]
@@ -1415,7 +1424,7 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), Some(json!({}).to_string())),
         ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] [--days N] [--scopes LIST] | token rotate <id> [--days N] [--keep-old-hours N] [--scopes LIST] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] [--team] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] [--days N] [--scopes LIST] | token rotate <id> [--days N] [--keep-old-hours N] [--scopes LIST] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role remap <id> <role> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] [--team] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
         }
     })
 }
@@ -2367,6 +2376,27 @@ fn run(args: &[String]) -> Result<String, String> {
             }
             Ok(out)
         }
+        ["offline", rest @ ..] => {
+            let (path, json) = offline_check_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
+            let out = if json {
+                let mut v = v.clone();
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("text");
+                }
+                serde_json::to_string_pretty(&v).unwrap_or_default()
+            } else {
+                v["text"].as_str().unwrap_or_default().trim_end().to_string()
+            };
+            // Anything on the internet exits 1, so a script can stop before going offline.
+            if v["offline"] != true {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(format!("{out}\n").as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["business-review", rest @ ..] => {
             let (path, json, out) = business_review_request(rest)?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -3131,6 +3161,23 @@ fn onboarding_markdown(v: &Value) -> String {
     out
 }
 
+/// `botctl offline check [--internal <list>]... [--json]`: the path to ask, and whether to print JSON.
+fn offline_check_request(rest: &[&str]) -> Result<(String, bool), String> {
+    const USAGE: &str = "Usage: botctl offline check [--internal <suffix or range>,...] [--json]";
+    let Some((&"check", rest)) = rest.split_first() else { return Err(USAGE.into()) };
+    let (mut internal, mut json) = (Vec::new(), false);
+    let mut it = rest.iter();
+    while let Some(&flag) = it.next() {
+        match flag {
+            "--json" | "json" => json = true,
+            "--internal" => internal.extend(it.next().ok_or(USAGE)?.split(',').map(str::trim).filter(|v| !v.is_empty())),
+            _ => return Err(format!("Unknown option {flag}\n{USAGE}")),
+        }
+    }
+    let path = if internal.is_empty() { "/api/offline-check".to_string() } else { format!("/api/offline-check?internal={}", encode(&internal.join(","))) };
+    Ok((path, json))
+}
+
 /// `botctl health-check [markdown | json]`: how to print it.
 fn health_check_request(rest: &[&str]) -> Result<Shape, String> {
     match rest {
@@ -3600,6 +3647,18 @@ mod tests {
         let served = "superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z.tar";
         assert_eq!(evidence_check("evidence.tar", Some(served)), "tar -xf 'evidence.tar' && cd 'superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z' && sha256sum -c SHA256SUMS");
         assert_eq!(evidence_check("my dir/it's.tar", None), "tar -xf 'my dir/it'\\''s.tar' && cd 'it'\\''s' && sha256sum -c SHA256SUMS");
+    }
+
+    #[test]
+    fn the_offline_check_takes_internal_ranges_and_json() {
+        assert_eq!(offline_check_request(&["check"]), Ok(("/api/offline-check".into(), false)));
+        assert_eq!(
+            offline_check_request(&["check", "--internal", "corp.example, 10.0.0.0/8", "--json", "--internal", "[fd00::]/8"]),
+            Ok(("/api/offline-check?internal=corp.example,10.0.0.0%2F8,%5Bfd00::%5D%2F8".into(), true))
+        );
+        for bad in [&[][..], &["verify"], &["check", "--internal"], &["check", "--home", "/h"]] {
+            assert!(offline_check_request(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -4681,6 +4740,8 @@ mod tests {
         assert_eq!(req(&["role", "map", "t1", "Support Lead"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "Support Lead", "scope": "team" })))));
         assert_eq!(req(&["role", "map", "t1", "auditor", "--org"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "auditor", "scope": "org" })))));
         assert_eq!(req(&["role", "show", "sm 1"]), Ok(("GET", "/api/scim/role-mappings/sm%201".into(), None)));
+        assert_eq!(req(&["role", "remap", "sm 1", "Viewer"]), Ok(("PATCH", "/api/scim/role-mappings/sm%201".into(), Some(json!({ "role": "Viewer" })))));
+        assert!(req(&["role", "remap", "sm1"]).is_err());
         assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
         assert_eq!(req(&["role-groups"]), Ok(("GET", "/api/scim/role-groups".into(), None)));
         assert_eq!(req(&["role-group", "list"]), Ok(("GET", "/api/scim/role-groups".into(), None)));

@@ -308,8 +308,9 @@ impl Provider {
 
     /// What signing in here reaches, as `(setting, URL, what it is)`: the setting is the
     /// `SSO_<ID>_...` that names the URL, or would if it weren't the default (`botd offline
-    /// check`, ADR 0257). Native SAML adds the loaded metadata's sign-in and logout URLs; with
-    /// metadata saved by botctl, which isn't loaded yet, it has only those it can name.
+    /// check`, ADR 0257). Native SAML adds the loaded metadata's sign-in and logout URLs: with
+    /// metadata saved by botctl, only once the running botd has loaded it (ADR 0266), named
+    /// by the command that saved it.
     pub fn reaches(&self) -> Vec<(String, String, &'static str)> {
         let key = |k: &str| format!("SSO_{}_{k}", self.id.to_ascii_uppercase());
         match &self.kind {
@@ -320,7 +321,7 @@ impl Provider {
                 let (mut out, from) = match source {
                     IdpSource::Url(url) => (vec![(key("IDP_METADATA_URL"), url.clone(), "metadata")], key("IDP_METADATA_URL")),
                     IdpSource::File(_) => (Vec::new(), key("IDP_METADATA_FILE")),
-                    IdpSource::Saved => return Vec::new(),
+                    IdpSource::Saved => (Vec::new(), format!("botctl sso saml {} import", self.id)),
                 };
                 if let Some(m) = self.idp_loaded() {
                     out.push((from.clone(), m.sso_url.clone(), "sign-in page"));
@@ -679,6 +680,15 @@ impl Provider {
                 stale.ok_or(e)
             }
         }
+    }
+
+    /// The endpoints its discovery document names, as `(what, URL)`, through the same cache as
+    /// sign-in (`botctl offline check`, ADR 0266). None for GitHub and native SAML, which have none.
+    pub async fn discovered(&self, http: &reqwest::Client, gap: Duration) -> Option<Result<Vec<(&'static str, String)>, Invalid>> {
+        self.discovery_url()?;
+        Some(self.metadata(http, gap).await.map(|m| {
+            vec![("authorization endpoint", m.authorization_endpoint.clone()), ("token endpoint", m.token_endpoint.clone()), ("signing keys", m.jwks_uri.clone())]
+        }))
     }
 
     async fn fetch_metadata(&self, http: &reqwest::Client) -> Result<Metadata, Invalid> {

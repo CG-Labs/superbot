@@ -183,6 +183,15 @@ async fn choices_offer_exactly_what_mappings_and_role_groups_take() {
     );
     let g = &m["choices"]["groups"][0];
     assert_eq!((g["tenant"].as_str(), g["team"]["name"].as_str()), (Some("entra"), Some("Team 1")), "{g}");
+
+    // Changing a mapping's role (ADR 0265) takes exactly the same roles.
+    for mapping in m["mappings"].as_array().unwrap() {
+        let scope = mapping["scope"].as_str().unwrap();
+        for (name, id) in &ids {
+            let (code, v) = json_call(port, "PATCH", &format!("/api/scim/role-mappings/{}", mapping["id"].as_str().unwrap()), &admin, &json!({ "role": id }).to_string()).await;
+            assert_eq!(code == 200, names(&offered[scope]).contains(name), "changing a mapping in {scope} to {name}: {v}");
+        }
+    }
 }
 
 #[tokio::test]

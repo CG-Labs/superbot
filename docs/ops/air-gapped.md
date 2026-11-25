@@ -384,7 +384,7 @@ It exits 1 while anything is `internet`, else 0, and 2 for a usage error. `insta
 | Area | What it reads |
 |------|---------------|
 | License | Nothing: the license is checked offline |
-| Sign-in | Each SSO provider's issuer, authority or metadata URL (`SSO_*`), defaults included; for native SAML, the sign-in and logout URLs in its metadata file (metadata saved with botctl is to check) |
+| Sign-in | Each SSO provider's issuer, authority or metadata URL (`SSO_*`), defaults included; for native SAML, the sign-in and logout URLs in its metadata file (metadata saved with botctl is read by `botctl offline check`) |
 | Model providers | The tiers file's `providers` and routes, `SUPERBOT_HERMES_BASE_URL`, `ANTHROPIC_BASE_URL`, or an API key with no base URL |
 | Machines | `LINODE_TOKEN`; `INCUS_URL`, `INCUS_HOSTS` and `INCUS_IMAGE_SERVER` |
 | Harnesses on machines | `MACHINE_HARNESSES` (or the managed tiers' harnesses), `MACHINE_HARNESS_BUNDLE`, `MACHINE_NODE_MIRROR`, `MACHINE_NPM_REGISTRY`, `MACHINE_HERMES_BUNDLE`, `MACHINE_HARNESS_LOGINS` |
@@ -399,7 +399,21 @@ It exits 1 while anything is `internet`, else 0, and 2 for a usage error. `insta
 | Secrets manager | `SECRETS_BACKEND`: its endpoint and where botd signs in to it (STS, Entra ID, a metadata server, a key's token URI), as the backend builds them |
 | Directory sync | `GOOGLE_DIRECTORY_SYNC` |
 
-It reads only botd's settings. Secrets saved with `botctl secret set` or kept in a secrets manager (a Linode token or error-report DSN there, for example) aren't read, nor a Bot's own Codex or Pi configuration on its machine. An OIDC provider's discovery document may name token and key endpoints on other hosts. So treat a clean check as the start, and test sign-in, a Bot run and a backup from inside the network.
+It reads botd's settings and the `_FILE` each secret setting may name. Secrets saved with `botctl secret set` or the console, or kept in a secrets manager, IdP metadata saved with botctl and OIDC discovery documents are read only on the running server, below.
+
+### Checking the running server
+
+`botctl offline check` asks the running botd the same question, over what it uses ([ADR 0266](../adr/0266-checking-the-running-server-for-air-gapped-networks.md)). It needs an admin (`SUPERBOT_PASSWORD` or `SUPERBOT_TOKEN`):
+
+```sh
+botctl offline check --internal corp.example,203.0.113.0/24
+```
+
+- **Secrets:** `LINODE_TOKEN`, `ERROR_REPORT_DSN`, `NOTIFY_WEBHOOK_URL`, each `NOTIFY_WEBHOOK_URL_BOT_*` and the Anthropic settings are judged where botd finds them: `.env`, a `_FILE`, saved in botd or in the secrets manager. Each line says which, such as `NOTIFY_WEBHOOK_URL (saved in botd)`. Only hosts are shown. A store that doesn't answer is one `check` line naming what it couldn't read. `LINODE_TOKEN` and `ERROR_REPORT_DSN` are read only when botd starts, and not from what's saved in botd, so they are judged as botd read them then; a change since is a `check` line until botd restarts.
+- **Sign-in:** native SAML metadata saved with botctl, as loaded, and each OIDC provider's authorization, token and signing-key endpoints from its discovery document. The document comes from sign-in's cache, and isn't fetched for an issuer already on the internet.
+- `--internal` and `--json` work as for `botd offline check`, and it exits 1 while anything is `internet`. Each run is in the audit log as `offline.checked`.
+
+Neither check reads a Bot's own Codex or Pi configuration on its machine, or a user's own secrets. So treat a clean check as the start, and test sign-in, a Bot run and a backup from inside the network.
 
 ## License and seats
 

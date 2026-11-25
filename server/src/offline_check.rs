@@ -9,10 +9,12 @@
 //! the internet, so the installer and scripts can say so.
 
 use crate::support_check::Settings;
+use axum::extract::{Extension, Query};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Bumped when the JSON's shape changes.
 pub const FORMAT: u32 = 1;
@@ -199,6 +201,9 @@ pub struct Finding {
     pub setting: Option<String>,
     pub host: Option<String>,
     pub detail: String,
+    /// Where the setting's value came from when not `.env` (ADR 0266): `file` for its
+    /// `_FILE`, or the secrets store it was saved in (`sealed`, `vault`, ...).
+    pub from: Option<&'static str>,
 }
 
 /// Where an address is, judged from the address alone.
@@ -358,9 +363,19 @@ const HARNESS_FIX: &str = "Set MACHINE_HARNESS_BUNDLE to this release's harness 
 const AUDIT_FIX: &str = "Send it to a SIEM or syslog collector inside your network";
 const SECRETS_FIX: &str = "Use a secrets manager inside your network, a private endpoint, or botd's own store (SECRETS_BACKEND unset)";
 
+/// What the running botd knows beyond its settings (ADR 0266): its SSO providers, with the
+/// IdP metadata it loaded, and what each OIDC provider's discovery document names.
+#[derive(Default)]
+pub struct Live<'a> {
+    pub sso: Option<&'a crate::sso::Sso>,
+    /// By provider id: `(what, URL)` for each endpoint, or why the document didn't load.
+    pub discovered: BTreeMap<String, Result<Vec<(&'static str, String)>, String>>,
+}
+
 struct Judge<'a> {
     vars: &'a BTreeMap<String, String>,
     internal: &'a Internal,
+    live: &'a Live<'a>,
     out: Vec<Finding>,
 }
 
@@ -374,7 +389,7 @@ impl<'a> Judge<'a> {
     }
 
     fn push(&mut self, area: Area, status: Status, setting: Option<&str>, host: Option<&str>, detail: String) {
-        self.out.push(Finding { area, status, setting: setting.map(String::from), host: host.map(String::from), detail: scrub(&detail) });
+        self.out.push(Finding { area, status, setting: setting.map(String::from), host: host.map(String::from), detail: scrub(&detail), from: None });
     }
 
     /// Each address a provider says it reaches, or why its settings don't read.
@@ -424,26 +439,57 @@ impl<'a> Judge<'a> {
         Some(self.get(k)).filter(|v| !v.is_empty()).unwrap_or(default)
     }
 
+    /// The running botd's providers (ADR 0266), or those its settings would give it.
     fn sign_in(&mut self) {
-        if !self.set("SSO_PROVIDERS") {
+        const FIX: &str = "Sign in with an identity provider inside your network (ADFS, Keycloak, or another OIDC or SAML IdP)";
+        let live = self.live;
+        let parsed;
+        let sso = match live.sso {
+            Some(s) => s,
+            None if !self.set("SSO_PROVIDERS") => return self.ok(Area::SignIn, "SSO is off: passwords and TOTP need no network"),
+            None => {
+                let vars = self.vars;
+                match crate::sso::Sso::from_vars(&|k| vars.get(k).cloned()) {
+                    Err(e) => return self.push(Area::SignIn, Status::Check, Some("SSO_PROVIDERS"), None, format!("the SSO settings don't read ({e}), so botd won't start with them. Fix them and check again")),
+                    Ok(s) => {
+                        parsed = s;
+                        &parsed
+                    }
+                }
+            }
+        };
+        if sso.providers.is_empty() {
             return self.ok(Area::SignIn, "SSO is off: passwords and TOTP need no network");
         }
-        let vars = self.vars;
-        match crate::sso::Sso::from_vars(&|k| vars.get(k).cloned()) {
-            Err(e) => self.push(Area::SignIn, Status::Check, Some("SSO_PROVIDERS"), None, format!("the SSO settings don't read ({e}), so botd won't start with them. Fix them and check again")),
-            Ok(sso) => {
-                for p in &sso.providers {
-                    if matches!(&p.kind, crate::sso::Kind::SamlSp { source: crate::sso::IdpSource::Saved, .. }) {
-                        let detail = format!(
-                            "SSO provider {}: native SAML with the IdP's metadata saved with botctl, which this check doesn't read. Check that its sign-in and logout URLs are inside your network",
-                            p.id
-                        );
-                        self.push(Area::SignIn, Status::Check, Some("SSO_PROVIDERS"), None, detail);
+        for p in &sso.providers {
+            if matches!(&p.kind, crate::sso::Kind::SamlSp { source: crate::sso::IdpSource::Saved, .. }) && p.idp_loaded().is_none() {
+                let detail = if live.sso.is_some() {
+                    format!("SSO provider {}: native SAML with no IdP metadata imported yet, so it isn't offered. Import it (botctl sso saml {} import) and check again", p.id, p.id)
+                } else {
+                    format!(
+                        "SSO provider {}: native SAML with the IdP's metadata saved with botctl, which this check doesn't read. Run botctl offline check on the running server, or check that its sign-in and logout URLs are inside your network",
+                        p.id
+                    )
+                };
+                self.push(Area::SignIn, Status::Check, Some("SSO_PROVIDERS"), None, detail);
+            }
+            let reaches = p.reaches();
+            for (setting, url, what) in &reaches {
+                let what = format!("SSO provider {}'s {what}", p.id);
+                self.address(Area::SignIn, setting, url, &what, FIX);
+            }
+            let setting = reaches.first().map_or_else(|| "SSO_PROVIDERS".to_string(), |(s, ..)| s.clone());
+            match live.discovered.get(&p.id) {
+                None => {}
+                Some(Ok(endpoints)) => {
+                    for (what, url) in endpoints {
+                        let what = format!("SSO provider {}'s {what}, from its discovery document", p.id);
+                        self.address(Area::SignIn, &setting, url, &what, FIX);
                     }
-                    for (setting, url, what) in p.reaches() {
-                        let what = format!("SSO provider {}'s {what}", p.id);
-                        self.address(Area::SignIn, &setting, &url, &what, "Sign in with an identity provider inside your network (ADFS, Keycloak, or another OIDC or SAML IdP)");
-                    }
+                }
+                Some(Err(e)) => {
+                    let detail = format!("SSO provider {}'s discovery document didn't load ({e}), so the endpoints it names weren't checked. Check that it answers from botd and check again", p.id);
+                    self.push(Area::SignIn, Status::Check, Some(&setting), None, detail);
                 }
             }
         }
@@ -769,8 +815,14 @@ impl<'a> Judge<'a> {
 }
 
 /// Every finding for botd's settings `vars`, in the order of [`Area::ALL`].
+#[cfg(test)]
 pub fn judge(vars: &BTreeMap<String, String>, internal: &Internal) -> Vec<Finding> {
-    let mut j = Judge { vars, internal, out: Vec::new() };
+    judge_with(vars, internal, &Live::default())
+}
+
+/// `judge`, with what the running botd knows besides (ADR 0266).
+pub fn judge_with(vars: &BTreeMap<String, String>, internal: &Internal, live: &Live) -> Vec<Finding> {
+    let mut j = Judge { vars, internal, live, out: Vec::new() };
     j.ok(Area::License, "checked against keys built into botd, with no network: botd never calls home");
     j.sign_in();
     let tiers = j.models();
@@ -809,7 +861,13 @@ impl Report {
         let findings: Vec<Value> = self
             .findings
             .iter()
-            .map(|f| json!({ "area": f.area.id(), "status": f.status.word(), "setting": f.setting, "host": f.host, "detail": f.detail }))
+            .map(|f| {
+                let mut v = json!({ "area": f.area.id(), "status": f.status.word(), "setting": f.setting, "host": f.host, "detail": f.detail });
+                if let Some(from) = f.from {
+                    v["from"] = json!(from);
+                }
+                v
+            })
             .collect();
         json!({
             "format": FORMAT,
@@ -824,8 +882,14 @@ impl Report {
 
     /// The internet first, then what to check, then the rest, each in area order.
     pub fn text(&self) -> String {
-        let mut out = String::from("botd offline check: what botd's settings reach outside an air-gapped network (ADR 0257)\n");
+        let running = self.source["running"] == true;
+        let mut out = if running {
+            String::from("botctl offline check: what the running botd reaches outside an air-gapped network (ADR 0257, ADR 0266)\n")
+        } else {
+            String::from("botd offline check: what botd's settings reach outside an air-gapped network (ADR 0257)\n")
+        };
         match self.source["envFile"].as_str() {
+            _ if running => out += "Settings: the running botd's environment, its secrets, its SSO providers as loaded and their discovery documents\n",
             Some(f) => out += &format!("Settings: {f}, over botd's environment\n"),
             None => out += "Settings: botd's environment\n",
         }
@@ -835,7 +899,13 @@ impl Report {
         let mut shown: Vec<&Finding> = self.findings.iter().collect();
         shown.sort_by_key(|f| std::cmp::Reverse(f.status));
         for f in shown {
-            let setting = f.setting.as_ref().map(|s| format!("{s}: ")).unwrap_or_default();
+            let from = match f.from {
+                Some("file") => " (from its _FILE)".to_string(),
+                Some("sealed") => " (saved in botd)".to_string(),
+                Some(store) => format!(" (in {store})"),
+                None => String::new(),
+            };
+            let setting = f.setting.as_ref().map(|s| format!("{s}{from}: ")).unwrap_or_default();
             out += &format!("  {:<9} {:<22} {setting}{}\n", f.status.word(), f.area.label(), f.detail);
         }
         let (internet, check, ok) = (self.count(Status::Internet), self.count(Status::Check), self.count(Status::Ok));
@@ -845,14 +915,211 @@ impl Report {
         } else {
             "Nothing botd's settings name is on the internet.\n"
         };
+        if !running {
+            out += "Secrets saved in botd or a secrets manager, IdP metadata saved with botctl and OIDC discovery documents are read on the running server: botctl offline check.\n";
+        }
         out += &format!("Docs: {DOC}\n");
         out
     }
 }
 
 pub fn run(s: &Settings, internal: &Internal) -> Report {
-    let vars: BTreeMap<String, String> = s.vars().into_iter().collect();
-    Report { findings: judge(&vars, internal), internal: internal.listed(), source: s.source() }
+    let mut vars: BTreeMap<String, String> = s.vars().into_iter().collect();
+    let files: Vec<String> = vars.keys().filter_map(|k| k.strip_suffix("_FILE")).filter(|n| n.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX)).map(String::from).collect();
+    let env = crate::secrets::env::EnvStore::vars(vars.clone().into_iter().collect());
+    let filled = fill(&mut vars, saved_names(files), |n| Ok(crate::secrets::SecretStore::get(&env, n)?.map(|v| (v, "file"))));
+    Report { findings: filled.judge(&mut vars, internal, &Live::default()), internal: internal.listed(), source: s.source() }
+}
+
+/// Settings the check reads that botd takes through its secrets (ADR 0010), so they may be
+/// in a `_FILE`, saved with `botctl secret set` or the console, or kept in a secrets manager,
+/// rather than in `.env` (ADR 0266). Each Bot's own `NOTIFY_WEBHOOK_URL_BOT_<ID>` too.
+pub const SAVED: [&str; 6] = ["LINODE_TOKEN", "ERROR_REPORT_DSN", "NOTIFY_WEBHOOK_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+
+fn saved_names(bot_webhooks: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut names: Vec<String> = SAVED.iter().map(|s| s.to_string()).chain(bot_webhooks).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Settings filled in from where botd reads them besides `.env`.
+#[derive(Default)]
+struct Filled {
+    /// Each setting filled in, and where from: `file`, or the store's kind.
+    from: BTreeMap<String, &'static str>,
+    /// Settings that couldn't be read, and why.
+    failed: Vec<(String, String)>,
+    /// Findings about where a setting is rather than what it names.
+    extra: Vec<Finding>,
+}
+
+impl Filled {
+    /// The findings for `vars`, each filled setting marked with where it came from, then
+    /// those values wiped from `vars`.
+    fn judge(&self, vars: &mut BTreeMap<String, String>, internal: &Internal, live: &Live) -> Vec<Finding> {
+        let mut out = judge_with(vars, internal, live);
+        for f in &mut out {
+            f.from = f.setting.as_ref().and_then(|s| self.from.get(s)).copied();
+        }
+        let mut by_why: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (name, why) in &self.failed {
+            by_why.entry(why).or_default().push(name);
+        }
+        for (why, names) in by_why {
+            let names = names.join(", ");
+            let detail = scrub(&format!("{names} couldn't be read from where botd keeps them ({why}), so what they name wasn't checked. Check again when they read"));
+            out.push(Finding { area: Area::Secrets, status: Status::Check, setting: Some(names), host: None, detail, from: None });
+        }
+        out.extend(self.extra.iter().cloned());
+        out.sort_by_key(|f| Area::ALL.iter().position(|a| *a == f.area));
+        for name in self.from.keys() {
+            if let Some(v) = vars.get_mut(name) {
+                zeroize::Zeroize::zeroize(v);
+            }
+        }
+        out
+    }
+}
+
+/// Fills each of `names` that `vars` leaves empty from `get`: its value and where it came from.
+fn fill(vars: &mut BTreeMap<String, String>, names: Vec<String>, get: impl Fn(&str) -> Result<Option<(crate::secrets::Secret, &'static str)>, crate::secrets::Error>) -> Filled {
+    let mut out = Filled::default();
+    for name in names {
+        // With `NAME_FILE` set too, the store refuses both, as botd does.
+        if set(vars, &name) && !set(vars, &format!("{name}_FILE")) {
+            continue;
+        }
+        match get(&name) {
+            Ok(Some((v, from))) => {
+                vars.insert(name.clone(), v.expose().to_string());
+                out.from.insert(name, from);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                vars.remove(&name);
+                out.failed.push((name, e.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn set(vars: &BTreeMap<String, String>, name: &str) -> bool {
+    vars.get(name).is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Settings botd reads once, at start, from its environment (or `_FILE`) and its secrets
+/// manager, never its sealed store: the control plane's token and the error tracker's DSN.
+pub const AT_START: [&str; 2] = ["LINODE_TOKEN", "ERROR_REPORT_DSN"];
+
+/// What botd read at start for each of [`AT_START`], and where from.
+#[derive(Default)]
+pub struct Started(BTreeMap<String, (crate::secrets::Secret, &'static str)>);
+
+static STARTED: std::sync::OnceLock<Started> = std::sync::OnceLock::new();
+
+impl Started {
+    /// Reads [`AT_START`] from `stores` in order, as botd's start does.
+    pub fn read(stores: &[&dyn crate::secrets::SecretStore]) -> Started {
+        let mut out = BTreeMap::new();
+        for name in AT_START {
+            for s in stores {
+                match s.get(name) {
+                    Ok(Some(v)) => {
+                        out.insert(name.to_string(), (v, if s.kind() == "env" { "file" } else { s.kind() }));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        Started(out)
+    }
+}
+
+/// Records what botd's start read, for the running server's check. Once, at start.
+pub fn record_start(stores: &[&dyn crate::secrets::SecretStore]) {
+    let _ = STARTED.set(Started::read(stores));
+}
+
+/// A `check` line when `name`, read only at start, is now somewhere else or different.
+fn since_start(name: &str, then: Option<&crate::secrets::Secret>, now: &Option<(crate::secrets::Secret, &'static str)>) -> Option<Finding> {
+    let detail = match now {
+        Some((_, "sealed")) if then.is_none() => {
+            format!("{name} is saved in botd, but botd reads it only at start, from its environment, a _FILE or its secrets manager, so the saved value isn't used. Set it there and restart botd, or remove it")
+        }
+        _ if now.as_ref().map(|(v, _)| v.expose()) != then.map(|v| v.expose()) => {
+            format!("{name} changed since botd started. This check judges the value botd read then, which it still uses: restart botd to use the new one, and check again")
+        }
+        _ => return None,
+    };
+    let area = if name == "LINODE_TOKEN" { Area::Machines } else { Area::Observability };
+    Some(Finding { area, status: Status::Check, setting: Some(name.to_string()), host: None, detail: scrub(&detail), from: None })
+}
+
+/// The check on the running botd (ADR 0266): its environment `env`, with each of [`SAVED`]
+/// taken from where botd takes it (a `_FILE`, botd's sealed store, its secrets manager), its
+/// SSO providers as loaded, with IdP metadata saved by botctl, and the endpoints each OIDC
+/// provider's discovery document names. Only discovery opens a connection, and only to an
+/// identity provider not on the internet, as a sign-in would, through the same cache.
+pub async fn live(mut env: BTreeMap<String, String>, secrets: &crate::secrets::Secrets, started: &Started, sso: &crate::sso::Sso, internal: &Internal) -> Report {
+    let prefix = crate::secrets::BOT_WEBHOOK_PREFIX;
+    let (mut hooks, unlisted): (Vec<String>, _) = match secrets.list() {
+        Ok(l) => (l.into_iter().map(|l| l.name).filter(|n| n.starts_with(prefix)).collect(), None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    // A `_FILE` alone isn't listed: its name doesn't say it holds a secret.
+    hooks.extend(env.keys().filter_map(|k| k.strip_suffix("_FILE")).filter(|n| n.starts_with(prefix)).map(String::from));
+    let in_env: Vec<&str> = AT_START.into_iter().filter(|n| set(&env, n)).collect();
+    let (at_start, any_time): (Vec<String>, Vec<String>) = saved_names(hooks).into_iter().partition(|n| AT_START.contains(&n.as_str()));
+    let mut filled = fill(&mut env, any_time, |n| Ok(secrets.found(n)?.map(|(v, kind)| (v, if kind == "env" { "file" } else { kind }))));
+    let then = fill(&mut env, at_start, |n| Ok(started.0.get(n).map(|(v, from)| (crate::secrets::Secret::new(v.expose()), *from))));
+    filled.from.extend(then.from);
+    filled.failed.extend(then.failed);
+    for name in AT_START.into_iter().filter(|n| !in_env.contains(n)) {
+        match secrets.found(name) {
+            Ok(now) => filled.extra.extend(since_start(name, started.0.get(name).map(|(v, _)| v), &now)),
+            Err(e) => filled.failed.push((name.to_string(), e.to_string())),
+        }
+    }
+    if let Some(e) = unlisted {
+        filled.failed.push((format!("{prefix}*"), e));
+    }
+    let mut discovered = BTreeMap::new();
+    for p in &sso.providers {
+        let on_internet = p.reaches().first().and_then(|(_, url, _)| host_of(url)).is_some_and(|h| matches!(place(&h, internal), Place::Internet(_)));
+        if on_internet {
+            continue;
+        }
+        if let Some(found) = sso.discovered(p).await {
+            discovered.insert(p.id.clone(), found);
+        }
+    }
+    let findings = filled.judge(&mut env, internal, &Live { sso: Some(sso), discovered });
+    let from: BTreeMap<&str, &str> = filled.from.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    Report { findings, internal: internal.listed(), source: json!({ "running": true, "from": from }) }
+}
+
+pub const CHECKED: &str = "offline.checked";
+
+/// `GET /api/offline-check[?internal=<suffix or range>,...]` (admins, ADR 0266): the check
+/// on the running botd, as JSON with its text. Audited as `offline.checked`.
+pub async fn get(Extension(a): Extension<Arc<crate::Auth>>, Extension(by): Extension<crate::audit::Who>, Query(q): Query<BTreeMap<String, String>>) -> crate::Res {
+    if let Some(k) = q.keys().find(|k| *k != "internal") {
+        let shown = if k.len() <= 40 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { k.as_str() } else { "[text]" };
+        return Err(crate::bad(format!("Unknown parameter \"{shown}\". The check takes only internal=<suffix or range>,...")));
+    }
+    let internal = Internal::parse(&[q.get("internal").map_or("", String::as_str)]).map_err(|e| crate::bad(e.replacen("--internal", "internal", 1)))?;
+    let env = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
+    let r = live(env, crate::secrets::global(), STARTED.get_or_init(Started::default), &a.sso, &internal).await;
+    let counts = json!({ "ok": r.count(Status::Ok), "check": r.count(Status::Check), "internet": r.count(Status::Internet) });
+    let internet: Vec<&str> = r.findings.iter().filter(|f| f.status == Status::Internet).filter_map(|f| f.setting.as_deref()).collect();
+    a.record(by.event(CHECKED).target("setup", "server").details(json!({ "offline": r.offline(), "counts": counts, "internal": r.internal, "internet": internet, "from": r.source["from"] })));
+    let mut v = r.json();
+    v["text"] = Value::String(r.text());
+    Ok(axum::Json(v))
 }
 
 struct Args<'a> {
@@ -1459,5 +1726,213 @@ mod tests {
             assert!(section.contains(&format!("| {} |", a.label())), "the section's table has {}", a.label());
         }
         assert!(guide.contains("INCUS_IMAGE_SERVER"), "the guide says where Incus images come from");
+    }
+
+    // The running server's check (ADR 0266).
+
+    fn store(env: &[(&str, &str)]) -> crate::secrets::Secrets {
+        use crate::secrets::{env::EnvStore, sealed};
+        let path = crate::db::temp_path("offline-live").join("app.sqlite");
+        let sealed = sealed::SealedStore::new(sealed::connect(&path).unwrap(), sealed::cipher());
+        crate::secrets::Secrets::new(vec![Box::new(EnvStore::fixed(env)), Box::new(sealed)])
+    }
+
+    fn sso(pairs: &[(&str, &str)]) -> crate::sso::Sso {
+        let v = vars(pairs);
+        crate::sso::Sso::from_vars(&|k| v.get(k).cloned()).unwrap()
+    }
+
+    fn started(env: &[(&str, &str)]) -> Started {
+        Started::read(&[&crate::secrets::env::EnvStore::fixed(env)])
+    }
+
+    #[tokio::test]
+    async fn the_running_server_reads_settings_where_botd_keeps_them() {
+        let dsn_key = crate::random_hex(12);
+        let hook_path = crate::random_hex(12);
+        let dsn = temp_file("offline-live-dsn", &format!("https://{dsn_key}@o1.ingest.sentry.io/1\n"));
+        let at_start = [("ERROR_REPORT_DSN_FILE", dsn.as_str())];
+        let s = store(&at_start);
+        s.put("NOTIFY_WEBHOOK_URL_BOT_AB12CD34", &format!("https://hooks.slack.com/services/T0/B0/{hook_path}")).unwrap();
+        s.put("NOTIFY_WEBHOOK_URL", "https://hooks.slack.com/services/T0/B0/shadowed").unwrap();
+        s.put("ANTHROPIC_BASE_URL", "https://llm.corp.example").unwrap();
+        let env = vars(&[("NOTIFY_WEBHOOK_URL", "https://chat.corp.example/hooks/a")]);
+        let r = live(env, &s, &started(&at_start), &crate::sso::Sso::default(), &internal(&["corp.example"])).await;
+        let f = &r.findings;
+        let errors = by(f, "ERROR_REPORT_DSN");
+        assert_eq!((errors.status, errors.host.as_deref(), errors.from), (Status::Internet, Some("o1.ingest.sentry.io"), Some("file")), "{f:#?}");
+        let hook = by(f, "NOTIFY_WEBHOOK_URL_BOT_AB12CD34");
+        assert_eq!((hook.status, hook.from), (Status::Internet, Some("sealed")), "a Bot's own webhook, set from the console");
+        let shared = by(f, "NOTIFY_WEBHOOK_URL");
+        assert_eq!((shared.status, shared.from), (Status::Ok, None), "the environment wins, as it does for botd");
+        let model = by(f, "ANTHROPIC_BASE_URL");
+        assert_eq!((model.status, model.from), (Status::Ok, Some("sealed")), "Bots get a saved base URL");
+        assert!(of(f, Area::Models).iter().all(|x| !x.detail.starts_with("no model endpoint")), "{f:#?}");
+        assert!(f.iter().all(|x| !x.detail.contains("since botd started")), "nothing changed: {f:#?}");
+        assert!(!r.offline());
+        let text = r.text();
+        assert!(text.starts_with("botctl offline check: what the running botd reaches"), "{text}");
+        assert!(text.contains("ERROR_REPORT_DSN (from its _FILE): Error reports") && text.contains("NOTIFY_WEBHOOK_URL_BOT_AB12CD34 (saved in botd): "), "{text}");
+        assert!(!text.contains("are read on the running server"), "{text}");
+        let j = r.json();
+        assert_eq!(j["settings"], json!({ "running": true, "from": { "ANTHROPIC_BASE_URL": "sealed", "ERROR_REPORT_DSN": "file", "NOTIFY_WEBHOOK_URL_BOT_AB12CD34": "sealed" } }));
+        assert!(j["findings"].as_array().unwrap().iter().any(|x| x["setting"] == "ERROR_REPORT_DSN" && x["from"] == "file"));
+        let all = format!("{text}{j}{f:?}");
+        for (what, secret) in [("the DSN's key", dsn_key.as_str()), ("the webhook's path", &hook_path), ("the shadowed webhook", "shadowed")] {
+            assert!(!all.contains(secret), "{what} reached the report");
+        }
+        for v in [format!("https://hooks.slack.com/services/T0/B0/{hook_path}"), "https://hooks.slack.com/services/T0/B0/shadowed".into(), "https://llm.corp.example".into()] {
+            crate::secrets::redact::forget(&v);
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_read_at_start_are_judged_as_botd_read_them() {
+        let dsn = temp_file("offline-live-start", "https://k1@o1.ingest.sentry.io/1\n");
+        let at_start = [("ERROR_REPORT_DSN_FILE", dsn.as_str())];
+        let then = started(&at_start);
+        std::fs::write(&dsn, "https://k2@errors.corp.example/1\n").unwrap();
+        let token = format!("lin-{}", crate::random_hex(12));
+        let s = store(&at_start);
+        s.put("LINODE_TOKEN", &token).unwrap();
+        let r = live(BTreeMap::new(), &s, &then, &crate::sso::Sso::default(), &internal(&["corp.example"])).await;
+        let f = &r.findings;
+        let errors: Vec<&Finding> = f.iter().filter(|x| x.setting.as_deref() == Some("ERROR_REPORT_DSN")).collect();
+        assert_eq!((errors[0].status, errors[0].host.as_deref()), (Status::Internet, Some("o1.ingest.sentry.io")), "what botd still sends to: {f:#?}");
+        assert!(errors.iter().any(|x| x.status == Status::Check && x.detail.contains("changed since botd started") && x.detail.contains("restart botd")), "{f:#?}");
+        let linode: Vec<&Finding> = f.iter().filter(|x| x.setting.as_deref() == Some("LINODE_TOKEN")).collect();
+        assert_eq!(linode.len(), 1, "a sealed token isn't one botd uses: {f:#?}");
+        assert_eq!((linode[0].area, linode[0].status), (Area::Machines, Status::Check));
+        assert!(linode[0].detail.contains("saved in botd, but botd reads it only at start"), "{}", linode[0].detail);
+        assert!(!format!("{f:?}{}", r.text()).contains(&token));
+        let again = live(BTreeMap::new(), &store(&at_start), &started(&at_start), &crate::sso::Sso::default(), &internal(&["corp.example"])).await;
+        assert!(again.findings.iter().all(|x| !x.detail.contains("since botd started")), "after a restart: {:#?}", again.findings);
+        assert_eq!(by(&again.findings, "ERROR_REPORT_DSN").status, Status::Ok);
+        crate::secrets::redact::forget(&token);
+    }
+
+    #[tokio::test]
+    async fn a_bot_webhook_in_a_file_and_a_setting_set_twice_are_read_as_botd_would() {
+        let hook = temp_file("offline-live-hook", "https://hooks.slack.com/services/T0/B0/from-a-file\n");
+        let twice = temp_file("offline-live-twice", "https://chat.corp.example/hooks/b\n");
+        let env = [("NOTIFY_WEBHOOK_URL_BOT_CD34EF56_FILE", hook.as_str()), ("NOTIFY_WEBHOOK_URL", "https://chat.corp.example/hooks/a"), ("NOTIFY_WEBHOOK_URL_FILE", twice.as_str())];
+        let r = live(vars(&env), &store(&env), &Started::default(), &crate::sso::Sso::default(), &internal(&["corp.example"])).await;
+        let f = &r.findings;
+        let own = by(f, "NOTIFY_WEBHOOK_URL_BOT_CD34EF56");
+        assert_eq!((own.status, own.host.as_deref(), own.from), (Status::Internet, Some("hooks.slack.com"), Some("file")), "{f:#?}");
+        let both = by(f, "NOTIFY_WEBHOOK_URL");
+        assert_eq!((both.area, both.status), (Area::Secrets, Status::Check), "{f:#?}");
+        assert!(both.detail.contains("not both"), "{}", both.detail);
+        assert!(of(f, Area::Webhooks).iter().all(|x| x.setting.as_deref() != Some("NOTIFY_WEBHOOK_URL")), "a setting botd refuses isn't judged: {f:#?}");
+        let mut files = vars(&env);
+        files.remove("NOTIFY_WEBHOOK_URL_BOT_CD34EF56_FILE");
+        let r = run(&Settings::new(None, None, files), &internal(&["corp.example"]));
+        assert_eq!(by(&r.findings, "NOTIFY_WEBHOOK_URL").area, Area::Secrets, "the settings check refuses it too: {:#?}", r.findings);
+    }
+
+    #[tokio::test]
+    async fn a_secrets_manager_that_doesnt_answer_is_to_check_once() {
+        struct Down;
+        impl crate::secrets::SecretStore for Down {
+            fn kind(&self) -> &'static str {
+                "vault"
+            }
+            fn get(&self, _: &str) -> Result<Option<crate::secrets::Secret>, crate::secrets::Error> {
+                Err(crate::secrets::Error::Unavailable("Vault didn't answer".into()))
+            }
+            fn names(&self) -> Result<Vec<String>, crate::secrets::Error> {
+                Err(crate::secrets::Error::Unavailable("Vault didn't answer".into()))
+            }
+        }
+        let s = crate::secrets::Secrets::new(vec![Box::new(crate::secrets::env::EnvStore::fixed(&[("LINODE_TOKEN", "from-env")])), Box::new(Down)]);
+        let r = live(BTreeMap::new(), &s, &Started::read(&[&crate::secrets::env::EnvStore::fixed(&[("LINODE_TOKEN", "from-env")])]), &crate::sso::Sso::default(), &Internal::default()).await;
+        let down: Vec<&Finding> = r.findings.iter().filter(|x| x.detail.contains("couldn't be read")).collect();
+        assert_eq!(down.len(), 1, "{:#?}", r.findings);
+        assert_eq!((down[0].area, down[0].status), (Area::Secrets, Status::Check));
+        assert!(down[0].detail.contains("NOTIFY_WEBHOOK_URL_BOT_*") && down[0].detail.contains("ERROR_REPORT_DSN") && down[0].detail.contains("Vault didn't answer"), "{}", down[0].detail);
+        assert!(!down[0].detail.contains("LINODE_TOKEN"), "the environment answered for it");
+        assert_eq!(by(&r.findings, "LINODE_TOKEN").from, Some("file"), "from botd's own environment store: {:#?}", r.findings);
+    }
+
+    #[tokio::test]
+    async fn saved_saml_metadata_and_discovery_documents_are_read_on_the_running_server() {
+        use crate::sso::saml_sp::{RequestBinding, load_idp_metadata, test_idp};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let issuer = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let doc = json!({
+            "issuer": issuer,
+            "authorization_endpoint": "https://sso.corp.example/authorize",
+            "token_endpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+            "jwks_uri": "https://sso.corp.example/keys",
+        });
+        let n = asked.clone();
+        let app = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(move || {
+                n.fetch_add(1, Ordering::SeqCst);
+                let doc = doc.clone();
+                async move { axum::Json(doc) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sso = sso(&[
+            ("SSO_PROVIDERS", "corp,okta,down,google"),
+            ("SSO_PUBLIC_URL", "https://bot.corp.example"),
+            ("SSO_CORP_TYPE", "saml"),
+            ("SSO_CORP_IDP_ENTITY_ID", test_idp::IDP),
+            ("SSO_OKTA_TYPE", "oidc"),
+            ("SSO_OKTA_ISSUER", &issuer),
+            ("SSO_OKTA_CLIENT_ID", "superbot"),
+            ("SSO_DOWN_TYPE", "oidc"),
+            ("SSO_DOWN_ISSUER", "http://127.0.0.1:1"),
+            ("SSO_DOWN_CLIENT_ID", "superbot"),
+            ("SSO_GOOGLE_CLIENT_ID", "c.apps.googleusercontent.com"),
+        ]);
+        let none = &Internal::default();
+        let r = live(BTreeMap::new(), &store(&[]), &Started::default(), &sso, none).await;
+        let saved = r.findings.iter().find(|x| x.detail.starts_with("SSO provider corp: native SAML with no IdP metadata imported yet")).unwrap_or_else(|| panic!("{:#?}", r.findings));
+        assert_eq!(saved.status, Status::Check);
+
+        let corp = sso.provider("corp").unwrap();
+        corp.set_idp(load_idp_metadata(&test_idp::metadata(), test_idp::IDP, false, RequestBinding::Auto, None, crate::db::now()).unwrap());
+        let r = live(BTreeMap::new(), &store(&[]), &Started::default(), &sso, &internal(&["idp.example"])).await;
+        let f = &r.findings;
+        let page = by(f, "botctl sso saml corp import");
+        assert_eq!((page.status, page.host.as_deref()), (Status::Ok, Some("idp.example")), "{f:#?}");
+        assert!(page.detail.starts_with("SSO provider corp's sign-in page at idp.example"), "{}", page.detail);
+        assert!(f.iter().all(|x| !x.detail.contains("no IdP metadata imported")), "{f:#?}");
+
+        let okta: Vec<&Finding> = f.iter().filter(|x| x.setting.as_deref() == Some("SSO_OKTA_ISSUER")).collect();
+        let at = |what: &str| okta.iter().find(|x| x.detail.starts_with(&format!("SSO provider okta's {what}"))).unwrap_or_else(|| panic!("no {what}: {okta:#?}"));
+        assert_eq!(at("issuer").status, Status::Ok);
+        let token = at("token endpoint, from its discovery document");
+        assert_eq!((token.status, token.host.as_deref()), (Status::Internet, Some("login.microsoftonline.com")));
+        assert_eq!(at("authorization endpoint, from its discovery document").status, Status::Check);
+        assert_eq!(at("signing keys, from its discovery document").host.as_deref(), Some("sso.corp.example"));
+        let down = by(f, "SSO_DOWN_ISSUER");
+        let failed = f.iter().find(|x| x.detail.starts_with("SSO provider down's discovery document didn't load (idp_unreachable)")).unwrap_or_else(|| panic!("{f:#?}"));
+        assert_eq!((down.status, failed.status), (Status::Ok, Status::Check));
+        let google: Vec<&Finding> = f.iter().filter(|x| x.detail.starts_with("SSO provider google")).collect();
+        assert_eq!(google.len(), 1, "an issuer on the internet isn't asked for its document: {google:#?}");
+        assert_eq!(google[0].status, Status::Internet);
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "discovery goes through sign-in's cache");
+        assert!(!r.offline());
+    }
+
+    #[test]
+    fn the_settings_check_reads_secret_files_and_points_at_the_running_check() {
+        let dsn = temp_file("offline-dsn-file", "https://key-0123@o1.ingest.sentry.io/1\n");
+        let s = Settings::new(None, None, vars(&[("ERROR_REPORT_DSN_FILE", &dsn), ("NOTIFY_WEBHOOK_URL_FILE", "/nonexistent/offline-hook")]));
+        let r = run(&s, &Internal::default());
+        let errors = by(&r.findings, "ERROR_REPORT_DSN");
+        assert_eq!((errors.status, errors.from), (Status::Internet, Some("file")));
+        let unread = by(&r.findings, "NOTIFY_WEBHOOK_URL");
+        assert_eq!((unread.area, unread.status), (Area::Secrets, Status::Check));
+        assert!(unread.detail.contains("NOTIFY_WEBHOOK_URL_FILE (/nonexistent/offline-hook)"), "{}", unread.detail);
+        let text = r.text();
+        assert!(text.contains("ERROR_REPORT_DSN (from its _FILE): ") && !text.contains("key-0123"), "{text}");
+        assert!(text.contains("are read on the running server: botctl offline check.\nDocs: "), "{text}");
     }
 }

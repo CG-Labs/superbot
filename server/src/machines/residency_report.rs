@@ -206,10 +206,12 @@ pub(super) fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Op
     let inside = backups.iter().filter(|b| residency::stored_in(cp.offsite.as_deref(), b.store_region.as_deref(), region)).count();
     let tier = app.tier_of(id);
     let gap = app.tiers().residency_gap(tier, region);
+    let (on, runs_in) = residency::runs_of(app, cp, id, region);
     Some(json!({
         "id": u.id, "name": u.name, "email": u.email, "machine": machine,
         "backups": { "kept": backups.len(), "inRegion": inside, "outside": backups.len() - inside },
         "modelRoutes": { "plan": tier.label, "inRegion": gap.is_none(), "gap": gap },
+        "runs": { "on": on, "inRegion": runs_in },
     }))
 }
 
@@ -247,6 +249,9 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
     }
     let mut warnings = residency::unready(cp, region);
     warnings.extend(residency::route_gaps(app, &ids, region).into_iter().map(|g| format!("{g}, so their Bots' runs are refused (ADR 0139)")));
+    if let Some((names, why)) = residency::server_run_gaps(app, cp, &ids, region) {
+        warnings.push(format!("{} Bots run on botd's own server, and {why}, so their runs are refused (ADR 0267)", residency::possessive(&names)));
+    }
     let server_data = cp.server_data.against(app, region);
     outside.extend(cp.server_data.refuses(region).into_iter().map(|w| format!("botd: {w} (RESIDENCY_SERVER_DATA=require, ADR 0184)")));
     if let Some(n) = server_data["earlierCopies"].as_i64().filter(|n| *n > 0) {
@@ -321,20 +326,21 @@ pub fn markdown(r: &Value) -> String {
     };
     list(&mut out, "Data outside the region", &r["outside"], "None.");
     list(&mut out, "Warnings", &r["warnings"], "None.");
-    out += "## Where their data is\n\n| Person | Machine | Machine region | Host (region) | Backups in region | Backups outside | Model routes |\n|---|---|---|---|---|---|---|\n";
+    out += "## Where their data is\n\n| Person | Machine | Machine region | Host (region) | Backups in region | Backups outside | Model routes | Bots run on |\n|---|---|---|---|---|---|---|---|\n";
     for p in r["people"].as_array().into_iter().flatten() {
         let m = &p["machine"];
         let host = if m["host"].is_string() { format!("{} ({})", c(&m["host"]), c(&m["hostRegion"])) } else { "-".into() };
         let routes = if p["modelRoutes"]["inRegion"] == true { format!("{}: in region", c(&p["modelRoutes"]["plan"])) } else { c(&p["modelRoutes"]["gap"]) };
         out += &format!(
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             c(&p["name"]),
             if m.is_object() { format!("{} ({})", c(&m["id"]), c(&m["state"])) } else { "none".into() },
             c(&m["region"]),
             host,
             c(&p["backups"]["inRegion"]),
             c(&p["backups"]["outside"]),
-            routes
+            routes,
+            runs_cell(&p["runs"])
         );
     }
     out += &server_data_markdown(&r["serverData"]);
@@ -370,6 +376,20 @@ pub fn markdown(r: &Value) -> String {
     let fence = "`".repeat(longest_backtick_run(&json).max(2) + 1);
     out += &format!("{fence}json\n{json}\n{fence}\n");
     out
+}
+
+/// Where a person's own Bots run, against the region (ADR 0267). "-" for reports without it.
+fn runs_cell(r: &Value) -> String {
+    let at = match r["on"].as_str() {
+        Some("server") => "botd's server",
+        Some("machine") => "their machine",
+        Some("nowhere") => return "nowhere yet (refused)".into(),
+        _ => return "-".into(),
+    };
+    match r["inRegion"].as_bool() {
+        Some(true) => format!("{at}, in region"),
+        _ => format!("{at}, outside (refused)"),
+    }
 }
 
 /// The report's "botd's own data" section (ADR 0184). Empty for reports without one.

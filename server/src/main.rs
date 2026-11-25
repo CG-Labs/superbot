@@ -155,6 +155,8 @@ mod machines_residency_tests;
 #[cfg(test)]
 mod residency_routes_http_tests;
 #[cfg(test)]
+mod residency_run_place_http_tests;
+#[cfg(test)]
 mod residency_report_http_tests;
 #[cfg(test)]
 mod residency_me_http_tests;
@@ -172,6 +174,8 @@ mod obs;
 #[cfg(test)]
 mod obs_http_tests;
 mod offline_check;
+#[cfg(test)]
+mod offline_check_http_tests;
 #[cfg(test)]
 mod push_http_tests;
 mod paths;
@@ -437,6 +441,7 @@ async fn main() {
     let external_names = external.as_ref().map(|x| x.check().unwrap_or_else(|e| exit(format!("Secrets backend: {e}. botd won't start without its secrets (ADR 0125)."))));
     let external_shared = external.clone().map(secrets::external::Shared);
     let startup_store = secrets::external::Layered(std::iter::once(&process_env as &dyn secrets::SecretStore).chain(external_shared.as_ref().map(|s| s as &dyn secrets::SecretStore)).collect());
+    offline_check::record_start(&startup_store.0);
     let observe = obs::Settings::from_env(&|k| env(k, ""), &startup_store).unwrap_or_else(|e| exit(format!("Observability: {e}")));
     obs::log::set_format(observe.log);
     match (&external, external_names) {
@@ -1111,6 +1116,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/support/health-score", get(health_score::get))
         .route("/support/health-score/history", get(health_history::get))
         .route("/support/onboarding", get(onboarding::get))
+        .route("/offline-check", get(offline_check::get))
         .route("/evidence", get(evidence::get))
         .route("/evidence/bundle", get(evidence::bundle))
         .route("/evidence/baseline", get(baseline::get))
@@ -1289,7 +1295,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
-        .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
+        .route("/scim/role-mappings/{id}", get(scim::roles::get).patch(scim::roles::update).delete(scim::roles::delete))
         .route("/scim/role-groups", get(scim::role_groups::list).post(scim::role_groups::create_api))
         .route("/scim/role-groups/{id}", get(scim::role_groups::get_api).patch(scim::role_groups::update_api).delete(scim::role_groups::delete_api))
         .route("/scim/google", get(scim::google::status))
