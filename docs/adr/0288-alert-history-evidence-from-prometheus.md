@@ -29,7 +29,7 @@ The manifest names CC2.1, CC7.2, A1.1 and rows CC2.1-1, CC7.2-1 and A1.1-1 only 
 
 **Exceptions** (counted by the coverage report): every page, which needs its response on record (a ticket, or an incident in the [policy register](../security/policy-register.md#incidents)); episodes that fired more than a day; alerts still firing at the period's end; watch gaps, and months whose gaps exceed the budget; rules that couldn't be read, aren't loaded, are failing, aren't being evaluated, or are loaded with another severity (a page downgraded to a ticket reaches no one on call); notifications that failed, by day and integration; and the days with no notifications recorded.
 
-**What stays out.** The token, the Prometheus address, rule files' paths, rules' expressions and errors (`lastError` can quote a target), and every label but `alertname`, `severity`, `job` and the ones the shipped rules group by that never name a host (`harness`, `route_class`, `provider`, `tier`); `instance`, `host` and `target` go only into the series' digest. Group and integration names are kept when plain.
+**What stays out.** The token, the Prometheus address, rule files' paths, rules' expressions and errors (`lastError` can quote a target), the text of a failed rules request (a proxy's error page can name hosts, so the bundle records only the HTTP status or that there was no answer, and the command prints the full error to the operator), and every label but `alertname`, `severity`, `job` and the ones the shipped rules group by that never name a host (`harness`, `route_class`, `provider`, `tier`); `instance`, `host` and `target` go only into the series' digest. Group and integration names are kept when plain.
 
 ### Coverage
 
@@ -56,6 +56,7 @@ The coverage report knows the seventh prefix, kind and format, expects `alerts.j
 - Operators run it themselves each month, where Prometheus is reachable, and keep Prometheus' retention over a month (the default 15 days isn't); a month not made is a gap in the coverage report.
 - A page's response is still a record people keep; the bundle is the population an auditor samples it from.
 - The shipped rule files are now read by the binary as well as `promtool`; adding one to `deploy/prometheus/` fails a unit test until it is listed.
+- The container image's build compiles only the four binaries it installs, as the offline workflow does, since its build context leaves out `deploy/prometheus/` and `superbot-evidence` now embeds it.
 
 ## Deferred
 
