@@ -679,7 +679,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let set = settings.clone();
     let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
     let cipher = crate::secrets::sealed::cipher();
-    let opened = chat_stores::open(&app.db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let opened = chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
     let (lines, rekeyed) = (opened.lines, opened.rekeyed);
     assert_eq!(rekeyed, 0);
     assert!(lines.iter().any(|l| l.contains("made gb-lon's store")) && lines.iter().any(|l| l.contains("made de-fra-2's store")), "{lines:?}");
@@ -800,7 +800,7 @@ async fn a_pinned_persons_routines_and_approvals_are_kept_with_their_chats() {
     let set = settings.clone();
     let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
     let cipher = crate::secrets::sealed::cipher();
-    chat_stores::open(&app.db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
     let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
     let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;
     let body = r#"{"name":"Standup","cron":"0 9 * * 1-5","instruction":"summarise the contract"}"#;
@@ -839,7 +839,7 @@ async fn a_pinned_persons_routines_and_approvals_are_kept_with_their_chats() {
     let c = &r["chats"];
     assert_eq!((c["inRegion"].as_bool(), c["routines"]["inStore"].as_i64(), c["approvals"]["inStore"].as_i64(), c["approvals"]["inServerDatabase"].as_i64()), (Some(true), Some(1), Some(2), Some(0)), "{r}");
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
-    assert!(md.contains("## Chats, routines and approvals") && md.contains("- **Routines in it:** 1") && md.contains("- **Approvals in it:** 2"), "{md}");
+    assert!(md.contains("## Chats, routines, approvals and memory") && md.contains("- **Routines in it:** 1") && md.contains("- **Approvals in it:** 2"), "{md}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
     assert_eq!((lon_row["chatStore"]["routines"].as_i64(), lon_row["chatStore"]["approvals"].as_i64()), (Some(1), Some(2)), "{regions}");
@@ -870,6 +870,70 @@ async fn a_pinned_persons_routines_and_approvals_are_kept_with_their_chats() {
 }
 
 #[tokio::test]
+async fn a_pinned_persons_bots_memory_is_kept_in_their_regions_chat_store_not_in_data_dir() {
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;
+    let file = app.data_memory_file(&bot).unwrap();
+    let word = "memory-1f9a3c-the-client-plan";
+    app.keep_memory_text(&bot, word).unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), word, "unpinned: kept in its file in DATA_DIR");
+    let count = || rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(count(), 0);
+
+    // A pin moves it into London's store and deletes its file, audited.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    assert_eq!((count(), file.exists()), (1, false));
+    assert_eq!(app.kept_memory(&bot).as_deref(), Some(word));
+    let moved = audit(port, &admin, chat_stores::MOVED).await;
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["memories"].as_i64()), (Some("gb-lon"), Some(1)), "{moved:?}");
+    // Saved there from now on: what a run sends back never lands in DATA_DIR.
+    app.keep_memory_text(&bot, "learned on the machine").unwrap();
+    assert_eq!((count(), file.exists(), app.kept_memory(&bot).as_deref()), (1, false, Some("learned on the machine")));
+
+    // The report, the app and the regions page count it.
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    let c = &r["chats"];
+    assert_eq!((c["inRegion"].as_bool(), c["memories"]["inStore"].as_i64(), c["memories"]["inServerDatabase"].as_i64()), (Some(true), Some(1), Some(0)), "{r}");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("- **Bots' memory in it:** 1"), "{md}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
+    assert_eq!(lon_row["chatStore"]["memories"].as_i64(), Some(1), "{regions}");
+
+    // A memory file left in DATA_DIR makes the pin unkept until reconcile deletes it; the
+    // store's copy is the newer one.
+    std::fs::write(&file, "stale").unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert!(r["outside"].to_string().contains("their Bots have 1 Bot memory in botd's own database or its files, not gb-lon's chat store"), "{r}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!(me["chats"]["moving"].as_bool(), Some(true), "{me}");
+    reconcile_as(port, &admin).await;
+    assert_eq!((file.exists(), app.kept_memory(&bot).as_deref()), (false, Some("learned on the machine")));
+    // A row left in botd's own table is moved by reconcile.
+    app.db.conn_for_tests().execute_batch("INSERT INTO main.memories SELECT * FROM chats_0.memories; DELETE FROM chats_0.memories;").unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert_eq!(reconcile_as(port, &admin).await["memoriesMoved"].as_i64(), Some(1));
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("kept"), "{r}");
+
+    // Unpinned, it is written back to its file.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!((count(), std::fs::read_to_string(&file).unwrap().as_str()), (0, "learned on the machine"));
+    assert!(app.db.memory(&bot).is_none());
+}
+
+#[tokio::test]
 async fn a_pinned_persons_store_backups_are_copied_off_the_host_into_a_bucket_in_their_region() {
     use crate::machines::chat_store_copies::{self, COPIED, Copies};
     use crate::machines::chat_stores::{self, CLEARED, Settings};
@@ -888,7 +952,7 @@ async fn a_pinned_persons_store_backups_are_copied_off_the_host_into_a_bucket_in
     })
     .await;
     let cipher = crate::secrets::sealed::cipher();
-    chat_stores::open(&app.db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
     let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
     let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;
     let word = "chat-5d70-contract-terms";

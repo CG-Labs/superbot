@@ -629,7 +629,7 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
         Current::Readable(k) => {
             let p = place.store.path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", place.store.path.display()))?;
             c.execute("ATTACH DATABASE ?1 AS now_store KEY ?2", rusqlite::params![p, k.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
-            let waiting = elsewhere(&c, "now_store", &kept).map_err(err)?;
+            let waiting = crate::db::held_apart_from(&c, "now_store", &kept).map_err(err)?;
             if waiting.total() > 0 {
                 return Err(format!(
                     "the store now holds {} of Bots kept elsewhere now that botd hasn't moved yet, which a restore would leave behind in a backup. Start botd, let it move them, stop it, then restore",
@@ -662,13 +662,6 @@ fn unopened(c: &Connection, ciphers: &[Arc<Cipher>]) -> rusqlite::Result<usize> 
         }
     }
     Ok(n)
-}
-
-/// The rows of Bots other than `kept` in the store attached as `schema`.
-fn elsewhere(c: &Connection, schema: &str, kept: &[String]) -> rusqlite::Result<Held> {
-    let list = serde_json::to_string(kept).unwrap_or_else(|_| "[]".into());
-    let n = |t: &str| c.query_row(&format!("SELECT COUNT(*) FROM {schema}.{t} WHERE bot_id NOT IN (SELECT value FROM json_each(?1))"), [&list], |r| r.get(0));
-    Ok(Held { messages: n("messages")?, routines: n("routines")?, approvals: n("approvals")? })
 }
 
 /// Keeps the store now as a backup made at `at` in its folder's `backups/`, as one file,
@@ -1120,7 +1113,7 @@ mod tests {
         let db = Db::open(&w.app).unwrap();
         let settings = chat_stores::Settings { dirs: w.dirs(), ..chat_stores::Settings::default() };
         let cipher = crate::secrets::sealed::cipher();
-        let opened = chat_stores::open(&db, &settings, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+        let opened = chat_stores::open(&db, &settings, w.app.parent().unwrap(), None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
         let lines: Vec<&String> = opened.lines.iter().filter(|l| l.contains("restore")).collect();
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].contains("was cut off before it replaced the store, so nothing was restored"), "{lines:?}");
@@ -1158,7 +1151,7 @@ mod tests {
         drop(db);
 
         let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
-        assert_eq!(r.plan.erased, Held { messages: 1, routines: 1, approvals: 1 }, "{r:?}");
+        assert_eq!(r.plan.erased, Held { messages: 1, routines: 1, approvals: 1, memories: 0 }, "{r:?}");
         assert!(r.text("gb-lon").contains("Erased in it again: 1 chat message, 1 routine and 1 approval"), "{}", r.text("gb-lon"));
         assert_eq!(texts(&w.store()), ["[erased]", "chat-6f-adas-own"]);
         let c = Connection::open(w.store()).unwrap();
@@ -1339,19 +1332,44 @@ mod tests {
         let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
         db.add_message(&ada, "user", "chat-12l-older-botd", None, false, None);
         db.add_routine_by(&ada, "daily", "0 9 * * *", "chat-13m-newer", true, None);
+        db.set_memory(&ada, "memory-14n-newer").unwrap();
         let at = now() + 2000;
         backup_pass(&db, 7, at);
         let backup = chat_stores::backups_strictly(&w.place().store).unwrap()[0].1.clone();
-        Connection::open(&backup).unwrap().execute_batch("DROP TABLE routines; DROP TABLE approvals; ALTER TABLE messages DROP COLUMN from_bot; VACUUM").unwrap();
+        Connection::open(&backup).unwrap().execute_batch("DROP TABLE routines; DROP TABLE approvals; DROP TABLE memories; ALTER TABLE messages DROP COLUMN from_bot; VACUUM").unwrap();
         db.erase_user(&bob, "erased-c41d", None, &[]).unwrap();
         drop(db);
 
         let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
-        assert_eq!((r.plan.held.messages, r.plan.gone.unwrap().routines), (1, 1), "{r:?}");
+        let gone = r.plan.gone.unwrap();
+        assert_eq!((r.plan.held.messages, gone.routines, gone.memories), (1, 1, 1), "{r:?}");
         let c = Connection::open(w.store()).unwrap();
-        let n: i64 = c.query_row("SELECT (SELECT COUNT(*) FROM routines) + (SELECT COUNT(*) FROM approvals) + (SELECT COUNT(from_bot) FROM messages)", [], |r| r.get(0)).unwrap();
+        let n: i64 = c
+            .query_row("SELECT (SELECT COUNT(*) FROM routines) + (SELECT COUNT(*) FROM approvals) + (SELECT COUNT(*) FROM memories) + (SELECT COUNT(from_bot) FROM messages)", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0, "the tables and columns botd keeps now, empty");
         assert_eq!(texts(&w.store()), ["chat-12l-older-botd"]);
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_keeps_bots_memory_only_for_bots_still_kept_in_the_store() {
+        let (w, db) = World::new();
+        let (_, ada) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, bobs) = pinned_bot(&db, "bob", "gb-lon");
+        db.set_memory(&ada, "memory-15p-adas").unwrap();
+        db.set_memory(&bobs, "memory-16q-moved-to-frankfurt").unwrap();
+        backup_pass(&db, 7, now() - DAY);
+        db.set_memory(&ada, "memory-17r-after-the-backup").unwrap();
+        db.pin_residency(PinOn::User, &bob, "de-fra-2", "DPA-2", None).unwrap();
+        db.place_chats().unwrap();
+        drop(db);
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.memories, r.plan.dropped.memories), (1, 1), "{r:?}");
+        assert!(holds(&w.store(), "memory-15p-adas") && !holds(&w.store(), "memory-16q-moved") && !holds(&w.store(), "memory-17r"), "no page of the moved Bot's memory is left in it");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!((db.memory(&ada).as_deref(), db.memory(&bobs).as_deref()), (Some("memory-15p-adas"), Some("memory-16q-moved-to-frankfurt")));
     }
 
     #[test]
