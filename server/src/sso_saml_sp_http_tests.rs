@@ -3551,5 +3551,45 @@ async fn a_tenant_of_a_provider_with_one_idp_records_it() {
     // One IdP's emails aren't checked: its admin chose it, and it may publish no scope.
     let (code, _, u) = scim(sp.port, &t, "POST", SCIM_USERS, okta_user("ada@anywhere.example", NAME_ID)).await;
     assert_eq!(code, 201, "{u}");
-    assert_eq!(sp.app.db.identity(IDP, STORED).map(|(_, u)| u.id), u["id"].as_str().map(String::from));
+    let ada = u["id"].as_str().unwrap().to_string();
+    assert_eq!(sp.app.db.identity(IDP, STORED).map(|(_, u)| u.id), Some(ada.clone()));
+
+    // Once the provider stops listing the tenant's IdP (B, dropped from A and B), it sets no
+    // email, though one IdP is left; deprovisioning keeps the email, so it still works.
+    sp.app.db.with_conn(|c| c.execute("UPDATE scim_tokens SET sso_idp = ? WHERE id = ?", [IDP_B, id.as_str()]).unwrap());
+    let moved = json!({ "Operations": [{ "op": "Replace", "path": "emails[type eq \"work\"].value", "value": "ada@elsewhere.example" }] });
+    let (code, _, body) = scim(sp.port, &t, "PATCH", &format!("{SCIM_USERS}/{ada}"), moved).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(body["detail"].as_str().unwrap().contains(IDP_B), "{body}");
+    assert_eq!(sp.app.db.user(&ada).unwrap().email.as_deref(), Some("ada@anywhere.example"));
+    let off = json!({ "Operations": [{ "op": "Replace", "path": "active", "value": "False" }] });
+    assert_eq!(scim(sp.port, &t, "PATCH", &format!("{SCIM_USERS}/{ada}"), off).await.0, 200);
+    assert!(!sp.app.db.user(&ada).unwrap().active());
+}
+
+#[tokio::test]
+async fn an_idps_missing_metadata_blocks_only_new_emails() {
+    use crate::scim_http_tests::{okta_user, scim, token};
+    // B's MDQ answer is for another entity, so B's metadata is refused and never loaded.
+    let (sp, dir, _) = serve_federation_with(&[], 2, |e, md| if e == IDP_B { md.replace(&format!(r#"entityID="{IDP_B}""#), r#"entityID="https://idp.gone.example""#) } else { md }).await;
+    let (t, _) = token(sp.port, &sp.admin, json!({ "tenant": "uni-b", "sso": sp.id, "idp": IDP_B })).await;
+
+    // A new email can't be checked against B's domains: 503, and nobody is made.
+    let (code, _, body) = scim(sp.port, &t, "POST", SCIM_USERS, okta_user("bob@uni-b.example", NAME_ID)).await;
+    assert_eq!(code, 503, "{body}");
+    assert!(sp.app.db.identity(IDP_B, STORED).is_none());
+
+    // A person made before the outage keeps being updated and deprovisioned, but not moved.
+    let bob = sp.app.db.create_user(None, Some("bob@uni-b.example"), "Bob", Role::Member).unwrap().id;
+    let made = "INSERT INTO scim_users (user_id, tenant, user_name, created_at, updated_at) VALUES (?1, 'uni-b', 'bob@uni-b.example', 0, 0)";
+    sp.app.db.with_conn(|c| c.execute(made, [bob.as_str()]).unwrap());
+    let moved = json!({ "Operations": [{ "op": "Replace", "path": "emails[type eq \"work\"].value", "value": "bob@example.com" }] });
+    let (code, _, body) = scim(sp.port, &t, "PATCH", &format!("{SCIM_USERS}/{bob}"), moved).await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(sp.app.db.user(&bob).unwrap().email.as_deref(), Some("bob@uni-b.example"));
+    let off = json!({ "Operations": [{ "op": "Replace", "path": "active", "value": "False" }] });
+    let (code, _, body) = scim(sp.port, &t, "PATCH", &format!("{SCIM_USERS}/{bob}"), off).await;
+    assert_eq!(code, 200, "{body}");
+    assert!(!sp.app.db.user(&bob).unwrap().active());
+    std::fs::remove_dir_all(dir).ok();
 }

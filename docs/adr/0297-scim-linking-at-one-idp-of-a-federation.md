@@ -32,7 +32,7 @@ A person the tenant provisions gets the identity `(that IdP's entity ID, externa
 
 ### Emails at the IdP's domains
 
-With several IdPs, an email the tenant sets must be at one of its IdP's `shibmd:Scope`s, exactly, as at sign-in. Otherwise the request is refused, 400 `invalidValue`, naming the IdP's domains, and nothing is saved. Only a new email is checked: a create, or an update that changes it. An update that keeps it, a deactivation and a `DELETE` read no metadata, so deprovisioning never waits on the federation's MDQ server. When a new email has to be checked and the IdP's metadata can't be loaded, the answer is 503, which IdPs retry.
+With several IdPs, an email the tenant sets must be at one of its IdP's `shibmd:Scope`s, exactly, as at sign-in. Otherwise the request is refused, 400 `invalidValue`, naming the IdP's domains, and nothing is saved. Only a new email is checked: a create, or an update that changes it. An update that keeps it, a deactivation and a `DELETE` read no metadata, so deprovisioning never waits on the federation's MDQ server. When a new email has to be checked and the IdP's metadata can't be loaded, the answer is 503, which IdPs retry. A tenant whose IdP the provider no longer lists sets no new email (500, naming the IdP), even when the provider is down to one IdP, whose emails aren't otherwise checked.
 
 A single IdP isn't checked, as at sign-in: its admin chose it, and many IdPs outside federations publish no scope.
 

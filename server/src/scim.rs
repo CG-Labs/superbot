@@ -980,11 +980,18 @@ fn linked_issuer(p: &crate::sso::Provider, t: &ScimToken) -> Result<(String, Opt
 /// With several IdPs of a federation, the IdP a tenant links speaks only for its own
 /// domains, as at sign-in (ADR 0282, 0297): an email the tenant sets must be at one of that
 /// IdP's `shibmd:Scope`s. Only a new email is checked, so deprovisioning and updates that
-/// keep the email never wait on the federation's metadata.
+/// keep the email never wait on the federation's metadata. An IdP the provider no longer
+/// lists sets no email, even when one IdP is left.
 async fn email_in_scope(a: &Auth, t: &ScimToken, was: Option<&str>, email: Option<&str>) -> ScimRes<()> {
     let Some(email) = email.filter(|e| was.is_none_or(|w| !w.eq_ignore_ascii_case(e))) else { return Ok(()) };
-    let Some(p) = t.sso_provider.as_deref().and_then(|pid| a.sso.provider(pid)).filter(|p| p.several_idps()) else { return Ok(()) };
+    let Some(p) = t.sso_provider.as_deref().and_then(|pid| a.sso.provider(pid)) else { return Ok(()) };
+    if t.sso_idp.is_none() && !p.several_idps() {
+        return Ok(());
+    }
     let (idp, _) = linked_issuer(p, t).map_err(server_error)?;
+    if !p.several_idps() {
+        return Ok(());
+    }
     let m = crate::sso::idp_metadata(a, p, &idp)
         .await
         .map_err(|e| ScimError::new(StatusCode::SERVICE_UNAVAILABLE, None, format!("Can't check the email against {idp}'s domains: its metadata isn't loaded ({e}). Try again later.")))?;
