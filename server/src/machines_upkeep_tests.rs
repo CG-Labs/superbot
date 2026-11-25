@@ -323,6 +323,7 @@ async fn the_mirror_check_reads_the_apt_mirror_with_no_harness_plan() {
         e.upkeep.plan = None;
         e.upkeep.mirrors = None;
         e.apt = Some(apt);
+        e.hardening = crate::machines::hardening::Settings::from_env(&|_| String::new()).unwrap();
         e
     })
     .await;
@@ -332,7 +333,9 @@ async fn the_mirror_check_reads_the_apt_mirror_with_no_harness_plan() {
     assert_eq!(v["ok"], true, "{v}");
     let items = v["items"].as_array().unwrap();
     assert_eq!(items.iter().filter(|i| i["name"] == "ubuntu").count(), 6, "three suites for each arch: {v}");
-    assert_eq!(items.iter().filter(|i| i["name"] == "ubuntu-packages").count(), 2, "{v}");
+    let lists: Vec<&Value> = items.iter().filter(|i| i["name"] == "ubuntu-packages").collect();
+    assert_eq!(lists.len(), 2, "{v}");
+    assert_eq!(lists[0]["packages"], json!(crate::machines::hardening::PACKAGES), "hardening's packages, with screens off: {v}");
     assert_eq!((v["mirrors"]["apt"].clone(), v["mirrors"]["caFile"].clone()), (shown, json!("/etc/superbot/mirror-ca.pem")), "{v}");
 
     mirror.file("/ubuntu-ports/dists/noble-security/InRelease", b"Suite: noble-security\n");
