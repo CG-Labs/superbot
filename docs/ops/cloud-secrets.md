@@ -60,11 +60,13 @@ AZURE_CLIENT_SECRET_FILE=/etc/superbot/azure/client_secret
 Off Azure, a certificate is safer than a client secret, and some tenants allow only certificates. The private key stays on botd's host; Entra gets a signed assertion that lasts 10 minutes ([ADR 0269](../adr/0269-azure-certificate-credentials.md)). Make a key and certificate, upload the certificate to the app, and give botd one PEM file with both:
 
 ```sh
+umask 077   # the key is unencrypted: create every file readable only by you
 openssl req -x509 -newkey rsa:3072 -nodes -days 365 -subj "/CN=superbot-botd" \
   -keyout key.pem -out cert.pem
 az ad app credential reset --id <app-client-id> --cert @cert.pem --append
 cat cert.pem key.pem > /etc/superbot/azure/botd.pem
 chown superbot: /etc/superbot/azure/botd.pem && chmod 600 /etc/superbot/azure/botd.pem
+rm key.pem
 ```
 
 ```sh
