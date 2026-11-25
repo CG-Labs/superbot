@@ -17,10 +17,13 @@
 //! probe's exported files, month by month against the objectives. `alerts` (ADR 0288):
 //! every SuperBot alert the operator's Prometheus fired, the stretches it wasn't watching
 //! botd, the rules loaded against those shipped, and Alertmanager's notifications.
+//! `sample` and `results` (ADR 0296): samples drawn from the store's populations by a
+//! seeded ranking anyone can re-perform, with a worksheet for the tester, and the
+//! filled-in worksheet checked against them.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
-//! `coverage` and `register` read local files only, and so do `drills --no-ci` and
+//! `coverage`, `register`, `sample` and `results` read local files only, and so do `drills --no-ci` and
 //! `uptime --checks`; `uptime --prometheus` and `alerts` read only the operator's
 //! Prometheus.
 
@@ -33,6 +36,7 @@ mod github;
 mod period;
 mod prometheus;
 mod register;
+mod sample;
 mod uptime;
 #[path = "../../ustar.rs"]
 mod ustar;
@@ -41,7 +45,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), alert history (ADR 0288), and its coverage (ADR 0169).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), alert history (ADR 0288), its coverage (ADR 0169), and samples to test it on (ADR 0296).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
@@ -59,6 +63,9 @@ const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, AD
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
   superbot-evidence alerts --prometheus <url> [--watch <selector>] [--rules <rule file>]...
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
+  superbot-evidence sample <evidence store> [--from <YYYY-MM-DD> --to <YYYY-MM-DD>]
+                    [--seed <text>] [--size <test>=<n>]... [-o <file>]
+  superbot-evidence results <samples bundle> <worksheet.csv> [-o <file>]
 
 Writes one bundle for the period (whole UTC days, --to not included; neither: last month):
 every pull request merged into the branch (default: the repository's default branch) with
@@ -155,7 +162,21 @@ missing, failing, not evaluated, or with another severity; and Alertmanager's
 notifications sent and failed each day, where Prometheus scrapes it. Labels that could
 name a host stay out. It maps to CC2.1-1, CC7.2-1 and A1.1-1 only while the unwatched
 minutes fit in the 99.9% error budget and every expected rule is loaded, healthy and
-evaluated. Token and address as for uptime --prometheus.";
+evaluated. Token and address as for uptime --prometheus.
+
+sample reads the evidence store as coverage does and, for the period, gathers each test's
+population from the bundles that check (docs/security/soc2-evidence-plan.md, Testing
+samples): merged pull requests, production changes, access grants and reviews, security
+events, reported vulnerabilities, closed scanner alerts, pages and days of backups. It
+draws each sample by ranking every item on SHA-256 of the seed, test and item and taking
+the lowest: 1 of 1, 2 of up to 12, 5 of up to 52, else 25, or --size. The seed is derived
+from the store unless --seed gives the auditor's. It writes a bundle of the samples, each
+population's size, SHA-256 and the days or bundles it is missing, and worksheet.csv for
+the tester; it copies no evidence. results checks a filled-in copy of that worksheet (a
+result of pass, fail or n/a, the tester's register id and the day tested for each item)
+against the samples bundle and writes a bundle of the results and each test's deviations,
+untested items and incomplete populations. Exits 0 when nothing deviated and everything
+was tested, 2 otherwise, 1 on an error. No token and no network.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -399,6 +420,7 @@ fn main() -> ExitCode {
         Some("register") => Some(register::run),
         Some("uptime") => Some(uptime::run),
         Some("alerts") => Some(alerts::run),
+        Some("sample") => Some(sample::run_sample),
         _ => None,
     };
     if let Some(run) = own {
@@ -413,8 +435,13 @@ fn main() -> ExitCode {
             }
         };
     }
-    if args.first().is_some_and(|a| a == "coverage") {
-        return match coverage::run(&args[1..], chrono::Utc::now()) {
+    let judged: Option<fn(&[String], chrono::DateTime<chrono::Utc>) -> Result<(String, bool), String>> = match args.first().map(String::as_str) {
+        Some("coverage") => Some(coverage::run),
+        Some("results") => Some(sample::run_results),
+        _ => None,
+    };
+    if let Some(judge) = judged {
+        return match judge(&args[1..], chrono::Utc::now()) {
             Ok((out, complete)) => {
                 println!("{out}");
                 if complete { ExitCode::SUCCESS } else { ExitCode::from(2) }
