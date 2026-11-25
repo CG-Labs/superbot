@@ -143,8 +143,23 @@ impl Login {
     }
 }
 
+/// MACHINE_MIRROR_CA_FILE's certificates, and the file they came from.
+pub fn ca_file(var: &dyn Fn(&str) -> String) -> Result<Option<(String, String)>, String> {
+    let file = var("MACHINE_MIRROR_CA_FILE").trim().to_string();
+    if file.is_empty() {
+        return Ok(None);
+    }
+    let meta = std::fs::metadata(&file).map_err(|e| format!("MACHINE_MIRROR_CA_FILE ({file}): {e}"))?;
+    if meta.len() > MAX_CA as u64 {
+        return Err(format!("MACHINE_MIRROR_CA_FILE ({file}) is over {} KiB", MAX_CA >> 10));
+    }
+    let pem = std::fs::read_to_string(&file).map_err(|e| format!("MACHINE_MIRROR_CA_FILE ({file}): {e}"))?;
+    tools::ca_bundle(&pem).map_err(|e| format!("MACHINE_MIRROR_CA_FILE ({file}): {e}"))?;
+    Ok(Some((pem, file)))
+}
+
 /// An https URL with no login, query or fragment, without its trailing `/`.
-fn base(key: &str, raw: &str) -> Result<Option<String>, String> {
+pub(super) fn base(key: &str, raw: &str) -> Result<Option<String>, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(None);
@@ -168,23 +183,13 @@ impl Mirrors {
             return Err("MACHINE_NPM_TOKEN, MACHINE_NPM_USERNAME and MACHINE_NPM_PASSWORD need MACHINE_NPM_REGISTRY: botd sends a registry login only to the operator's own registry".into());
         }
         if node.is_none() && npm.is_none() {
-            if !file.is_empty() {
-                return Err("MACHINE_MIRROR_CA_FILE needs MACHINE_NODE_MIRROR or MACHINE_NPM_REGISTRY".into());
+            let apt = ["MACHINE_APT_MIRROR", "MACHINE_APT_PORTS_MIRROR"].iter().any(|k| !var(k).trim().is_empty());
+            if !file.is_empty() && !apt {
+                return Err("MACHINE_MIRROR_CA_FILE needs MACHINE_NODE_MIRROR, MACHINE_NPM_REGISTRY or MACHINE_APT_MIRROR".into());
             }
             return Ok(None);
         }
-        let ca = if file.is_empty() {
-            None
-        } else {
-            let meta = std::fs::metadata(&file).map_err(|e| format!("MACHINE_MIRROR_CA_FILE ({file}): {e}"))?;
-            if meta.len() > MAX_CA as u64 {
-                return Err(format!("MACHINE_MIRROR_CA_FILE ({file}) is over {} KiB", MAX_CA >> 10));
-            }
-            let pem = std::fs::read_to_string(&file).map_err(|e| format!("MACHINE_MIRROR_CA_FILE ({file}): {e}"))?;
-            tools::ca_bundle(&pem).map_err(|e| format!("MACHINE_MIRROR_CA_FILE ({file}): {e}"))?;
-            Some((pem, file))
-        };
-        Ok(Some(Mirrors { node, npm, ca, login }))
+        Ok(Some(Mirrors { node, npm, ca: ca_file(var)?, login }))
     }
 
     /// `plan` as machines fetch it here: the same pins, from the mirrors. A plan with
@@ -508,7 +513,7 @@ impl Outbound {
 /// outside the machines' firewall, so a mirror on a private address passes here but
 /// not there.
 pub async fn reach(v: &mut Value, out: &Outbound) {
-    let mut urls: Vec<String> = vec![v["npmRegistry"].as_str().unwrap_or(NPM_REGISTRY).to_string()];
+    let mut urls: Vec<String> = v["npmRegistry"].as_str().map(String::from).into_iter().collect();
     for i in v["items"].as_array().into_iter().flatten() {
         if i["note"].is_null()
             && let Some(u) = i["url"].as_str()
@@ -543,18 +548,45 @@ pub async fn reach(v: &mut Value, out: &Outbound) {
     v["blocked"] = json!(blocked);
 }
 
+/// What new machines install with apt at first boot, which an apt mirror must carry.
+pub fn apt_packages(e: &super::enroll::Enrollment) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if e.hardening.is_some() {
+        out.extend(super::hardening::PACKAGES);
+    }
+    if e.screens.is_some() {
+        out.extend(super::enroll::SCREEN_PACKAGES);
+    }
+    out
+}
+
 /// `GET /api/machines/harness-mirror` (admins): `check` on the harness plan machines
-/// get. Nothing is installed or changed.
+/// get, and on the apt mirror their first boot uses (ADR 0284). Nothing is installed or
+/// changed.
 pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
     let cp = app.control_plane.get().ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))?;
     let e = super::enroll::need(cp)?;
-    let plan = e
-        .upkeep
-        .plan
-        .clone()
-        .ok_or_else(|| ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is none, so machines get no harnesses to check.".into()))?;
+    let plan = e.upkeep.plan.clone();
+    if plan.is_none() && e.apt.is_none() {
+        return Err(ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is none, so machines get no harnesses to check.".into()));
+    }
     let served: Vec<_> = [e.upkeep.hermes.as_ref(), e.upkeep.harness_bundle.as_ref()].into_iter().flatten().collect();
-    let mut v = check(&plan, &served, e.upkeep.mirrors.as_ref().and_then(|m| m.login.as_ref())).await;
+    let mut v = match &plan {
+        Some(plan) => check(plan, &served, e.upkeep.mirrors.as_ref().and_then(|m| m.login.as_ref())).await,
+        None => json!({ "ok": true, "items": [], "redirects": [] }),
+    };
+    if let Some(a) = &e.apt {
+        let (items, redirects) = super::apt::check(a, &apt_packages(e)).await;
+        if items.iter().any(|i| i["ok"] != true) {
+            v["ok"] = json!(false);
+        }
+        if let Some(list) = v["items"].as_array_mut() {
+            list.extend(items);
+        }
+        if let Some(list) = v["redirects"].as_array_mut() {
+            list.extend(redirects.into_iter().map(Value::from));
+        }
+    }
     if let Some(out) = Outbound::from_env(&|k| std::env::var(k).unwrap_or_default()) {
         reach(&mut v, &out).await;
     }
@@ -563,7 +595,11 @@ pub async fn check_now(AppS(app): AppS<AppState>) -> Res<Json<Value>> {
         "npm": e.upkeep.mirrors.as_ref().and_then(|m| m.npm.clone()),
         "caFile": e.upkeep.mirrors.as_ref().and_then(|m| m.ca.as_ref().map(|(_, f)| f.clone())),
         "npmLogin": e.upkeep.mirrors.as_ref().and_then(|m| m.login.as_ref().map(Login::kind)),
+        "apt": e.apt.as_ref().map(super::apt::Settings::shown),
     });
+    if e.apt.is_some() && e.upkeep.mirrors.is_none() {
+        v["mirrors"]["caFile"] = json!(e.apt.as_ref().and_then(|a| a.ca.as_ref().map(|(_, f)| f.clone())));
+    }
     Ok(Json(v))
 }
 

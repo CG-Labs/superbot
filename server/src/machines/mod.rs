@@ -8,6 +8,7 @@
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod agent;
+pub mod apt;
 pub mod backup;
 pub mod botuser;
 pub mod cgroup;
@@ -1311,6 +1312,9 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
         ("approvalsMoved", moves.iter().map(|m| m.approvals).sum()),
         ("memoriesMoved", moves.iter().map(|m| m.memories).sum()),
         ("factsMoved", moves.iter().map(|m| m.facts).sum()),
+        ("sessionsMoved", moves.iter().map(|m| m.sessions).sum()),
+        ("samlSessionsMoved", moves.iter().map(|m| m.saml_sessions).sum()),
+        ("pushDevicesMoved", moves.iter().map(|m| m.push_devices).sum()),
     ] {
         if n > 0 {
             out[key] = n.into();

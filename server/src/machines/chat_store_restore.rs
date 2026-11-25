@@ -253,7 +253,7 @@ pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
             let backup = note["backup"].as_str().map_or("a backup".to_string(), |b| clip(b, 200));
             if note["file"].as_u64().is_some_and(|f| files.contains(&f)) {
                 let mut details = json!({ "region": region });
-                for k in ["storeId", "backup", "from", "backupAt", "restoredAt", "kept", "replacedUnreadable", "held", "dropped", "erased", "back", "gone", "uid"] {
+                for k in ["storeId", "backup", "from", "backupAt", "restoredAt", "kept", "replacedUnreadable", "held", "dropped", "erased", "signInsReplaced", "signedIn", "back", "gone", "uid"] {
                     match &note[k] {
                         Value::String(v) => details[k] = json!(clip(v, 200)),
                         Value::Null => {}
@@ -517,6 +517,10 @@ pub struct Plan {
     dropped: Held,
     /// What erasures made since rewrote or deleted in it.
     erased: Held,
+    /// Its own sign-ins (ADR 0283), replaced by `signed_in`.
+    sign_ins_replaced: Held,
+    /// The sign-ins of the people kept in it, from the store now (none: it is missing or unreadable).
+    signed_in: Held,
     /// Against the store now (None: it is missing or unreadable): what comes back, what goes.
     back: Option<Held>,
     gone: Option<Held>,
@@ -569,8 +573,9 @@ fn erasures(c: &Connection, backup_at: i64) -> Result<(Vec<(String, String)>, Ve
 }
 
 /// Prepares the work file to be the store: checks it is this store, takes out the rows of
-/// Bots that aren't kept in the region now, runs erasures again, rebuilds it so nothing
-/// taken out is left in its pages, and compares it with the store now.
+/// Bots that aren't kept in the region now, runs erasures again, puts the store's sign-ins
+/// now in place of its own, rebuilds it so nothing taken out is left in its pages, and
+/// compares it with the store now.
 fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Plan, String> {
     let shown = work.display().to_string();
     let key = key_for(work, &place.keys)?;
@@ -614,6 +619,22 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
         plan.erased.add(crate::db::erase_in_copy(&c, user, pseudonym, theirs).map_err(err)?);
     }
     plan.dropped = crate::db::keep_only_in_copy(&c, &kept).map_err(err)?;
+    let attach_now = |c: &Connection, k: &Option<DbKey>| -> Result<(), String> {
+        let p = place.store.path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", place.store.path.display()))?;
+        c.execute("ATTACH DATABASE ?1 AS now_store KEY ?2", rusqlite::params![p, k.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
+        Ok(())
+    };
+    // A session revoked since the backup must not work again (ADR 0283).
+    let now = if let Current::Readable(k) = current {
+        attach_now(&c, k)?;
+        Some("now_store")
+    } else {
+        None
+    };
+    (plan.sign_ins_replaced, plan.signed_in) = crate::db::sign_ins_from(&c, now, &kept).map_err(err)?;
+    if now.is_some() {
+        c.execute("DETACH DATABASE now_store", []).map_err(err)?;
+    }
     c.execute_batch("VACUUM").map_err(err)?;
     check(&c)?;
     plan.held = crate::db::held_in_copy(&c, &kept).map_err(err)?;
@@ -627,8 +648,7 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
     }
     match current {
         Current::Readable(k) => {
-            let p = place.store.path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", place.store.path.display()))?;
-            c.execute("ATTACH DATABASE ?1 AS now_store KEY ?2", rusqlite::params![p, k.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
+            attach_now(&c, k)?;
             let waiting = crate::db::held_apart_from(&c, "now_store", &kept).map_err(err)?;
             if waiting.total() > 0 {
                 return Err(format!(
@@ -790,6 +810,8 @@ fn write_note(place: &Place, r: &Restore, work: &Path, at: i64) -> Result<PathBu
         "held": r.plan.held,
         "dropped": r.plan.dropped,
         "erased": r.plan.erased,
+        "signInsReplaced": r.plan.sign_ins_replaced,
+        "signedIn": r.plan.signed_in,
         "back": r.plan.back,
         "gone": r.plan.gone,
         "uid": euid(),
@@ -851,6 +873,15 @@ impl Restore {
         }
         if p.erased.total() > 0 {
             out.push_str(&format!("  Erased in it again: {} of people erased since.\n", p.erased.describe()));
+        }
+        match (p.sign_ins_replaced.total(), p.back.is_some()) {
+            (0, _) => {}
+            (_, true) => out.push_str(&format!(
+                "  Its sign-ins ({}) are replaced by the store's now ({}), so a session revoked since stays revoked (ADR 0283).\n",
+                p.sign_ins_replaced.describe(),
+                if p.signed_in.total() > 0 { p.signed_in.describe() } else { "none".to_string() }
+            )),
+            (_, false) => out.push_str(&format!("  Its sign-ins ({}) are dropped, so their people sign in again (ADR 0283).\n", p.sign_ins_replaced.describe())),
         }
         if p.unopened > 0 {
             out.push_str(&format!("  {} saved tool inputs of approvals in it don't open with the master key; botd drops them at start (SUPERBOT_FORGET_SEALED=1).\n", p.unopened));
@@ -1151,7 +1182,7 @@ mod tests {
         drop(db);
 
         let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
-        assert_eq!(r.plan.erased, Held { messages: 1, routines: 1, approvals: 1, memories: 0, facts: 0 }, "{r:?}");
+        assert_eq!(r.plan.erased, Held { messages: 1, routines: 1, approvals: 1, ..Default::default() }, "{r:?}");
         assert!(r.text("gb-lon").contains("Erased in it again: 1 chat message, 1 routine and 1 approval"), "{}", r.text("gb-lon"));
         assert_eq!(texts(&w.store()), ["[erased]", "chat-6f-adas-own"]);
         let c = Connection::open(w.store()).unwrap();
@@ -1398,6 +1429,63 @@ mod tests {
         let db = Db::open(&w.app).unwrap();
         db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
         assert_eq!((db.facts(&ada).as_deref(), db.facts(&bob).as_deref(), db.facts(&cy)), (Some("facts-21a-adas"), Some("facts-22b-moved-to-frankfurt"), None));
+    }
+
+    fn signed_in(db: &Db, user: &str, ua: &str) -> String {
+        let s = crate::db::NewSession {
+            user_id: user,
+            token_hash: ua,
+            kind: "cookie",
+            method: "password",
+            idp_subject: None,
+            idp_provider: None,
+            label: None,
+            ip: None,
+            user_agent: Some(ua),
+            expires_at: now() + 30 * DAY,
+            mfa: None,
+        };
+        db.create_session(&s).id
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_takes_its_sign_ins_from_the_store_it_replaces_so_a_revoked_session_stays_revoked() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
+        let old = signed_in(&db, &ada, "ua-31a-revoked-since");
+        let bobs = signed_in(&db, &bob, "ua-33c-moved-to-frankfurt");
+        backup_pass(&db, 7, now() - DAY);
+        assert!(db.revoke_session(&old, "ada", "signed_out"));
+        let new = signed_in(&db, &ada, "ua-32b-made-since");
+        db.pin_residency(PinOn::User, &bob, "de-fra-2", "DPA-2", None).unwrap();
+        db.place_chats().unwrap();
+        drop(db);
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.dropped.sessions, r.plan.sign_ins_replaced.sessions, r.plan.signed_in.sessions), (1, 1, 2), "{r:?}");
+        assert_eq!((r.plan.back.unwrap().sessions, r.plan.gone.unwrap().sessions), (0, 0), "nobody is signed out or back in: {r:?}");
+        let text = r.text("gb-lon");
+        assert!(text.contains("Its sign-ins (1 sign-in session) are replaced by the store's now (2 sign-in sessions), so a session revoked since stays revoked"), "{text}");
+        assert!(!holds(&w.store(), "ua-33c"), "no page of a session kept elsewhere now is left in it");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert!(db.session(&old).unwrap().revoked_at.is_some(), "a session revoked after the backup doesn't work again");
+        assert!(db.session(&new).unwrap().revoked_at.is_none(), "one made since still works");
+        assert!(db.session(&bobs).is_some());
+        backup_pass(&db, 8, now());
+        drop(db);
+
+        // With the store gone, the backup's own sign-ins are dropped rather than trusted.
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.sign_ins_replaced.sessions, r.plan.signed_in.total()), (2, 0), "{r:?}");
+        assert!(r.text("gb-lon").contains("Its sign-ins (2 sign-in sessions) are dropped, so their people sign in again"), "{}", r.text("gb-lon"));
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert!(db.session(&old).is_none() && db.session(&new).is_none());
     }
 
     #[test]
