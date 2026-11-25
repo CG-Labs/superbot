@@ -2285,7 +2285,7 @@ fn idp_signed_out(a: &Auth, app: &AppState, source: &Source, id: &str, idp: &sam
 
 /// IdP `entity`'s metadata, auditing metadata from the URL refused for its signature or
 /// validity, also when the last good copy is used instead.
-async fn idp_metadata(a: &Auth, p: &Provider, entity: &str) -> Result<Arc<saml_sp::IdpMetadata>, jwt::Invalid> {
+pub(crate) async fn idp_metadata(a: &Auth, p: &Provider, entity: &str) -> Result<Arc<saml_sp::IdpMetadata>, jwt::Invalid> {
     let m = p.idp_metadata_for(a.sso.http(), a.sso.refresh_gap, entity).await;
     audit_metadata_refusal(a, p);
     m

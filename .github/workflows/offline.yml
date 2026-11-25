@@ -22,6 +22,8 @@ name: offline
 # It builds a harness bundle (Node.js, Claude Code, Codex and Pi at botd's pins), connected, and
 # installs it with no network; an upgrade without --harness-bundle keeps it
 # (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md).
+# The upgrade backs up the database and .env first, and --rollback with the older bundle puts
+# them back, undoing what was saved since (docs/adr/0300-offline-upgrades-keep-a-way-back.md).
 # release-bundle: for every v* tag, once the docker workflow has published and signed that tag's
 # images (or by hand, for a published release), bundles them for each arch, with a Hermes bundle
 # and a harness bundle for each arch, signs each bundle with cosign keylessly under this
@@ -270,17 +272,25 @@ jobs:
           if grep -Fq offline-ci-not-real /tmp/offline-live.log; then echo "the check showed the webhook" >&2; exit 1; fi
           botctl secret rm NOTIFY_WEBHOOK_URL
           botctl offline check --json | jq -e '.offline == true and .settings.running == true' >/dev/null
-      - name: Upgrade from a newer bundle with no network; refuse the older one again
+      - name: Upgrade from a newer bundle with no network, backing up first; refuse the older one again
         run: |
           set -euo pipefail
           arch=$(uname -m)
           curl() { sudo ip netns exec offline curl "$@"; }
+          pass=$(sudo cat /home/superbot/.superbot-admin-password)
+          sudo ip netns exec offline env SUPERBOT_PASSWORD="$pass" /usr/local/bin/botctl secret set OFFLINE_CI_BEFORE_UPGRADE <<<before
           before=$(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot)
           sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
             --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC \
             | tee /tmp/offline-upgrade.log
           grep -Fq "Offline upgrade: $OLD -> $NEW" /tmp/offline-upgrade.log
           grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
+          # The backup --rollback goes back to, encrypted to the server's backup key (ADR 0300).
+          grep -Fq "Rollback point: /usr/local/share/superbot/rollback/superbot-pre-upgrade-$OLD-" /tmp/offline-upgrade.log
+          sudo grep -qx "from_version=$OLD" /usr/local/share/superbot/rollback/record
+          sudo grep -qx "to_version=$NEW" /usr/local/share/superbot/rollback/record
+          sudo grep -Eq '^archive=superbot-pre-upgrade-.*\.tar\.gz\.age$' /usr/local/share/superbot/rollback/record
+          [[ $(sudo stat -c '%U %a' /usr/local/share/superbot/rollback) == 'root 700' ]]
           [[ $(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot) != "$before" ]]
           for _ in $(seq 1 30); do
             curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz >/dev/null 2>&1 && break
@@ -293,6 +303,7 @@ jobs:
             echo "a downgrade was allowed" >&2; exit 1
           fi
           grep -Fq "newer than the bundle's $OLD" /tmp/offline-downgrade.log
+          grep -Fq "add --rollback" /tmp/offline-downgrade.log
           grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
           sudo systemctl is-active --quiet superbot
       # Connected, as an operator makes it once per Hermes pin; then nothing below has a network.
@@ -462,6 +473,45 @@ jobs:
           [[ $(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot) == "$before" ]]
           sudo cp -p /tmp/offline-env.bak "$home/superbot/.env"
           sudo systemctl is-active --quiet superbot
+      # The backup the upgrade from $OLD took puts back the database and .env from then (ADR 0300):
+      # a secret saved since and the machine bundle written since are gone. Then forward again.
+      - name: Roll back to the older bundle with the backup the upgrade took, with no network
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          home=$(getent passwd superbot | cut -d: -f6)
+          pass=$(sudo cat "$home/.superbot-admin-password")
+          botctl() { sudo ip netns exec offline env SUPERBOT_PASSWORD="$pass" /usr/local/bin/botctl "$@"; }
+          curl() { sudo ip netns exec offline curl "$@"; }
+          reinstall() {
+            sudo ip netns exec offline bash deploy/install.sh --offline "$1" --upgrade \
+              --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC "${@:2}"
+          }
+          healthy() {
+            for _ in $(seq 1 30); do
+              curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz >/dev/null 2>&1 && break
+              sleep 1
+            done
+            curl -fsS --cacert "$RUNNER_TEMP/tls.pem" https://offline.test/healthz
+          }
+          botctl secret set OFFLINE_CI_AFTER_UPGRADE <<<after
+          sudo grep -q '^MACHINE_HARNESS_BUNDLE=' "$home/superbot/.env"
+          reinstall "$RUNNER_TEMP/b/superbot-offline-$OLD-$arch.tar.gz" --rollback | tee /tmp/offline-rollback.log
+          grep -Fq "Offline rollback: $NEW -> $OLD, with the backup taken before the upgrade to $NEW" /tmp/offline-rollback.log
+          grep -Fq "Rollback: the backup taken before the upgrade to $NEW unpacks and checks out" /tmp/offline-rollback.log
+          grep -Fq "Put back DATA_DIR and .env from before the upgrade to $NEW" /tmp/offline-rollback.log
+          grep -qx "version=$OLD" /usr/local/share/superbot/offline-release
+          [[ -z $(sudo ls -A /usr/local/share/superbot/rollback) ]]
+          healthy
+          botctl secrets >/tmp/offline-rollback-secrets.log
+          grep -q OFFLINE_CI_BEFORE_UPGRADE /tmp/offline-rollback-secrets.log
+          if grep -q OFFLINE_CI_AFTER_UPGRADE /tmp/offline-rollback-secrets.log; then echo "a secret saved after the upgrade outlived the rollback" >&2; exit 1; fi
+          if sudo grep -q '^MACHINE_HARNESS_BUNDLE=' "$home/superbot/.env"; then echo "the .env from before the upgrade wasn't put back" >&2; exit 1; fi
+          sudo sh -c 'grep -q "^MACHINE_HARNESS_BUNDLE=" "$1"/superbot/.env.before-rollback-*' _ "$home"
+          reinstall "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" | tee /tmp/offline-reupgrade.log
+          grep -Fq "Rollback point: /usr/local/share/superbot/rollback/superbot-pre-upgrade-$OLD-" /tmp/offline-reupgrade.log
+          grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
+          healthy
       - name: Load the bundle's images into Docker with no network
         run: |
           set -euo pipefail

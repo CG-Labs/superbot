@@ -1835,7 +1835,7 @@ async function loadScim() {
     : t.state === "expired" ? "Expired"
     : `${t.state === "rotated" ? "" : '<button type="button" class="btn" data-act="rotate">Rotate</button> '}<button type="button" class="btn" data-act="revoke">Revoke</button>`;
   $("scim-rows").innerHTML = scimTokens.map((t) => `<tr data-token="${esc(t.id)}" class="${t.state === "revoked" || t.state === "expired" ? "revoked" : ""}">
-      <td>${esc(t.tenant)}</td><td>${esc(t.label || "")}</td><td>${esc(t.ssoProvider || "")}</td>
+      <td>${esc(t.tenant)}</td><td>${esc(t.label || "")}</td><td>${esc(t.ssoProvider || "")}${t.ssoIdp ? `<br><span class="hint">${esc(t.ssoIdp)}</span>` : ""}</td>
       <td>${esc(scimCan(t.scopes || []))}</td><td>${esc(fmt(t.createdAt))}</td><td>${esc(fmt(t.lastUsedAt))}</td><td>${esc(ends(t))}</td>
       <td class="actions">${actions(t)}</td>
     </tr>`).join("");
@@ -2029,12 +2029,13 @@ $("scim-roles-rows").addEventListener("click", async (e) => {
 $("scim-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = { tenant: $("scim-tenant").value.trim(), scopes: $("scim-scopes").value.split(",") };
-  const label = $("scim-label").value.trim(), sso = $("scim-sso").value.trim();
+  const label = $("scim-label").value.trim(), sso = $("scim-sso").value.trim(), idp = $("scim-idp").value.trim();
   if (label) body.label = label;
   if (sso) body.sso = sso;
+  if (idp) body.idp = idp;
   try {
     const r = await api("POST", "/api/scim/tokens", body);
-    for (const id of ["scim-tenant", "scim-label", "scim-sso"]) $(id).value = "";
+    for (const id of ["scim-tenant", "scim-label", "scim-sso", "scim-idp"]) $(id).value = "";
     const groups = r.scimToken.scopes.includes("groups:write") ? "" : " This token can't push groups: turn group provisioning off there.";
     showOnce({ title: `SCIM token for ${r.scimToken.tenant}`, note: `Paste it into your identity provider's provisioning settings now. It can't be shown again.${groups}`, value: r.token });
   } catch (err) {

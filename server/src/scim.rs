@@ -959,8 +959,47 @@ fn sso_link(a: &Auth, t: &ScimToken, external_id: Option<&str>) -> ScimRes<Optio
     let hint = if p.type_name() == "entra" { " Map the user's objectId to externalId in the provisioning attribute mappings." } else { "" };
     let ext = external_id.ok_or_else(|| invalid(format!("externalId is required: this tenant links the SSO provider {pid}, so externalId must be the person's subject there.{hint}")))?;
     let subject = p.subject(ext).map_err(|e| invalid(format!("externalId: {e}.{hint}")))?;
-    let (issuer, tenant) = p.issuer_for(None).map_err(server_error)?;
+    let (issuer, tenant) = linked_issuer(p, t).map_err(server_error)?;
     Ok(Some(Link { provider: pid.clone(), issuer, subject, tenant }))
+}
+
+/// The issuer the tenant's people are stored under: for native SAML, the IdP it links (ADR
+/// 0297), which the provider must still list; else the provider's own.
+fn linked_issuer(p: &crate::sso::Provider, t: &ScimToken) -> Result<(String, Option<String>), String> {
+    match &t.sso_idp {
+        Some(idp) => p.issuer_at(idp).map(|i| (i, None)).map_err(|e| format!("This SCIM tenant links the IdP {idp} of {}: {e}. List it again, or provision its people with a new tenant.", p.id)),
+        None if p.several_idps() => Err(format!(
+            "This SCIM tenant links {pid}, which has several IdPs now, without saying whose NameIDs its externalIds are. Name it: botctl scim token create {} --sso {pid} --idp <entity ID>.",
+            t.tenant,
+            pid = p.id
+        )),
+        None => p.issuer_for(None),
+    }
+}
+
+/// With several IdPs of a federation, the IdP a tenant links speaks only for its own
+/// domains, as at sign-in (ADR 0282, 0297): an email the tenant sets must be at one of that
+/// IdP's `shibmd:Scope`s. Only a new email is checked, so deprovisioning and updates that
+/// keep the email never wait on the federation's metadata. An IdP the provider no longer
+/// lists sets no email, even when one IdP is left.
+async fn email_in_scope(a: &Auth, t: &ScimToken, was: Option<&str>, email: Option<&str>) -> ScimRes<()> {
+    let Some(email) = email.filter(|e| was.is_none_or(|w| !w.eq_ignore_ascii_case(e))) else { return Ok(()) };
+    let Some(p) = t.sso_provider.as_deref().and_then(|pid| a.sso.provider(pid)) else { return Ok(()) };
+    if t.sso_idp.is_none() && !p.several_idps() {
+        return Ok(());
+    }
+    let (idp, _) = linked_issuer(p, t).map_err(server_error)?;
+    if !p.several_idps() {
+        return Ok(());
+    }
+    let m = crate::sso::idp_metadata(a, p, &idp)
+        .await
+        .map_err(|e| ScimError::new(StatusCode::SERVICE_UNAVAILABLE, None, format!("Can't check the email against {idp}'s domains: its metadata isn't loaded ({e}). Try again later.")))?;
+    if m.in_scope(email) {
+        return Ok(());
+    }
+    let listed = if m.scopes.is_empty() { "none".to_string() } else { m.scopes.join(", ") };
+    Err(invalid(format!("emails: {email} isn't at a domain the federation lists for {idp} (shibmd:Scope: {listed}), the IdP this tenant links. Send the person's address at one of them.")))
 }
 
 fn fields<'a>(d: &'a Attrs, shown: &'a str, active: Option<bool>) -> ScimFields<'a> {
@@ -1047,6 +1086,7 @@ async fn update(app: &AppState, a: &Auth, c: &Caller, user: &User, before: Optio
     {
         return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("mutability"), "externalId can't change once set. Delete the user and provision the person again."));
     }
+    email_in_scope(a, &c.token, user.email.as_deref(), d.email.as_deref()).await?;
     let shown = match before {
         Some(b) if Attrs::of(b).names() == d.names() => user.name.clone(),
         _ => d.shown_name(),
@@ -1161,6 +1201,7 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         let after = update(&app, &a, &c, &user, None, &d, Some((action, linked))).await?;
         return created(&after);
     }
+    email_in_scope(&a, &c.token, None, d.email.as_deref()).await?;
     let shown = d.shown_name();
     let created_by = c.who.actor.id.clone();
     let identity = link.as_ref().map(|l| NewIdentity {
@@ -1328,9 +1369,25 @@ fn token_days(v: &Value) -> Res<i64> {
     whole(v, "expiresInDays", 1, MAX_TOKEN_DAYS, DEFAULT_TOKEN_DAYS)
 }
 
-/// `POST /api/scim/tokens {tenant, label?, sso?, expiresInDays?, scopes?}`. `sso` names a
-/// configured SSO provider whose subjects this tenant's `externalId`s are; a tenant's
-/// first token sets it for good. It expires after `expiresInDays` (default 365, at most
+/// The native SAML IdP a new token of `tenant` links (ADR 0297): the one asked for, if the
+/// provider lists it; else the tenant's own; else a native SAML provider's one IdP, so the
+/// link still holds once the provider lists more. A provider with several IdPs needs one
+/// named. None for other providers.
+fn link_idp(p: &crate::sso::Provider, asked: Option<&str>, tenant: Option<db::ScimTenantLink>) -> Result<Option<String>, String> {
+    if let Some(i) = asked {
+        return p.issuer_at(i).map(Some);
+    }
+    if let Some(had) = tenant.filter(|l| l.provider.as_deref() == Some(p.id.as_str())).and_then(|l| l.idp) {
+        return Ok(Some(had));
+    }
+    let (issuer, _) = p.issuer_for(None)?;
+    Ok(p.saml_sp().then_some(issuer))
+}
+
+/// `POST /api/scim/tokens {tenant, label?, sso?, idp?, expiresInDays?, scopes?}`. `sso` names
+/// a configured SSO provider whose subjects this tenant's `externalId`s are, and for native
+/// SAML `idp` the IdP whose NameIDs they are (needed with several); a tenant's first token
+/// sets them for good. It expires after `expiresInDays` (default 365, at most
 /// 730), and can do what `scopes` names (default all; ADR 0224). The token is returned
 /// once; only its hash is kept.
 pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<Response> {
@@ -1347,21 +1404,40 @@ pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<A
         Value::String(s) => Some(s.trim().to_ascii_lowercase()),
         _ => return Err(bad("sso must be an SSO provider id")),
     };
-    if let Some(pid) = &sso {
-        let p = a.sso.provider(pid).ok_or_else(|| {
-            let known: Vec<&str> = a.sso.providers.iter().map(|p| p.id.as_str()).collect();
-            bad(if known.is_empty() { "SSO is off: set SSO_PROVIDERS, or leave sso out".to_string() } else { format!("sso must be one of: {}", known.join(", ")) })
-        })?;
-        p.issuer_for(None).map_err(|e| bad(format!("SCIM can't link {pid}: {e}")))?;
-    }
+    let idp = match &v["idp"] {
+        Value::Null => None,
+        Value::String(s) if s.trim().is_empty() => None,
+        Value::String(s) => Some(s.trim().to_string()),
+        _ => return Err(bad("idp must be a SAML IdP's entity ID")),
+    };
+    let idp = match &sso {
+        None if idp.is_some() => return Err(bad("idp needs sso: the native SAML provider whose IdP it is")),
+        None => None,
+        Some(pid) => {
+            let p = a.sso.provider(pid).ok_or_else(|| {
+                let known: Vec<&str> = a.sso.providers.iter().map(|p| p.id.as_str()).collect();
+                bad(if known.is_empty() { "SSO is off: set SSO_PROVIDERS, or leave sso out".to_string() } else { format!("sso must be one of: {}", known.join(", ")) })
+            })?;
+            link_idp(p, idp.as_deref(), app.db.scim_tenant_link(&tenant)).map_err(|e| bad(format!("SCIM can't link {pid}: {e}")))?
+        }
+    };
     let token = users::new_secret(TOKEN_PREFIX);
-    let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref(), expires_at, scopes).map_err(|first| {
-        let had = first.map_or("no SSO provider".to_string(), |p| format!("the SSO provider {p}"));
+    let (t, idp_set) = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), idp.as_deref(), &users::hash(&token), by.actor.id.as_deref(), expires_at, scopes).map_err(|first| {
+        let had = match (first.provider, first.idp) {
+            (None, _) => "no SSO provider".to_string(),
+            (Some(p), None) => format!("the SSO provider {p}"),
+            (Some(p), Some(i)) => format!("the SSO provider {p} at the IdP {i}"),
+        };
         ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} links {had}; its tokens all must. Use a new tenant name for another link."))
     })?;
-    app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(json!({
-        "tenant": t.tenant, "label": t.label, "sso": t.sso_provider, "expiresAt": t.expires_at, "scopes": t.scopes,
-    })));
+    let mut details = json!({ "tenant": t.tenant, "label": t.label, "sso": t.sso_provider, "expiresAt": t.expires_at, "scopes": t.scopes });
+    if let Some(i) = &t.sso_idp {
+        details["idp"] = json!(i);
+    }
+    if idp_set {
+        details["idpSet"] = json!(true);
+    }
+    app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(details));
     let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": token_view(&t, db::now()), "enabled": a.scim.enabled }))).into_response();
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(res)

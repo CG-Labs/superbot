@@ -196,10 +196,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl sso role show <id>                        A mapping and who it gave the role to
   botctl sso role unmap <id>                       Takes the role from everyone the mapping gave it to
   botctl scim tokens                               SCIM tokens (never their values), and whether SCIM is on
-  botctl scim token create <tenant> [--sso <provider>] [--label "<text>"] [--days <n>] [--scopes <list>]
+  botctl scim token create <tenant> [--sso <provider>] [--idp <entity ID>] [--label "<text>"] [--days <n>] [--scopes <list>]
                                                    A bearer token for an IdP's SCIM app, shown once.
                                                    <tenant> names the IdP connection (e.g. entra);
                                                    --sso: externalId is the person's subject there;
+                                                   --idp: with a native SAML provider's several
+                                                   IdPs, the one whose NameIDs they are;
                                                    expires in --days (default 365, at most 730);
                                                    --scopes, comma-separated, of users:read,
                                                    users:write, groups:read, groups:write (default
@@ -1448,7 +1450,10 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         ["role-group", "set-role", id, role] => ("PATCH", format!("/api/scim/role-groups/{}", encode(id)), Some(json!({ "role": role }).to_string())),
         ["role-group", "remove", id] => ("DELETE", format!("/api/scim/role-groups/{}", encode(id)), None),
         ["token", "create", tenant, rest @ ..] if !tenant.starts_with("--") => {
-            let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label"), "expiresInDays": number(rest, "--days")?, "scopes": scope_list(rest)? });
+            let mut body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label"), "expiresInDays": number(rest, "--days")?, "scopes": scope_list(rest)? });
+            if let Some(idp) = flag(rest, "--idp") {
+                body["idp"] = json!(idp);
+            }
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "rotate", id, rest @ ..] if !id.starts_with("--") && rest.chunks(2).all(|p| matches!(p, ["--days" | "--keep-old-hours" | "--scopes", _])) => {
@@ -1460,7 +1465,7 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), Some(json!({}).to_string())),
         ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] [--days N] [--scopes LIST] | token rotate <id> [--days N] [--keep-old-hours N] [--scopes LIST] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role remap <id> <role> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] [--team] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--idp ENTITY_ID] [--label TEXT] [--days N] [--scopes LIST] | token rotate <id> [--days N] [--keep-old-hours N] [--scopes LIST] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role remap <id> <role> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] [--team] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
         }
     })
 }
@@ -5061,6 +5066,14 @@ mod tests {
         assert_eq!(
             req(&["token", "create", "entra", "--sso", "work", "--label", "Entra prod", "--days", "90"]),
             Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "entra", "sso": "work", "label": "Entra prod", "expiresInDays": 90, "scopes": null }))))
+        );
+        assert_eq!(
+            req(&["token", "create", "uni-b", "--sso", "uni", "--idp", "https://login.uni-b.example/idp/shibboleth"]),
+            Ok((
+                "POST",
+                "/api/scim/tokens".into(),
+                Some(json!({ "tenant": "uni-b", "sso": "uni", "idp": "https://login.uni-b.example/idp/shibboleth", "label": null, "expiresInDays": null, "scopes": null }))
+            ))
         );
         assert_eq!(
             req(&["token", "create", "okta", "--scopes", "users:write, groups:read,"]),

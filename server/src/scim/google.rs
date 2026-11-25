@@ -876,6 +876,7 @@ fn caller(a: &Auth, s: &Settings) -> Caller {
         tenant: s.tenant.clone(),
         label: Some("Google Workspace directory sync".into()),
         sso_provider: s.sso.clone(),
+        sso_idp: None,
         created_at: 0,
         created_by: None,
         last_used_at: None,

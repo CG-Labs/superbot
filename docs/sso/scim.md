@@ -39,6 +39,21 @@ botctl scim token rotate <id>                        # a new token with the same
 botctl scim token revoke <id>                        # its users stay as they are
 ```
 
+### Federations
+
+A [native SAML provider with several IdPs](saml-native.md#several-idps-of-a-federation) stores each person under the IdP that signed them in, so a tenant linking it must also say which IdP its `externalId`s are NameIDs at ([ADR 0297](../adr/0297-scim-linking-at-one-idp-of-a-federation.md)):
+
+```sh
+botctl scim token create uni-b --sso uni --idp https://login.uni-b.example/idp/shibboleth --label "Uni B provisioning"
+```
+
+- **One IdP per tenant.** Give each institution that provisions its own tenant. Without `--idp` the token is refused, as is an IdP the provider doesn't list (`SSO_<ID>_IDP_ENTITY_IDS`). A tenant's first token fixes its IdP with its SSO link; its other tokens take it.
+- **The IdP must send its NameID as `externalId`**: the persistent NameID it signs people in with (the value `botctl user link … --idp` would take).
+- **Emails only at the IdP's domains.** An email the tenant sets must be at one of the domains the federation lists for its IdP (`shibmd:Scope`, exactly), as at sign-in; another is refused with `invalidValue`, naming the domains. Only a new email is checked, so a deactivation or `DELETE` never waits on the federation's MDQ server.
+- **A native SAML provider with one IdP** records it when the tenant is made, so the tenant keeps working when the provider lists more. A tenant made before IdPs were recorded has none: once its provider lists several, name it with a new token (`botctl scim token create <tenant> --sso <provider> --idp <entity ID>`), which sets it for all the tenant's tokens.
+
+`botctl scim tokens` and the console show each token's IdP (`ssoIdp`).
+
 ## Token expiry and rotation
 
 A SCIM token can deactivate everyone its tenant provisioned, so it doesn't live forever; but when it stops, **deprovisioning stops** too, so its end is announced well before. Design: [ADR 0196](../adr/0196-scim-token-expiry-and-rotation.md).
@@ -297,6 +312,9 @@ Bulk: at most 100 operations (`maxOperations`) and 1 MiB (`maxPayloadSize`) a re
 - **403 "This SCIM token's scopes (…) don't include …"**: the token can't do that; see [Token scopes](#token-scopes). Usually a users-only token on a connection that pushes groups: turn group provisioning off in the IdP, or rotate the token with the scope it needs (`botctl scim token rotate <id> --scopes users:write,groups:write`).
 - **403 "Unknown Host"**: add the public hostname to `ALLOWED_HOSTS` (Compose adds `SUPERBOT_DOMAIN`).
 - **400 "externalId is required" or "externalId: …"**: the tenant links SSO, and the IdP didn't send the person's subject. Entra: map **objectId** to **externalId**.
+- **400 "emails: … isn't at a domain the federation lists for …"**: the tenant links one IdP of a federation, and the email isn't at that IdP's domains. Send the address the institution gives the person ([Federations](#federations)).
+- **500 "… which has several IdPs now, without saying whose NameIDs …"** or **"… is not one of this provider's IdPs"**: the tenant's provider lists several IdPs and the tenant names none, or no longer lists the one it names. Name it with `botctl scim token create <tenant> --sso <provider> --idp <entity ID>`, or list the IdP again.
+- **503 "Can't check the email against …"**: the federation's metadata for the tenant's IdP couldn't be loaded; the IdP retries. Check the MDQ server is reachable (`botctl sso saml <provider>`).
 - **409 "Another SuperBot user has this email"**: see *One person, one user* above.
 - **409 on a user that exists**: the IdP is creating someone this tenant already has. Entra and Okta look the user up first and then update instead; check the matching attribute is `userName`.
 - **Group errors (501)**: `SCIM_GROUPS=on` isn't set. Set it, or turn group provisioning off in the IdP.
