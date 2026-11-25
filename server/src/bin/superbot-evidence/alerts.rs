@@ -381,6 +381,18 @@ fn day_ranges(days: &[i64], p: &Period) -> Vec<Value> {
     out
 }
 
+/// Why the rules couldn't be read, as the bundle records it: the HTTP status at most, since
+/// Prometheus' or a proxy's error text can name hosts and paths.
+fn unreadable(e: &str) -> String {
+    let status = e.strip_prefix("Prometheus answered ").and_then(|r| r.get(..3)).filter(|s| s.bytes().all(|b| b.is_ascii_digit()));
+    match status {
+        Some(s) => format!("the rules API answered {s}"),
+        None if e.starts_with("Prometheus didn't answer") => "the rules API didn't answer".into(),
+        None if e.starts_with("Prometheus' answer isn't JSON") => "the rules API's answer isn't JSON".into(),
+        None => "the rules API couldn't be read".into(),
+    }
+}
+
 /// Everything in `alerts.json` but the period.
 pub fn assess(c: &Collected, expected: &[Rule], p: &Period, now_ms: i64) -> Value {
     let total_minutes = p.days() * 1440;
@@ -391,7 +403,7 @@ pub fn assess(c: &Collected, expected: &[Rule], p: &Period, now_ms: i64) -> Valu
 
     let (rules_view, rules_read) = match &c.rules {
         Some(Ok(data)) => (Some(loaded(data)), None),
-        Some(Err(e)) => (None, Some(e.chars().take(200).collect::<String>())),
+        Some(Err(e)) => (None, Some(unreadable(e))),
         None => (None, Some("not read".to_string())),
     };
     let stale = |l: &Loaded| l.last_ms.is_none_or(|t| now_ms - t > STALE_EVALUATION_MINUTES * 60_000);
@@ -702,8 +714,12 @@ fn run_with(args: &[String], now: chrono::DateTime<chrono::Utc>, env: &dyn Fn(&s
     }
     let file = a.out.clone().unwrap_or_else(|| format!("{}.tar", b.name));
     crate::save_private(&file, &b.tar)?;
+    let unread = match &c.rules {
+        Some(Err(e)) => format!("The rules couldn't be read (the bundle records only why, not this): {e}\n"),
+        _ => String::new(),
+    };
     Ok(format!(
-        "Saved {file} ({} KB) for {} to {} (not included), in {} requests.\n{}\nManifest SHA-256: {}\nBundle SHA-256: {}\nKeep it in the evidence store; to check it:\n  tar -xf {} && (cd {} && sha256sum -c SHA256SUMS)",
+        "{unread}Saved {file} ({} KB) for {} to {} (not included), in {} requests.\n{}\nManifest SHA-256: {}\nBundle SHA-256: {}\nKeep it in the evidence store; to check it:\n  tar -xf {} && (cd {} && sha256sum -c SHA256SUMS)",
         b.tar.len().div_ceil(1024),
         p.from,
         p.to,
@@ -881,11 +897,21 @@ mod tests {
         let c = collect(&mut f, DEFAULT_WATCH, &p).unwrap();
         let clean = assess(&c, &shipped(), &p, now());
         assert_eq!(clean["summary"]["mapsControls"], true);
-        f.rules = Err("Prometheus answered 404: not found".into());
+        f.rules = Err("Prometheus answered 502: <html>no upstream prom-internal.example:9090/etc/prometheus</html>".into());
         let c = collect(&mut f, DEFAULT_WATCH, &p).unwrap();
         let unread = assess(&c, &shipped(), &p, now());
-        assert_eq!((unread["summary"]["mapsControls"].as_bool(), unread["exceptions"]["rulesUnreadable"].clone()), (Some(false), json!(["Prometheus answered 404: not found"])));
+        assert_eq!((unread["summary"]["mapsControls"].as_bool(), unread["exceptions"]["rulesUnreadable"].clone()), (Some(false), json!(["the rules API answered 502"])));
         assert_eq!(unread["rules"][0].get("loaded"), None, "unknown, not false");
+        let text = serde_json::to_string(&unread).unwrap();
+        assert!(!text.contains("prom-internal") && !text.contains("/etc/prometheus"), "an error's text stays out of alerts.json");
+        for (raw, kept) in [
+            ("Prometheus didn't answer: connect to 10.0.0.9 refused", "the rules API didn't answer"),
+            ("Prometheus' answer isn't JSON: expected value at line 1", "the rules API's answer isn't JSON"),
+            ("Prometheus answered abc", "the rules API couldn't be read"),
+            ("this Prometheus can't list its rules", "the rules API couldn't be read"),
+        ] {
+            assert_eq!(unreadable(raw), kept);
+        }
     }
 
     #[test]
