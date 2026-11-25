@@ -431,7 +431,7 @@ fn on_team(app: &App, q: &RoleRequest, team: &str) -> bool {
 
 /// How many requests within `team` wait for a decision, from people still on it.
 pub fn pending_in_team(app: &App, team: &str) -> usize {
-    app.db.team_role_requests(team, Some("pending"), 200).iter().filter(|q| on_team(app, q, team)).count()
+    app.db.team_role_requests_pending(team)
 }
 
 /// `GET /api/team/role-requests?status=...` (ADR 0263): the requests for roles within your
@@ -441,9 +441,8 @@ pub async fn team_list(State(app): State<AppState>, Extension(c): Extension<Call
     lapse_due(&app);
     crate::roles::expire_due(&app);
     let status = status_filter(&params)?;
-    let mine = |status| app.db.team_role_requests(&t.id, status, 200).into_iter().filter(|q| on_team(&app, q, &t.id)).collect::<Vec<_>>();
-    let requests: Vec<Value> = mine(status).iter().map(|q| view(&app, q)).collect();
-    let pending = if status == Some("pending") { requests.len() } else { pending_in_team(&app, &t.id) };
+    let requests: Vec<Value> = app.db.team_role_requests(&t.id, status, 200).iter().map(|q| view(&app, q)).collect();
+    let pending = pending_in_team(&app, &t.id);
     Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "requests": requests, "pending": pending, "pendingDays": PENDING_DAYS })))
 }
 
