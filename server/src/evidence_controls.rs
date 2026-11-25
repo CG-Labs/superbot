@@ -42,7 +42,7 @@ const LOAD_FAILED: &str = "machine.egress_policy_failed";
 const DROPPED: &str = "secret.read_events_dropped";
 const STARTED: &str = "server.started";
 /// Changes read from the period's start on; past this the file can't say the control held.
-const MAX_CHANGES: i64 = 10_000;
+pub(crate) const MAX_CHANGES: i64 = 10_000;
 /// Event ids listed per exception; the rest are only counted.
 const MAX_IDS: i64 = 1_000;
 

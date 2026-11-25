@@ -620,32 +620,57 @@ async fn secrets_are_evidence_only_while_every_start_used_an_external_manager() 
     app.db.record(&started(Some("vault")));
     app.db.record(&Event::new(Actor::system("secrets"), "secret.read").target("secret", "OPENAI_API_KEY").details(json!({ "store": "vault", "scope": "bots", "found": true })));
     app.db.record(&Event::new(Actor::system("secrets"), "secret.backend_login").outcome(Outcome::Failure).target("secrets_backend", "vault").details(json!({ "store": "vault", "method": "kubernetes", "error": "unavailable" })));
+    // Asserts here compare fields, never print the file: CodeQL reads that as logging secrets.
     let (v, (c, rows)) = manager_file(&app);
-    assert_eq!((c, rows), (json!(["CC6.1"]), json!(["CC6.1-4"])), "{v}");
-    assert_eq!((v["summary"]["reads"].as_u64(), v["summary"]["signInFailures"].as_u64()), (Some(1), Some(1)), "{v}");
-    assert_eq!(v["starts"].as_array().map(Vec::len), Some(2), "{v}");
+    assert_eq!((c, rows), (json!(["CC6.1"]), json!(["CC6.1-4"])));
+    assert_eq!((v["summary"]["reads"].as_u64(), v["summary"]["signInFailures"].as_u64()), (Some(1), Some(1)));
+    assert_eq!((v["starts"].as_array().map(Vec::len), v["startsTruncated"].as_bool()), (Some(2), Some(false)));
     assert_eq!(v["now"]["backend"], "local", "this test's botd has none");
 
     // A restart on local secrets in the period: a gap, listed.
     app.db.record(&started(Some("local")));
     let (v, (_, rows)) = manager_file(&app);
-    assert_eq!(rows, json!([]), "{v}");
-    assert_eq!(v["exceptions"]["startsWithoutExternalManager"][0]["backend"], "local", "{v}");
+    assert_eq!(rows, json!([]));
+    assert_eq!(v["exceptions"]["startsWithoutExternalManager"][0]["backend"].as_str(), Some("local"));
 
     // The start before the period from a botd that didn't record its backend: unknown.
     let (_, app, _, _) = serve_app().await;
     app.db.record_at(&started(None), p.start_ms() - 3_600_000).unwrap();
     let (v, (_, rows)) = manager_file(&app);
-    assert_eq!((rows, v["exceptions"]["startsWithoutExternalManager"][0]["backend"].as_str()), (json!([]), Some("unknown")), "{v}");
+    assert_eq!((rows, v["exceptions"]["startsWithoutExternalManager"][0]["backend"].as_str()), (json!([]), Some("unknown")));
 
     // No start before the period on record (pruned, or never): what ran until the first
     // one in it is unknown, so a Vault start halfway through doesn't make the month.
     let (_, app, _, _) = serve_app().await;
     app.db.record(&started(Some("vault")));
     let (v, (_, rows)) = manager_file(&app);
-    assert_eq!(rows, json!([]), "{v}");
+    assert_eq!((rows, v["everyStartUsedAnExternalManager"].as_bool()), (json!([]), Some(false)));
     let gap = &v["exceptions"]["startsWithoutExternalManager"][0];
-    assert_eq!((gap["backend"].as_str(), gap["startedAt"].is_null()), (Some("unknown"), true), "{v}");
+    assert_eq!((gap["backend"].as_str(), gap["startedAt"].is_null()), (Some("unknown"), true));
+}
+
+/// More botd starts in the period than `secrets.json` reads: one past the cap could be
+/// on local secrets, so the file names nothing and says the list is cut short.
+#[tokio::test]
+async fn too_many_starts_in_the_period_name_no_secrets_row() {
+    let (_, app, _, _) = serve_app().await;
+    let p = Period { from: today(), to: today().succ_opt().unwrap() };
+    let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+    let started = |backend: &str| Event::new(Actor::system("server"), "server.started").details(json!({ "version": "0.1.0", "vaultBackend": backend }));
+    app.db.record_at(&started("vault"), p.start_ms() - 3_600_000).unwrap();
+    let cap = crate::evidence_controls::MAX_CHANGES;
+    for i in 0..cap {
+        app.db.record_at(&started("vault"), p.start_ms() + i).unwrap();
+    }
+    // The last start, past the cap, is on local secrets: never read.
+    app.db.record_at(&started("local"), p.start_ms() + cap).unwrap();
+    let (_, f) = files(&evidence::build(&app, &inputs, &p, db::now(), false).tar);
+    let v = parse(file(&f, "secrets.json"));
+    let (_, rows) = listed(&parse(file(&f, "manifest.json")), "secrets.json");
+    assert_eq!(rows, json!([]));
+    assert_eq!((v["startsTruncated"].as_bool(), v["everyStartUsedAnExternalManager"].as_bool()), (Some(true), Some(false)));
+    assert_eq!(v["starts"].as_array().map(Vec::len), Some(cap as usize + 1));
+    assert_eq!(v["exceptions"]["startsWithoutExternalManager"].as_array().map(Vec::len), Some(0));
 }
 
 /// Custom roles (ADR 0285): `access-review.json` lists each one's definition and how
