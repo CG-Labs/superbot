@@ -293,6 +293,9 @@ fn pem_blocks(text: &str) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>, String> {
     let mut open: Option<(String, Zeroizing<String>)> = None;
     for line in text.lines().map(str::trim) {
         if let Some(label) = line.strip_prefix("-----BEGIN ").and_then(|l| l.strip_suffix("-----")) {
+            if let Some((begun, _)) = &open {
+                return Err(format!("its {begun} block has no END before the next BEGIN"));
+            }
             open = Some((label.to_string(), Zeroizing::new(String::new())));
         } else if let Some(label) = line.strip_prefix("-----END ").and_then(|l| l.strip_suffix("-----")) {
             match open.take() {
@@ -308,6 +311,9 @@ fn pem_blocks(text: &str) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>, String> {
             }
             b64.push_str(line);
         }
+    }
+    if let Some((begun, _)) = open {
+        return Err(format!("its {begun} block has no END; was the file cut short?"));
     }
     Ok(out)
 }
@@ -1703,6 +1709,8 @@ mod tests {
             (format!("{}-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n", good.cert_pem), "encrypted"),
             (format!("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n{}", good.key_pem), "isn't base64"),
             (format!("{}-----END CERTIFICATE-----\n", good.key_pem), "no matching BEGIN"),
+            (format!("{}-----BEGIN PRIVATE KEY-----\nMIIE", good.pem()), "has no END; was the file cut short?"),
+            (format!("-----BEGIN PRIVATE KEY-----\nMIIE\n{}", good.pem()), "no END before the next BEGIN"),
             (TestCert::new(-30, -1).pem(), "expired on"),
             (TestCert::new(2, 30).pem(), "isn't valid until"),
         ] {
