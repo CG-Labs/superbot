@@ -918,7 +918,7 @@ pub(crate) mod tests {
             assert!(s.try_harness_env().unwrap().is_empty() && s.try_inherited_harness_env().unwrap().is_empty(), "{var}");
         }
         let host = crate::adapters::local_host();
-        for k in ["AZURE_CLIENT_SECRET", "AZURE_CLIENT_SECRET_FILE", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
+        for k in ["AZURE_CLIENT_SECRET", "AZURE_CLIENT_SECRET_FILE", "AZURE_FEDERATED_TOKEN_FILE", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "IDENTITY_HEADER", "GCP_SERVICE_ACCOUNT_KEY", "GCP_SERVICE_ACCOUNT_KEY_FILE"] {
             assert!(host.remove.iter().any(|r| r == k), "{k} removed from local jobs");
         }
     }

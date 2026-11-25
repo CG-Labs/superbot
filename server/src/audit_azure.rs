@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(m.entra.method(), "managed-identity");
 
         for (vars, why) in [
-            (vec![("AUDIT_EXPORT_AZURE_AUTH", "password")], "AUDIT_EXPORT_AZURE_AUTH must be managed-identity, client-secret or workload-identity"),
+            (vec![("AUDIT_EXPORT_AZURE_AUTH", "password")], "AUDIT_EXPORT_AZURE_AUTH must be managed-identity, client-secret, client-certificate or workload-identity"),
             (vec![("AUDIT_EXPORT_AZURE_AUTH", "client-secret"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c")], "AUDIT_EXPORT_AZURE_AUTH=client-secret needs AZURE_CLIENT_SECRET"),
             (vec![("AUDIT_EXPORT_AZURE_AUTH", "workload-identity"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c")], "AUDIT_EXPORT_AZURE_AUTH=workload-identity needs AZURE_FEDERATED_TOKEN_FILE"),
             (vec![("AZURE_KEYVAULT_AUTH", "client-secret")], "AZURE_KEYVAULT_AUTH=client-secret needs AZURE_CLIENT_SECRET"),

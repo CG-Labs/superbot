@@ -5,9 +5,9 @@
 //! with each `_` written as `-` (`superbot-bots-OPENAI-API-KEY`). Secret names never hold a
 //! `-`, so the mapping goes both ways. botd signs in to Microsoft Entra ID with a managed
 //! identity (the VM's instance metadata service, or App Service's and Container Apps'
-//! identity endpoint), a service principal's client secret, or a federated token file
-//! (AKS workload identity), and gets a new token two thirds of the way through each one's
-//! life and once more whenever Key Vault refuses it.
+//! identity endpoint), a service principal's client secret or certificate (ADR 0269), or
+//! a federated token file (AKS workload identity), and gets a new token two thirds of the
+//! way through each one's life and once more whenever Key Vault refuses it.
 //!
 //! It is also the `leases::Issuer` of `AZURE_RUN_CREDENTIALS` (ADR 0213): an access token
 //! of an Entra app that trusts botd's user-assigned managed identity or workload identity
@@ -20,8 +20,12 @@ use super::http::{self, Bearer, Worker};
 use super::leases::{Field, Issuer, Lease, Narrowed};
 use super::{Error, SecretStore};
 use crate::audit::{Event, Outcome};
+use aws_lc_rs::signature::{KeyPair, RsaKeyPair, RSA_PSS_SHA256};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -39,6 +43,9 @@ pub enum Auth {
     /// A system-assigned identity, or the user-assigned one with this client id.
     ManagedIdentity { client_id: Option<String> },
     ClientSecret { tenant: String, client_id: String, secret: Zeroizing<String> },
+    /// A PEM file with the app's certificate and its RSA key (`AZURE_CLIENT_CERTIFICATE_PATH`),
+    /// read again for every sign-in so a renewed certificate needs no restart.
+    ClientCertificate { tenant: String, client_id: String, path: PathBuf },
     /// A token file the platform keeps fresh (AKS writes `AZURE_FEDERATED_TOKEN_FILE`),
     /// read again for every sign-in.
     WorkloadIdentity { tenant: String, client_id: String, token_file: PathBuf },
@@ -147,6 +154,21 @@ fn sign_in_settings(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, metho
             super::redact::register(secret.expose());
             Auth::ClientSecret { tenant: tenant()?, client_id: client_id()?, secret: Zeroizing::new(secret.expose().to_string()) }
         }
+        "client-certificate" => {
+            let file = var("AZURE_CLIENT_CERTIFICATE_PATH");
+            if file.trim().is_empty() {
+                return Err(format!("{method_var}=client-certificate needs AZURE_CLIENT_CERTIFICATE_PATH, a PEM file with the certificate and its private key"));
+            }
+            if !var("AZURE_CLIENT_CERTIFICATE_PASSWORD").is_empty() {
+                return Err("AZURE_CLIENT_CERTIFICATE_PASSWORD isn't supported: botd reads an unencrypted PEM file, kept readable only by its own user (from a PFX: openssl pkcs12 -in cert.pfx -nodes -out cert.pem)".into());
+            }
+            if matches!(var("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN").trim().to_ascii_lowercase().as_str(), "1" | "true") {
+                return Err("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN isn't supported: upload the certificate to the app registration instead of trusting it by subject name".into());
+            }
+            let (tenant, client_id, path) = (tenant()?, client_id()?, PathBuf::from(file.trim()));
+            certificate(&path).map_err(|e| format!("AZURE_CLIENT_CERTIFICATE_PATH: {e}"))?;
+            Auth::ClientCertificate { tenant, client_id, path }
+        }
         "workload-identity" => {
             let file = var("AZURE_FEDERATED_TOKEN_FILE");
             if file.trim().is_empty() {
@@ -154,7 +176,7 @@ fn sign_in_settings(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, metho
             }
             Auth::WorkloadIdentity { tenant: tenant()?, client_id: client_id()?, token_file: PathBuf::from(file.trim()) }
         }
-        other => return Err(format!("{method_var} must be managed-identity, client-secret or workload-identity, not {other:?}")),
+        other => return Err(format!("{method_var} must be {METHODS}, not {other:?}")),
     };
     let authority = authority_setting(var)?;
     let identity = match (var("IDENTITY_ENDPOINT").trim(), var("IDENTITY_HEADER")) {
@@ -195,16 +217,19 @@ pub fn sign_in_reaches(var: &dyn Fn(&str) -> String, method_var: &str, method: &
                 out.push(("AZURE_AUTHORITY_HOST", authority, "Entra ID, for runs' credentials"));
             }
         }
-        "client-secret" | "workload-identity" => out.push(("AZURE_AUTHORITY_HOST", authority, "Entra ID sign-in")),
-        other => return Err(format!("{method_var} must be managed-identity, client-secret or workload-identity, not {other:?}")),
+        "client-secret" | "client-certificate" | "workload-identity" => out.push(("AZURE_AUTHORITY_HOST", authority, "Entra ID sign-in")),
+        other => return Err(format!("{method_var} must be {METHODS}, not {other:?}")),
     }
     Ok(out)
 }
+
+const METHODS: &str = "managed-identity, client-secret, client-certificate or workload-identity";
 
 fn method_of(auth: &Auth) -> &'static str {
     match auth {
         Auth::ManagedIdentity { .. } => "managed-identity",
         Auth::ClientSecret { .. } => "client-secret",
+        Auth::ClientCertificate { .. } => "client-certificate",
         Auth::WorkloadIdentity { .. } => "workload-identity",
     }
 }
@@ -215,6 +240,7 @@ fn signs_in_as(auth: &Auth) -> String {
         Auth::ManagedIdentity { client_id: Some(id) } => format!("user-assigned managed identity {id}"),
         Auth::ManagedIdentity { client_id: None } => "managed identity".to_string(),
         Auth::ClientSecret { tenant, client_id, .. } => format!("service principal {client_id} in tenant {tenant}"),
+        Auth::ClientCertificate { tenant, client_id, .. } => format!("service principal {client_id} in tenant {tenant} with a certificate"),
         Auth::WorkloadIdentity { tenant, client_id, .. } => format!("workload identity {client_id} in tenant {tenant}"),
     }
 }
@@ -252,6 +278,102 @@ fn federated_token(label: &str, token_file: &std::path::Path) -> Result<Zeroizin
     Ok(Zeroizing::new(assertion.to_string()))
 }
 
+/// A service principal's certificate and the RSA key it was made for.
+struct Certificate {
+    key: RsaKeyPair,
+    /// `x5t#S256`: the SHA-256 of the certificate's DER, base64url, as Entra matches it.
+    x5t_s256: String,
+    /// The SHA-1 thumbprint in hex, as the Entra admin center lists it, for errors.
+    thumbprint: String,
+}
+
+/// The labelled blocks of a PEM file, decoded. Legacy encrypted keys (`Proc-Type`) are refused.
+fn pem_blocks(text: &str) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>, String> {
+    let mut out = Vec::new();
+    let mut open: Option<(String, Zeroizing<String>)> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(label) = line.strip_prefix("-----BEGIN ").and_then(|l| l.strip_suffix("-----")) {
+            if let Some((begun, _)) = &open {
+                return Err(format!("its {begun} block has no END before the next BEGIN"));
+            }
+            open = Some((label.to_string(), Zeroizing::new(String::new())));
+        } else if let Some(label) = line.strip_prefix("-----END ").and_then(|l| l.strip_suffix("-----")) {
+            match open.take() {
+                Some((begun, b64)) if begun == label => {
+                    let der = STANDARD.decode(b64.as_bytes()).map_err(|_| format!("its {label} block isn't base64"))?;
+                    out.push((begun, Zeroizing::new(der)));
+                }
+                _ => return Err(format!("its END {label} has no matching BEGIN")),
+            }
+        } else if let Some((_, b64)) = open.as_mut() {
+            if line.starts_with("Proc-Type:") {
+                return Err("its private key is encrypted; botd needs it unencrypted, in a file only botd's user can read".into());
+            }
+            b64.push_str(line);
+        }
+    }
+    if let Some((begun, _)) = open {
+        return Err(format!("its {begun} block has no END; was the file cut short?"));
+    }
+    Ok(out)
+}
+
+/// The certificate and private key in the PEM file at `path`: one RSA key (PKCS#8 or
+/// PKCS#1), unencrypted, and the certificate for that key (the file may hold its chain),
+/// valid now. Errors never quote the file.
+fn certificate(path: &Path) -> Result<Certificate, String> {
+    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    let blocks = pem_blocks(&text)?;
+    let mut keys = Vec::new();
+    for (label, der) in &blocks {
+        match label.as_str() {
+            "PRIVATE KEY" => keys.push(RsaKeyPair::from_pkcs8(der).map_err(|e| format!("its private key isn't an RSA key Entra can check ({e})"))?),
+            "RSA PRIVATE KEY" => keys.push(RsaKeyPair::from_der(der).map_err(|e| format!("its RSA private key can't be used ({e})"))?),
+            "ENCRYPTED PRIVATE KEY" => return Err("its private key is encrypted; botd needs it unencrypted, in a file only botd's user can read".into()),
+            "EC PRIVATE KEY" => return Err("its private key is an EC key; Entra app certificates are RSA".into()),
+            _ => {}
+        }
+    }
+    let key = match keys.len() {
+        1 => keys.remove(0),
+        0 => return Err("it has no private key (PEM \"PRIVATE KEY\" or \"RSA PRIVATE KEY\")".into()),
+        _ => return Err("it has more than one private key".into()),
+    };
+    let public = key.public_key().as_ref().to_vec();
+    let certs: Vec<&[u8]> = blocks.iter().filter(|(l, _)| l == "CERTIFICATE").map(|(_, der)| der.as_slice()).collect();
+    if certs.is_empty() {
+        return Err("it has no certificate (PEM \"CERTIFICATE\")".into());
+    }
+    let der = certs
+        .into_iter()
+        .find(|der| x509_parser::parse_x509_certificate(der).is_ok_and(|(_, c)| c.public_key().subject_public_key.data.as_ref() == public.as_slice()))
+        .ok_or("none of its certificates is for its private key")?;
+    let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|_| "its certificate isn't X.509".to_string())?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let day = |t: i64| chrono::DateTime::from_timestamp(t, 0).map_or_else(|| t.to_string(), |d| d.format("%Y-%m-%d %H:%M UTC").to_string());
+    let (from, until) = (cert.validity().not_before.timestamp(), cert.validity().not_after.timestamp());
+    if now < from {
+        return Err(format!("its certificate isn't valid until {}", day(from)));
+    }
+    if now >= until {
+        return Err(format!("its certificate expired on {}", day(until)));
+    }
+    let sha1 = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, der);
+    Ok(Certificate { key, x5t_s256: URL_SAFE_NO_PAD.encode(Sha256::digest(der)), thumbprint: sha1.as_ref().iter().map(|b| format!("{b:02X}")).collect() })
+}
+
+/// The client assertion Entra takes for a certificate credential: a JWT for the token
+/// endpoint `audience`, from and about the app, signed PS256, good for 10 minutes.
+fn certificate_assertion(cert: &Certificate, client_id: &str, audience: &str) -> Result<Zeroizing<String>, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs();
+    let header = json!({ "alg": "PS256", "typ": "JWT", "x5t#S256": cert.x5t_s256 });
+    let claims = json!({ "aud": audience, "iss": client_id, "sub": client_id, "jti": crate::random_hex(16), "nbf": now, "iat": now, "exp": now + 600 });
+    let signing_input = format!("{}.{}", URL_SAFE_NO_PAD.encode(header.to_string()), URL_SAFE_NO_PAD.encode(claims.to_string()));
+    let mut sig = vec![0u8; cert.key.public_modulus_len()];
+    cert.key.sign(&RSA_PSS_SHA256, &aws_lc_rs::rand::SystemRandom::new(), signing_input.as_bytes(), &mut sig).map_err(|_| "couldn't sign the client assertion".to_string())?;
+    Ok(Zeroizing::new(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig))))
+}
+
 /// Sends a token request and reads the token and its lifetime from the answer.
 async fn bearer(label: &str, req: reqwest::RequestBuilder, what: &str) -> Result<Bearer, Error> {
     let failed = |e: reqwest::Error| Error::Unavailable(format!("{label}: {what}: {e}"));
@@ -277,6 +399,16 @@ async fn sign_in(label: &str, http: &reqwest::Client, local: &reqwest::Client, a
         Auth::ClientSecret { tenant, client_id, secret } => {
             let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_secret", secret), ("scope", &scope)];
             http.post(token_url(authority, tenant)).form(&form)
+        }
+        Auth::ClientCertificate { tenant, client_id, path } => {
+            let cert = certificate(path).map_err(|e| Error::Unavailable(format!("{label}: AZURE_CLIENT_CERTIFICATE_PATH: {e}")))?;
+            let url = token_url(authority, tenant);
+            let assertion = certificate_assertion(&cert, client_id, &url).map_err(|e| Error::Unavailable(format!("{label}: {e}")))?;
+            let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_assertion_type", ASSERTION_TYPE), ("client_assertion", &assertion), ("scope", &scope)];
+            return bearer(label, http.post(url).form(&form), "client-certificate sign-in").await.map_err(|e| match e {
+                Error::Unavailable(m) if m.contains("(invalid_client)") => Error::Unavailable(format!("{m}; is the certificate with thumbprint {} uploaded to app {client_id}'s certificates, and in date?", cert.thumbprint)),
+                e => e,
+            });
         }
         Auth::WorkloadIdentity { tenant, client_id, token_file } => {
             let assertion = federated_token(label, token_file)?;
@@ -418,7 +550,9 @@ impl Config {
                 None => Err("AZURE_RUN_CREDENTIALS needs AZURE_TENANT_ID, the tenant of the managed identity and its apps".into()),
                 Some(t) => id_setting("AZURE_TENANT_ID", t).map(|_| ()),
             },
-            Auth::ClientSecret { .. } => Err("AZURE_RUN_CREDENTIALS needs AZURE_KEYVAULT_AUTH=managed-identity (user-assigned) or workload-identity: Entra doesn't take a client secret as another app's credential".into()),
+            Auth::ClientSecret { .. } | Auth::ClientCertificate { .. } => {
+                Err("AZURE_RUN_CREDENTIALS needs AZURE_KEYVAULT_AUTH=managed-identity (user-assigned) or workload-identity: Entra doesn't take a client secret or certificate as another app's credential".into())
+            }
             Auth::WorkloadIdentity { .. } => Ok(()),
         }
     }
@@ -427,7 +561,7 @@ impl Config {
     fn run_tenant(&self) -> Option<&str> {
         match &self.auth {
             Auth::ManagedIdentity { .. } => self.tenant.as_deref(),
-            Auth::ClientSecret { tenant, .. } | Auth::WorkloadIdentity { tenant, .. } => Some(tenant),
+            Auth::ClientSecret { tenant, .. } | Auth::ClientCertificate { tenant, .. } | Auth::WorkloadIdentity { tenant, .. } => Some(tenant),
         }
     }
 }
@@ -758,6 +892,14 @@ mod tests {
         exchanged: Mutex<Vec<(String, HashMap<String, String>)>>,
         /// The app tokens made for runs.
         run_tokens: Mutex<Vec<String>>,
+        /// Certificates uploaded to `client-1`: `x5t#S256` and the RSA public key.
+        certs: Mutex<Vec<(String, Vec<u8>)>>,
+        /// Client assertions' `jti`s, each taken once.
+        jtis: Mutex<Vec<String>>,
+        /// The `x5t#S256` of the last certificate sign-in Entra took.
+        last_x5t: Mutex<String>,
+        /// Requests to the token endpoint, taken or not.
+        entra_calls: AtomicUsize,
     }
 
     type F = Arc<Fake>;
@@ -799,18 +941,60 @@ mod tests {
         (StatusCode::OK, issue(&f, q))
     }
 
-    async fn entra(State(f): State<F>, Path(tenant): Path<String>, Form(form): Form<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+    async fn entra(State(f): State<F>, Path(tenant): Path<String>, h: HeaderMap, Form(form): Form<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+        f.entra_calls.fetch_add(1, Ordering::SeqCst);
         if form.get("client_id").map(String::as_str) != Some("client-1") && form.contains_key("client_assertion") {
             return app_token(&f, &tenant, form);
         }
+        let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or_default();
         let ok = tenant == "tenant-1"
             && form.get("client_id").map(String::as_str) == Some("client-1")
             && form.get("grant_type").map(String::as_str) == Some("client_credentials")
-            && (form.get("client_secret").map(String::as_str) == Some("sp-secret-1") || form.get("client_assertion").map(String::as_str) == Some("federated-jwt-1"));
+            && (form.get("client_secret").map(String::as_str) == Some("sp-secret-1")
+                || form.get("client_assertion").map(String::as_str) == Some("federated-jwt-1")
+                || certificate_ok(&f, &format!("http://{host}/{tenant}/oauth2/v2.0/token"), &form));
         if !ok {
             return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided." })));
         }
         (StatusCode::OK, issue(&f, form))
+    }
+
+    /// Whether the form carries a certificate credential as Entra takes one: a PS256 JWT
+    /// whose `x5t#S256` names a certificate uploaded to `client-1` and whose signature is
+    /// that certificate's key's, for this token endpoint, from and about `client-1`, at most
+    /// 10 minutes long, with a `jti` never seen before.
+    fn certificate_ok(f: &Fake, token_url: &str, form: &HashMap<String, String>) -> bool {
+        use aws_lc_rs::signature::{UnparsedPublicKey, RSA_PSS_2048_8192_SHA256};
+        if form.get("client_assertion_type").map(String::as_str) != Some(ASSERTION_TYPE) {
+            return false;
+        }
+        let parts: Vec<&str> = form.get("client_assertion").map(|a| a.split('.').collect()).unwrap_or_default();
+        let [head, body, sig] = parts[..] else { return false };
+        let json = |s: &str| URL_SAFE_NO_PAD.decode(s).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or_default();
+        let (header, claims) = (json(head), json(body));
+        let x5t = header["x5t#S256"].as_str().unwrap_or_default().to_string();
+        let Some(public) = f.certs.lock().unwrap().iter().find(|(t, _)| *t == x5t).map(|(_, p)| p.clone()) else { return false };
+        let signed = URL_SAFE_NO_PAD.decode(sig).is_ok_and(|sig| UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public).verify(format!("{head}.{body}").as_bytes(), &sig).is_ok());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let n = |k: &str| claims[k].as_u64().unwrap_or_default();
+        let ok = signed
+            && header["alg"] == "PS256"
+            && header["typ"] == "JWT"
+            && claims["aud"] == token_url
+            && claims["iss"] == "client-1"
+            && claims["sub"] == "client-1"
+            && n("nbf") <= now + 5
+            && n("iat") == n("nbf")
+            && n("exp") > now
+            && n("exp") - n("nbf") <= 600;
+        let jti = claims["jti"].as_str().unwrap_or_default().to_string();
+        let mut seen = f.jtis.lock().unwrap();
+        if !ok || jti.is_empty() || seen.contains(&jti) {
+            return false;
+        }
+        seen.push(jti);
+        *f.last_x5t.lock().unwrap() = x5t;
+        true
     }
 
     /// Entra trading botd's own token for an app's (ADR 0213). It takes only a managed
@@ -1356,7 +1540,7 @@ mod tests {
             (vec![("AZURE_KEYVAULT_URL", "http://kv1.vault.azure.net")], "must use https"),
             (vec![("AZURE_KEYVAULT_URL", "https://kv1.vault.azure.net/secrets")], "just the scheme"),
             (vec![("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_PREFIX", "super_bot")], "AZURE_KEYVAULT_PREFIX"),
-            (vec![("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "password")], "managed-identity, client-secret or workload-identity"),
+            (vec![("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "password")], "managed-identity, client-secret, client-certificate or workload-identity"),
             (vec![("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "client-secret")], "AZURE_TENANT_ID"),
             (vec![("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "client-secret"), ("AZURE_TENANT_ID", "t")], "AZURE_CLIENT_ID"),
             (vec![("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "workload-identity"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c")], "AZURE_FEDERATED_TOKEN_FILE"),
@@ -1372,5 +1556,181 @@ mod tests {
         assert!(Config::from_env(&pairs, &none).err().unwrap().contains("AZURE_CLIENT_SECRET"));
         let c = Config::from_env(&settings(&[("AZURE_KEYVAULT_URL", kv), ("IDENTITY_ENDPOINT", "http://169.254.130.1:8081/msi/token"), ("IDENTITY_HEADER", "h")]), &none).unwrap();
         assert!(matches!(c.identity, Identity::Endpoint { .. }));
+    }
+
+    /// A self-signed RSA certificate valid from `from` to `until` days from now, and its key.
+    struct TestCert {
+        cert_pem: String,
+        key_pem: String,
+        pkcs8: Vec<u8>,
+        x5t: String,
+        public: Vec<u8>,
+    }
+
+    impl TestCert {
+        fn new(from: i64, until: i64) -> TestCert {
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.distinguished_name.push(rcgen::DnType::CommonName, "superbot-botd");
+            params.not_before = time::OffsetDateTime::now_utc() + time::Duration::days(from);
+            params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(until);
+            let cert = params.self_signed(&key).unwrap();
+            let pkcs8 = key.serialize_der();
+            let public = RsaKeyPair::from_pkcs8(&pkcs8).unwrap().public_key().as_ref().to_vec();
+            TestCert { cert_pem: cert.pem(), key_pem: key.serialize_pem(), pkcs8, x5t: URL_SAFE_NO_PAD.encode(Sha256::digest(cert.der())), public }
+        }
+
+        fn pem(&self) -> String {
+            format!("{}{}", self.cert_pem, self.key_pem)
+        }
+
+        /// The same key as PKCS#1 (`RSA PRIVATE KEY`), as older OpenSSL writes it: the
+        /// OCTET STRING at the end of the PKCS#8 SEQUENCE.
+        fn pkcs1_pem(&self) -> String {
+            fn tlv(b: &[u8]) -> (u8, &[u8], &[u8]) {
+                let (tag, first) = (b[0], b[1] as usize);
+                let (len, at) = if first < 0x80 { (first, 2) } else { (b[2..2 + (first & 0x7f)].iter().fold(0, |a, x| a << 8 | *x as usize), 2 + (first & 0x7f)) };
+                (tag, &b[at..at + len], &b[at + len..])
+            }
+            let (_, seq, _) = tlv(&self.pkcs8);
+            let (_, _, rest) = tlv(seq);
+            let (_, _, rest) = tlv(rest);
+            let (tag, rsa, _) = tlv(rest);
+            assert_eq!(tag, 0x04);
+            let b64 = STANDARD.encode(rsa);
+            let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\n", lines.join("\n"))
+        }
+    }
+
+    fn cert_file(name: &str, pem: &str) -> PathBuf {
+        let file = crate::db::temp_path(name).join("cert.pem");
+        std::fs::write(&file, pem).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_service_principal_signs_in_with_its_certificate_read_at_each_sign_in() {
+        let (url, f) = stand_in();
+        put(&f, "superbot-server-SMTP-PASSWORD", "smtp-from-azure-cert-1");
+        let (a, b, unknown) = (TestCert::new(-1, 30), TestCert::new(-1, 365), TestCert::new(-1, 30));
+        f.certs.lock().unwrap().extend([(a.x5t.clone(), a.public.clone()), (b.x5t.clone(), b.public.clone())]);
+        let file = cert_file("azure-cert", &a.pem());
+        let path = file.to_str().unwrap();
+        let creds = [("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "tenant-1"), ("AZURE_CLIENT_ID", "client-1"), ("AZURE_CLIENT_CERTIFICATE_PATH", path)];
+        let kv = KeyVault::new(config(&url, &creds)).unwrap();
+        assert!(kv.describe().ends_with("service principal client-1 in tenant tenant-1 with a certificate"), "{}", kv.describe());
+        let s = Arc::new(ExternalStore::new(Box::new(kv), Duration::ZERO));
+        assert_eq!(s.get("SMTP_PASSWORD").unwrap().unwrap().expose(), "smtp-from-azure-cert-1");
+        let asked = f.asked.lock().unwrap().last().unwrap().clone();
+        assert_eq!((asked["scope"].as_str(), asked["client_assertion_type"].as_str()), ("https://vault.azure.net/.default", ASSERTION_TYPE));
+        assert!(!asked.contains_key("client_secret"));
+        assert_eq!(*f.last_x5t.lock().unwrap(), a.x5t);
+        s.get("SMTP_PASSWORD").unwrap();
+        assert_eq!(f.sign_ins.load(Ordering::SeqCst), 1, "the token is kept while it lasts");
+
+        // A renewed certificate is used at the next sign-in, with no restart; so is a PKCS#1 key.
+        std::fs::write(&file, b.pem()).unwrap();
+        f.tokens.lock().unwrap().clear();
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some(), "refused: signs in again with the file as it is now");
+        assert_eq!(*f.last_x5t.lock().unwrap(), b.x5t);
+        std::fs::write(&file, format!("{}{}", b.cert_pem, b.pkcs1_pem())).unwrap();
+        f.tokens.lock().unwrap().clear();
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        assert_eq!(f.jtis.lock().unwrap().len(), 3, "a new assertion for each sign-in");
+
+        // A certificate the app doesn't have is refused, naming its thumbprint, never the key.
+        std::fs::write(&file, unknown.pem()).unwrap();
+        f.tokens.lock().unwrap().clear();
+        let thumbprint = certificate(&file).unwrap().thumbprint;
+        assert_eq!(thumbprint.len(), 40);
+        let e = s.get("SMTP_PASSWORD").unwrap_err().to_string();
+        assert!(e.contains("401") && e.contains("invalid_client") && e.contains(&thumbprint) && e.contains("app client-1") && !e.contains("PRIVATE KEY") && !e.contains("AADSTS"), "{e}");
+
+        // A file that can't be used fails closed before Entra is asked, never with the last key.
+        let calls = f.entra_calls.load(Ordering::SeqCst);
+        for (pem, err) in [("not a certificate", "no private key"), (TestCert::new(-30, -1).pem().as_str(), "expired on")] {
+            std::fs::write(&file, pem).unwrap();
+            let e = s.get("SMTP_PASSWORD").unwrap_err().to_string();
+            assert!(e.contains("AZURE_CLIENT_CERTIFICATE_PATH") && e.contains(err), "{e}");
+        }
+        assert_eq!(f.entra_calls.load(Ordering::SeqCst), calls);
+        let logins = audited("azure-keyvault");
+        assert!(logins.iter().any(|e| e.outcome == Outcome::Success && e.details["method"] == "client-certificate"), "{logins:?}");
+        assert!(logins.iter().any(|e| e.outcome == Outcome::Failure && e.details["method"] == "client-certificate"));
+        assert!(!format!("{logins:?}").contains("PRIVATE KEY"));
+        redact::forget("smtp-from-azure-cert-1");
+    }
+
+    #[test]
+    fn vault_and_azure_monitor_sign_in_with_the_certificate_too() {
+        let (url, f) = stand_in();
+        let cert = TestCert::new(-1, 30);
+        f.certs.lock().unwrap().push((cert.x5t.clone(), cert.public.clone()));
+        let file = cert_file("azure-cert-entra", &cert.pem());
+        let pairs = [("AZURE_AUTHORITY_HOST", url.as_str()), ("AZURE_TENANT_ID", "tenant-1"), ("AZURE_CLIENT_ID", "client-1"), ("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap())];
+        let mut e = Entra::from_env(&settings(&pairs), &EnvStore::fixed(&pairs), "VAULT_AZURE_CREDENTIALS", "client-certificate", "Entra ID (for Vault)", "https://management.azure.com/").unwrap();
+        e.point_at(&url);
+        assert_eq!((e.method(), e.on_vm()), ("client-certificate", false));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let token = rt.block_on(e.token(false)).unwrap();
+        assert!(f.tokens.lock().unwrap().contains(&*token));
+        assert_eq!(f.asked.lock().unwrap().last().unwrap()["scope"], "https://management.azure.com/.default");
+        let reaches = sign_in_reaches(&settings(&pairs), "VAULT_AZURE_CREDENTIALS", "client-certificate", false).unwrap();
+        assert_eq!(reaches, [("AZURE_AUTHORITY_HOST", url.clone(), "Entra ID sign-in")]);
+    }
+
+    #[test]
+    fn certificate_files_are_checked() {
+        let good = TestCert::new(-1, 30);
+        let (other, ca) = (TestCert::new(-1, 30), TestCert::new(-1, 3650));
+        let ec = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap().serialize_pem();
+        let kv = "https://kv1.vault.azure.net";
+        let with = |extra: &[(&str, &str)]| {
+            let pairs = [&[("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c")][..], extra].concat();
+            Config::from_env(&settings(&pairs), &EnvStore::fixed(&[]))
+        };
+        let in_file = |pem: &str| {
+            let file = cert_file("azure-cert-check", pem);
+            with(&[("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap())])
+        };
+        let c = in_file(&format!("{}{}{}", ca.cert_pem, good.cert_pem, good.key_pem)).unwrap();
+        assert!(matches!(c.auth, Auth::ClientCertificate { .. }), "the certificate for the key is found among its chain");
+        assert!(in_file(&format!("{}{}", good.key_pem, good.cert_pem)).is_ok(), "in either order");
+        let secret_part = &good.key_pem[40..80];
+        for (pem, err) in [
+            (good.cert_pem.clone(), "no private key"),
+            (good.key_pem.clone(), "no certificate"),
+            (format!("{}{}", other.cert_pem, good.key_pem), "none of its certificates is for its private key"),
+            (format!("{}{}", good.pem(), other.key_pem), "more than one private key"),
+            (format!("{}{ec}", good.cert_pem), "isn't an RSA key"),
+            (format!("{}-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n", good.cert_pem), "EC key"),
+            (format!("{}-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n", good.cert_pem), "encrypted"),
+            (format!("{}-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n", good.cert_pem), "encrypted"),
+            (format!("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n{}", good.key_pem), "isn't base64"),
+            (format!("{}-----END CERTIFICATE-----\n", good.key_pem), "no matching BEGIN"),
+            (format!("{}-----BEGIN PRIVATE KEY-----\nMIIE", good.pem()), "has no END; was the file cut short?"),
+            (format!("-----BEGIN PRIVATE KEY-----\nMIIE\n{}", good.pem()), "no END before the next BEGIN"),
+            (TestCert::new(-30, -1).pem(), "expired on"),
+            (TestCert::new(2, 30).pem(), "isn't valid until"),
+        ] {
+            let e = in_file(&pem).err().unwrap_or_default();
+            assert!(e.starts_with("AZURE_CLIENT_CERTIFICATE_PATH: ") && e.contains(err) && !e.contains(secret_part), "expected {err:?}: {e}");
+        }
+        let file = cert_file("azure-cert-settings", &good.pem());
+        let path = ("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap());
+        for (extra, err) in [
+            (vec![], "needs AZURE_CLIENT_CERTIFICATE_PATH"),
+            (vec![("AZURE_CLIENT_CERTIFICATE_PATH", "/nonexistent/superbot/cert.pem")], "AZURE_CLIENT_CERTIFICATE_PATH: /nonexistent/superbot/cert.pem"),
+            (vec![path, ("AZURE_CLIENT_CERTIFICATE_PASSWORD", "pfx-password")], "AZURE_CLIENT_CERTIFICATE_PASSWORD isn't supported"),
+            (vec![path, ("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN", "true")], "AZURE_CLIENT_SEND_CERTIFICATE_CHAIN isn't supported"),
+            (vec![path, ("AZURE_TENANT_ID", "")], "AZURE_TENANT_ID"),
+        ] {
+            let e = with(&extra).err().unwrap_or_default();
+            assert!(e.contains(err), "expected {err:?} for {extra:?}: {e}");
+        }
+        let run = [("SECRETS_BACKEND", "azure-keyvault"), ("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c"), path, ("AZURE_RUN_CREDENTIALS", APP)];
+        let e = external::from_env(&settings(&run), &EnvStore::fixed(&run)).err().unwrap_or_default();
+        assert!(e.contains("doesn't take a client secret or certificate"), "AZURE_RUN_CREDENTIALS refuses a certificate sign-in");
     }
 }
