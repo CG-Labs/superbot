@@ -1,4 +1,4 @@
-import { archiveCheckLine, chainLines, checkpointLine, exportLine, exportLines, shortHash, timestampLine, verificationLine } from "../auditChain";
+import { archiveCheckLine, chainLines, checkpointLine, exportLine, exportLines, shortHash, stoppedLine, timestampLine, verificationLine } from "../auditChain";
 import type { AuditChainState, AuditCheckpoint } from "../types";
 
 const HASH = "ab".repeat(32);
@@ -101,6 +101,38 @@ describe("audit chain lines (ADR 0149)", () => {
       ["SIEM export (soc)", "bad"],
       ["Archive", "ok"],
     ]);
+  });
+
+  it("shows sinks taken out of AUDIT_EXPORT after those running (ADR 0273)", () => {
+    const at = Date.UTC(2026, 10, 24, 9);
+    const mdr = { kind: "webhook", name: "mdr", sink: "https://mdr.example.net:443", delivered: 30, pending: 13, stoppedEvent: 31, stoppedAt: at, reason: "removed" as const };
+    expect(stoppedLine(mdr)).toEqual({
+      label: "Stopped SIEM (mdr)",
+      text: `https://mdr.example.net:443: taken out of AUDIT_EXPORT ${new Date(at).toLocaleString()} (event 31). It last took event 30, 13 events since.`,
+      tone: "warn",
+    });
+    expect(stoppedLine({ ...mdr, kind: "s3", name: null, sink: "s3://audit/prod", reason: "export_off", pending: 1 })).toMatchObject({
+      label: "Stopped archive",
+      text: expect.stringContaining("s3://audit/prod: stopped when export was turned off"),
+    });
+    const pruned = stoppedLine({ ...mdr, stoppedAt: null, reason: null, sink: null });
+    expect(pruned.text).toBe("A sink: stopped (event 31). It last took event 30, 13 events since.");
+
+    const running = { kind: "webhook", name: "splunk", sink: "https://hec.example", delivered: 43, pending: 0, deliveredAt: null, failing: false, lastError: null };
+    const on = { enabled: true as const, ...running, sinks: [running], stopped: [mdr] };
+    expect(exportLines(on).map((l) => [l.label, l.tone])).toEqual([
+      ["SIEM export (splunk)", "ok"],
+      ["Stopped SIEM (mdr)", "warn"],
+    ]);
+    // Off after sinks ran is a warning, not the quiet default.
+    const off = { enabled: false as const, stopped: [mdr, { ...mdr, name: "soc", reason: "export_off" as const }] };
+    expect(exportLines(off).map((l) => [l.label, l.tone])).toEqual([
+      ["SIEM export", "warn"],
+      ["Stopped SIEM (mdr)", "warn"],
+      ["Stopped SIEM (soc)", "warn"],
+    ]);
+    expect(exportLine({ enabled: false })).toMatchObject({ tone: "dim" });
+    expect(chainLines(chainState({ export: off })).map((l) => l.label).slice(-3)).toEqual(["SIEM export", "Stopped SIEM (mdr)", "Stopped SIEM (soc)"]);
   });
 
   it("lists every part in order", () => {
