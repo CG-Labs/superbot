@@ -24,7 +24,7 @@ A native SAML provider takes responses over one binding, set by `SSO_<ID>_RESPON
   - `InResponseTo` our request (`artifact_mismatch`), and under five minutes old with the usual skew;
   - status Success with exactly one `samlp:Response` (Success with nothing is `artifact_unknown`; other statuses are `idp_error`, a SOAP fault `soap_fault`).
 - **The Response inside** is taken out as a document of its own, with the namespaces it had in scope declared on its root, and goes through the same checks as a posted one (`check_response_xml`): the assertion signature, audience, recipient, InResponseTo, times, encryption. Exclusive C14N, the only kind botd verifies, renders namespaces where they are used, so signatures verify the same out of place.
-- **Counting.** Refusals the browser can cause count against its address, and those before a signature is checked are logged sparingly, as before. `artifact_unreachable` and `artifact_http_error` (the IdP is down) don't count.
+- **Counting.** Refusals the browser can cause count against its address, and those before a signature is checked are logged sparingly, as before. `artifact_unreachable` (no connection, or the answer cut off partway) and `artifact_http_error` (the IdP is down) don't count. Back-channel logout's answers read the same way: a cut-off one is `unreachable` there.
 - **Audit.** `auth.login` carries `responseBinding` (`post` or `artifact`). `GET /api/sso/{id}/saml` and `botctl sso saml` show the setting and the IdP's artifact resolution URLs, and `botd offline check` (ADR 0257) lists them among the addresses botd reaches.
 
 ## Alternatives considered

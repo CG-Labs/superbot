@@ -1356,8 +1356,8 @@ async fn resolve_artifact(a: &Auth, app: &AppState, p: &Provider, idp: &saml_sp:
         Err(e) => Err(Refused("artifact_unreachable", Some(crate::audit::clip(&e.without_url().to_string(), 128)))),
         // SOAP 1.1 faults come with a 500, so the body is read either way.
         Ok(res) => match capped_body(res, saml_sp::MAX_RESPONSE).await {
-            Some((code, body)) => saml_artifact::receive(&body, idp, &id, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("artifact_http_error", Some(code.as_u16().to_string())) } else { r }),
-            None => Err(Refused("bad_message", None)),
+            Ok((code, body)) => saml_artifact::receive(&body, idp, &id, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("artifact_http_error", Some(code.as_u16().to_string())) } else { r }),
+            Err(e) => Err(e.refused("artifact_unreachable")),
         },
     }
 }
@@ -1845,8 +1845,8 @@ async fn back_channel_logout(http: &reqwest::Client, app: &AppState, b: &BackCha
         Err(e) => Err(Refused("unreachable", Some(crate::audit::clip(&e.without_url().to_string(), 128)))),
         // SOAP 1.1 faults come with a 500, so the body is read either way.
         Ok(res) => match capped_body(res, saml_sp::MAX_RESPONSE).await {
-            Some((code, body)) => saml_slo::receive_soap_response(&body, &b.idp, &b.request, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("http_error", Some(code.as_u16().to_string())) } else { r }),
-            None => Err(Refused("bad_message", None)),
+            Ok((code, body)) => saml_slo::receive_soap_response(&body, &b.idp, &b.request, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("http_error", Some(code.as_u16().to_string())) } else { r }),
+            Err(e) => Err(e.refused("unreachable")),
         },
     };
     let provider = b.provider.as_str();
@@ -1870,17 +1870,35 @@ async fn back_channel_logout(http: &reqwest::Client, app: &AppState, b: &BackCha
     app.db.record(&Event::new(actor, "auth.slo_response").target("session", &b.session).outcome(outcome).details(details));
 }
 
-/// A response's status and body, or None when it's over `max` bytes or not UTF-8.
-async fn capped_body(mut res: reqwest::Response, max: usize) -> Option<(StatusCode, String)> {
+/// Why a response has no body to read.
+enum NoBody {
+    /// The connection failed or timed out partway: the other end's trouble, not the message's.
+    Cut(String),
+    /// Over the size limit, or not UTF-8.
+    Bad,
+}
+
+impl NoBody {
+    /// As a refusal: `cut` (the caller's unreachable reason) with why, or `bad_message`.
+    fn refused(self, cut: &'static str) -> Refused {
+        match self {
+            NoBody::Cut(e) => Refused(cut, Some(crate::audit::clip(&e, 128))),
+            NoBody::Bad => Refused("bad_message", None),
+        }
+    }
+}
+
+/// A response's status and body, up to `max` bytes of UTF-8.
+async fn capped_body(mut res: reqwest::Response, max: usize) -> Result<(StatusCode, String), NoBody> {
     let code = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut body = Vec::new();
-    while let Some(chunk) = res.chunk().await.ok()? {
+    while let Some(chunk) = res.chunk().await.map_err(|e| NoBody::Cut(e.without_url().to_string()))? {
         if body.len() + chunk.len() > max {
-            return None;
+            return Err(NoBody::Bad);
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body).ok().map(|b| (code, b))
+    String::from_utf8(body).map(|b| (code, b)).map_err(|_| NoBody::Bad)
 }
 
 /// Refused logout messages anyone can send: the ones before the IdP's signature was checked.

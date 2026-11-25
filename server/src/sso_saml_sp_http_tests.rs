@@ -2768,6 +2768,27 @@ impl ArtifactIdp {
     }
 }
 
+/// An ArtifactResolutionService that reads the request, starts its answer and hangs up halfway.
+async fn cut_off_ars() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}/ars", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !String::from_utf8_lossy(&got).contains("</soap11:Envelope>") {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 5000\r\n\r\n<soap11:Envelope").await;
+        }
+    });
+    url
+}
+
 impl Sp {
     /// The IdP's redirect to our ACS with `artifact`: the status, where it goes next, the head.
     async fn send_artifact(&self, artifact: &str, relay: &str, cookie: &str) -> (u16, String, String) {
@@ -2830,19 +2851,23 @@ async fn an_artifact_is_resolved_over_soap_into_a_sign_in_once() {
 async fn only_our_idps_artifacts_for_its_endpoints_are_sent_and_posts_are_refused() {
     let (ars, ars_url) = ArtifactIdp::start().await;
     let md = test_idp::with_artifact_resolution(&test_idp::with_artifact_resolution(&test_idp::metadata(), &ars_url, 1), "http://127.0.0.1:9/ars", 2);
+    let md = test_idp::with_artifact_resolution(&md, &cut_off_ars().await, 3);
     // Each on a server of its own: refusals nobody vouched for are audited once a minute.
-    for (artifact, reason, asks) in [
-        (crate::sso::saml_artifact::test_idp::artifact("https://evil.example/idp", 1), "wrong_artifact_source", false),
-        (crate::sso::saml_artifact::test_idp::artifact(IDP, 7), "no_artifact_resolution", false),
-        ("AAQ=".to_string(), "bad_artifact", false),
-        (crate::sso::saml_artifact::test_idp::artifact(IDP, 1), "artifact_unknown", true),
-        (crate::sso::saml_artifact::test_idp::artifact(IDP, 2), "artifact_unreachable", false),
+    for (artifact, reason, why, asks) in [
+        (crate::sso::saml_artifact::test_idp::artifact("https://evil.example/idp", 1), "wrong_artifact_source", None, false),
+        (crate::sso::saml_artifact::test_idp::artifact(IDP, 7), "no_artifact_resolution", Some("7"), false),
+        ("AAQ=".to_string(), "bad_artifact", None, false),
+        (crate::sso::saml_artifact::test_idp::artifact(IDP, 1), "artifact_unknown", None, true),
+        (crate::sso::saml_artifact::test_idp::artifact(IDP, 2), "artifact_unreachable", Some("error sending request"), false),
+        // The IdP's answer cut off halfway: its trouble too, so not counted against the browser.
+        (crate::sso::saml_artifact::test_idp::artifact(IDP, 3), "artifact_unreachable", Some("error decoding response body"), false),
     ] {
         let sp = serve_importing(&[("RESPONSE_BINDING", "artifact")], |_| {}, &md).await;
         let before = ars.got.lock().unwrap().len();
         let (_, relay, cookie) = sp.start().await;
         let (_, to, _) = sp.send_artifact(&artifact, &relay, &cookie).await;
-        assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_failed", Some(reason)));
+        let f = sp.last_failure().await;
+        assert_eq!((to.as_str(), f["reason"].as_str(), f["idpStatus"].as_str()), ("/login?error=sso_failed", Some(reason), why));
         assert_eq!(ars.got.lock().unwrap().len(), before + usize::from(asks), "{reason}");
     }
 
