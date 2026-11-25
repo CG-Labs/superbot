@@ -2233,6 +2233,9 @@ fn scim_role_group_error(e: rusqlite::Error) -> ScimRoleGroupError {
 pub struct SamlRoleMapping {
     pub id: String,
     pub provider: String,
+    /// The IdP whose group it is, for a provider with several IdPs of a federation (ADR
+    /// 0287). None: the provider's one IdP.
+    pub idp: Option<String>,
     pub group: String,
     pub role_id: String,
     pub created_at: i64,
@@ -2240,7 +2243,16 @@ pub struct SamlRoleMapping {
 }
 
 fn saml_role_mapping_row(r: &Row) -> rusqlite::Result<SamlRoleMapping> {
-    Ok(SamlRoleMapping { id: r.get("id")?, provider: r.get("provider")?, group: r.get("group_name")?, role_id: r.get("role_id")?, created_at: r.get("created_at")?, created_by: r.get("created_by")? })
+    let idp: String = r.get("idp")?;
+    Ok(SamlRoleMapping {
+        id: r.get("id")?,
+        provider: r.get("provider")?,
+        idp: (!idp.is_empty()).then_some(idp),
+        group: r.get("group_name")?,
+        role_id: r.get("role_id")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+    })
 }
 
 /// A role a SAML mapping gave someone, at most one per person (a person holds one custom
@@ -2423,7 +2435,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 71] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 72] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2495,6 +2507,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 71] = [
     migrate_scim_token_scopes,
     migrate_deleted_teams,
     migrate_saml_session_users,
+    migrate_saml_group_roles_per_idp,
 ];
 
 /// Native SAML sign-ins name their person (ADR 0283), so a regional chat store keeps them
@@ -2507,6 +2520,42 @@ fn migrate_saml_session_users(c: &Connection, _fresh: bool) -> rusqlite::Result<
     c.execute_batch(
         "ALTER TABLE main.saml_sessions ADD COLUMN user_id TEXT;
         UPDATE main.saml_sessions SET user_id = (SELECT s.user_id FROM main.sessions s WHERE s.id = saml_sessions.session_id);",
+    )
+}
+
+/// SAML group mappings per IdP of a federation (ADR 0287): a mapping may name the IdP whose
+/// group it is (`idp`, empty for the provider's one IdP), and the same group name may be
+/// mapped once per IdP. SQLite can't change a UNIQUE constraint in place, so the table is
+/// made again; its grants are kept aside meanwhile, as dropping it would cascade to them.
+fn migrate_saml_group_roles_per_idp(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE saml_role_grants_kept AS SELECT mapping_id, user_id, prior_role, granted_at, released_at FROM saml_role_grants;
+        DROP TABLE saml_role_grants;
+        CREATE TABLE saml_role_mappings_per_idp (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          idp TEXT NOT NULL DEFAULT '',
+          group_name TEXT NOT NULL,
+          role_id TEXT NOT NULL REFERENCES roles(id),
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          UNIQUE (provider, idp, group_name)
+        );
+        INSERT INTO saml_role_mappings_per_idp (id, provider, idp, group_name, role_id, created_at, created_by)
+          SELECT id, provider, '', group_name, role_id, created_at, created_by FROM saml_role_mappings;
+        DROP TABLE saml_role_mappings;
+        ALTER TABLE saml_role_mappings_per_idp RENAME TO saml_role_mappings;
+        CREATE INDEX saml_role_mappings_role ON saml_role_mappings(role_id);
+        CREATE TABLE saml_role_grants (
+          mapping_id TEXT NOT NULL REFERENCES saml_role_mappings(id) ON DELETE CASCADE,
+          user_id TEXT PRIMARY KEY,
+          prior_role TEXT,
+          granted_at INTEGER NOT NULL,
+          released_at INTEGER
+        );
+        INSERT INTO saml_role_grants SELECT * FROM saml_role_grants_kept;
+        DROP TABLE saml_role_grants_kept;
+        CREATE INDEX saml_role_grants_mapping ON saml_role_grants(mapping_id);",
     )
 }
 
@@ -6982,9 +7031,9 @@ impl Db {
         self.c().query_row("SELECT * FROM saml_role_mappings WHERE id = ?", [id], saml_role_mapping_row).optional().ok().flatten()
     }
 
-    /// Maps `provider`'s `group` to a role, while it exists and its permissions, as they are
-    /// now, don't reach admins across the server.
-    pub fn create_saml_role_mapping(&self, provider: &str, group: &str, role_id: &str, by: Option<&str>) -> Result<SamlRoleMapping, ScimRoleMapError> {
+    /// Maps `provider`'s `group` (at IdP `idp`, with several) to a role, while it exists and
+    /// its permissions, as they are now, don't reach admins across the server.
+    pub fn create_saml_role_mapping(&self, provider: &str, idp: Option<&str>, group: &str, role_id: &str, by: Option<&str>) -> Result<SamlRoleMapping, ScimRoleMapError> {
         let id = format!("gm{}", crate::random_hex(5));
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| ScimRoleMapError::Db(e.to_string()))?;
@@ -6996,7 +7045,10 @@ impl Db {
         if role_time_bound_in(&tx, role_id).map_err(|e| ScimRoleMapError::Db(e.to_string()))? {
             return Err(ScimRoleMapError::TimeBound);
         }
-        tx.execute("INSERT INTO saml_role_mappings (id, provider, group_name, role_id, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![id, provider, group, role_id, now(), by])
+        tx.execute(
+            "INSERT INTO saml_role_mappings (id, provider, idp, group_name, role_id, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, provider, idp.unwrap_or(""), group, role_id, now(), by],
+        )
             .map_err(|e| if constraint(&e) { ScimRoleMapError::Taken } else { ScimRoleMapError::Db(e.to_string()) })?;
         tx.commit().map_err(|e| ScimRoleMapError::Db(e.to_string()))?;
         drop(c);
@@ -11970,11 +12022,11 @@ mod tests {
         let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
         let hand = db.create_custom_role("Hand", "", Role::Member, &["users.manage"], None, None).unwrap();
         let ops = db.create_custom_role("Ops", "", Role::Member, &["bots.manage"], None, None).unwrap();
-        assert!(matches!(db.create_saml_role_mapping("corp", "Ops", &ops.id, None), Err(ScimRoleMapError::Reaches(p)) if p == ["bots.manage"]), "never a role that reaches admins");
-        assert!(matches!(db.create_saml_role_mapping("corp", "Ghosts", "rnone", None), Err(ScimRoleMapError::Gone)));
-        let m = db.create_saml_role_mapping("corp", "Auditors", &r.id, Some("admin")).unwrap();
-        assert!(matches!(db.create_saml_role_mapping("corp", "Auditors", &hand.id, None), Err(ScimRoleMapError::Taken)), "one role per group");
-        let okta = db.create_saml_role_mapping("okta", "Auditors", &r.id, None).unwrap();
+        assert!(matches!(db.create_saml_role_mapping("corp", None, "Ops", &ops.id, None), Err(ScimRoleMapError::Reaches(p)) if p == ["bots.manage"]), "never a role that reaches admins");
+        assert!(matches!(db.create_saml_role_mapping("corp", None, "Ghosts", "rnone", None), Err(ScimRoleMapError::Gone)));
+        let m = db.create_saml_role_mapping("corp", None, "Auditors", &r.id, Some("admin")).unwrap();
+        assert!(matches!(db.create_saml_role_mapping("corp", None, "Auditors", &hand.id, None), Err(ScimRoleMapError::Taken)), "one role per group");
+        let okta = db.create_saml_role_mapping("okta", None, "Auditors", &r.id, None).unwrap();
         assert!(matches!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2))));
         assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "machines.manage"]), None, None), Err(RoleError::Reaches { via: "saml", .. })), "checked as it's saved");
 
@@ -12139,7 +12191,7 @@ mod tests {
         assert!(db.give_team_custom_role_until(&team.id, &a.id, &r.id, Some(now() + crate::roles::DAY)).is_some());
         // And no group is given it: a group holds its role while people are in it.
         assert!(matches!(db.create_scim_role_mapping("okta", &team.id, &r.id, "org", None), Err(ScimRoleMapError::TimeBound)));
-        assert!(matches!(db.create_saml_role_mapping("corp", "Admins", &r.id, None), Err(ScimRoleMapError::TimeBound)));
+        assert!(matches!(db.create_saml_role_mapping("corp", None, "Admins", &r.id, None), Err(ScimRoleMapError::TimeBound)));
         assert!(matches!(db.declare_scim_role_group("okta", "org", "Helpdesk", None, &r.id, None), Err(ScimRoleGroupError::TimeBound)));
         let plain = db.create_custom_role("Plain", "", Role::Member, &["users.manage"], None, None).unwrap();
         let g = db.declare_scim_role_group("okta", "org", "Helpdesk", None, &plain.id, None).unwrap();
@@ -12148,7 +12200,7 @@ mod tests {
         // The limit lifted, it's a role like any other.
         assert!(db.update_custom_role(&r.id, None, None, None, None, Some(None), None).is_ok());
         assert!(db.give_user_custom_role_until(&a.id, &r.id, None).is_some());
-        assert!(db.create_saml_role_mapping("corp", "Admins", &r.id, None).is_ok());
+        assert!(db.create_saml_role_mapping("corp", None, "Admins", &r.id, None).is_ok());
     }
 
     #[test]
@@ -12900,6 +12952,49 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let r = db.machine(&m.id).unwrap();
         assert_eq!((r.rebuild_state, r.rebuild_attempts, r.rebuild_discard), (None, 0, false));
+    }
+
+    #[test]
+    fn saml_group_mappings_are_per_idp_and_kept_with_their_grants_on_upgrade() {
+        let path = temp_path("saml-roles-per-idp").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let r = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+        let u = db.create_user(None, Some("a@example.com"), "A", Role::Readonly).unwrap();
+        let (a, b) = ("https://idp.uni-a.example", "https://idp.uni-b.example");
+        let at_a = db.create_saml_role_mapping("uni", Some(a), "staff", &r.id, None).unwrap();
+        assert_eq!(at_a.idp.as_deref(), Some(a));
+        assert!(db.create_saml_role_mapping("uni", Some(b), "staff", &r.id, None).is_ok(), "the same name at another IdP is another group");
+        assert!(matches!(db.create_saml_role_mapping("uni", Some(a), "staff", &r.id, None), Err(ScimRoleMapError::Taken)));
+        assert_eq!(db.create_saml_role_mapping("corp", None, "staff", &r.id, None).unwrap().idp, None);
+
+        // A database from before: the old table, a mapping and a grant from it.
+        db.c()
+            .execute_batch(
+                "DELETE FROM saml_role_mappings;
+                 PRAGMA foreign_keys = OFF;
+                 DROP TABLE saml_role_mappings;
+                 CREATE TABLE saml_role_mappings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, group_name TEXT NOT NULL, role_id TEXT NOT NULL REFERENCES roles(id), created_at INTEGER NOT NULL, created_by TEXT, UNIQUE (provider, group_name));
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        db.c().execute("INSERT INTO saml_role_mappings VALUES ('gmold', 'corp', 'Auditors', ?1, 1, 'admin')", [&r.id]).unwrap();
+        let old = db.c().query_row("SELECT * FROM saml_role_mappings WHERE id = 'gmold'", [], |r| Ok((r.get::<_, String>("id")?, r.get::<_, String>("role_id")?))).unwrap();
+        db.c().execute("UPDATE users SET role_id = ?1, role = 'member' WHERE id = ?2", [&old.1, &u.id]).unwrap();
+        db.c().execute("INSERT INTO saml_role_grants (mapping_id, user_id, prior_role, granted_at) VALUES ('gmold', ?1, 'readonly', 2)", [&u.id]).unwrap();
+        let at = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_saml_group_roles_per_idp as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
+        db.c().execute_batch(&format!("PRAGMA user_version = {at};")).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let m = db.saml_role_mapping("gmold").unwrap();
+        assert_eq!((m.provider.as_str(), m.idp.as_deref(), m.group.as_str(), m.created_by.as_deref()), ("corp", None, "Auditors", Some("admin")));
+        let g = db.saml_role_grant_of_user(&u.id).unwrap();
+        assert_eq!((g.mapping_id.as_str(), g.prior_role), ("gmold", Some(Role::Readonly)));
+        assert!(db.create_saml_role_mapping("corp", Some(a), "Auditors", &r.id, None).is_ok());
+        let back = db.revoke_saml_role(&m, &u.id).unwrap();
+        assert_eq!((back.cleared, back.role_after), (true, Some(Role::Readonly)));
+        // Grants still go with their mapping.
+        assert!(db.grant_saml_role(&m, &u.id));
+        assert!(db.delete_saml_role_mapping("gmold") && db.saml_role_grant_of_user(&u.id).is_none());
     }
 
     #[test]

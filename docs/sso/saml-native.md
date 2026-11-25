@@ -133,6 +133,7 @@ SSO_CORP_REQUIRED_GROUPS=SuperBot Users           # optional: only people in one
 ```bash
 botctl role add "Auditor" --perms audit.view
 botctl sso role map corp "SuperBot Auditors" Auditor   # or a group's object id for Entra ID
+                                                       # several IdPs: add --idp <entity ID> (below)
 botctl sso role-mappings                               # every mapping, and the providers that read groups
 botctl sso role show <id>                              # who it gave the role to
 botctl sso role unmap <id>                             # takes the role from all of them
@@ -194,7 +195,7 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_METADATA_SIGNING_CERT_FILE` | | The certificates (PEM, one or more) the IdP signs its metadata with. Metadata is then checked on every load ([below](#signed-idp-metadata)). |
 | `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked (not with `IDP_MDQ_URL`). Badly signed metadata is refused either way. |
 | `SSO_<ID>_GROUPS_ATTRIBUTE` | | The assertion attribute with the person's groups ([above](#groups)). No default: without it, groups aren't read. |
-| `SSO_<ID>_REQUIRED_GROUPS` | | Only people in one of these groups sign in, comma separated (exact). Needs `GROUPS_ATTRIBUTE`. |
+| `SSO_<ID>_REQUIRED_GROUPS` | | Only people in one of these groups sign in, comma separated (exact). Needs `GROUPS_ATTRIBUTE`. With `IDP_ENTITY_IDS`, each must be scoped, like `member@uni.example` ([below](#groups-with-several-idps)). |
 | `SSO_<ID>_IDP_INITIATED` | `off` | `restart`: an unsolicited response from an IdP's app tile starts an SP-initiated sign-in ([above](#idp-initiated-sign-in-app-tiles)). `off` refuses it. |
 | `SSO_<ID>_AUTHN_CONTEXT` | | Only people the IdP says signed in one of these ways get in, comma separated (exact): authentication context classes, or values of `AUTHN_METHODS_ATTRIBUTE` ([below](#require-mfa-at-the-idp)). |
 | `SSO_<ID>_AUTHN_METHODS_ATTRIBUTE` | | The assertion attribute listing how the person signed in, whose values count for `AUTHN_CONTEXT` too (Entra ID: `http://schemas.microsoft.com/claims/authnmethodsreferences`). Needs `AUTHN_CONTEXT`. |
@@ -376,7 +377,29 @@ SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
 - **Emails only from the IdP's own domains.** Any IdP in the federation could send any email, so botd takes an email only at a domain the federation's metadata lists for that IdP (its `shibmd:Scope`s, exact domains; patterns are ignored). Another email is dropped. With `ALLOWED_DOMAINS` set, where the email decides who gets in, the sign-in is refused as `email_out_of_scope` instead.
 - **Logout reaches the right IdP.** Signing out goes to the IdP that signed the session in; a logout message from an IdP is checked against that IdP's metadata, and one naming an IdP that isn't listed is refused as `unknown_idp`.
 - **Each IdP's metadata is its own.** It's fetched when first needed and daily after, a refusal is audited with its `entityId`, and [certificate warnings](#certificates-that-are-ending) name the IdP. `botctl sso saml uni` lists every IdP with its name, email domains and certificates, and `botctl offline check` lists each MDQ URL.
-- **Not with these settings:** `GROUPS_ATTRIBUTE` and `REQUIRED_GROUPS` (one institution's `admins` group isn't another's, so group names can't grant roles across IdPs), and `IDP_INITIATED=restart` (each sign-in starts at the chooser). SCIM can't link a provider with several IdPs either: link people by hand or with just in time. botd won't start with them, and lists at most 100 IdPs. Entity IDs with a comma or a `|` can't be listed: sessions keep `<entity ID>|<NameID>`, and a `|` in the entity ID could make one IdP's person look like another's at logout.
+- **Groups are each IdP's.** Groups work, but with rules of their own ([below](#groups-with-several-idps)).
+- **Not with these settings:** `IDP_INITIATED=restart` (each sign-in starts at the chooser). SCIM can't link a provider with several IdPs either: link people by hand or with just in time. botd won't start with them, and lists at most 100 IdPs. Entity IDs with a comma or a `|` can't be listed: sessions keep `<entity ID>|<NameID>`, and a `|` in the entity ID could make one IdP's person look like another's at logout.
+
+#### Groups with several IdPs
+
+One institution's `staff` group isn't another's, so with several IdPs botd keeps groups apart by IdP ([ADR 0287](../adr/0287-saml-groups-per-idp-of-a-federation.md)). Federations send who someone is at an institution as *scoped* values, like eduPersonScopedAffiliation (`urn:oid:1.3.6.1.4.1.5923.1.1.1.9`, values like `member@uni-a.example`):
+
+```bash
+SSO_UNI_GROUPS_ATTRIBUTE=urn:oid:1.3.6.1.4.1.5923.1.1.1.9
+SSO_UNI_REQUIRED_GROUPS=member@uni-a.example,member@uni-b.example   # only members, at either
+```
+
+- **A scoped value counts only from its own IdP.** A value is scoped when a domain follows its last `@`. It's kept only if that domain is one of the signing IdP's `shibmd:Scope`s, exactly, as for emails; otherwise it's dropped, so University B can't say someone is `member@uni-a.example`. Values without a scope (`staff`, `urn:mace:…` entitlements) are the IdP's own and stay.
+- **Required groups must be scoped.** Each `REQUIRED_GROUPS` entry needs a domain (`member@uni-a.example`), or botd won't start: an unscoped `staff` would let in anyone at any listed IdP with a group of that name. A refusal lists the values it dropped as `groupsOutOfScope`.
+- **Each mapping names its IdP.** Map a group at one IdP with `--idp`; the same name at another IdP is another group, mapped on its own:
+
+```bash
+botctl sso role map uni staff Auditor --idp https://idp.uni-a.example/idp/shibboleth
+botctl sso role map uni faculty@uni-b.example Auditor --idp https://login.uni-b.example/idp/shibboleth
+```
+
+- A sign-in at an IdP applies only that IdP's mappings, and takes back only what they gave: someone with identities at two IdPs keeps a role from A's group when they sign in at B. Unlinking takes it back once they have no identity left at A.
+- A mapping for an IdP the provider no longer has (taken off `IDP_ENTITY_IDS`, or made before the provider had several IdPs) shows `active: false`, gives nothing, and what it gave goes at the person's next sign-in (`idp_not_listed`). Map the group again with the right `--idp`, and remove the old one.
 
 ## Single logout
 

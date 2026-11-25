@@ -187,8 +187,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    promote puts it in use once the IdP has it, retire
                                                    drops the encryption key it replaced (ADR 0181)
   botctl sso role-mappings                         SAML groups mapped to custom roles (SSO_<ID>_GROUPS_ATTRIBUTE)
-  botctl sso role map <provider> <group> <role>    Sign-ins listing <group> get <role> across the server.
-                                                   Never admin, nor a role that acts on admins
+  botctl sso role map <provider> <group> <role> [--idp <entity-id>]
+                                                   Sign-ins listing <group> get <role> across the server.
+                                                   Never admin, nor a role that acts on admins. With
+                                                   several IdPs: --idp says whose group it is
   botctl sso role show <id>                        A mapping and who it gave the role to
   botctl sso role unmap <id>                       Takes the role from everyone the mapping gave it to
   botctl scim tokens                               SCIM tokens (never their values), and whether SCIM is on
@@ -1456,9 +1458,10 @@ fn sso_role_request(args: &[&str]) -> Result<(&'static str, String, Option<Strin
     Ok(match args {
         ["role-mappings"] | ["role", "list"] => ("GET", "/api/sso/role-mappings".into(), None),
         ["role", "map", provider, group, role] => ("POST", "/api/sso/role-mappings".into(), Some(json!({ "provider": provider, "group": group, "role": role }).to_string())),
+        ["role", "map", provider, group, role, "--idp", idp] => ("POST", "/api/sso/role-mappings".into(), Some(json!({ "provider": provider, "group": group, "role": role, "idp": idp }).to_string())),
         ["role", "show", id] => ("GET", format!("/api/sso/role-mappings/{}", encode(id)), None),
         ["role", "unmap", id] => ("DELETE", format!("/api/sso/role-mappings/{}", encode(id)), None),
-        _ => return Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -] | sso saml <provider> key next|promote|cancel|retire signing|encryption | sso role-mappings | sso role map <provider> <group> <role> | sso role show <id> | sso role unmap <id>".into()),
+        _ => return Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -] | sso saml <provider> key next|promote|cancel|retire signing|encryption | sso role-mappings | sso role map <provider> <group> <role> [--idp <entity ID>] | sso role show <id> | sso role unmap <id>".into()),
     })
 }
 
@@ -4757,6 +4760,11 @@ mod tests {
         );
         assert_eq!(req(&["role", "show", "gm 1"]), Ok(("GET", "/api/sso/role-mappings/gm%201".into(), None)));
         assert_eq!(req(&["role", "unmap", "gm1"]), Ok(("DELETE", "/api/sso/role-mappings/gm1".into(), None)));
+        assert_eq!(
+            req(&["role", "map", "uni", "staff", "Auditor", "--idp", "https://idp.uni-a.example/idp"]),
+            Ok(("POST", "/api/sso/role-mappings".into(), Some(json!({ "provider": "uni", "group": "staff", "role": "Auditor", "idp": "https://idp.uni-a.example/idp" }))))
+        );
+        assert!(req(&["role", "map", "uni", "staff", "Auditor", "--idp"]).is_err());
         assert!(req(&["role", "map", "corp", "Auditors"]).is_err());
         assert!(req(&["role", "map", "corp", "Auditors", "Auditor", "--org"]).is_err());
         assert!(req(&["role", "unmap"]).is_err());

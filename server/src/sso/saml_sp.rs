@@ -339,6 +339,23 @@ impl IdpMetadata {
     pub fn in_scope(&self, email: &str) -> bool {
         super::provider::email_in(email, &self.scopes)
     }
+
+    /// With several IdPs (ADR 0287): leaves out of `groups` every value scoped to a domain
+    /// that isn't one of the IdP's (`staff@uni-b.example` from University A), as Shibboleth
+    /// does for scoped attributes, so no IdP speaks for another's people. Unscoped values are
+    /// the IdP's own names and stay. The values left out.
+    pub fn scope_groups(&self, groups: &mut Groups) -> Vec<String> {
+        let Groups::Listed(g) = groups else { return vec![] };
+        let (kept, out) = std::mem::take(g).into_iter().partition(|v| group_scope(v).is_none_or(|d| self.scopes.contains(&d)));
+        *g = kept;
+        out
+    }
+}
+
+/// The domain a group value is scoped to, after its last `@`, as in eduPersonScopedAffiliation
+/// (`member@uni.example`), lowercase. None for a value without one.
+pub fn group_scope(g: &str) -> Option<String> {
+    g.rsplit_once('@').and_then(|(_, d)| super::provider::domain(d))
 }
 
 /// The most IdPs one provider takes from a federation (`SSO_<ID>_IDP_ENTITY_IDS`, ADR 0282).
@@ -1111,6 +1128,9 @@ pub struct Checked {
     /// The NameID as sent and the IdP's session, for single logout.
     pub login: SamlLogin,
     pub groups: Groups,
+    /// With several IdPs, the group values left out of `groups` for being scoped to another
+    /// IdP's domain (ADR 0287), for the audit log.
+    pub groups_out_of_scope: Vec<String>,
     /// Which of `Expect::decrypt` opened the assertion and its NameID, for those encrypted: what
     /// tells an admin which keys the IdP encrypts to (ADR 0181). Both, if they differ.
     pub decrypted_with: Vec<usize>,
@@ -1528,7 +1548,7 @@ pub fn check_response_xml(xml: &str, e: &Expect) -> Result<Checked, Refused> {
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
-    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups, decrypted_with, authn: how, authn_instant, idp_session_ends })
+    Ok(Checked { claims, assertion_id, until_ms: until.min(now + 24 * 3600 * 1000), login, groups, groups_out_of_scope: vec![], decrypted_with, authn: how, authn_instant, idp_session_ends })
 }
 
 #[cfg(test)]
@@ -2046,6 +2066,20 @@ pub(crate) mod tests {
         let many: Vec<String> = (0..100).map(|i| format!("d{i}.example")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         assert_eq!(parse_idp_metadata(&with_ui(&metadata(), "U", &many), IDP, false).unwrap().scopes.len(), MAX_SCOPES);
+    }
+
+    #[test]
+    fn scoped_groups_count_only_at_the_idps_own_domains() {
+        let m = parse_idp_metadata(&with_ui(&metadata(), "Uni A", &["uni-a.example"]), IDP, false).unwrap();
+        let s = |v: &[&str]| v.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let mut g = Groups::Listed(s(&["member@uni-a.example", "staff@Uni-A.example", "member@uni-b.example", "member@sub.uni-a.example", "staff", "urn:mace:dir:entitlement:x", "a@b@uni-b.example", "x@not a domain"]));
+        assert_eq!(m.scope_groups(&mut g), s(&["member@uni-b.example", "member@sub.uni-a.example", "a@b@uni-b.example"]), "the last @ is the scope, exactly");
+        assert_eq!(g, Groups::Listed(s(&["member@uni-a.example", "staff@Uni-A.example", "staff", "urn:mace:dir:entitlement:x", "x@not a domain"])), "unscoped values are the IdP's own");
+        let mut unknown = Groups::Unknown("overage");
+        assert!(m.scope_groups(&mut unknown).is_empty() && unknown == Groups::Unknown("overage"));
+        let mut none = Groups::Listed(s(&["member@uni-a.example"]));
+        assert_eq!(idp().scope_groups(&mut none).len(), 1, "no scope in its metadata: no scoped group");
+        assert_eq!((group_scope("member@Uni-A.example").as_deref(), group_scope("staff"), group_scope("x@localhost")), (Some("uni-a.example"), None, None));
     }
 
     #[test]
