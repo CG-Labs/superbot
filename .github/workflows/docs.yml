@@ -11,7 +11,8 @@ name: docs
 # tag gets signed offline bundles once its images are published (ADR 0140), and that the
 # change-evidence workflow only reads and its bundle still matches the evidence plan
 # (ADR 0148), that the drill bundle reads the drill scripts' records (ADR 0177), and that the
-# register bundle checks against the real policy files (ADR 0204). The site job
+# register bundle checks against the real policy files (ADR 0204), and that samples are
+# drawn re-performably from a store of them (ADR 0296). The site job
 # builds the public site and docs portal from docs/ and fails on any broken internal link
 # (ADR 0119); the site is kept as an artifact, never published from here.
 on:
@@ -30,6 +31,7 @@ on:
       - 'server/tests/register_evidence.rs'
       - 'server/tests/uptime_evidence.rs'
       - 'server/tests/alert_evidence.rs'
+      - 'server/tests/control_testing_samples.rs'
       - 'deploy/backup-drill.sh'
       - 'deploy/machine-restore-drill.sh'
       - 'server/tests/fixtures/github/**'
@@ -59,6 +61,7 @@ on:
       - 'server/tests/register_evidence.rs'
       - 'server/tests/uptime_evidence.rs'
       - 'server/tests/alert_evidence.rs'
+      - 'server/tests/control_testing_samples.rs'
       - 'deploy/backup-drill.sh'
       - 'deploy/machine-restore-drill.sh'
       - 'server/tests/fixtures/github/**'
@@ -109,6 +112,8 @@ jobs:
       - run: cargo test --test uptime_evidence
       # ADR 0288: the alerts bundle from a stand-in Prometheus's query and rules API.
       - run: cargo test --test alert_evidence
+      # ADR 0296: samples and results from a store of real register bundles.
+      - run: cargo test --test control_testing_samples
 
   site:
     runs-on: ubuntu-latest
