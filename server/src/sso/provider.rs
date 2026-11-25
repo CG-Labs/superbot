@@ -665,7 +665,7 @@ impl Provider {
         // Whoever held the lock may just have fetched it.
         if let Some((m, at)) = self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
             && at.elapsed() < META_TTL
-            && m.valid_at(now)
+            && m.valid_at(crate::db::now())
         {
             return Ok(m.clone());
         }
