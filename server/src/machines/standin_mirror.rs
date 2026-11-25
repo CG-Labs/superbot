@@ -149,6 +149,11 @@ impl Mirror {
         w.redirects.insert(path.into(), format!("{}/stored{path}", self.other));
     }
 
+    /// Answers `path` with a redirect to `to`.
+    pub fn redirect(&self, path: &str, to: &str) {
+        self.world.lock().unwrap().redirects.insert(path.into(), to.into());
+    }
+
     /// Answers `path` with a redirect to `/stored<path>` on this same host and port:
     /// outside the registry's path, though npm's key for the host still matches.
     pub fn redirect_within(&self, path: &str) {

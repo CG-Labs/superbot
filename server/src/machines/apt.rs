@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// The Ubuntu release machines are made from (Incus's `ubuntu/24.04/cloud`, Linode's
 /// `linode/ubuntu24.04`), whose suites the check reads.
@@ -208,14 +208,58 @@ fn date(v: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDateTime::parse_from_str(v, "%a, %d %b %Y %H:%M:%S").ok().map(|t| t.and_utc())
 }
 
+/// Fetches as a machine's apt would: MACHINE_MIRROR_CA_FILE is trusted for the mirrors'
+/// hosts alone, as `Settings::files` tells apt, so redirects are followed here, each hop
+/// with the trust apt would give its host.
 struct Fetch {
-    http: reqwest::Client,
+    with_ca: reqwest::Client,
+    roots: reqwest::Client,
+    /// The hosts apt trusts the CA for; empty without one.
+    ca_hosts: BTreeSet<String>,
+    hops: Mutex<Vec<String>>,
 }
 
 impl Fetch {
+    fn new(s: &Settings) -> Result<Fetch, String> {
+        let build = |ca: Option<&str>| super::tools::download_builder(None, ca)?.redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string());
+        let ca = s.ca.as_ref().map(|(pem, _)| pem.as_str());
+        let ca_hosts = if ca.is_some() { s.mirrors().iter().filter_map(|(_, u)| url::Url::parse(u).ok()?.host_str().map(String::from)).collect() } else { BTreeSet::new() };
+        Ok(Fetch { with_ca: build(ca)?, roots: build(None)?, ca_hosts, hops: Mutex::new(Vec::new()) })
+    }
+
     async fn get(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
+        let mut at = url::Url::parse(url).map_err(|_| format!("{url} isn't a URL"))?;
+        let mut r = None;
+        for _ in 0..=10 {
+            let host = at.host_str().unwrap_or_default().to_string();
+            let trusted = self.ca_hosts.contains(&host);
+            let fail = |e: reqwest::Error| {
+                let hint = if !trusted && !self.ca_hosts.is_empty() {
+                    format!(". Machines trust MACHINE_MIRROR_CA_FILE only for {}, not {host}", self.ca_hosts.iter().cloned().collect::<Vec<_>>().join(", "))
+                } else {
+                    String::new()
+                };
+                format!("couldn't fetch {url}: {}{hint}", chain(&e.without_url()))
+            };
+            let resp = if trusted { &self.with_ca } else { &self.roots }.get(at.clone()).send().await.map_err(fail)?;
+            if !resp.status().is_redirection() {
+                r = Some(resp.error_for_status().map_err(fail)?);
+                break;
+            }
+            let next = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|l| at.join(l).ok())
+                .ok_or_else(|| format!("{url} redirects with no Location botd can read"))?;
+            if next.scheme() != "https" {
+                return Err(format!("{url} redirects to {next}, which isn't https, so apt refuses it"));
+            }
+            self.hops.lock().unwrap().push(next.to_string());
+            at = next;
+        }
+        let Some(mut r) = r else { return Err(format!("couldn't fetch {url}: too many redirects")) };
         let fail = |e: reqwest::Error| format!("couldn't fetch {url}: {}", chain(&e.without_url()));
-        let mut r = self.http.get(url).send().await.map_err(fail)?.error_for_status().map_err(fail)?;
         let mut body = Vec::new();
         while let Some(chunk) = r.chunk().await.map_err(fail)? {
             if (body.len() + chunk.len()) as u64 > max {
@@ -324,15 +368,8 @@ async fn index(http: &Fetch, base: &str, release: &BTreeMap<String, String>, com
 /// with the CA machines would trust, and checks `packages` are there. Its items, and
 /// every redirect followed, for `mirror::reach`.
 pub async fn check(s: &Settings, packages: &[&str]) -> (Vec<Value>, Vec<String>) {
-    let hops = Arc::new(Mutex::new(Vec::<String>::new()));
-    let seen = hops.clone();
-    let follow = reqwest::redirect::Policy::custom(move |a| {
-        seen.lock().unwrap().push(a.url().to_string());
-        if a.previous().len() >= 10 { a.error("too many redirects") } else { a.follow() }
-    });
-    let built = super::tools::download_builder(None, s.ca.as_ref().map(|(pem, _)| pem.as_str())).and_then(|b| b.redirect(follow).build().map_err(|e| e.to_string()));
-    let http = match built {
-        Ok(h) => Fetch { http: h },
+    let http = match Fetch::new(s) {
+        Ok(h) => h,
         Err(e) => return (vec![json!({ "name": "ubuntu", "ok": false, "error": format!("the mirrors' CA: {e}") })], Vec::new()),
     };
     let now = chrono::Utc::now();
@@ -394,7 +431,7 @@ pub async fn check(s: &Settings, packages: &[&str]) -> (Vec<Value>, Vec<String>)
         }
         items.push(v);
     }
-    let mut redirects = hops.lock().unwrap().clone();
+    let mut redirects = http.hops.lock().unwrap().clone();
     redirects.sort();
     redirects.dedup();
     (items, redirects)

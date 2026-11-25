@@ -234,6 +234,22 @@ async fn the_check_reads_every_pocket_and_the_packages_machines_install() {
     // No packages to look for: the pockets alone.
     let (items, _) = check(&s, &[]).await;
     assert_eq!(items.len(), 3);
+
+    // apt trusts the CA for the mirror's host, whatever the port, and nowhere else, and
+    // won't follow https to http. The check follows redirects as apt would.
+    let path = "/ubuntu/dists/noble-updates/InRelease";
+    m.redirect_to_other(path);
+    let (items, redirects) = check(&s, &[]).await;
+    assert!(items.iter().all(|i| i["ok"] == true), "another port on the same host: {items:?}");
+    assert_eq!(redirects, [format!("{}/stored{path}", m.other)]);
+    m.redirect(path, &format!("{}/stored{path}", m.url.replace("127.0.0.1", "localhost")));
+    let (items, redirects) = check(&s, &[]).await;
+    let e = item(&items, "ubuntu", "noble-updates")["error"].as_str().unwrap().to_string();
+    assert!(e.contains("trust MACHINE_MIRROR_CA_FILE only for 127.0.0.1, not localhost"), "{e}");
+    assert!(redirects[0].contains("//localhost:"), "{redirects:?}");
+    m.redirect(path, "http://127.0.0.1:1/ubuntu/dists/noble-updates/InRelease");
+    let (items, _) = check(&s, &[]).await;
+    assert!(item(&items, "ubuntu", "noble-updates")["error"].as_str().unwrap().contains("isn't https, so apt refuses it"), "{items:?}");
 }
 
 #[tokio::test]
