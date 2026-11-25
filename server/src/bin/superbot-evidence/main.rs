@@ -14,13 +14,17 @@
 //! vendors, exceptions, conduct concerns, security incidents and tabletop exercises)
 //! against the policies' cadences, as a bundle naming people by id. `uptime` (ADR 0249):
 //! the availability SLO measured from the outside probe's checks, from Prometheus or the
-//! probe's exported files, month by month against the objectives.
+//! probe's exported files, month by month against the objectives. `alerts` (ADR 0288):
+//! every SuperBot alert the operator's Prometheus fired, the stretches it wasn't watching
+//! botd, the rules loaded against those shipped, and Alertmanager's notifications.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
 //! `coverage` and `register` read local files only, and so do `drills --no-ci` and
-//! `uptime --checks`; `uptime --prometheus` reads only the operator's Prometheus.
+//! `uptime --checks`; `uptime --prometheus` and `alerts` read only the operator's
+//! Prometheus.
 
+mod alerts;
 mod changes;
 mod coverage;
 mod drills;
@@ -37,7 +41,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), and its coverage (ADR 0169).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), alert history (ADR 0288), and its coverage (ADR 0169).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
@@ -52,6 +56,8 @@ const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, AD
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
   superbot-evidence uptime (--prometheus <url> [--query <selector>] | --checks <file>...)
                     [--objective <percent>] [--maintenance <from>/<to>]...
+                    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
+  superbot-evidence alerts --prometheus <url> [--watch <selector>] [--rules <rule file>]...
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]
 
 Writes one bundle for the period (whole UTC days, --to not included; neither: last month):
@@ -137,7 +143,19 @@ this computer). --checks reads any other probe's export instead: one check a lin
 <time>,<result>[,<location>], the time as RFC 3339 or Unix seconds and the result 1/0,
 true/false or up/down. Each --maintenance window was announced maintenance and doesn't
 count, up to 4 hours a month. It maps to A1.1-3 only while the probe's gaps fit in the
-error budget.";
+error budget.
+
+alerts writes one bundle for the period of what the operator's Prometheus alerted on:
+every SuperBot alert that fired (from ALERTS{alertstate=\"firing\"}, read a day at a time
+like uptime), as episodes with their severity and minutes, the pages listed for their
+response records; the stretches of more than 5 minutes with no sample of --watch (default
+up{job=\"superbot\"}, botd's scrape), when no alert could fire; the alerting rules loaded
+now against those deploy/prometheus ships (or each --rules file the operator loads):
+missing, failing, not evaluated, or with another severity; and Alertmanager's
+notifications sent and failed each day, where Prometheus scrapes it. Labels that could
+name a host stay out. It maps to CC2.1-1, CC7.2-1 and A1.1-1 only while the unwatched
+minutes fit in the 99.9% error budget and every expected rule is loaded, healthy and
+evaluated. Token and address as for uptime --prometheus.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -380,6 +398,7 @@ fn main() -> ExitCode {
     let own: Option<Command> = match args.first().map(String::as_str) {
         Some("register") => Some(register::run),
         Some("uptime") => Some(uptime::run),
+        Some("alerts") => Some(alerts::run),
         _ => None,
     };
     if let Some(run) = own {

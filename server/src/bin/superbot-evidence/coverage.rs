@@ -2,12 +2,13 @@
 //! observation period. Every bundle in it (botd's evidence bundles, ADR 0142; the
 //! change-management bundles, ADR 0148; the vulnerability bundles, ADR 0086; the restore
 //! drill bundles, ADR 0177; the policy register bundles, ADR 0204; the uptime bundles,
-//! ADR 0249) is checked
+//! ADR 0249; the alert history bundles, ADR 0288) is checked
 //! against its own `SHA256SUMS` and manifest, and the report says which days of the period
 //! each kind of bundle, each readiness checklist row and each criterion has evidence for,
 //! and where the gaps are. Reads local files only: no token, no network, nothing written
 //! into the store.
 
+use crate::alerts;
 use crate::changes::{self, json_file, rfc3339, sha256};
 use crate::drills;
 use crate::period::Period;
@@ -71,7 +72,7 @@ pub struct Kind {
     pub made_by: &'static str,
 }
 
-pub const KINDS: [Kind; 6] = [
+pub const KINDS: [Kind; 7] = [
     Kind { id: "evidence", prefix: "superbot-evidence-", manifest_kind: None, format: 4, title: "Evidence bundle", made_by: "botd (EVIDENCE_BUNDLES=monthly, or botctl evidence bundle)" },
     Kind {
         id: "change-management",
@@ -113,6 +114,14 @@ pub const KINDS: [Kind; 6] = [
         title: "Uptime bundle",
         made_by: "superbot-evidence uptime (from the operator's outside probe)",
     },
+    Kind {
+        id: "alerting",
+        prefix: alerts::PREFIX,
+        manifest_kind: Some("alerting"),
+        format: alerts::FORMAT as u64,
+        title: "Alerts bundle",
+        made_by: "superbot-evidence alerts (from the operator's Prometheus)",
+    },
 ];
 
 /// Each file a kind always has, with its criteria and rows.
@@ -124,6 +133,7 @@ pub fn expected(kind: &str) -> Vec<(&'static str, &'static [&'static str], &'sta
         "recovery-drills" => drills::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         "policy-register" => register::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         "availability" => uptime::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
+        "alerting" => alerts::SECTIONS.iter().map(|s| (s.file, s.criteria, s.rows)).collect(),
         _ => Vec::new(),
     }
 }
@@ -139,7 +149,7 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 21] = [
+const EXCEPTION_FILES: [&str; 22] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -158,6 +168,7 @@ const EXCEPTION_FILES: [&str; 21] = [
     "vulnerabilities.json",
     "production-changes.json",
     "uptime.json",
+    alerts::FILE,
     AUDIT_INTEGRITY,
     EGRESS,
     SECRETS,
@@ -1331,6 +1342,7 @@ mod tests {
             found.push(month(&KINDS[3], from, to));
             found.push(month(&KINDS[4], from, to));
             found.push(month(&KINDS[5], from, to));
+            found.push(month(&KINDS[6], from, to));
         }
         // Change management: January only, and a tampered February.
         found.push(month(&KINDS[1], "2027-01-01", "2027-02-01"));
@@ -1347,9 +1359,9 @@ mod tests {
         assert!(problems.iter().any(|x| x.contains("superbot-changes-2027-02-01") && x.contains("changed after")), "{problems:?}");
         assert!(problems.iter().any(|x| x == "No verified change-management bundle covers 2027-02-01 to 2027-04-01 (59 days)"), "{problems:?}");
         assert_eq!(problems.len(), 2, "{problems:?}");
-        assert_eq!(r["summary"]["inPeriod"], 16);
+        assert_eq!(r["summary"]["inPeriod"], 19);
         assert_eq!(r["summary"]["failed"], 1);
-        assert_eq!(r["summary"]["kindsComplete"], 5);
+        assert_eq!(r["summary"]["kindsComplete"], 6);
         assert_eq!(r["summary"]["exceptionsInBundles"], 2);
 
         let kind = |id: &str| r["kinds"].as_array().unwrap().iter().find(|k| k["kind"] == id).unwrap().clone();

@@ -188,7 +188,7 @@ pub fn valid_selector(s: &str) -> bool {
 /// The query as the bundle records it: the metric, each matcher's label and operator, and
 /// the values of the job and location labels when plain; any other value (a target's
 /// address, say) is left out.
-fn shown_query(selector: &str) -> String {
+pub fn shown_query(selector: &str) -> String {
     let Some((name, matchers)) = parse_selector(selector) else { return "<not a selector>".into() };
     if matchers.is_empty() {
         return name;

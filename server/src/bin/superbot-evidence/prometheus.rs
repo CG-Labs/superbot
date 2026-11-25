@@ -1,6 +1,7 @@
 //! Prometheus' HTTP API, read only: instant queries of a range vector, so the probe's raw
 //! samples come back with their own timestamps rather than values Prometheus evaluated on
-//! a grid (which would carry a stopped probe's last answer for five minutes). A bearer
+//! a grid (which would carry a stopped probe's last answer for five minutes), and the
+//! alerting rules loaded (ADR 0288). A bearer
 //! token, if any, comes from `PROMETHEUS_TOKEN` and never goes over plain HTTP off this
 //! computer. Server errors and dropped connections are retried.
 
@@ -9,10 +10,15 @@ use std::time::Duration;
 
 const RETRIES: u32 = 3;
 
-/// What the uptime exporter needs from Prometheus; the tests answer it from fixtures.
+/// What the uptime and alert exporters need from Prometheus; the tests answer it from
+/// fixtures.
 pub trait Api {
     /// `GET /api/v1/query?query=<query>&time=<time_s>`: the `data` of a successful answer.
     fn query(&mut self, query: &str, time_s: i64) -> Result<Value, String>;
+    /// `GET /api/v1/rules?type=alert`: the alerting rules loaded now, by group.
+    fn rules(&mut self) -> Result<Value, String> {
+        Err("this Prometheus can't list its rules".into())
+    }
 }
 
 /// `--prometheus`: `http(s)://host[:port][/path]`, no query, fragment or credentials, no
@@ -79,10 +85,10 @@ pub fn data(status: u16, text: &str) -> Result<Value, String> {
     Ok(v["data"].clone())
 }
 
-impl Api for Http {
-    fn query(&mut self, query: &str, time_s: i64) -> Result<Value, String> {
-        let mut url = url::Url::parse(&format!("{}/api/v1/query", self.base)).map_err(|e| e.to_string())?;
-        url.query_pairs_mut().append_pair("query", query).append_pair("time", &time_s.to_string());
+impl Http {
+    fn get(&mut self, path: &str, pairs: &[(&str, &str)]) -> Result<Value, String> {
+        let mut url = url::Url::parse(&format!("{}{path}", self.base)).map_err(|e| e.to_string())?;
+        url.query_pairs_mut().extend_pairs(pairs);
         let _in = self.rt.enter();
         let mut attempt = 0;
         loop {
@@ -116,6 +122,16 @@ impl Api for Http {
                 _ => e,
             });
         }
+    }
+}
+
+impl Api for Http {
+    fn query(&mut self, query: &str, time_s: i64) -> Result<Value, String> {
+        self.get("/api/v1/query", &[("query", query), ("time", &time_s.to_string())])
+    }
+
+    fn rules(&mut self) -> Result<Value, String> {
+        self.get("/api/v1/rules", &[("type", "alert")])
     }
 }
 

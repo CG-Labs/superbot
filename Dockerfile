@@ -41,7 +41,7 @@ COPY site site
 COPY deploy/hermes-share.sh deploy/hermes-share.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked \
+    cargo build --release --locked --bin botd --bin botctl --bin superbot-machine --bin superbot-run \
     && install -D -m 0755 -t /out target/release/botd target/release/botctl target/release/superbot-machine \
         target/release/superbot-run
 
