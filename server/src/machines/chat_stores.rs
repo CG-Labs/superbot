@@ -236,7 +236,8 @@ pub fn place(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
 
 /// Held while botd's copy of a Bot's memory or a person's facts is moved or saved (`place`,
 /// `App::keep_memory_text`, `App::keep_facts_text`), so a save can't land between a move
-/// reading it and writing it to its file, only to be overwritten with the older text.
+/// reading it and writing it to its file, only to be overwritten with the older text, and
+/// while a person is erased, so a move can't write their facts back after.
 pub(crate) fn memory_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())

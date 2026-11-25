@@ -286,10 +286,15 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     crate::machines::offboard::check_owner(&app, &by, &u.id);
     let secrets = crate::secrets::global().user_forget(&u.id).map_err(crate::secret_error)?;
     let users_dir = |root: &std::path::Path| crate::paths::child(&crate::paths::child(&crate::paths::canonical(root)?, crate::isolation::USERS)?, &u.id);
-    files += usize::from(remove(users_dir(&app.cfg.data_dir))?);
-    // Their facts in a regional chat store, zeroed there (ADR 0277); once unpinned below,
-    // a row left would otherwise be written back to their folder.
-    app.db.delete_facts(&u.id).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("Deleting their facts: {e}. Nothing is marked erased yet, so erase them again.")))?;
+    {
+        // A pass moving facts out of a store holds this from reading them to writing the
+        // file, so none can recreate their folder after it is removed.
+        let _held = crate::machines::chat_stores::memory_lock();
+        files += usize::from(remove(users_dir(&app.cfg.data_dir))?);
+        // Their facts in a regional chat store, zeroed there (ADR 0277); once unpinned below,
+        // a row left would otherwise be written back to their folder.
+        app.db.delete_facts(&u.id).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("Deleting their facts: {e}. Nothing is marked erased yet, so erase them again.")))?;
+    }
     let isolation_left = match app.isolation() {
         None => {
             files += usize::from(remove(users_dir(&app.cfg.workspace))?);
