@@ -23,10 +23,10 @@ pub const USAGE: &str = "Usage: botctl support-triage <bundle.tar | bundle.tar.g
 /// A bundle, unpacked, at most this big; botd's own are well under 1 MiB.
 pub const MAX_BYTES: u64 = 64 << 20;
 /// The newest bundle formats this reads: `botctl support-bundle`'s, `botd support bundle`'s.
-pub const ONLINE_FORMAT: u64 = 3;
+pub const ONLINE_FORMAT: u64 = 4;
 pub const OFFLINE_FORMAT: u64 = 1;
 /// Every file either bundle has. Anything else in the tar is left unread.
-pub const FILES: [&str; 12] = [
+pub const FILES: [&str; 13] = [
     "README.txt",
     "version.json",
     "config.json",
@@ -34,6 +34,7 @@ pub const FILES: [&str; 12] = [
     "health-score.json",
     "health-score-history.json",
     "onboarding.json",
+    "health-check.json",
     "logs.jsonl",
     "audit-summary.json",
     "check.json",
@@ -42,7 +43,31 @@ pub const FILES: [&str; 12] = [
 ];
 const ONLINE_FILES: [&str; 7] = ["version.json", "config.json", "health.json", "health-score.json", "health-score-history.json", "logs.jsonl", "audit-summary.json"];
 /// Files an online bundle has from this format on, so an older bundle isn't asked for them.
-const ONLINE_SINCE: [(&str, u64); 1] = [("onboarding.json", 3)];
+const ONLINE_SINCE: [(&str, u64); 2] = [("onboarding.json", 3), ("health-check.json", 4)];
+/// Health check items whose judgement only restates what triage already reads from
+/// health-score.json and health.json's setup checklist, so they aren't listed twice.
+pub const HEALTH_CHECK_SHOWN_ELSEWHERE: [&str; 4] = ["score", "sign_in", "runs", "setup"];
+/// The guide for each health check item, as `health_check::ITEMS` has it without `docs/`.
+/// Taken from here, not the bundle, so a crafted bundle can't name a page. Items whose
+/// guide isn't a playbook (the changelog, an ADR) have none.
+pub const HEALTH_CHECK_GUIDES: [(&str, &str); 16] = [
+    ("trend", "support/health-score.md#history"),
+    ("actions", "support/health-score.md#the-signals"),
+    ("incidents", "support/incident-review.md#the-review-draft"),
+    ("saml", "support/runbook-saml.md"),
+    ("scim", "sso/scim.md"),
+    ("roles", "support/runbook-custom-roles.md"),
+    ("backups", "ops/backup-restore.md"),
+    ("machine_recovery", "ops/machine-recovery.md"),
+    ("residency", "support/runbook-residency.md"),
+    ("restore_drill", "support/tam.md#cadence"),
+    ("egress", "support/runbook-run-limits-egress.md"),
+    ("approvals", "support/runbook-approvals-stuck.md"),
+    ("usage", "support/tiers.md"),
+    ("license", "support/health-score.md#license"),
+    ("tickets", "support/support-report.md"),
+    ("changes", "support/tam.md#what-a-tam-does"),
+];
 const OFFLINE_FILES: [&str; 4] = ["version.json", "check.json", "config.json", "logs.txt"];
 /// Longest text taken from the bundle into the triage, in characters.
 const TEXT: usize = 240;
@@ -541,16 +566,8 @@ fn health_rules(health: &Value, version: Option<&Value>, out: &mut Vec<Finding>)
 /// made after the check ran.
 fn onboarding_rules(onboarding: &Value, out: &mut Vec<Finding>) {
     let items = onboarding["items"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let id_ok = |id: &str| !id.is_empty() && id.len() <= 40 && id.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_');
-    let open: Vec<String> = items
-        .iter()
-        .filter(|i| str_at(i, "status") == Some("open"))
-        .filter_map(|i| str_at(i, "id").filter(|id| id_ok(id) && *id != "first_bundle").map(|id| (id, i)))
-        .map(|(id, i)| match str_at(i, "label").map(clean) {
-            Some(label) => format!("{label} ({id})"),
-            None => id.to_string(),
-        })
-        .collect();
+    let open: Vec<String> =
+        items.iter().filter(|i| str_at(i, "status") == Some("open")).filter_map(|i| item_id(i).filter(|id| *id != "first_bundle").map(|id| labelled(id, i))).collect();
     if open.is_empty() {
         return;
     }
@@ -560,6 +577,59 @@ fn onboarding_rules(onboarding: &Value, out: &mut Vec<Finding>) {
             .runbook("support/onboarding-check.md")
             .next("For the TAM: items agreed at kickoff show open here, since the bundle has no skips; check them against the onboarding record and raise the rest."),
     );
+}
+
+/// A checklist item's id from the bundle, if it looks like one.
+fn item_id(item: &Value) -> Option<&str> {
+    str_at(item, "id").filter(|id| !id.is_empty() && id.len() <= 40 && id.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'))
+}
+
+fn labelled(id: &str, item: &Value) -> String {
+    match str_at(item, "label").map(clean) {
+        Some(label) => format!("{label} ({id})"),
+        None => id.to_string(),
+    }
+}
+
+/// The monthly health check in the bundle (ADR 0271): open items the rest of the bundle
+/// doesn't already show, for the TAM, so no severity, each pointing at its guide. A SAML
+/// certificate ending with nothing to replace it is a warning of its own: when it ends,
+/// sign-in through that provider stops.
+fn health_check_rules(check: &Value, out: &mut Vec<Finding>) {
+    let items = check["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let (mut open, mut guides) = (Vec::new(), Vec::new());
+    for i in items.iter().filter(|i| str_at(i, "status") == Some("open")) {
+        let Some(id) = item_id(i).filter(|id| !HEALTH_CHECK_SHOWN_ELSEWHERE.contains(id)) else { continue };
+        if id == "saml" {
+            let detail = str_at(i, "detail").map(clean).unwrap_or_default();
+            out.push(
+                Finding::new("health_check.saml", Level::Warn, None, format!("Native SAML certificate ending: {detail}"), "health-check.json items saml")
+                    .runbook("support/runbook-saml.md#first-five-minutes")
+                    .next("If the ticket is about SAML sign-in, check this certificate first (botctl sso saml <provider>); otherwise agree with the customer who rotates it, and when, before it ends."),
+            );
+            continue;
+        }
+        open.push(labelled(id, i));
+        if let Some((_, g)) = HEALTH_CHECK_GUIDES.iter().find(|(k, _)| *k == id) {
+            guides.push(*g);
+        }
+    }
+    if open.is_empty() {
+        return;
+    }
+    let mut f = Finding::new(
+        "health_check.open",
+        Level::Info,
+        None,
+        format!("Monthly health check: {} open beside the score and setup: {}", many(open.len() as u64, "item", "items"), open.join("; ")),
+        "health-check.json items",
+    )
+    .runbook("support/health-check.md")
+    .next("For the TAM: raise them at the next monthly check (botctl health-check); a bundle isn't recorded as one.");
+    for g in guides {
+        f = f.runbook(g);
+    }
+    out.push(f);
 }
 
 /// The runbook a set of sign-in reason codes points at.
@@ -1007,7 +1077,10 @@ pub fn triage(b: &Bundle, o: &Options) -> Result<Triage, String> {
         Kind::Online => (read("health.json"), read("health-score.json"), read("health-score-history.json"), read("audit-summary.json"), None),
         Kind::Offline => (None, None, None, None, read("check.json")),
     };
-    let onboarding = if kind == Kind::Online { read("onboarding.json") } else { None };
+    let (onboarding, health_check) = match kind {
+        Kind::Online => (read("onboarding.json"), read("health-check.json")),
+        Kind::Offline => (None, None),
+    };
     let mut findings = out;
     if let Some(v) = &version {
         version_rules(v, kind, o, &mut findings);
@@ -1030,6 +1103,9 @@ pub fn triage(b: &Bundle, o: &Options) -> Result<Triage, String> {
     }
     if let Some(o) = &onboarding {
         onboarding_rules(o, &mut findings);
+    }
+    if let Some(h) = &health_check {
+        health_check_rules(h, &mut findings);
     }
     let log_file = if kind == Kind::Online { "logs.jsonl" } else { "logs.txt" };
     if let Some(t) = b.text(log_file) {
@@ -1561,17 +1637,56 @@ mod tests {
     }
 
     #[test]
+    fn open_health_check_items_are_for_the_tam_and_an_ending_saml_certificate_warns() {
+        let mut v = version();
+        v["bundleFormat"] = json!(4);
+        let item = |id: &str, label: &str, status: &str, detail: &str| json!({ "id": id, "section": "identity", "label": label, "status": status, "detail": detail, "guide": "https://example.invalid/x" });
+        let check = json!({ "format": 1, "clear": false, "items": [
+            item("score", "Health score and band", "open", "Score 60, watch."),
+            item("setup", "Setup still complete", "open", "Open in botctl setup: backups."),
+            item("incidents", "Incidents closed and reviewed", "open", "Of major or critical impact with no review drafted: inc_1."),
+            item("saml", "SAML certificates not ending", "open", "Ending within 60 days with nothing to replace it: okta\u{1b}[31m's the IdP's signing certificate in 9 days.\n"),
+            item("scim", "SCIM tokens working", "open", "Every token of 1 tenant has expired."),
+            item("roles", "Custom roles still needed", "confirm", "2 custom roles."),
+            item("residency", "No residency warnings", "done", "No residency warnings."),
+            item("Bad Id!", "Not an item", "open", "x"),
+            item("newer_item", "From a newer botd", "open", "x"),
+        ] });
+        let t = triage(&online(vec![("version.json", v.clone()), ("health-check.json", check)]), &opts()).unwrap();
+        let f = find(&t, "health_check.open");
+        assert_eq!((f.level, f.severity), (Level::Info, None));
+        assert_eq!(
+            f.summary,
+            "Monthly health check: 3 items open beside the score and setup: Incidents closed and reviewed (incidents); SCIM tokens working (scim); From a newer botd (newer_item)"
+        );
+        assert_eq!(f.evidence, "health-check.json items");
+        assert_eq!(f.runbooks, ["support/health-check.md", "support/incident-review.md#the-review-draft", "sso/scim.md"], "guides from botctl's table, never the bundle's");
+        let saml = find(&t, "health_check.saml");
+        assert_eq!((saml.level, saml.severity), (Level::Warn, None), "it hasn't ended yet");
+        assert_eq!(saml.summary, "Native SAML certificate ending: Ending within 60 days with nothing to replace it: okta [31m's the IdP's signing certificate in 9 days.");
+        assert_eq!(saml.runbooks, ["support/runbook-saml.md#first-five-minutes"]);
+        assert!(t.severity().is_none() && t.missing == ["onboarding.json"], "{:?}", t.missing);
+
+        let shown = json!({ "items": [item("score", "Health score and band", "open", "x"), item("sign_in", "Sign-in", "open", "x"), item("runs", "Runs", "open", "x"), item("license", "License", "done", "x")] });
+        assert!(triage(&online(vec![("version.json", v.clone()), ("health-check.json", shown)]), &opts()).unwrap().findings.is_empty(), "already shown by the score");
+        assert_eq!(triage(&online(vec![("version.json", v)]), &opts()).unwrap().missing, ["onboarding.json", "health-check.json"], "format 4 has both");
+        let mut three = version();
+        three["bundleFormat"] = json!(3);
+        assert_eq!(triage(&online(vec![("version.json", three)]), &opts()).unwrap().missing, ["onboarding.json"], "format 3 had no health check");
+    }
+
+    #[test]
     fn versions_age_and_formats() {
         let mut v = version();
         v["uptimeSeconds"] = json!(90);
-        v["bundleFormat"] = json!(4);
+        v["bundleFormat"] = json!(5);
         let mut o = opts();
         o.as_of = at("2026-11-27T05:00:00Z");
         o.latest = semver("1.6.1");
         let t = triage(&online(vec![("version.json", v.clone())]), &o).unwrap();
         assert_eq!(find(&t, "version.behind").level, Level::Warn, "a minor release behind");
         assert_eq!(find(&t, "botd.restarted").summary, "botd started 90 s before the bundle was made: a restart, or a crash it came back from");
-        assert!(find(&t, "bundle.format").summary.contains("bundle format 4; this botctl reads 3"));
+        assert!(find(&t, "bundle.format").summary.contains("bundle format 5; this botctl reads 4"));
         assert_eq!(find(&t, "bundle.stale").summary, "The bundle was made 3 days before this triage");
         o.latest = semver("1.4.3");
         assert_eq!(find(&triage(&online(vec![("version.json", v.clone())]), &o).unwrap(), "version.behind").level, Level::Info);

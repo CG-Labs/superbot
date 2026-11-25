@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so support tools can tell bundles apart.
-pub const FORMAT: u32 = 3;
+pub const FORMAT: u32 = 4;
 const AUDIT_DAYS: i64 = 7;
 /// Newest events read for the summary; older ones in the window are counted as truncated.
 const AUDIT_SCAN: i64 = 20_000;
@@ -62,6 +62,8 @@ you send it: every file is plain text.
                       its band and each signal's status
   onboarding.json     the onboarding checklist's items as botd judges them: done,
                       open, to confirm or not applicable, with codes and counts
+  health-check.json   the monthly health check's items as botd judges them, the same
+                      way: codes, counts, provider ids and incident ids
   logs.jsonl          the newest lines botd logged since it started (at most 2,000)
   audit-summary.json  the last 7 days of the audit log, counted by action and outcome,
                       and the newest failures and denials (no names, emails or addresses)
@@ -438,9 +440,28 @@ pub struct Bundle {
     pub audit_events: usize,
 }
 
-/// The whole bundle. `vars` is botd's environment; `setup`, the setup wizard's checklist;
-/// `onboarding`, the onboarding check's view with no skips (ADR 0243).
-pub fn build(app: &App, vars: &[(String, String)], setup: Value, onboarding: Value, now_ms: i64) -> Bundle {
+/// The checks a bundle carries as their views: the onboarding check with no skips
+/// (ADR 0243) and the monthly health check (ADR 0271).
+pub struct Checks {
+    pub onboarding: Value,
+    pub health_check: Value,
+}
+
+impl Checks {
+    /// Both checks judged now, as their routes would. Neither is recorded as its own
+    /// check: the bundle's `support.bundle_created` lists the files, and a bundle made for a
+    /// ticket isn't the TAM's monthly health check.
+    pub fn judge(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Checks {
+        let at = rfc3339(now_ms);
+        Checks {
+            onboarding: crate::onboarding::check(&crate::onboarding::gather(app, a, setup, now_ms), &[]).view(&at),
+            health_check: crate::health_check::check(&crate::health_check::gather(app, a, setup, now_ms)).view(&at),
+        }
+    }
+}
+
+/// The whole bundle. `vars` is botd's environment; `setup`, the setup wizard's checklist.
+pub fn build(app: &App, vars: &[(String, String)], setup: Value, checks: Checks, now_ms: i64) -> Bundle {
     let stamp = chrono::DateTime::from_timestamp_millis(now_ms).map(|t| t.format("%Y%m%dT%H%M%SZ").to_string()).unwrap_or_default();
     let name = format!("superbot-support-{stamp}");
     let started = last_start(app);
@@ -455,7 +476,8 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, onboarding: Val
         ("health.json", json_file(health(app, setup, now_ms), &names)),
         ("health-score.json", json_file(crate::health_score::build(app, now_ms, crate::health_score::DEFAULT_DAYS), &names)),
         ("health-score-history.json", json_file(crate::health_history::history(app, now_ms, crate::health_history::DEFAULT_DAYS).unwrap_or_else(|e| json!({ "error": e.to_string() })), &names)),
-        ("onboarding.json", json_file(onboarding, &names)),
+        ("onboarding.json", json_file(checks.onboarding, &names)),
+        ("health-check.json", json_file(checks.health_check, &names)),
         ("logs.jsonl", redact::text(&logs).into_owned().into_bytes()),
         ("audit-summary.json", json_file(audit, &names)),
     ];
@@ -492,8 +514,8 @@ pub async fn bundle(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
         let app = app.clone();
         tokio::task::spawn_blocking(move || {
             let now_ms = now();
-            let onboarding = crate::onboarding::check(&crate::onboarding::gather(&app, &a, &report, now_ms), &[]).view(&rfc3339(now_ms));
-            build(&app, &vars, setup, onboarding, now_ms)
+            let checks = Checks::judge(&app, &a, &report, now_ms);
+            build(&app, &vars, setup, checks, now_ms)
         })
         .await
     }

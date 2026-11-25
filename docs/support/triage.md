@@ -65,6 +65,8 @@ A server in testing mode isn't production, and Severity 1 and 2 are for producti
 | `harness.none` | `version.json` | No harness on the server and no managed machines | 2 | [Harness outage](runbook-harness-outage.md) |
 | `setup.open` | the setup checklist | Items not done | 4 | [Onboarding](onboarding.md) |
 | `onboarding.open` | `onboarding.json` | Onboarding checklist items botd sees open, for the TAM. Not `first_bundle`, since the bundle is one; items agreed at kickoff show too, as the bundle has no skips | | [Onboarding check](onboarding-check.md) |
+| `health_check.open` | `health-check.json` | Monthly health check items botd sees open, for the TAM. Not `score`, `sign_in`, `runs` or `setup`, which the score's signals and the setup checklist already show | | [Health check](health-check.md#in-the-support-bundle) and each item's guide |
+| `health_check.saml` | the same | A native SAML certificate in use ends within 60 days with nothing to replace it: sign-in through that provider stops when it does | | [SAML](runbook-saml.md#first-five-minutes) |
 | `signal.identity` | `health-score.json` | At risk; watch. The reasons pick SAML or other sign-in, and SCIM | 2; 3 | [SAML](runbook-saml.md#reasons-and-fixes), [sign-in](runbook-sign-in.md#reasons-and-fixes), [SCIM](../sso/scim.md) |
 | `signal.backups` | the same | At risk (past the RPO); watch | 2; none | [Machine down](runbook-machine-down.md), [backup and restore](../ops/backup-restore.md) |
 | `signal.license` | the same | At risk; watch | 2; 4 | [License](health-score.md#license) |
