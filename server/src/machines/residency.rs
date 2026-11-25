@@ -13,8 +13,10 @@
 //! no backup store there) or while any of their data is still elsewhere. Unpinning needs
 //! a reason. Every pin, unpin and refusal is audited. A pinned person's Bot runs take only
 //! model routes the tiers file marks as in the region, or are refused (ADR 0139, in the
-//! runner). botd's own database and server backups are where the operator runs botd;
-//! with RESIDENCY_SERVER_DATA=require, pins are held to that region too (ADR 0184).
+//! runner), and run only on a computer in it: a machine there, or botd's own server when
+//! the operator states botd is there (ADR 0267, `run_place_gaps`). botd's own database
+//! and server backups are where the operator runs botd; with RESIDENCY_SERVER_DATA=require,
+//! pins are held to that region too (ADR 0184).
 //!
 //! Someone leaving a pinned team keeps its pin as their own (ADR 0171), and with
 //! RESIDENCY_STARTUP=refuse botd won't start while it can't keep a pin. A kept pin ends
@@ -110,16 +112,8 @@ pub(super) fn host_of(cp: &ControlPlane, m: &Machine) -> Option<(String, Option<
 /// may have finished before it failed. Empty: all of it is in.
 pub(super) fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(m) = app.db.user_machine(user_id) {
-        if m.region != region {
-            out.push(format!("their machine is in {}", m.region));
-        } else if let Some((host, r)) = host_of(cp, &m) {
-            match r {
-                Some(r) if r == region => {}
-                Some(r) => out.push(format!("their machine is on host {host}, in {r}")),
-                None => out.push(format!("their machine is on host {host}, which has no data region")),
-            }
-        }
+    if let Some(why) = app.db.user_machine(user_id).and_then(|m| machine_outside(cp, &m, region)) {
+        out.push(format!("their machine {why}"));
     }
     let off = cp.offsite.as_deref();
     let n = app
@@ -132,6 +126,83 @@ pub(super) fn outside(app: &App, cp: &ControlPlane, user_id: &str, region: &str)
         out.push(format!("{n} of their machine backups are in a store outside {region}"));
     }
     out
+}
+
+/// Why machine `m` isn't in `region`, as "is in <region>" or "is on host <host>, ...": by
+/// its record, and by its host's tag now. None: it is.
+fn machine_outside(cp: &ControlPlane, m: &Machine, region: &str) -> Option<String> {
+    if m.region != region {
+        return Some(format!("is in {}", m.region));
+    }
+    match host_of(cp, m)? {
+        (_, Some(r)) if r == region => None,
+        (host, Some(r)) => Some(format!("is on host {host}, in {r}")),
+        (host, None) => Some(format!("is on host {host}, which has no data region")),
+    }
+}
+
+/// Where a Bot's run takes place (ADR 0267): botd's own server, or its owner's machine.
+#[derive(Clone, Copy, Debug)]
+pub enum RunsOn<'a> {
+    Server,
+    Machine(&'a str),
+}
+
+impl RunsOn<'_> {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunsOn::Server => "server",
+            RunsOn::Machine(_) => "machine",
+        }
+    }
+}
+
+/// Why a run on `on` would take data pinned to `region` outside it (ADR 0267). botd's own
+/// server is in a region only as the operator states it (SERVER_DATA_REGION, ADR 0184);
+/// a machine by its record and its host's tag, as for its backups (ADR 0129). None: it
+/// stays in.
+pub fn run_outside(app: &App, cp: &ControlPlane, on: RunsOn, region: &str) -> Option<String> {
+    match on {
+        RunsOn::Server => match cp.server_data.region.as_deref() {
+            Some(r) if r == region => None,
+            Some(r) => Some(format!("botd's own server is in {r}")),
+            None => Some("botd's own server isn't stated to be in any data region (SERVER_DATA_REGION)".into()),
+        },
+        RunsOn::Machine(id) => match app.db.machine(id) {
+            Some(m) => machine_outside(cp, &m, region).map(|why| format!("the machine {why}")),
+            None => Some("the machine is gone".into()),
+        },
+    }
+}
+
+/// The pins of the people a run carries (`of_run`) that a run on `on` would take outside
+/// their region, each with why (ADR 0267). Empty: it stays in every one. Checked only with
+/// the control plane on, as every other pin is: without it there are no machines and no
+/// pins can be made.
+pub fn run_place_gaps(app: &App, cp: &ControlPlane, people: &[String], on: RunsOn) -> Vec<(ResidencyPin, String)> {
+    if !cp.enabled() {
+        return Vec::new();
+    }
+    of_run(app, people).into_iter().filter_map(|p| run_outside(app, cp, on, &p.region).map(|why| (p, why))).collect()
+}
+
+/// Where `user_id`'s own Bots run now, as routing says (ADR 0036): `server`, `machine` or
+/// `nowhere`; and for the first two, whether that is in `region` (ADR 0267).
+pub(super) fn runs_of(app: &App, cp: &ControlPlane, user_id: &str, region: &str) -> (&'static str, Option<bool>) {
+    let on = match cp.route(app, user_id) {
+        Ok(super::route::Target::Local) => RunsOn::Server,
+        Ok(super::route::Target::Machine(to)) => return ("machine", Some(run_outside(app, cp, RunsOn::Machine(&to.machine_id), region).is_none())),
+        Err(_) => return ("nowhere", None),
+    };
+    (on.as_str(), Some(run_outside(app, cp, on, region).is_none()))
+}
+
+/// The people of `people` whose own Bots run on botd's own server, outside `region`
+/// (ADR 0267): their runs are refused. Their names, and why botd's server isn't there.
+pub(super) fn server_run_gaps(app: &App, cp: &ControlPlane, people: &[String], region: &str) -> Option<(Vec<String>, String)> {
+    let why = run_outside(app, cp, RunsOn::Server, region)?;
+    let names: Vec<String> = people.iter().filter(|id| runs_of(app, cp, id, region) == ("server", Some(false))).filter_map(|id| app.db.user(id).map(|u| u.name)).collect();
+    (!names.is_empty()).then_some((names, why))
 }
 
 pub(super) fn pinned_to(p: &ResidencyPin) -> String {
@@ -468,9 +539,9 @@ pub async fn end_kept(app: &App, cp: &ControlPlane) -> usize {
 
 /// Warnings for startup and admins: pins whose region this server can't keep now, or
 /// whose data is outside it. Their backups and restores are refused until fixed. Also
-/// pins whose people's plans have no model route there (ADR 0139), whose runs are refused,
-/// and, while there are pins, server backup copies left in a store botd no longer uses
-/// (ADR 0184).
+/// pins whose people's plans have no model route there (ADR 0139), or whose Bots run on
+/// botd's own server outside it (ADR 0267), whose runs are refused, and, while there are
+/// pins, server backup copies left in a store botd no longer uses (ADR 0184).
 pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
     let mut out: Vec<String> = app.tiers().unknown_regions(&cp.regions).into_iter().map(|w| format!("The tiers file's {w} (ADR 0139).")).collect();
     out.extend(super::chat_stores::warnings(app, cp, crate::db::now()));
@@ -499,8 +570,27 @@ pub fn warnings(app: &App, cp: &ControlPlane) -> Vec<String> {
                 p.region
             ));
         }
+        if let Some((names, why)) = server_run_gaps(app, cp, &people, &p.region) {
+            out.push(format!(
+                "{name} is {}, but {} Bots run on botd's own server, and {why}. Their runs are refused until they run on a machine in {} (MACHINE_ROUTING=on, or assigned with their machine assigned), or botd runs in {} and SERVER_DATA_REGION says so (ADR 0267).",
+                pinned_to(&p),
+                possessive(&names),
+                p.region,
+                p.region
+            ));
+        }
     }
     out
+}
+
+/// "Ada's", "Ada's and Bea's", "Ada's, Bea's and 3 others'".
+pub(super) fn possessive(names: &[String]) -> String {
+    let shown: Vec<String> = names.iter().take(3).map(|n| format!("{n}'s")).collect();
+    match (shown.as_slice(), names.len().saturating_sub(3)) {
+        ([one], 0) => one.clone(),
+        ([rest @ .., last], 0) => format!("{} and {last}", rest.join(", ")),
+        (_, more) => format!("{} and {more} other{}'", shown.join(", "), if more == 1 { "" } else { "s" }),
+    }
 }
 
 /// Every pin, with the name of whom it is on, for `GET /api/regions`.

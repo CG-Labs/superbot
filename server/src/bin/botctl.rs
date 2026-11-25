@@ -210,6 +210,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl scim role map <team> <role> [--org]       The group <team> is gives its members <role> in the
                                                    team, or with --org across the server. Never admin
   botctl scim role show <id>                       A mapping and who it gave the role to
+  botctl scim role remap <id> <role>               The mapping gives <role> instead, in the same scope:
+                                                   whoever holds the old one from it gets it instead
   botctl scim role unmap <id>                      Takes the role from everyone the mapping gave it to
   botctl scim role-groups                          SCIM role groups: groups that give a custom role
                                                    and aren't teams
@@ -1387,6 +1389,7 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
             ("POST", "/api/scim/role-mappings".into(), Some(body.to_string()))
         }
         ["role", "show", id] => ("GET", format!("/api/scim/role-mappings/{}", encode(id)), None),
+        ["role", "remap", id, role] => ("PATCH", format!("/api/scim/role-mappings/{}", encode(id)), Some(json!({ "role": role }).to_string())),
         ["role", "unmap", id] => ("DELETE", format!("/api/scim/role-mappings/{}", encode(id)), None),
         ["role-groups"] | ["role-group", "list"] => ("GET", "/api/scim/role-groups".into(), None),
         ["role-group", "add", tenant, group, role, rest @ ..]
@@ -1415,7 +1418,7 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
         ["google", "sync"] => ("POST", "/api/scim/google/sync".into(), Some(json!({}).to_string())),
         ["google", "sync", "--force"] => ("POST", "/api/scim/google/sync".into(), Some(json!({ "force": true }).to_string())),
         _ => {
-            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] [--days N] [--scopes LIST] | token rotate <id> [--days N] [--keep-old-hours N] [--scopes LIST] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] [--team] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] [--days N] [--scopes LIST] | token rotate <id> [--days N] [--keep-old-hours N] [--scopes LIST] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team> | role-mappings | role map <team> <role> [--org] | role show <id> | role remap <id> <role> | role unmap <id> | role-groups | role-group add <tenant> <group> <role> [--external-id ID] [--team] | role-group show <id> | role-group set-role <id> <role> | role-group remove <id> | google [status] | google sync [--force]".into());
         }
     })
 }
@@ -4681,6 +4684,8 @@ mod tests {
         assert_eq!(req(&["role", "map", "t1", "Support Lead"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "Support Lead", "scope": "team" })))));
         assert_eq!(req(&["role", "map", "t1", "auditor", "--org"]), Ok(("POST", "/api/scim/role-mappings".into(), Some(json!({ "team": "t1", "role": "auditor", "scope": "org" })))));
         assert_eq!(req(&["role", "show", "sm 1"]), Ok(("GET", "/api/scim/role-mappings/sm%201".into(), None)));
+        assert_eq!(req(&["role", "remap", "sm 1", "Viewer"]), Ok(("PATCH", "/api/scim/role-mappings/sm%201".into(), Some(json!({ "role": "Viewer" })))));
+        assert!(req(&["role", "remap", "sm1"]).is_err());
         assert_eq!(req(&["role", "unmap", "sm1"]), Ok(("DELETE", "/api/scim/role-mappings/sm1".into(), None)));
         assert_eq!(req(&["role-groups"]), Ok(("GET", "/api/scim/role-groups".into(), None)));
         assert_eq!(req(&["role-group", "list"]), Ok(("GET", "/api/scim/role-groups".into(), None)));

@@ -7,6 +7,7 @@ use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput, Sandbox, U
 use crate::audit::{Actor, ActorKind, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message, TokenRow};
 use crate::machines::ControlPlane;
+use crate::machines::residency::RunsOn;
 use crate::obs::trace;
 use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
@@ -1012,7 +1013,7 @@ impl App {
         // A route to one of the tiers file's endpoints brings its key, so the harness needs
         // no login of its own (ADR 0192).
         let keyed = route.provider.as_deref().is_some_and(|p| wiring.endpoints.iter().any(|e| e.name == p));
-        let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref(), keyed).await else { return };
+        let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref(), keyed, &asker, &people).await else { return };
         // Held until the run ends, however it ends: dropping it lets the next run in.
         let Some((_slot, waited)) = self.slot_for(&bot, msg, &by, &period.key, &place).await else { return };
         trace::note("superbot.run.waited_for_slot", waited);
@@ -1693,12 +1694,52 @@ impl App {
     /// why. Never another user's machine, and never here instead of an assigned one.
     /// `for_other`: the run is for someone else, so it can't count on the owner's keys.
     /// `keyed`: its route's endpoint gives the key, so no harness login is needed there.
+    /// While the data of anyone the run carries (`people`) is pinned, it runs only on a
+    /// computer in their region (ADR 0267).
     #[allow(clippy::too_many_arguments)]
-    async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str, for_other: Option<&str>, keyed: bool) -> Option<Place> {
+    async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str, for_other: Option<&str>, keyed: bool, asker: &str, people: &[String]) -> Option<Place> {
         let Some(cp) = self.control_plane.get() else { return Some(Place::Here) };
         // Others read a shared Bot's chat: they learn whose computer it is, not its insides.
         let team = bot.visibility == Visibility::Shared || !self.db.grants(&bot.id).is_empty();
         let owner_name = self.db.user(&bot.owner_id).map(|u| u.name);
+        let target = cp.route(self, &bot.owner_id);
+        let on = match &target {
+            Ok(Target::Local) => Some(RunsOn::Server),
+            Ok(Target::Machine(to)) => Some(RunsOn::Machine(&to.machine_id)),
+            Err(_) => None,
+        };
+        if let Some(on) = on {
+            let gaps = crate::machines::residency::run_place_gaps(self, cp, people, on);
+            if !gaps.is_empty() {
+                self.give_back(bot, msg, period);
+                let regions: Vec<&str> = gaps.iter().map(|(p, _)| p.region.as_str()).collect();
+                let pins: Vec<Value> = gaps.iter().map(|(p, _)| json!({ "region": p.region, "pinnedOn": p.subject_type, "subjectId": p.subject_id, "reference": p.reference })).collect();
+                let why: Vec<String> = gaps.iter().map(|(p, w)| format!("{}: {w}", p.region)).collect();
+                let (action, machine) = match on {
+                    RunsOn::Server => ("run on botd's server", None),
+                    RunsOn::Machine(id) => ("run on a machine outside the region", Some(id)),
+                };
+                let details = json!({
+                    "reason": crate::machines::residency::PINNED, "action": action, "runsOn": on.as_str(), "machine": machine, "serverDataRegion": cp.server_data.region,
+                    "owner": bot.owner_id, "pinnedRegions": regions, "pins": pins, "people": people, "forUser": (asker != bot.owner_id).then_some(asker), "messageId": msg.id, "error": why.join("; "),
+                });
+                self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
+                let (whom, whose) = match owner_name.as_deref() {
+                    _ if asker == bot.owner_id && !team => ("you".to_string(), "your".to_string()),
+                    Some(n) => (n.to_string(), format!("{n}'s")),
+                    None => ("my owner".to_string(), "my owner's".to_string()),
+                };
+                let regions = regions.join(" and ");
+                let text = match on {
+                    RunsOn::Server => format!(
+                        "This run's data is pinned to {regions} under a residency agreement, and I run on this server, which isn't in {regions}, so I didn't run. Ask an admin to give {whom} a computer in {regions} (ADR 0267)."
+                    ),
+                    RunsOn::Machine(_) => format!("This run's data is pinned to {regions} under a residency agreement, and I run on {whose} computer, which isn't in {regions}, so I didn't run (ADR 0267)."),
+                };
+                self.say(&bot.id, &text, true);
+                return None;
+            }
+        }
         let refused = |r: Refusal, machine: Option<&str>| {
             self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
@@ -1710,7 +1751,7 @@ impl App {
             self.say(&bot.id, &text, true);
             None
         };
-        let to = match cp.route(self, &bot.owner_id) {
+        let to = match target {
             Ok(Target::Local) => return Some(Place::Here),
             Err(r) => return refused(r, None),
             Ok(Target::Machine(to)) => to,

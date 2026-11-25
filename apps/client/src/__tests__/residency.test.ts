@@ -96,6 +96,22 @@ describe("residencyLines (ADR 0168)", () => {
   });
 });
 
+describe("where your Bots run (ADR 0267)", () => {
+  it("says your Bots run on the server in the region, or warns that they don't run because it isn't there", () => {
+    const here = residencyLines(view({ machine: null, runs: { on: "server", inRegion: true } }));
+    expect(here.lines).toContain("Your Bots run on SuperBot's own server, in gb-lon.");
+    expect(here.warnings).toEqual([]);
+    const away = residencyLines(view({ machine: null, runs: { on: "server", inRegion: false } }));
+    expect(away.warnings).toEqual(["Your Bots run on SuperBot's own server, which isn't in gb-lon, so they don't run until your admin gives you a computer there. Nothing runs outside the region instead."]);
+    expect(away.lines.some((l) => l.includes("own server"))).toBe(false);
+  });
+
+  it("leaves a computer of your own to the computer's line, and says nothing for servers before it", () => {
+    expect(residencyLines(view({ runs: { on: "machine", inRegion: true } }))).toEqual(residencyLines(view()));
+    expect(residencyLines(view({ runs: { on: "nowhere", inRegion: null } }))).toEqual(residencyLines(view()));
+  });
+});
+
 describe("chats, routines and approvals in the region's own database (ADR 0215, ADR 0228)", () => {
   it("says chats are kept in the region and leaves them out of the server's copy", () => {
     const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true } }));
