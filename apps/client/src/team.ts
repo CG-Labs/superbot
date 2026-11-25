@@ -3,7 +3,7 @@ import type { SuperBotApi } from "./api";
 import { subscriptionLine } from "./billing";
 import { relativeTime } from "./invite";
 import { endsLabel } from "./roles";
-import type { CustomRoleRef, OffboardingPreview, Team, TeamBilling, TeamMachine, TeamMember, TeamRole, TeamRoleChoice, WorkPolicy } from "./types";
+import type { CustomRoleRef, OffboardingPreview, RoleRequest, Team, TeamBilling, TeamMachine, TeamMember, TeamRole, TeamRoleChoice, WorkPolicy } from "./types";
 
 /**
  * The team screen's rules (ADR 0088). They mirror the server's (ADR 0087) so the screen
@@ -52,6 +52,22 @@ export function customRoleActions(
 ): { give: boolean; take: boolean } {
   if (!managesTeam(team.role) || member.id === meId || member.customRole?.fromIdp) return { give: false, take: false };
   return { give: member.role === "member" && !member.readOnly && !!team.roleChoices?.length, take: !!member.customRole };
+}
+
+/** Who decides a request of yours for a role in the team (ADR 0263). */
+export const TEAM_DECIDES_YOURS = "another of the team's owners or admins, or a server admin,";
+
+/**
+ * Why the team's owners and admins can't approve `q` (ADR 0263), or null when they may:
+ * they approve only for the team's plain members, and never over a role the person's
+ * identity provider gives them in the team. They may still deny it. The server decides.
+ */
+export function teamApproveBlocked(team: Pick<Team, "members">, q: Pick<RoleRequest, "user">): string | null {
+  const m = team.members.find((x) => x.id === q.user?.id);
+  if (!m) return "They're no longer on the team.";
+  if (m.role !== "member") return "They're one of the team's owners or admins, so they can do all of that already. A server admin can still approve it.";
+  if (m.customRole?.fromIdp) return "Their role in the team comes from your identity provider. A server admin decides this request.";
+  return null;
 }
 
 /** A teammate's custom role in a few words: "Team people · ends in 3 days", or null with none. */

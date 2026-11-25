@@ -19,13 +19,16 @@ import {
   seatsLine,
   TEAM_ROLE_LABEL,
   teamPlanLine,
+  TEAM_DECIDES_YOURS,
+  teamApproveBlocked,
   teamRegionLine,
   teamSubscriptionLine,
   type Tone,
 } from "../src/team";
 import { colors } from "../src/theme";
-import type { CustomRoleRef, MyTeamInvite, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
+import type { CustomRoleRef, MyTeamInvite, RoleRequest, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
 import { Chips } from "./Chips";
+import { RequestRow } from "./RolesAdmin";
 
 interface Props {
   api: SuperBotApi;
@@ -230,11 +233,15 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Exclude<TeamRole, "owner">>("member");
 
+  const [requests, setRequests] = useState<RoleRequest[]>([]);
+
   const load = useCallback(async () => {
     try {
       const [t, i] = await Promise.all([api.team(), api.myTeamInvites()]);
       setTeam(t);
       setInvites(i);
+      // Only owners and admins get a count, so nobody else asks (nor an older server, without one).
+      setRequests(t?.roleRequests ? (await api.teamRoleRequests("pending")).requests : []);
     } catch (e) {
       setError(message(e, "Couldn't load your team"));
       setTeam((t) => t ?? null);
@@ -422,6 +429,25 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
                     ))}
                   </View>
                 ) : null}
+              </View>
+            ) : null}
+
+            {manage && requests.length ? (
+              <View style={styles.section} testID="team-role-requests">
+                <Text style={styles.sectionTitle}>Requests for team roles ({requests.length})</Text>
+                <Text style={styles.faint}>Approving gives the role in this team only, for the hours asked or fewer, and it ends by itself.</Text>
+                {requests.map((q) => (
+                  <RequestRow
+                    key={q.id}
+                    q={q}
+                    meId={meId}
+                    onDecided={load}
+                    approve={(id, body) => api.approveTeamRoleRequest(id, body)}
+                    deny={(id, note) => api.denyTeamRoleRequest(id, note)}
+                    decidesYours={TEAM_DECIDES_YOURS}
+                    approveBlocked={teamApproveBlocked(team, q)}
+                  />
+                ))}
               </View>
             ) : null}
 
