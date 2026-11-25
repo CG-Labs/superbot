@@ -317,7 +317,7 @@ struct Finding {
 }
 
 #[derive(Clone, Debug)]
-struct Account {
+struct Listed {
     customer: String,
     tam: Option<String>,
     stage: Stage,
@@ -329,8 +329,8 @@ struct Account {
 pub struct Cadence {
     o: Options,
     today: NaiveDate,
-    accounts: usize,
-    listed: Vec<Account>,
+    read: usize,
+    listed: Vec<Listed>,
     tams: Vec<(Option<String>, usize, usize, usize)>,
     not_judged: Vec<Item>,
     notes: Vec<String>,
@@ -370,7 +370,7 @@ pub fn check(csv: &str, o: &Options) -> Result<Cadence, String> {
     let not_judged: Vec<Item> = Item::ALL.into_iter().filter(|i| !i.needs().iter().all(|f| has(*f))).collect();
     let judged = |i: Item| !not_judged.contains(&i);
 
-    let (mut seen, mut skipped, mut listed, mut accounts) = (HashSet::new(), Vec::new(), Vec::new(), 0);
+    let (mut seen, mut skipped, mut listed, mut read) = (HashSet::new(), Vec::new(), Vec::new(), 0);
     let mut tams: BTreeMap<String, (Option<String>, usize, usize, usize)> = BTreeMap::new();
     'rows: for (line, r) in body {
         let cell = |f: Field| col.get(&f).and_then(|&c| r.get(c)).map(|s| s.trim()).filter(|s| !normalize(s).is_empty());
@@ -400,7 +400,7 @@ pub fn check(csv: &str, o: &Options) -> Result<Cadence, String> {
                 }
             }
         }
-        accounts += 1;
+        read += 1;
         // Steps dated after today haven't happened yet: a kickoff or review booked ahead.
         let done = |f: Field| dates.get(&f).copied().filter(|d| *d <= today);
         let stage = if !has(Field::GoLive) || done(Field::GoLive).is_some() {
@@ -491,10 +491,10 @@ pub fn check(csv: &str, o: &Options) -> Result<Cadence, String> {
         e.2 += findings.iter().filter(|f| f.status == Status::Overdue).count();
         e.3 += findings.iter().filter(|f| f.status == Status::DueSoon).count();
         if !findings.is_empty() {
-            listed.push(Account { customer: customer.to_string(), tam: tam.map(str::to_string), stage, since, findings });
+            listed.push(Listed { customer: customer.to_string(), tam: tam.map(str::to_string), stage, since, findings });
         }
     }
-    let first = |a: &Account| (a.findings[0].status, a.findings[0].due);
+    let first = |a: &Listed| (a.findings[0].status, a.findings[0].due);
     listed.sort_by(|a, b| first(a).cmp(&first(b)).then(normalize(&a.customer).cmp(&normalize(&b.customer))));
     let mut tams: Vec<_> = tams.into_values().collect();
     tams.sort_by(|a, b| a.0.is_none().cmp(&b.0.is_none()).then(b.2.cmp(&a.2)).then(b.3.cmp(&a.3)).then(a.0.cmp(&b.0)));
@@ -510,7 +510,7 @@ pub fn check(csv: &str, o: &Options) -> Result<Cadence, String> {
     if tams.iter().any(|t| t.0.is_none()) {
         notes.push("Some accounts have no TAM in the export: botctl support-readiness --tams checks the TAM list.".to_string());
     }
-    Ok(Cadence { o: o.clone(), today, accounts, listed, tams, not_judged, notes, skipped })
+    Ok(Cadence { o: o.clone(), today, read, listed, tams, not_judged, notes, skipped })
 }
 
 impl Cadence {
@@ -532,7 +532,7 @@ impl Cadence {
         }
     }
 
-    fn stage_text(a: &Account) -> String {
+    fn stage_text(a: &Listed) -> String {
         match (a.stage, a.since) {
             (Stage::Live, Some(d)) => format!("live since {d}"),
             (Stage::Live, None) => "live".into(),
@@ -564,13 +564,13 @@ impl Cadence {
     }
 
     fn summary(&self) -> String {
-        let accounts = if self.accounts == 1 { "1 account".to_string() } else { format!("{} accounts", self.accounts) };
+        let read = if self.read == 1 { "1 account".to_string() } else { format!("{} accounts", self.read) };
         let (over, soon) = (self.count(Status::Overdue), self.count(Status::DueSoon));
         let verdict = match (over, soon) {
             (0, 0) => "nothing due.".to_string(),
             _ => format!("{over} overdue, {soon} due soon, across {} of them.", self.listed.len()),
         };
-        format!("{accounts}: {verdict}")
+        format!("{read}: {verdict}")
     }
 
     fn tam_name(t: &Option<String>) -> String {
@@ -663,7 +663,7 @@ impl Cadence {
             "businessDays": { "weekdays": cal.weekday_names(), "utcOffset": cal.offset.to_string(), "holidays": cal.holidays.len() },
             "warnDays": self.o.warn_days,
             "renewalDays": self.o.renewal_days,
-            "accounts": self.accounts,
+            "accounts": self.read,
             "overdue": self.count(Status::Overdue),
             "dueSoon": self.count(Status::DueSoon),
             "due": self.overdue(),
@@ -781,7 +781,7 @@ mod tests {
         }
     }
 
-    const ACCOUNTS: &str = "Account Name,TAM,TAM email,Signed,Kickoff,Go-live,Last check-in,Last health check,Last QBR,Last restore drill,Last Sev 1,Review shared,Renewal date,ARR,Owner email
+    const BOOK: &str = "Account Name,TAM,TAM email,Signed,Kickoff,Go-live,Last check-in,Last health check,Last QBR,Last restore drill,Last Sev 1,Review shared,Renewal date,ARR,Owner email
 Acme,Ana Lima,ana@example.com,2026-01-05,2026-01-07,2026-02-02,2026-02-06,2026-10-01,2026-08-20,2026-03-10,2026-11-16,2026-06-01,2027-01-31,120000,owner@acme.example
 Globex,Ana Lima,ana@example.com,2026-11-16,,,,,,,,,2027-11-16,50000,
 Soylent,ana lima,,2026-11-23,,,,,,,,,,,
@@ -798,7 +798,7 @@ Tyrell,Cy Diaz,,2026-13-01,,,,,,,,,,,
 
     #[test]
     fn a_book_of_accounts_is_judged_against_the_cadence() {
-        let c = check(ACCOUNTS, &opts(&[])).unwrap();
+        let c = check(BOOK, &opts(&[])).unwrap();
         let v = c.json();
         assert_eq!((v["accounts"].clone(), v["today"].clone()), (json!(9), json!("2026-11-25")));
         // Live since February: the restore drill 77 days late, the health check 24, and a
@@ -908,12 +908,12 @@ Tyrell,Cy Diaz,,2026-13-01,,,,,,,,,,,
     #[test]
     fn warning_windows_and_filters() {
         let o = opts(&["--warn-days", "0", "--renewal-days", "30"]);
-        let v = check(ACCOUNTS, &o).unwrap().json();
+        let v = check(BOOK, &o).unwrap().json();
         assert_eq!(items(&v, "Soylent"), vec![], "a kickoff due in 5 days isn't due soon with --warn-days 0");
         assert_eq!(items(&v, "Acme").last().unwrap().0, "incident_review", "nor is a renewal 67 days off within 30");
-        let v = check(ACCOUNTS, &opts(&["--tam", "ANA LIMA"])).unwrap().json();
+        let v = check(BOOK, &opts(&["--tam", "ANA LIMA"])).unwrap().json();
         assert_eq!((v["accounts"].clone(), v["tams"].as_array().unwrap().len()), (json!(3), 1), "the same TAM by name, in any case");
-        let c = check(ACCOUNTS, &opts(&["--customer", "hooli"])).unwrap();
+        let c = check(BOOK, &opts(&["--customer", "hooli"])).unwrap();
         assert!(!c.overdue());
         assert!(c.text().contains("TAM cadence for hooli as of") && c.text().contains("1 account: nothing due."));
     }

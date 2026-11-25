@@ -3707,17 +3707,17 @@ mod tests {
 
     #[test]
     fn tam_cadence_reads_a_file_or_stdin_and_says_whether_anything_is_overdue() {
-        let accounts = "Account,TAM,TAM email,Signed,Kickoff,Go-live,Last health check\nAcme,Ana,ana@example.com,2026-01-05,2026-01-07,2026-02-02,2026-10-01\nGlobex,Bo,,2026-01-05,2026-01-07,2026-02-02,2026-11-20\n";
+        let export = "Account,TAM,TAM email,Signed,Kickoff,Go-live,Last health check\nAcme,Ana,ana@example.com,2026-01-05,2026-01-07,2026-02-02,2026-10-01\nGlobex,Bo,,2026-01-05,2026-01-07,2026-02-02,2026-11-20\n";
         let file = std::env::temp_dir().join(format!("botctl-tam-cadence-{}.csv", std::process::id()));
-        std::fs::write(&file, accounts).unwrap();
+        std::fs::write(&file, export).unwrap();
         let path = file.to_str().unwrap();
         let (text, overdue) = tam_cadence(&[path, "--as-of", "2026-11-25"], std::io::empty()).unwrap();
         assert!(overdue);
         assert!(text.contains("\nAcme  TAM Ana  live since 2026-02-02\n  OVERDUE  health_check: 24 days overdue (due 2026-11-01)"));
         assert!(!text.contains("example.com") && !text.contains("\nGlobex  "));
-        let (md, _) = tam_cadence(&["-", "--as-of", "2026-11-25", "--markdown"], accounts.as_bytes()).unwrap();
+        let (md, _) = tam_cadence(&["-", "--as-of", "2026-11-25", "--markdown"], export.as_bytes()).unwrap();
         assert!(md.starts_with("## TAM cadence as of 2026-11-25 (UTC+00:00)\n"));
-        let (json, _) = tam_cadence(&["-", "--as-of", "2026-11-25", "--json", "--tam", "ana"], accounts.as_bytes()).unwrap();
+        let (json, _) = tam_cadence(&["-", "--as-of", "2026-11-25", "--json", "--tam", "ana"], export.as_bytes()).unwrap();
         let json: Value = serde_json::from_str(&json).unwrap();
         assert_eq!((json["accounts"].clone(), json["counts"]["health_check"]["overdue"].clone()), (json!(1), json!(1)));
         let (quiet, overdue) = tam_cadence(&[path, "--as-of", "2026-11-25", "--customer", "globex"], std::io::empty()).unwrap();
