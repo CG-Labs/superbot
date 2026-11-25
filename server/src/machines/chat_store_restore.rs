@@ -528,6 +528,9 @@ pub struct Plan {
     unreadable: Option<String>,
     /// Approvals' saved tool inputs neither master key opens, which botd drops at start.
     unopened: usize,
+    /// People's own secrets kept from it (the store now missing, ADR 0293) that neither
+    /// master key opens, which botd drops at start.
+    unopened_secrets: usize,
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
@@ -646,6 +649,14 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
             plan.unopened
         ));
     }
+    plan.unopened_secrets = unopened_secrets(&c, &place.ciphers).map_err(err)?;
+    if plan.unopened_secrets > 0 && !place.forget_sealed {
+        return Err(format!(
+            "{} people's own secrets in that backup don't open with the master key or the previous one, so botd wouldn't start with it. \
+             Set SUPERBOT_MASTER_KEY_PREVIOUS to the key they were sealed under; if it's lost for good, set SUPERBOT_FORGET_SEALED=1 so botd drops them at start and their owners save them again (ADR 0293)",
+            plan.unopened_secrets
+        ));
+    }
     match current {
         Current::Readable(k) => {
             attach_now(&c, k)?;
@@ -678,6 +689,26 @@ fn unopened(c: &Connection, ciphers: &[Arc<Cipher>]) -> rusqlite::Result<usize> 
         let (id, input) = row?;
         let context = sealed::approval_context(&id);
         if sealed::is_sealed(&input) && !ciphers.iter().any(|k| k.open(&context, &input).is_ok()) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// How many people's own secrets (ADR 0293) are sealed under a key none of `ciphers` is,
+/// which botd refuses at start. None in a backup from before them.
+fn unopened_secrets(c: &Connection, ciphers: &[Arc<Cipher>]) -> rusqlite::Result<usize> {
+    let has: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1)", [crate::db::SECRETS], |r| r.get(0))?;
+    if !has {
+        return Ok(0);
+    }
+    let mut s = c.prepare("SELECT user_id, name, value FROM main.user_secrets")?;
+    let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    let mut n = 0;
+    for row in rows {
+        let (user, name, value) = row?;
+        let context = sealed::user_context(&user, &name);
+        if sealed::is_sealed(&value) && !ciphers.iter().any(|k| k.open(&context, &value).is_ok()) {
             n += 1;
         }
     }
@@ -895,6 +926,12 @@ impl Restore {
         }
         if p.unopened > 0 {
             out.push_str(&format!("  {} saved tool inputs of approvals in it don't open with the master key; botd drops them at start (SUPERBOT_FORGET_SEALED=1).\n", p.unopened));
+        }
+        if p.unopened_secrets > 0 {
+            out.push_str(&format!(
+                "  {} people's own secrets in it don't open with the master key; botd drops them at start and their owners save them again (SUPERBOT_FORGET_SEALED=1).\n",
+                p.unopened_secrets
+            ));
         }
         match (&p.back, &p.gone, &p.unreadable) {
             (Some(back), Some(gone), _) => {
@@ -1545,6 +1582,31 @@ mod tests {
         db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
         let s = own_secrets(&w, &db);
         assert_eq!(s.get(&ada, "B").unwrap().map(|v| v.expose().to_string()).as_deref(), Some("new-value"));
+    }
+
+    #[tokio::test]
+    async fn a_backup_keeping_own_secrets_sealed_under_a_lost_key_is_refused_unless_botd_drops_them() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let s = own_secrets(&w, &db);
+        s.put(&ada, "K", "v").unwrap();
+        backup_pass(&db, 7, now() - DAY);
+        drop((s, db));
+        let (_, backup) = chat_stores::backups_strictly(&w.place().store).unwrap().pop().unwrap();
+        let under_lost_key = Cipher::new(&crate::secrets::key::MasterKey::generate()).seal(&sealed::user_context(&ada, "K"), b"v");
+        Connection::open(&backup).unwrap().execute("UPDATE user_secrets SET value = ?1", [under_lost_key]).unwrap();
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+
+        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("1 people's own secrets in that backup don't open") && e.contains("SUPERBOT_MASTER_KEY_PREVIOUS") && e.contains("SUPERBOT_FORGET_SEALED=1"), "{e}");
+        assert!(!w.store().exists() && work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
+
+        let place = Place { forget_sealed: true, ..w.place() };
+        let r = restore(&place, &opts("newest", true), now()).await.unwrap();
+        assert_eq!(r.plan.unopened_secrets, 1);
+        assert!(r.text("gb-lon").contains("1 people's own secrets in it don't open with the master key; botd drops them at start"), "{}", r.text("gb-lon"));
     }
 
     #[test]

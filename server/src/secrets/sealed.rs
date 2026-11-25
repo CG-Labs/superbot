@@ -771,6 +771,16 @@ impl UserSecrets {
         Ok(())
     }
 
+    /// How many secrets the attached stores hold.
+    pub fn in_stores(&self) -> Result<usize, Error> {
+        let c = self.c();
+        let mut n = 0;
+        for s in crate::db::places(self.stores()).into_iter().filter(|s| *s != "main") {
+            n += c.query_row(&format!("SELECT COUNT(*) FROM {s}.user_secrets"), [], |r| r.get::<_, i64>(0)).map_err(store_err)? as usize;
+        }
+        Ok(n)
+    }
+
     pub fn get(&self, user_id: &str, name: &str) -> Result<Option<Secret>, Error> {
         let v: Option<String> = self
             .c()
@@ -816,13 +826,16 @@ impl UserSecrets {
         Ok(existed)
     }
 
-    /// True if the user had it.
+    /// True if the user had it. Every place in one write transaction, so a move's copy
+    /// can't put it back in a place already cleared.
     pub fn delete(&self, user_id: &str, name: &str) -> Result<bool, Error> {
-        let c = self.c();
+        let mut c = self.c();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_err)?;
         let mut n = 0;
         for s in crate::db::places(self.stores()) {
-            n += c.execute(&format!("DELETE FROM {s}.user_secrets WHERE user_id = ? AND name = ?"), [user_id, name]).map_err(store_err)?;
+            n += tx.execute(&format!("DELETE FROM {s}.user_secrets WHERE user_id = ? AND name = ?"), [user_id, name]).map_err(store_err)?;
         }
+        tx.commit().map_err(store_err)?;
         Ok(n > 0)
     }
 

@@ -1175,6 +1175,14 @@ impl Db {
         crate::secrets::redact::scrub_rows_in(&self.c(), &messages, &approvals)
     }
 
+    /// Redacts known secrets from saved rows in botd's own database and every store, as
+    /// startup does each before the users' secrets attach the stores (ADR 0293): run again
+    /// once they have, for values only a store holds. How many rows changed.
+    pub fn scrub_saved_rows(&self) -> rusqlite::Result<usize> {
+        let own = crate::secrets::redact::scrub_rows(&self.c())?;
+        Ok(own + self.scrub_chat_stores()?)
+    }
+
     /// Brings the stores' approval inputs under the master key `current`, as startup does
     /// botd's own (ADR 0228): those sealed under `previous` (mid-rotation) are sealed again,
     /// plaintext is sealed, and with `forget` (SUPERBOT_FORGET_SEALED=1) those neither key
@@ -2567,6 +2575,21 @@ mod tests {
         assert_eq!(crate::db::erase_in_copy(&c, &ada, "erased-01", &[]).unwrap().user_secrets, 1);
         let left: Vec<String> = c.prepare("SELECT user_id FROM user_secrets").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(left, [cy]);
+    }
+
+    #[test]
+    fn saved_rows_are_scrubbed_again_of_secrets_only_a_store_holds() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let bot = bot_of(&db, &ada);
+        let value = "sk-0293-known-only-once-the-store-is-read";
+        db.add_message(&bot, "user", &format!("use {value} please"), None, false, None);
+        crate::secrets::redact::register_for(&ada, value);
+        assert!(db.scrub_saved_rows().unwrap() >= 1);
+        let text: String = db.c().query_row("SELECT text FROM chats_0.messages WHERE bot_id = ?1", [&bot], |r| r.get(0)).unwrap();
+        assert_eq!(text, format!("use {} please", crate::secrets::redact::MARK));
     }
 
     #[test]

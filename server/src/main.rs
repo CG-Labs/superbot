@@ -583,9 +583,16 @@ async fn main() {
     for line in &opened.lines {
         log_info!("{line}");
     }
-    secrets::global()
+    let in_stores = secrets::global()
         .attach_chat_stores(&db.chat_stores(), database_encryption::installed().map(database_encryption::DbKey::raw))
         .unwrap_or_else(|e| exit(format!("Regional chat stores: people's own secrets: {e}")));
+    // Both startup scrubs ran before the redactor knew the secrets only stores hold.
+    if in_stores > 0 {
+        let n = db.scrub_saved_rows().unwrap_or_else(|e| exit(format!("Regional chat stores: redacting people's own secrets: {e}")));
+        if n > 0 {
+            log_info!("Regional chat stores: redacted {n} saved rows of people's own secrets kept in stores (ADR 0293).");
+        }
+    }
     for w in machines::chat_store_copies::check_destinations(&db, control_plane.chat_copies.as_deref(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Regional chat stores: {e}"))) {
         log_warn!("WARNING: {w}");
     }
