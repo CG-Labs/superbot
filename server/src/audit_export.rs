@@ -833,8 +833,8 @@ fn resumed(app: &App, sink: &Sink, after: i64, stopped: Option<i64>) -> Option<V
     Some(d)
 }
 
-/// Sinks recorded as stopped and not set now, for `GET /api/audit/siem`.
-fn stopped(app: &App, head: i64) -> Vec<Value> {
+/// Sinks recorded as stopped and not set now: each one's record, cursor and stop's id.
+fn stopped_records(app: &App) -> Vec<(Value, i64, i64)> {
     let running: Vec<String> = app.audit_export.get().map(|x| x.sinks.iter().map(|s| s.sink.id.clone()).collect()).unwrap_or_default();
     app.db
         .audit_export_cursors()
@@ -844,9 +844,40 @@ fn stopped(app: &App, head: i64) -> Vec<Value> {
         .filter_map(|(id, delivered)| {
             let r = known(app, &id);
             let event = r["stopped"].as_i64()?;
-            Some(json!({ "kind": r["kind"], "name": r["name"], "sink": r["sink"], "delivered": delivered, "pending": (head - delivered).max(0), "stoppedEvent": event }))
+            Some((r, delivered, event))
         })
         .collect()
+}
+
+/// Sinks recorded as stopped and not set now, with when and why from their
+/// `audit.export_stopped` (ADR 0273); both null once retention has deleted it.
+fn stopped(app: &App, head: i64) -> Vec<Value> {
+    stopped_records(app)
+        .into_iter()
+        .map(|(r, delivered, event)| {
+            let filter = Filter { actions: vec!["audit.export_stopped".into()], after: Some(event - 1), before: Some(event + 1), ..Default::default() };
+            let stop = app.db.audit_events(&filter, 1, true).pop();
+            json!({
+                "kind": r["kind"], "name": r["name"], "sink": r["sink"], "delivered": delivered, "pending": (head - delivered).max(0), "stoppedEvent": event,
+                "stoppedAt": stop.as_ref().map(|e| e.at), "reason": stop.as_ref().map(|e| e.details["reason"].clone()),
+            })
+        })
+        .collect()
+}
+
+/// The export's state as `GET /api/audit/siem` and `GET /api/audit/chain` show it: the
+/// sinks running, and those taken out of `AUDIT_EXPORT` under `stopped` (ADR 0264), when
+/// export is off too.
+pub fn status(app: &App, head: i64) -> Value {
+    let mut v = match app.audit_export.get() {
+        Some(x) => x.view(head),
+        None => json!({ "enabled": false }),
+    };
+    let stopped = stopped(app, head);
+    if !stopped.is_empty() {
+        v["stopped"] = Value::Array(stopped);
+    }
+    v
 }
 
 impl Exports {
@@ -1278,21 +1309,15 @@ fn platform_tls() -> Arc<rustls::ClientConfig> {
 /// `GET /api/audit/siem`: whether the export is on, where to, and how far it got. Admins only.
 /// Sinks taken out of `AUDIT_EXPORT` are under `stopped` (ADR 0264).
 pub async fn get(axum::extract::State(app): axum::extract::State<Arc<App>>) -> axum::Json<Value> {
-    let head = app.db.audit_head();
-    let mut v = match app.audit_export.get() {
-        Some(x) => x.view(head),
-        None => json!({ "enabled": false }),
-    };
-    let stopped = stopped(&app, head);
-    if !stopped.is_empty() {
-        v["stopped"] = Value::Array(stopped);
-    }
-    axum::Json(v)
+    axum::Json(status(&app, app.db.audit_head()))
 }
 
-/// How far behind each sink is, when the export is on, labelled by its kind and, for a
-/// named sink, its name (ADR 0191), so several SIEMs of one kind are each a series.
+/// How many sinks are recorded as stopped, whether export is on or off (ADR 0273); then
+/// how far behind each running sink is, labelled by its kind and, for a named sink, its
+/// name (ADR 0191), so several SIEMs of one kind are each a series.
 pub fn render(app: &App, out: &mut String) {
+    metrics::family(out, "superbot_audit_export_stopped_sinks", "gauge", "Sinks taken out of AUDIT_EXPORT and recorded as audit.export_stopped, until set again (ADR 0264).");
+    metrics::sample(out, "superbot_audit_export_stopped_sinks", &[], stopped_records(app).len() as f64);
     let Some(xs) = app.audit_export.get() else { return };
     let head = app.db.audit_head();
     let views: Vec<(Vec<(&str, &str)>, Value)> = xs

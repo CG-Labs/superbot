@@ -1,4 +1,4 @@
-import type { AuditChainState, AuditCheckpoint, AuditExportSink, AuditExportState, AuditVerification } from "./types";
+import type { AuditChainState, AuditCheckpoint, AuditExportSink, AuditExportState, AuditStoppedSink, AuditVerification } from "./types";
 
 /** What the panel says about one part of the chain, and whether it's good news. */
 export interface ChainLine {
@@ -67,14 +67,25 @@ export function timestampLine(s: AuditChainState): ChainLine {
 }
 
 export function exportLine(x: AuditExportState): ChainLine {
-  if (!x.enabled) return { label: "SIEM export", text: "Off (AUDIT_EXPORT)", tone: "dim" };
+  // Off after a sink ran is a stop, not a server that never exported.
+  if (!x.enabled) return { label: "SIEM export", text: "Off (AUDIT_EXPORT)", tone: x.stopped?.length ? "warn" : "dim" };
   return sinkLine(x);
 }
 
-/** One line per sink: SIEMs and an archive side by side (ADR 0173, ADR 0191). */
+/** One line per sink: SIEMs and an archive side by side (ADR 0173, ADR 0191), then those taken out (ADR 0273). */
 export function exportLines(x: AuditExportState): ChainLine[] {
-  if (!x.enabled || !x.sinks?.length) return [exportLine(x)];
-  return x.sinks.map(sinkLine);
+  const running = !x.enabled || !x.sinks?.length ? [exportLine(x)] : x.sinks.map(sinkLine);
+  return [...running, ...(x.stopped ?? []).map(stoppedLine)];
+}
+
+/** A sink taken out of `AUDIT_EXPORT`: when and why, and the events it never took (ADR 0264). */
+export function stoppedLine(s: AuditStoppedSink): ChainLine {
+  const kind = s.kind === "s3" ? "Stopped archive" : "Stopped SIEM";
+  const label = s.name ? `${kind} (${s.name})` : kind;
+  const why = s.reason === "export_off" ? "stopped when export was turned off" : s.reason === "removed" ? "taken out of AUDIT_EXPORT" : "stopped";
+  const at = s.stoppedAt ? ` ${when(s.stoppedAt)}` : "";
+  const missing = `${s.pending} event${s.pending === 1 ? "" : "s"} since`;
+  return { label, text: `${s.sink ?? "A sink"}: ${why}${at} (event ${s.stoppedEvent}). It last took event ${s.delivered}, ${missing}.`, tone: "warn" };
 }
 
 function sinkLine(x: AuditExportSink): ChainLine {

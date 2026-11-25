@@ -69,8 +69,8 @@ export function AuditChainPanel({ api }: Props) {
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {!state && !error ? <ActivityIndicator color={colors.textDim} /> : null}
-      {lines.map((l) => (
-        <View key={l.label} style={styles.line} accessibilityLabel={`${l.label}: ${l.text}`}>
+      {lines.map((l, i) => (
+        <View key={`${i}:${l.label}`} style={styles.line} accessibilityLabel={`${l.label}: ${l.text}`}>
           <View style={[styles.dot, { backgroundColor: TONES[l.tone] }]} />
           <Text style={styles.label}>{l.label}</Text>
           <Text style={[styles.text, l.tone === "bad" && styles.bad]} selectable>
