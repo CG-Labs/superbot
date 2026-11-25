@@ -1,7 +1,8 @@
-//! Vault's Kubernetes and JWT sign-in (ADR 0159), on the real router: against a stand-in
-//! Vault, botd's logins and the reads they allow reach the audit log admins read, with
-//! the method, role and namespace and never a JWT, a Vault token or a value; a JWT file
-//! that can't be used is a failed login there too, and only admins see any of it.
+//! Vault's Kubernetes and JWT sign-in (ADR 0159) and cloud sign-in (ADR 0260), on the real
+//! router: against a stand-in Vault, botd's logins and the reads they allow reach the
+//! audit log admins read, with the method, role and namespace and never a JWT, an AWS key
+//! or signature, a Vault token or a value; a JWT file that can't be used, or a login Vault
+//! refuses, is a failed login there too, and only admins see any of it.
 
 use crate::secrets::external::tests::flush_audit_for;
 use crate::secrets::vault::tests::{jwt, put, stand_in, token_file, vault};
@@ -67,4 +68,60 @@ async fn admins_see_kubernetes_and_jwt_logins_never_the_tokens() {
     assert_eq!(code, 403, "{body}");
     assert!(!body.contains(&k8s_mount));
     crate::secrets::redact::forget(&value);
+}
+
+#[tokio::test]
+async fn admins_see_cloud_logins_never_the_keys_or_signatures() {
+    let (port, app, admin, _) = serve_app().await;
+    let (url, f) = stand_in();
+    let aws_mount = format!("aws-http-{}", random_hex(6));
+    let gcp_mount = format!("gcp-http-{}", random_hex(6));
+    let name = format!("CLOUD_HTTP_{}_TOKEN", random_hex(4).to_uppercase());
+    let value = format!("cloud-http-value-{}", random_hex(8));
+    put(&f, &format!("bots/{name}"), &value);
+
+    // AWS: an STS request signed with botd's own keys; Vault refuses the second, whose
+    // server id header isn't the mount's.
+    let (id, secret) = ("AKIAHTTPKEYS0001", format!("vault-http-secret-{}", random_hex(8)));
+    f.aws_keys.lock().unwrap().insert(id.into(), (secret.clone(), None));
+    *f.aws_server_id.lock().unwrap() = Some("vault.example.com".into());
+    let aws = |header: &'static str| {
+        vault(
+            &url,
+            &[("VAULT_AUTH", "aws"), ("VAULT_AWS_MOUNT", &aws_mount), ("VAULT_AWS_ROLE", "superbot"), ("VAULT_AWS_HEADER_VALUE", header), ("VAULT_AWS_CREDENTIALS", "env"), ("AWS_ACCESS_KEY_ID", id), ("AWS_SECRET_ACCESS_KEY", &secret)],
+            Duration::from_secs(60),
+        )
+    };
+    use crate::secrets::SecretStore;
+    assert_eq!(aws("vault.example.com").get(&name).unwrap().unwrap().expose(), value);
+    assert!(aws("vault.other.example").check().is_err());
+
+    // GCP: a JWT Google signs as botd's service account; one botd may not sign as fails.
+    let host = url.trim_start_matches("http://").to_string();
+    let gcp = |account: &'static str| vault(&url, &[("VAULT_AUTH", "gcp"), ("VAULT_GCP_MOUNT", &gcp_mount), ("VAULT_GCP_ROLE", "superbot"), ("VAULT_GCP_SERVICE_ACCOUNT", account), ("GCE_METADATA_HOST", &host), ("GCP_IAM_CREDENTIALS_ENDPOINT", &url)], Duration::ZERO);
+    let jwts = f.jwts.lock().unwrap().len();
+    assert!(gcp("botd@acme-prod.iam.gserviceaccount.com").check().is_ok());
+    assert!(gcp("denied@acme-prod.iam.gserviceaccount.com").check().is_err());
+    let signed: Vec<String> = f.jwts.lock().unwrap()[jwts..].iter().map(|j| j.2.clone()).collect();
+    assert_eq!(signed.len(), 1, "only the account botd may sign as made a JWT");
+
+    flush_audit_for(&app.db, &[&aws_mount, &gcp_mount, &name]);
+    let logins: Vec<Value> = events(port, &admin, "action=secret.vault_login").await.into_iter().filter(|e| e["targetId"] == aws_mount.as_str() || e["targetId"] == gcp_mount.as_str()).collect();
+    let got: Vec<_> = logins.iter().map(|e| (e["targetId"].as_str().unwrap(), e["outcome"].as_str(), e["details"].clone())).collect();
+    assert_eq!(got.len(), 4, "{logins:?}");
+    assert!(got.contains(&(aws_mount.as_str(), Some("success"), json!({ "method": "aws", "role": "superbot" }))), "{got:?}");
+    assert!(got.iter().any(|g| g.0 == aws_mount && g.1 == Some("failure") && g.2["method"] == "aws" && g.2["error"].is_string()), "{got:?}");
+    assert!(got.contains(&(gcp_mount.as_str(), Some("success"), json!({ "method": "gcp", "role": "superbot" }))), "{got:?}");
+    assert!(got.iter().any(|g| g.0 == gcp_mount && g.1 == Some("failure") && g.2["method"] == "gcp" && g.2["error"].is_string()), "{got:?}");
+
+    let (_, all) = call(port, "GET", "/api/audit?action=secret.*&limit=500", &admin, "").await;
+    for leaked in [secret.as_str(), value.as_str(), "Signature=", "hvs.", signed[0].as_str()] {
+        assert!(!all.contains(leaked), "{leaked} reached the audit log");
+    }
+    let (_, member) = user_with(port, &admin, "lee@example.com", "member").await;
+    let (code, _) = call(port, "GET", "/api/audit?action=secret.vault_login", &member, "").await;
+    assert_eq!(code, 403);
+    for v in [value.as_str(), secret.as_str()] {
+        crate::secrets::redact::forget(v);
+    }
 }

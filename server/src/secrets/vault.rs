@@ -6,7 +6,9 @@
 //! has, so Vault Agent can rotate it), AppRole (`VAULT_ROLE_ID`, `VAULT_SECRET_ID`,
 //! each also `_FILE`), or a JWT the platform keeps in a file: Kubernetes service account
 //! tokens (`VAULT_AUTH=kubernetes`) or any OIDC/JWT issuer (`VAULT_AUTH=jwt`, ADR 0159),
-//! read again at each login. botd logs in again before the token's lease runs out and
+//! read again at each login, or botd's cloud identity (ADR 0260): `VAULT_AUTH=aws`, an STS
+//! request signed with botd's own AWS keys; `gcp`, a JWT Google signs as its service
+//! account; `azure`, its managed identity's token. botd logs in again before the token's lease runs out and
 //! once more when Vault refuses it, in `VAULT_AUTH_NAMESPACE` if the auth method is
 //! mounted somewhere other than the secrets. Requests run on a runtime of their own
 //! (`http::Worker`). It is also the `leases::Issuer` of `VAULT_RUN_CREDENTIALS`: a new
@@ -16,7 +18,7 @@
 use super::external::{self, Provider, Scope};
 use super::http::Worker;
 use super::leases::{Field, Issuer, Lease, Renewal};
-use super::{Error, SecretStore};
+use super::{aws, azure, gcp, Error, SecretStore};
 use crate::audit::{Event, Outcome};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -61,7 +63,41 @@ pub enum Auth {
     /// A JWT read from `file` at each login, so the platform can rotate it. `role` is None
     /// only for `jwt`, whose mount then uses its `default_role`.
     Jwt { method: JwtMethod, mount: String, role: Option<String>, file: PathBuf },
+    /// Vault's `aws` method (`iam` type, ADR 0260): an STS `GetCallerIdentity` request
+    /// signed with botd's own AWS keys for `sts_url`, which Vault sends on. `role` None:
+    /// the role named after botd's IAM principal.
+    Aws { mount: String, role: Option<String>, region: String, sts_url: url::Url, server_id: Option<String>, creds: Box<aws::Credentials> },
+    /// Vault's `gcp` method (`iam` type): a short JWT for `vault/<role>`, signed by IAM
+    /// Credentials' `signJwt` as `account` (botd's own service account unless set).
+    Gcp { mount: String, role: String, signer: Option<String>, iam: String, google: Box<gcp::Google> },
+    /// Vault's `azure` method: botd's Entra ID token for the mount's `resource`, with the
+    /// VM's subscription, resource group and name from instance metadata if `instance`.
+    Azure { mount: String, role: String, instance: bool, entra: Box<azure::Entra> },
 }
+
+impl Auth {
+    /// The method in audit details and errors' names for it, for those that log in.
+    fn method(&self) -> &'static str {
+        match self {
+            Auth::Token { .. } => "token",
+            Auth::AppRole { .. } => "approle",
+            Auth::Jwt { method, .. } => method.as_str(),
+            Auth::Aws { .. } => "aws",
+            Auth::Gcp { .. } => "gcp",
+            Auth::Azure { .. } => "azure",
+        }
+    }
+}
+
+/// How long the JWT botd has Google sign for a `gcp` login lasts: within the 15 minutes
+/// Vault's roles allow by default (`max_jwt_exp`), with room for clocks.
+const GCP_JWT_SECONDS: u64 = 600;
+/// What Vault's `aws` mount checks the login's STS request against unless told otherwise.
+const AWS_STS_REGION: &str = "us-east-1";
+/// What Vault's `azure` mount takes tokens for unless its `resource` says otherwise.
+const AZURE_RESOURCE: &str = "https://management.azure.com/";
+/// The header Vault's `aws` mount checks against its `iam_server_id_header_value`.
+const AWS_SERVER_ID_HEADER: &str = "x-vault-aws-iam-server-id";
 
 /// A role name: letters, digits, `.`, `_`, `-` and `@`, up to 128.
 fn role_setting(key: &str, raw: &str) -> Result<String, String> {
@@ -70,6 +106,98 @@ fn role_setting(key: &str, raw: &str) -> Result<String, String> {
         return Err(format!("{key} must be a Vault role name like \"superbot\" (letters, digits, . _ - @), not {v:?}"));
     }
     Ok(v.to_string())
+}
+
+fn required_role(var: &dyn Fn(&str) -> String, method: &str, key: &str) -> Result<String, String> {
+    match var(key).trim() {
+        "" => Err(format!("VAULT_AUTH={method} needs {key}, the Vault role botd logs in as")),
+        r => role_setting(key, r),
+    }
+}
+
+/// A service account's email, as `signJwt` names it.
+fn signer_setting(raw: &str) -> Result<String, String> {
+    let ok = raw.len() <= 254 && raw.split_once('@').is_some_and(|(n, d)| !n.is_empty() && d.contains('.')) && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b"@.-_".contains(&b));
+    if !ok {
+        return Err(format!("VAULT_GCP_SERVICE_ACCOUNT must be a service account's email like botd@my-project.iam.gserviceaccount.com, not {raw:?}"));
+    }
+    Ok(raw.to_string())
+}
+
+/// The region Vault's `aws` mount checks STS requests for (`VAULT_AWS_REGION`), the STS
+/// URL botd signs for it, and where botd trades a web identity token for its own keys.
+fn aws_sts(var: &dyn Fn(&str) -> String) -> Result<(String, url::Url, String), String> {
+    let raw = var("VAULT_AWS_REGION");
+    let region = match raw.trim() {
+        "" => AWS_STS_REGION,
+        r => r,
+    };
+    let parts: Vec<&str> = region.split('-').collect();
+    let ok = region.len() <= 32
+        && parts.len() >= 3
+        && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        && parts.last().is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()));
+    if !ok {
+        return Err(format!("VAULT_AWS_REGION must be the region of the aws mount's sts_endpoint, like {AWS_STS_REGION} (its default), not {region:?}"));
+    }
+    // As AWS's SDKs and Vault's own CLI sign it: STS's global endpoint for us-east-1.
+    let host = match region {
+        AWS_STS_REGION => "sts.amazonaws.com".to_string(),
+        r if r.starts_with("cn-") => format!("sts.{r}.amazonaws.com.cn"),
+        r => format!("sts.{r}.amazonaws.com"),
+    };
+    let sts_url = url::Url::parse(&format!("https://{host}/")).map_err(|e| format!("VAULT_AWS_REGION: {e}"))?;
+    let web_identity_sts = match var("AWS_ENDPOINT_URL_STS").trim() {
+        "" => sts_url.as_str().trim_end_matches('/').to_string(),
+        e => super::http::base_url("AWS_ENDPOINT_URL_STS", e, "https://sts.amazonaws.com")?,
+    };
+    Ok((region.to_string(), sts_url, web_identity_sts))
+}
+
+/// What botd reaches to log in to Vault with these settings, as `(setting, URL, what)`, for
+/// `botd offline check`: cloud sign-in's own endpoints (ADR 0260). Vault itself sends the
+/// `aws` method's STS request, so STS is on Vault's side, not botd's.
+pub fn sign_in_reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+    let mut out = Vec::new();
+    match var("VAULT_AUTH").trim() {
+        "aws" => {
+            let (_, _, sts) = aws_sts(var)?;
+            if aws::chosen_source(var, "VAULT_AWS_CREDENTIALS")? == "web-identity" {
+                out.push(("AWS_ENDPOINT_URL_STS", sts, "AWS STS, for botd's web identity"));
+            }
+            out.extend(aws::credentials_reach(var, "VAULT_AWS_CREDENTIALS")?);
+        }
+        "gcp" => {
+            out.extend(gcp::sign_in_reaches(var, "VAULT_GCP_CREDENTIALS", &var("VAULT_GCP_CREDENTIALS"))?);
+            let iam = match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
+                "" => gcp::IAM_CREDENTIALS.to_string(),
+                e => e.to_string(),
+            };
+            out.push(("GCP_IAM_CREDENTIALS_ENDPOINT", iam, "IAM Credentials, which signs botd's JWT for Vault"));
+        }
+        "azure" => out.extend(azure::sign_in_reaches(var, "VAULT_AZURE_CREDENTIALS", &var("VAULT_AZURE_CREDENTIALS"), false)?),
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// `VAULT_AUTH=aws`: the mount's settings, and botd's own AWS keys from AWS's standard
+/// chain (`VAULT_AWS_CREDENTIALS`), kept from Bots while botd uses them.
+fn aws_auth(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Auth, String> {
+    let (region, sts_url, web_identity_sts) = aws_sts(var)?;
+    let server_id = match var("VAULT_AWS_HEADER_VALUE").trim() {
+        "" => None,
+        v if v.len() <= 256 && v.bytes().all(|b| b.is_ascii_graphic()) => Some(v.to_string()),
+        _ => return Err("VAULT_AWS_HEADER_VALUE must be the aws mount's iam_server_id_header_value, printable with no spaces, like vault.example.com".into()),
+    };
+    let role = match var("VAULT_AWS_ROLE").trim() {
+        "" => None,
+        r => Some(role_setting("VAULT_AWS_ROLE", r)?),
+    };
+    let source = aws::source_from_env(var, store, "VAULT_AWS_CREDENTIALS", "VAULT_AUTH=aws", &web_identity_sts)?;
+    super::keep_from_bots(source.reserved(), source.settings());
+    let creds = aws::Credentials::new("AWS (for Vault)", "vault", source)?;
+    Ok(Auth::Aws { mount: path_setting("VAULT_AWS_MOUNT", &var("VAULT_AWS_MOUNT"), "aws")?, role, region, sts_url, server_id, creds: Box::new(creds) })
 }
 
 /// A namespace for logins only: `root` for none, else a Vault path.
@@ -162,10 +290,39 @@ impl Config {
                 jwt(JwtMethod::Kubernetes, "VAULT_KUBERNETES_MOUNT", "VAULT_KUBERNETES_ROLE", file)?
             }
             "jwt" => jwt(JwtMethod::Jwt, "VAULT_JWT_MOUNT", "VAULT_JWT_ROLE", var("VAULT_JWT_FILE"))?,
-            other => return Err(format!("VAULT_AUTH must be token, approle, kubernetes or jwt, not {other:?}")),
+            "aws" => aws_auth(var, store)?,
+            "gcp" => Auth::Gcp {
+                mount: path_setting("VAULT_GCP_MOUNT", &var("VAULT_GCP_MOUNT"), "gcp")?,
+                role: required_role(var, "gcp", "VAULT_GCP_ROLE")?,
+                signer: match var("VAULT_GCP_SERVICE_ACCOUNT").trim() {
+                    "" => None,
+                    a => Some(signer_setting(a)?),
+                },
+                iam: match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
+                    "" => gcp::IAM_CREDENTIALS.to_string(),
+                    e => super::http::base_url("GCP_IAM_CREDENTIALS_ENDPOINT", e, gcp::IAM_CREDENTIALS)?,
+                },
+                google: Box::new(gcp::Google::from_env(var, store, "VAULT_GCP_CREDENTIALS", &var("VAULT_GCP_CREDENTIALS"), "Google (for Vault)")?),
+            },
+            "azure" => {
+                let resource = match var("VAULT_AZURE_RESOURCE").trim() {
+                    "" => AZURE_RESOURCE.to_string(),
+                    r if r.len() <= 256 && !r.contains(|c: char| c.is_whitespace() || c.is_control()) => r.to_string(),
+                    r => return Err(format!("VAULT_AZURE_RESOURCE must be the resource the azure mount takes tokens for, like {AZURE_RESOURCE}, not {r:?}")),
+                };
+                let entra = azure::Entra::from_env(var, store, "VAULT_AZURE_CREDENTIALS", &var("VAULT_AZURE_CREDENTIALS"), "Entra ID (for Vault)", &resource)?;
+                let instance = match var("VAULT_AZURE_INSTANCE").trim() {
+                    "" | "0" => false,
+                    "1" if entra.on_vm() => true,
+                    "1" => return Err("VAULT_AZURE_INSTANCE=1 reads the VM's details from its instance metadata service, so it needs VAULT_AZURE_CREDENTIALS=managed-identity on a VM or scale set (no IDENTITY_ENDPOINT)".into()),
+                    other => return Err(format!("VAULT_AZURE_INSTANCE must be 1 or 0, not {other:?}")),
+                };
+                Auth::Azure { mount: path_setting("VAULT_AZURE_MOUNT", &var("VAULT_AZURE_MOUNT"), "azure")?, role: required_role(var, "azure", "VAULT_AZURE_ROLE")?, instance, entra: Box::new(entra) }
+            }
+            other => return Err(format!("VAULT_AUTH must be token, approle, kubernetes, jwt, aws, gcp or azure, not {other:?}")),
         };
         if auth_namespace != AuthNamespace::Same && matches!(auth, Auth::Token { .. }) {
-            return Err("VAULT_AUTH_NAMESPACE is where botd logs in, so it needs VAULT_AUTH=approle, kubernetes or jwt; a token needs no login".into());
+            return Err("VAULT_AUTH_NAMESPACE is where botd logs in, so it needs a VAULT_AUTH that logs in (approle, kubernetes, jwt, aws, gcp or azure); a token needs no login".into());
         }
         let field = var("VAULT_KV_FIELD");
         let field = match field.trim() {
@@ -244,6 +401,58 @@ fn read_jwt(method: JwtMethod, file: &std::path::Path) -> Result<Zeroizing<Strin
     Ok(Zeroizing::new(jwt.to_string()))
 }
 
+/// `{"jwt", "role"}` for the methods that take a JWT. A JWT is base64url and dots, so it
+/// needs no escaping; roles are checked at startup.
+fn jwt_body(jwt: &str, role: Option<&str>) -> Zeroizing<String> {
+    let role = role.map(|r| format!(",\"role\":\"{r}\"")).unwrap_or_default();
+    Zeroizing::new(format!("{{\"jwt\":\"{jwt}\"{role}}}"))
+}
+
+/// The login body of Vault's `aws` method: an STS `GetCallerIdentity` request signed with
+/// `keys` for `sts_url` in `region`, which Vault sends to STS to learn who botd is. The
+/// server id header, when the mount wants one, is signed so the request can't be replayed
+/// to another Vault. Never sent to STS by botd.
+fn aws_body(keys: &aws::Keys, role: Option<&str>, region: &str, sts_url: &url::Url, server_id: Option<&str>) -> Zeroizing<String> {
+    const BODY: &str = "Action=GetCallerIdentity&Version=2011-06-15";
+    const FORM: &str = "application/x-www-form-urlencoded; charset=utf-8";
+    let host = sts_url.host_str().unwrap_or_default();
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let scope = crate::sigv4::Scope { amz_date: &amz_date, region, service: "sts" };
+    let mut headers = vec![("content-type", FORM), ("host", host), ("x-amz-date", amz_date.as_str())];
+    if let Some(t) = &keys.token {
+        headers.push(("x-amz-security-token", t.as_str()));
+    }
+    if let Some(v) = server_id {
+        headers.push((AWS_SERVER_ID_HEADER, v));
+    }
+    let (signed, sig) = crate::sigv4::signature(&keys.secret, &scope, "POST", "/", "", &headers, &crate::sigv4::sha256_hex(BODY.as_bytes()));
+    let authorization = Zeroizing::new(scope.authorization(&keys.id, &signed, &sig));
+    let mut sent = serde_json::Map::new();
+    sent.insert("Authorization".into(), json!([authorization.as_str()]));
+    for (k, v) in &headers {
+        let name = match *k {
+            "content-type" => "Content-Type",
+            "host" => "Host",
+            "x-amz-date" => "X-Amz-Date",
+            "x-amz-security-token" => "X-Amz-Security-Token",
+            _ => "X-Vault-AWS-IAM-Server-ID",
+        };
+        sent.insert(name.into(), json!([v]));
+    }
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let headers = Zeroizing::new(Value::Object(sent).to_string());
+    let mut body = json!({
+        "iam_http_request_method": "POST",
+        "iam_request_url": b64(sts_url.as_str().as_bytes()),
+        "iam_request_body": b64(BODY.as_bytes()),
+        "iam_request_headers": b64(headers.as_bytes()),
+    });
+    if let Some(r) = role {
+        body["role"] = json!(r);
+    }
+    Zeroizing::new(body.to_string())
+}
+
 impl Vault {
     pub fn new(cfg: Config) -> Result<Vault, String> {
         let http = super::http::client("Vault", cfg.ca.as_deref().map(|pem| ("VAULT_CACERT", pem)), false)?;
@@ -311,16 +520,41 @@ impl Inner {
             Auth::Token { .. } => return Err(Error::Unavailable("Vault: no token".into())),
             Auth::AppRole { mount, role_id, secret_id } => {
                 let body = Zeroizing::new(json!({ "role_id": role_id.as_str(), "secret_id": secret_id.as_str() }).to_string());
-                self.login("approle", mount, None, async { Ok::<_, Error>(body) }).await?
+                self.login(mount, None, async { Ok::<_, Error>(body) }).await?
             }
             Auth::Jwt { method, mount, role, file } => {
                 let body = async {
                     let jwt = read_jwt(*method, file)?;
-                    // A JWT is base64url and dots, so it needs no escaping; roles are checked at startup.
-                    let role = role.as_deref().map(|r| format!(",\"role\":\"{r}\"")).unwrap_or_default();
-                    Ok(Zeroizing::new(format!("{{\"jwt\":\"{}\"{role}}}", jwt.as_str())))
+                    Ok(jwt_body(&jwt, role.as_deref()))
                 };
-                self.login(method.as_str(), mount, role.as_deref(), body).await?
+                self.login(mount, role.as_deref(), body).await?
+            }
+            Auth::Aws { mount, role, region, sts_url, server_id, creds } => {
+                let body = async {
+                    // New keys too when Vault refused its token: they may be what it refused.
+                    let keys = creds.keys(fresh).await?;
+                    Ok(aws_body(&keys, role.as_deref(), region, sts_url, server_id.as_deref()))
+                };
+                self.login(mount, role.as_deref(), body).await?
+            }
+            Auth::Gcp { mount, role, signer, iam, google } => self.login(mount, Some(role), self.gcp_jwt(role, signer.as_deref(), iam, google, fresh)).await?,
+            Auth::Azure { mount, role, instance, entra } => {
+                let body = async {
+                    let token = Zeroizing::new(entra.token(fresh).await.map_err(Error::Unavailable)?.to_string());
+                    let mut body = json!({ "role": role, "jwt": token.as_str() });
+                    if *instance {
+                        let vm = entra.vm().await.map_err(Error::Unavailable)?;
+                        body["subscription_id"] = json!(vm.subscription);
+                        body["resource_group_name"] = json!(vm.resource_group);
+                        // Vault ignores vm_name when vmss_name is given.
+                        match vm.scale_set {
+                            Some(s) => body["vmss_name"] = json!(s),
+                            None => body["vm_name"] = json!(vm.name),
+                        }
+                    }
+                    Ok(Zeroizing::new(body.to_string()))
+                };
+                self.login(mount, Some(role), body).await?
             }
         };
         let value = t.value.clone();
@@ -328,12 +562,52 @@ impl Inner {
         Ok(value)
     }
 
+    /// A JWT for `vault/<role>`, signed by Google's IAM Credentials as `signer` (botd's
+    /// own service account unless set) with botd's own token, for Vault's `gcp` method;
+    /// the login body. A token IAM Credentials refuses is replaced once.
+    async fn gcp_jwt(&self, role: &str, signer: Option<&str>, iam: &str, google: &gcp::Google, fresh: bool) -> Result<Zeroizing<String>, Error> {
+        let signer = match signer {
+            Some(a) => a.to_string(),
+            None => google.principal().await.map_err(Error::Unavailable)?,
+        };
+        let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) + GCP_JWT_SECONDS;
+        let payload = json!({ "aud": format!("vault/{role}"), "sub": signer, "exp": exp }).to_string();
+        let url = format!("{iam}/v1/projects/-/serviceAccounts/{signer}:signJwt");
+        let what = format!("signJwt as {signer}");
+        let mut fresh = fresh;
+        loop {
+            let token = google.token(fresh).await.map_err(Error::Unavailable)?;
+            let res = google.client().post(&url).bearer_auth(token.as_str()).json(&json!({ "payload": payload })).send().await.map_err(|e| unavailable(&what, e))?;
+            let status = res.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED && !fresh {
+                fresh = true;
+                continue;
+            }
+            let body = Zeroizing::new(res.bytes().await.map_err(|e| unavailable(&what, e))?.to_vec());
+            if !status.is_success() {
+                let hint = if status == reqwest::StatusCode::FORBIDDEN { "; botd's identity needs iam.serviceAccounts.signJwt on the account (Service Account Token Creator), and the IAM Credentials API must be on" } else { "" };
+                return Err(Error::Unavailable(format!("Vault: Google's {what} answered {status}{}{hint}", super::http::error_code(&body))));
+            }
+            let v: Value = serde_json::from_slice(&body).map_err(|e| unavailable(&what, e))?;
+            let jwt = v["signedJwt"].as_str().filter(|j| !j.is_empty()).ok_or_else(|| Error::Unavailable(format!("Vault: Google's {what} gave no JWT")))?;
+            let jwt = Zeroizing::new(jwt.to_string());
+            if jwt.split('.').count() != 3 || !jwt.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+                return Err(Error::Unavailable(format!("Vault: Google's {what} gave something that isn't a JWT")));
+            }
+            return Ok(jwt_body(&jwt, Some(role)));
+        }
+    }
+
     /// Logs in at `auth/<mount>/login` with the JSON `body`, in the auth namespace, and
     /// audits it as `secret.vault_login` with the method and role, never a credential.
-    async fn login(&self, method: &'static str, mount: &str, role: Option<&str>, body: impl std::future::Future<Output = Result<Zeroizing<String>, Error>>) -> Result<Token, Error> {
+    async fn login(&self, mount: &str, role: Option<&str>, body: impl std::future::Future<Output = Result<Zeroizing<String>, Error>>) -> Result<Token, Error> {
+        let method = self.cfg.auth.method();
         let what = match method {
             "approle" => "AppRole login",
             "kubernetes" => "Kubernetes login",
+            "aws" => "AWS login",
+            "gcp" => "GCP login",
+            "azure" => "Azure login",
             _ => "JWT login",
         };
         let namespace = self.auth_namespace();
@@ -619,6 +893,19 @@ impl Provider for Vault {
                 let kind = if *method == JwtMethod::Kubernetes { "Kubernetes" } else { "JWT" };
                 format!("{kind} login as {role} at auth/{mount} with the token in {}", file.display())
             }
+            Auth::Aws { mount, role, region, server_id, creds, .. } => {
+                let role = role.as_deref().map_or_else(|| "the role named after its IAM principal".to_string(), |r| format!("role {r}"));
+                let header = if server_id.is_some() { ", with the server id header" } else { "" };
+                format!("AWS login as {role} at auth/{mount}, an STS request signed for {region}{header} with {}", creds.describe())
+            }
+            Auth::Gcp { mount, role, signer, google, .. } => {
+                let who = signer.as_deref().map_or_else(|| "its own service account".to_string(), |a| format!("service account {a}"));
+                format!("GCP login as role {role} at auth/{mount}, a JWT signed as {who} with {}", google.describe())
+            }
+            Auth::Azure { mount, role, instance, entra } => {
+                let vm = if *instance { ", with the VM's details" } else { "" };
+                format!("Azure login as role {role} at auth/{mount}, a token for {} from {}{vm}", entra.resource(), entra.describe())
+            }
         };
         let auth_ns = match &c.auth_namespace {
             AuthNamespace::Same => String::new(),
@@ -688,6 +975,24 @@ pub(crate) mod tests {
         made: Mutex<Vec<String>>,
         /// (lease id, increment asked for) of each `sys/leases/renew`.
         lease_renewals: Mutex<Vec<(String, u64)>>,
+        /// AWS access key id → its secret and session token, as STS knows them.
+        pub aws_keys: Mutex<HashMap<String, (String, Option<String>)>>,
+        /// The `aws` mount's `iam_server_id_header_value`.
+        pub aws_server_id: Mutex<Option<String>>,
+        /// Each `aws` login STS answered: (key id, region, role, the URL it was signed for).
+        pub aws_logins: Mutex<Vec<(String, String, String, String)>>,
+        /// Keys the stand-in instance metadata service handed out.
+        imds_issued: AtomicUsize,
+        /// Google access tokens the stand-in metadata server handed out, and which `signJwt` takes.
+        google_tokens: Mutex<Vec<String>>,
+        /// Each `signJwt`: (account, payload).
+        signed: Mutex<Vec<(String, Value)>>,
+        /// Answers `signJwt` with this status instead, once.
+        sign_status: AtomicUsize,
+        /// The resource each managed identity token was asked for.
+        azure_resources: Mutex<Vec<String>>,
+        /// Each `azure` login's body, its token taken out.
+        azure_logins: Mutex<Vec<Value>>,
     }
 
     pub(crate) type F = Arc<Fake>;
@@ -756,19 +1061,73 @@ pub(crate) mod tests {
         (StatusCode::OK, Json(json!({ "data": { "keys": keys } })))
     }
 
-    /// `auth/approle/login` takes `role-1` and `secret-id-1`; any other mount takes the JWTs in `jwts`.
+    /// What Vault's `aws` method checks of a login before sending its request to STS, and
+    /// what STS checks of the signature: the role it is for, else why it is refused.
+    fn aws_login(f: &Fake, body: &Value) -> Result<String, &'static str> {
+        let decode = |k: &str| body[k].as_str().and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok()).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+        let (url, form) = (decode("iam_request_url"), decode("iam_request_body"));
+        if body["iam_http_request_method"] != "POST" || form != "Action=GetCallerIdentity&Version=2011-06-15" {
+            return Err("not a GetCallerIdentity request");
+        }
+        let headers: HashMap<String, Vec<String>> = serde_json::from_str(&decode("iam_request_headers")).map_err(|_| "headers aren't a map of lists")?;
+        let header = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).and_then(|(_, v)| v.first().cloned()).unwrap_or_default();
+        let auth = header("authorization");
+        let field = |name: &str| auth.split([' ', ',']).find_map(|p| p.strip_prefix(&format!("{name}="))).unwrap_or_default().to_string();
+        let credential = field("Credential");
+        let [id, date, region, "sts", "aws4_request"] = credential.split('/').collect::<Vec<_>>()[..] else { return Err("IncompleteSignature") };
+        let Some((secret, token)) = f.aws_keys.lock().unwrap().get(id).cloned() else { return Err("InvalidClientTokenId") };
+        if token.unwrap_or_default() != header("x-amz-security-token") {
+            return Err("InvalidClientTokenId");
+        }
+        let signed = field("SignedHeaders");
+        if let Some(want) = f.aws_server_id.lock().unwrap().clone()
+            && (header(AWS_SERVER_ID_HEADER) != want || !signed.split(';').any(|h| h == AWS_SERVER_ID_HEADER))
+        {
+            return Err("missing or unsigned server id header");
+        }
+        let host = url::Url::parse(&url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
+        if header("host") != host || !header("x-amz-date").starts_with(date) {
+            return Err("IncompleteSignature");
+        }
+        let values: Vec<(String, String)> = signed.split(';').map(|n| (n.to_string(), header(n))).collect();
+        let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let amz_date = header("x-amz-date");
+        let scope = crate::sigv4::Scope { amz_date: &amz_date, region, service: "sts" };
+        let (_, sig) = crate::sigv4::signature(&secret, &scope, "POST", "/", "", &pairs, &crate::sigv4::sha256_hex(form.as_bytes()));
+        if sig != field("Signature") {
+            return Err("SignatureDoesNotMatch");
+        }
+        // No role: Vault's role named after the principal, here the instance profile's.
+        let role = body["role"].as_str().unwrap_or("botd-role").to_string();
+        f.aws_logins.lock().unwrap().push((id.to_string(), region.to_string(), role.clone(), url));
+        Ok(role)
+    }
+
+    /// `auth/approle/login` takes `role-1` and `secret-id-1`; a body with an STS request
+    /// is checked as Vault's `aws` method does; any other mount takes the JWTs in `jwts`.
     async fn login(State(f): State<F>, Path(mount): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
         f.login_namespaces.lock().unwrap().push(h.get("x-vault-namespace").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string());
-        let method = if mount == "approle" {
+        let method = if body.get("iam_request_headers").is_some() {
+            if aws_login(&f, &body).is_err() {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["error making upstream request: the stand-in's text"] })));
+            }
+            "aws"
+        } else if mount == "approle" {
             if body["role_id"] != "role-1" || body["secret_id"] != "secret-id-1" {
                 return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["invalid role or secret ID"] })));
             }
             "approle"
         } else {
             let role = body.get("role").and_then(Value::as_str);
-            let ok = f.jwts.lock().unwrap().iter().any(|(m, r, j)| *m == mount && r.as_deref() == role && body["jwt"] == j.as_str());
+            // A JWT for `gcp` or `azure` also passes at the `gcp-...` or `azure-...` mounts tests make.
+            let ok = f.jwts.lock().unwrap().iter().any(|(m, r, j)| (*m == mount || mount.starts_with(&format!("{m}-"))) && r.as_deref() == role && body["jwt"] == j.as_str());
             if !ok {
                 return (StatusCode::FORBIDDEN, Json(json!({ "errors": ["permission denied"] })));
+            }
+            if body.get("subscription_id").is_some() || mount.starts_with("azure") {
+                let mut seen = body.clone();
+                seen["jwt"] = json!("<token>");
+                f.azure_logins.lock().unwrap().push(seen);
             }
             "jwt"
         };
@@ -854,7 +1213,93 @@ pub(crate) mod tests {
         (StatusCode::NO_CONTENT, Json(json!({})))
     }
 
-    /// Starts the stand-in on its own thread and runtime; returns its address.
+    /// AWS's instance metadata service (IMDSv2): each fetch of the role's keys gives new ones.
+    async fn imds_token(h: HeaderMap) -> (StatusCode, String) {
+        match h.get("x-aws-ec2-metadata-token-ttl-seconds") {
+            Some(_) => (StatusCode::OK, "imds-session-v".into()),
+            None => (StatusCode::BAD_REQUEST, String::new()),
+        }
+    }
+
+    async fn imds_role(State(f): State<F>, Path(role): Path<String>, h: HeaderMap) -> (StatusCode, String) {
+        if h.get("x-aws-ec2-metadata-token").and_then(|v| v.to_str().ok()) != Some("imds-session-v") {
+            return (StatusCode::UNAUTHORIZED, String::new());
+        }
+        if role.is_empty() {
+            return (StatusCode::OK, "botd-role\n".into());
+        }
+        let n = f.imds_issued.fetch_add(1, Ordering::SeqCst);
+        let (id, secret, token) = (format!("ASIAVAULT{n:07}"), format!("vault-aws-secret-{n}-{}", crate::random_hex(6)), format!("vault-aws-session-{n}-{}", crate::random_hex(6)));
+        f.aws_keys.lock().unwrap().insert(id.clone(), (secret.clone(), Some(token.clone())));
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(6)).to_rfc3339();
+        (StatusCode::OK, json!({ "Code": "Success", "AccessKeyId": id, "SecretAccessKey": secret, "Token": token, "Expiration": expires }).to_string())
+    }
+
+    async fn imds_roles(s: State<F>, h: HeaderMap) -> (StatusCode, String) {
+        imds_role(s, Path(String::new()), h).await
+    }
+
+    /// Google's metadata server: botd's token and its account's email.
+    async fn google_token(State(f): State<F>, h: HeaderMap) -> (StatusCode, Json<Value>) {
+        if h.get("metadata-flavor").and_then(|v| v.to_str().ok()) != Some("Google") {
+            return (StatusCode::FORBIDDEN, Json(json!({})));
+        }
+        let token = format!("ya29.vault-{}", crate::random_hex(8));
+        f.google_tokens.lock().unwrap().push(token.clone());
+        (StatusCode::OK, Json(json!({ "access_token": token, "expires_in": 3599, "token_type": "Bearer" })))
+    }
+
+    async fn google_email(h: HeaderMap) -> (StatusCode, String) {
+        match h.get("metadata-flavor").and_then(|v| v.to_str().ok()) {
+            Some("Google") => (StatusCode::OK, "botd@acme-prod.iam.gserviceaccount.com".into()),
+            _ => (StatusCode::FORBIDDEN, String::new()),
+        }
+    }
+
+    /// IAM Credentials' `signJwt`: takes the metadata server's tokens; signs as any account
+    /// but `denied@...`; the JWT it makes is one the `gcp` mount accepts for the payload's role.
+    async fn sign_jwt(State(f): State<F>, Path(rest): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        let token = h.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or_default().to_string();
+        if !f.google_tokens.lock().unwrap().contains(&token) {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": { "status": "UNAUTHENTICATED" } })));
+        }
+        if let s @ 1.. = f.sign_status.swap(0, Ordering::SeqCst) {
+            return (StatusCode::from_u16(s as u16).unwrap(), Json(json!({ "error": { "status": "UNAVAILABLE", "message": "the stand-in's message" } })));
+        }
+        let Some(account) = rest.strip_suffix(":signJwt") else { return (StatusCode::NOT_FOUND, Json(json!({}))) };
+        if account.starts_with("denied@") {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": { "status": "PERMISSION_DENIED", "message": "Permission 'iam.serviceAccounts.signJwt' denied" } })));
+        }
+        let payload: Value = serde_json::from_str(body["payload"].as_str().unwrap_or_default()).unwrap_or_default();
+        f.signed.lock().unwrap().push((account.to_string(), payload.clone()));
+        let role = payload["aud"].as_str().and_then(|a| a.strip_prefix("vault/")).unwrap_or_default().to_string();
+        let jwt = jwt(account, 600);
+        f.jwts.lock().unwrap().push(("gcp".into(), Some(role), jwt.clone()));
+        (StatusCode::OK, Json(json!({ "keyId": "k1", "signedJwt": jwt })))
+    }
+
+    /// Azure's instance metadata service: a managed identity token, which the `azure`
+    /// mount accepts for role `botd`, and the VM's details (a scale set's instance).
+    async fn azure_token(State(f): State<F>, Query(q): Query<HashMap<String, String>>, h: HeaderMap) -> (StatusCode, Json<Value>) {
+        if h.get("metadata").and_then(|v| v.to_str().ok()) != Some("true") {
+            return (StatusCode::BAD_REQUEST, Json(json!({})));
+        }
+        let resource = q.get("resource").cloned().unwrap_or_default();
+        f.azure_resources.lock().unwrap().push(resource);
+        let token = jwt("mi-principal", 3600);
+        f.jwts.lock().unwrap().push(("azure".into(), Some("botd".into()), token.clone()));
+        (StatusCode::OK, Json(json!({ "access_token": token, "expires_in": "3599", "token_type": "Bearer" })))
+    }
+
+    async fn azure_vm(h: HeaderMap) -> (StatusCode, Json<Value>) {
+        if h.get("metadata").and_then(|v| v.to_str().ok()) != Some("true") {
+            return (StatusCode::BAD_REQUEST, Json(json!({})));
+        }
+        (StatusCode::OK, Json(json!({ "subscriptionId": "00000000-1111-2222-3333-444444444444", "resourceGroupName": "superbot-prod", "name": "botd-vmss_2", "vmScaleSetName": "botd-vmss", "location": "uksouth" })))
+    }
+
+    /// Starts the stand-in on its own thread and runtime; returns its address. The cloud
+    /// metadata services and Google's IAM Credentials answer on the same address.
     pub(crate) fn stand_in() -> (String, F) {
         let f = F::default();
         f.lease.store(3600, Ordering::SeqCst);
@@ -867,6 +1312,14 @@ pub(crate) mod tests {
             .route("/v1/{engine}/creds/{role}", axum::routing::get(creds))
             .route("/v1/sys/leases/revoke/{*lease}", axum::routing::put(revoke))
             .route("/v1/sys/leases/renew/{*lease}", axum::routing::put(renew))
+            .route("/latest/api/token", axum::routing::put(imds_token))
+            .route("/latest/meta-data/iam/security-credentials/", axum::routing::get(imds_roles))
+            .route("/latest/meta-data/iam/security-credentials/{role}", axum::routing::get(imds_role))
+            .route("/computeMetadata/v1/instance/service-accounts/default/token", axum::routing::get(google_token))
+            .route("/computeMetadata/v1/instance/service-accounts/default/email", axum::routing::get(google_email))
+            .route("/v1/projects/-/serviceAccounts/{rest}", axum::routing::post(sign_jwt))
+            .route("/metadata/identity/oauth2/token", axum::routing::get(azure_token))
+            .route("/metadata/instance/compute", axum::routing::get(azure_vm))
             .with_state(Arc::clone(&f));
         (super::super::http::tests::serve(app), f)
     }
@@ -1204,6 +1657,178 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn aws_logs_in_with_an_sts_request_signed_with_botds_own_keys() {
+        let (url, f) = stand_in();
+        put(&f, "server/SMTP_PASSWORD", "aws-login-smtp-1");
+        let (id, secret, token) = ("ASIAENVKEYS0001", format!("vault-env-secret-{}", crate::random_hex(6)), format!("vault-env-session-{}", crate::random_hex(6)));
+        f.aws_keys.lock().unwrap().insert(id.into(), (secret.clone(), Some(token.clone())));
+        *f.aws_server_id.lock().unwrap() = Some("vault.example.com".into());
+        let mount = format!("aws-env-{}", crate::random_hex(4));
+        let pairs = [
+            ("VAULT_AUTH", "aws"),
+            ("VAULT_AWS_MOUNT", mount.as_str()),
+            ("VAULT_AWS_ROLE", "superbot"),
+            ("VAULT_AWS_REGION", "eu-west-2"),
+            ("VAULT_AWS_HEADER_VALUE", "vault.example.com"),
+            ("VAULT_AWS_CREDENTIALS", "env"),
+            ("AWS_ACCESS_KEY_ID", id),
+            ("AWS_SECRET_ACCESS_KEY", secret.as_str()),
+            ("AWS_SESSION_TOKEN", token.as_str()),
+            ("VAULT_NAMESPACE", "admin/team-a"),
+            ("VAULT_AUTH_NAMESPACE", "admin"),
+        ];
+        let s = vault(&url, &pairs, Duration::ZERO);
+        assert!(s.describe().contains("AWS login as role superbot at auth/") && s.describe().contains("signed for eu-west-2, with the server id header with temporary access keys from the environment"), "{}", s.describe());
+        assert_eq!(s.get("SMTP_PASSWORD").unwrap().unwrap().expose(), "aws-login-smtp-1");
+        assert_eq!(*f.aws_logins.lock().unwrap(), [(id.to_string(), "eu-west-2".to_string(), "superbot".to_string(), "https://sts.eu-west-2.amazonaws.com/".to_string())], "signed for the region's STS, as the mount's sts_endpoint must be");
+        assert_eq!(*f.login_namespaces.lock().unwrap(), ["admin"]);
+        let ev = audited(&mount);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].details, json!({ "method": "aws", "role": "superbot", "namespace": "admin" }));
+        assert!(!format!("{ev:?}").contains(&secret) && !format!("{ev:?}").contains(&token));
+        // botd's keys are kept from Bots while it signs in with them.
+        assert!(super::super::check_name("AWS_SECRET_ACCESS_KEY").is_err() && super::super::check_name("AWS_SESSION_TOKEN").is_err());
+
+        // A server id that isn't the mount's: Vault refuses the login, and the read fails closed.
+        *f.aws_server_id.lock().unwrap() = Some("vault-prod.example.com".into());
+        f.tokens.lock().unwrap().clear();
+        let e = s.get("SMTP_PASSWORD").err().unwrap().to_string();
+        assert!(e.contains("AWS login at auth/") && e.contains("answered 400") && !e.contains("stand-in's text"), "{e}");
+        assert!(audited(&mount).iter().any(|e| e.outcome == Outcome::Failure && e.details["method"] == "aws"));
+        let logged = format!("{:?}", audited(&mount));
+        assert!(!logged.contains(&secret) && !logged.contains(&token) && !logged.contains("Signature="), "no key or signature in the audit log");
+
+        // us-east-1, the mount's default: STS's global endpoint, and no role (the principal's name).
+        *f.aws_server_id.lock().unwrap() = None;
+        let s = vault(&url, &[pairs[0], pairs[5], pairs[6], pairs[7], pairs[8]], Duration::ZERO);
+        assert!(s.describe().contains("AWS login as the role named after its IAM principal at auth/aws"), "{}", s.describe());
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        let last = f.aws_logins.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((last.1.as_str(), last.2.as_str(), last.3.as_str()), ("us-east-1", "botd-role", "https://sts.amazonaws.com/"));
+        for v in ["aws-login-smtp-1", secret.as_str(), token.as_str()] {
+            redact::forget(v);
+        }
+    }
+
+    #[test]
+    fn aws_login_takes_keys_from_the_instance_profile_and_new_ones_when_vault_refuses() {
+        let (url, f) = stand_in();
+        put(&f, "bots/AWS_LOGIN_API_KEY", "aws-imds-value-1");
+        let mount = format!("aws-imds-{}", crate::random_hex(4));
+        let s = vault(&url, &[("VAULT_AUTH", "aws"), ("VAULT_AWS_MOUNT", &mount), ("VAULT_AWS_CREDENTIALS", "instance-profile"), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", &url)], Duration::ZERO);
+        assert!(s.describe().contains("with the instance profile (IMDSv2)"), "{}", s.describe());
+        assert_eq!(s.get("AWS_LOGIN_API_KEY").unwrap().unwrap().expose(), "aws-imds-value-1");
+        s.get("AWS_LOGIN_API_KEY").unwrap();
+        assert_eq!((f.imds_issued.load(Ordering::SeqCst), f.logins.load(Ordering::SeqCst)), (1, 1), "the keys and Vault's token are kept while they last");
+        let (first, ..) = f.aws_logins.lock().unwrap()[0].clone();
+        let first_secret = f.aws_keys.lock().unwrap()[&first].0.clone();
+        assert_eq!(redact::text(&first_secret), redact::MARK, "botd's keys are masked while it holds them");
+
+        // Vault revokes botd's token: the next login signs with new keys.
+        f.tokens.lock().unwrap().clear();
+        assert!(s.get("AWS_LOGIN_API_KEY").unwrap().is_some());
+        assert_eq!(f.imds_issued.load(Ordering::SeqCst), 2);
+        let ids: Vec<String> = f.aws_logins.lock().unwrap().iter().map(|l| l.0.clone()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(redact::text(&first_secret), redact::MARK, "the old keys are let go");
+        let fetched = audited("vault").into_iter().filter(|e| e.action == "secret.backend_login" && e.details["method"] == "instance-profile").count();
+        assert!(fetched >= 2, "each fetch of keys is audited as the vault store's");
+
+        // No instance profile: fails closed, audited as a failed login, nothing sent to Vault.
+        let logins = f.logins.load(Ordering::SeqCst);
+        let none = vault(&url, &[("VAULT_AUTH", "aws"), ("VAULT_AWS_MOUNT", &mount), ("VAULT_AWS_CREDENTIALS", "instance-profile"), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:9")], Duration::ZERO);
+        let e = none.check().err().unwrap().to_string();
+        assert!(e.contains("AWS (for Vault): instance-profile sign-in"), "{e}");
+        assert_eq!(f.logins.load(Ordering::SeqCst), logins);
+        assert!(audited(&mount).iter().any(|e| e.outcome == Outcome::Failure && e.details["error"] == "unavailable"));
+        redact::forget("aws-imds-value-1");
+    }
+
+    #[test]
+    fn gcp_logs_in_with_a_jwt_google_signs_as_botds_service_account() {
+        let (url, f) = stand_in();
+        put(&f, "server/SMTP_PASSWORD", "gcp-login-smtp-1");
+        let host = url.trim_start_matches("http://").to_string();
+        let base = [("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "superbot"), ("GCE_METADATA_HOST", host.as_str()), ("GCP_IAM_CREDENTIALS_ENDPOINT", url.as_str())];
+        let s = vault(&url, &base, Duration::ZERO);
+        assert!(s.describe().contains("GCP login as role superbot at auth/gcp, a JWT signed as its own service account with the metadata server's service account at"), "{}", s.describe());
+        assert_eq!(s.get("SMTP_PASSWORD").unwrap().unwrap().expose(), "gcp-login-smtp-1");
+        let (account, payload) = f.signed.lock().unwrap()[0].clone();
+        assert_eq!(account, "botd@acme-prod.iam.gserviceaccount.com", "the metadata server's account");
+        assert_eq!((payload["aud"].as_str(), payload["sub"].as_str()), (Some("vault/superbot"), Some(account.as_str())));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let exp = payload["exp"].as_u64().unwrap();
+        assert!(exp > now && exp <= now + GCP_JWT_SECONDS, "within the 15 minutes Vault's roles allow: {exp} vs {now}");
+        let ev = audited("gcp");
+        assert!(ev.iter().any(|e| e.outcome == Outcome::Success && e.details == json!({ "method": "gcp", "role": "superbot" })), "{ev:?}");
+
+        // Another account, which botd may sign as.
+        let s = vault(&url, &[base[0], base[1], base[2], base[3], ("VAULT_GCP_SERVICE_ACCOUNT", "vault-login@acme-prod.iam.gserviceaccount.com")], Duration::ZERO);
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        assert_eq!(f.signed.lock().unwrap().last().unwrap().0, "vault-login@acme-prod.iam.gserviceaccount.com");
+
+        // Google revokes botd's token while Vault's lasts: at the next login, two thirds
+        // through Vault's lease, IAM Credentials refuses it, and one new token is fetched.
+        f.lease.store(3, Ordering::SeqCst);
+        let s = vault(&url, &[base[0], base[1], base[2], base[3], ("VAULT_GCP_SERVICE_ACCOUNT", "vault-login@acme-prod.iam.gserviceaccount.com")], Duration::ZERO);
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        f.google_tokens.lock().unwrap().clear();
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        assert_eq!(f.google_tokens.lock().unwrap().len(), 1);
+        f.lease.store(3600, Ordering::SeqCst);
+
+        // An account botd may not sign as: the role to grant is named, never Google's text.
+        let denied = vault(&url, &[base[0], base[1], base[2], base[3], ("VAULT_GCP_SERVICE_ACCOUNT", "denied@acme-prod.iam.gserviceaccount.com")], Duration::ZERO);
+        let e = denied.check().err().unwrap().to_string();
+        assert!(e.contains("403") && e.contains("Service Account Token Creator") && !e.contains("stand-in"), "{e}");
+        f.sign_status.store(503, Ordering::SeqCst);
+        f.tokens.lock().unwrap().clear();
+        let e = s.check().err().unwrap().to_string();
+        assert!(e.contains("signJwt as vault-login@acme-prod.iam.gserviceaccount.com answered 503") && !e.contains("stand-in's message"), "{e}");
+        assert!(audited("gcp").iter().any(|e| e.outcome == Outcome::Failure && e.details["role"] == "superbot"));
+        redact::forget("gcp-login-smtp-1");
+    }
+
+    fn azure_vault(url: &str, extra: &[(&str, &str)]) -> Arc<ExternalStore> {
+        let mut pairs = vec![("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "botd")];
+        pairs.extend_from_slice(extra);
+        let mut cfg = Config::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap();
+        if let Auth::Azure { entra, .. } = &mut cfg.auth {
+            entra.point_at(url);
+        }
+        Arc::new(ExternalStore::new(Box::new(Vault::new(cfg).unwrap()), Duration::ZERO))
+    }
+
+    #[test]
+    fn azure_logs_in_with_the_managed_identitys_token_and_the_vms_details() {
+        let (url, f) = stand_in();
+        put(&f, "bots/AZURE_LOGIN_API_KEY", "azure-login-value-1");
+        let s = azure_vault(&url, &[]);
+        assert!(s.describe().contains("Azure login as role botd at auth/azure, a token for https://management.azure.com/ from managed identity"), "{}", s.describe());
+        assert_eq!(s.get("AZURE_LOGIN_API_KEY").unwrap().unwrap().expose(), "azure-login-value-1");
+        assert_eq!(*f.azure_resources.lock().unwrap(), ["https://management.azure.com/"], "the azure mount's default resource");
+        assert_eq!(f.azure_logins.lock().unwrap()[0], json!({ "role": "botd", "jwt": "<token>" }), "no VM details unless asked: a role bound only to the principal needs none");
+        assert!(audited("azure").iter().any(|e| e.outcome == Outcome::Success && e.details == json!({ "method": "azure", "role": "botd" })));
+
+        // A role bound to the scale set: its details from instance metadata, vmss_name over vm_name.
+        let s = azure_vault(&url, &[("VAULT_AZURE_INSTANCE", "1"), ("VAULT_AZURE_RESOURCE", "api://vault-prod"), ("AZURE_CLIENT_ID", "11111111-2222-3333-4444-555555555555")]);
+        assert!(s.describe().contains("a token for api://vault-prod from user-assigned managed identity 11111111-2222-3333-4444-555555555555, with the VM's details"), "{}", s.describe());
+        assert!(s.get("AZURE_LOGIN_API_KEY").unwrap().is_some());
+        assert_eq!(f.azure_resources.lock().unwrap().last().unwrap(), "api://vault-prod");
+        assert_eq!(
+            f.azure_logins.lock().unwrap()[1],
+            json!({ "role": "botd", "jwt": "<token>", "subscription_id": "00000000-1111-2222-3333-444444444444", "resource_group_name": "superbot-prod", "vmss_name": "botd-vmss" })
+        );
+
+        // A role Vault doesn't know: fails closed.
+        let e = azure_vault(&url, &[("VAULT_AZURE_ROLE", "nobody")]).check().err().unwrap().to_string();
+        assert!(e.contains("Azure login at auth/azure answered 403"), "{e}");
+        redact::forget("azure-login-value-1");
+    }
+
+    #[test]
     fn jwt_files_that_cant_be_used_fail_closed_before_anything_is_sent() {
         let (url, f) = stand_in();
         let expired = jwt("system:serviceaccount:superbot:botd", -120);
@@ -1333,7 +1958,26 @@ pub(crate) mod tests {
             (vec![("VAULT_ADDR", "https://vault.example.com/ui")], "just the scheme"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_KV_PREFIX", "a/../b")], "VAULT_KV_PREFIX"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_KV_MOUNT", "a b")], "VAULT_KV_MOUNT"),
-            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "ldap")], "token, approle, kubernetes or jwt"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "ldap")], "token, approle, kubernetes, jwt, aws, gcp or azure"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_REGION", "eu-west")], "VAULT_AWS_REGION must be"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_ROLE", "a b")], "VAULT_AWS_ROLE must be"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_HEADER_VALUE", "has space")], "VAULT_AWS_HEADER_VALUE must be"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_CREDENTIALS", "env")], "VAULT_AWS_CREDENTIALS=env needs AWS_ACCESS_KEY_ID"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_CREDENTIALS", "keys")], "VAULT_AWS_CREDENTIALS must be chain"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("AWS_EC2_METADATA_DISABLED", "true")], "VAULT_AUTH=aws found no AWS credentials"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_MOUNT", "../aws")], "VAULT_AWS_MOUNT"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp")], "needs VAULT_GCP_ROLE"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "r"), ("VAULT_GCP_SERVICE_ACCOUNT", "not-an-email")], "VAULT_GCP_SERVICE_ACCOUNT must be"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "r"), ("VAULT_GCP_CREDENTIALS", "service-account-key")], "VAULT_GCP_CREDENTIALS=service-account-key needs GCP_SERVICE_ACCOUNT_KEY_FILE"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "r"), ("GCP_IAM_CREDENTIALS_ENDPOINT", "http://iam.example.com")], "GCP_IAM_CREDENTIALS_ENDPOINT"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure")], "needs VAULT_AZURE_ROLE"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "r"), ("VAULT_AZURE_CREDENTIALS", "msi")], "VAULT_AZURE_CREDENTIALS must be managed-identity"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "r"), ("VAULT_AZURE_RESOURCE", "a b")], "VAULT_AZURE_RESOURCE must be"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "r"), ("VAULT_AZURE_INSTANCE", "yes")], "VAULT_AZURE_INSTANCE must be 1 or 0"),
+            (
+                vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "r"), ("VAULT_AZURE_INSTANCE", "1"), ("IDENTITY_ENDPOINT", "http://127.0.0.1:41000/msi/token"), ("IDENTITY_HEADER", "h-1")],
+                "VAULT_AZURE_INSTANCE=1 reads the VM's details",
+            ),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "approle")], "VAULT_ROLE_ID"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "kubernetes")], "needs VAULT_KUBERNETES_ROLE"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "kubernetes"), ("VAULT_KUBERNETES_ROLE", "bad role")], "VAULT_KUBERNETES_ROLE must be a Vault role name"),
@@ -1341,7 +1985,7 @@ pub(crate) mod tests {
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt")], "needs VAULT_JWT_FILE"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt"), ("VAULT_JWT_FILE", "/f"), ("VAULT_JWT_ROLE", "r\"}")], "VAULT_JWT_ROLE must be"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt"), ("VAULT_JWT_FILE", "/f"), ("VAULT_AUTH_NAMESPACE", "a/../b")], "VAULT_AUTH_NAMESPACE"),
-            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH_NAMESPACE", "admin")], "needs VAULT_AUTH=approle, kubernetes or jwt"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH_NAMESPACE", "admin")], "needs a VAULT_AUTH that logs in"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_CACERT", "/nonexistent/ca.pem")], "VAULT_CACERT"),
         ] {
             let e = ok(&pairs).err().unwrap_or_default();
@@ -1356,6 +2000,15 @@ pub(crate) mod tests {
         let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "jwt"), ("VAULT_JWT_FILE", " /run/oidc/token "), ("VAULT_AUTH_NAMESPACE", "/")]), &none).unwrap();
         assert!(matches!(&c.auth, Auth::Jwt { method: JwtMethod::Jwt, mount, role: None, file } if mount == "jwt" && file.to_str() == Some("/run/oidc/token")));
         assert_eq!(c.auth_namespace, AuthNamespace::Root);
+        // Cloud sign-in needs no secret either: the instance profile, metadata server or managed identity.
+        let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws")]), &none).unwrap();
+        assert!(matches!(&c.auth, Auth::Aws { mount, role: None, region, sts_url, server_id: None, creds } if mount == "aws" && region == "us-east-1" && sts_url.as_str() == "https://sts.amazonaws.com/" && creds.describe() == "the instance profile (IMDSv2)"));
+        let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_REGION", "cn-north-1")]), &none).unwrap();
+        assert!(matches!(&c.auth, Auth::Aws { sts_url, .. } if sts_url.as_str() == "https://sts.cn-north-1.amazonaws.com.cn/"));
+        let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "superbot")]), &none).unwrap();
+        assert!(matches!(&c.auth, Auth::Gcp { mount, signer: None, iam, .. } if mount == "gcp" && iam == gcp::IAM_CREDENTIALS));
+        let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "superbot"), ("VAULT_AUTH_NAMESPACE", "admin")]), &none).unwrap();
+        assert!(matches!(&c.auth, Auth::Azure { mount, instance: false, entra, .. } if mount == "azure" && entra.resource() == AZURE_RESOURCE));
     }
 
     #[test]
@@ -1366,7 +2019,13 @@ pub(crate) mod tests {
             let s = Secrets::new(vec![Box::new(EnvStore::fixed(&[(var, file.to_str().unwrap())]))]);
             assert!(s.try_harness_env().unwrap().is_empty() && s.try_inherited_harness_env().unwrap().is_empty() && s.list().unwrap().is_empty(), "{var}");
         }
-        for name in ["VAULT_TOKEN", "VAULT_SECRET_ID", "VAULT_ROLE_ID", "VAULT_JWT", "VAULT_KUBERNETES_TOKEN"] {
+        // Cloud sign-in: AWS keys botd signs Vault's logins with are kept from Bots once chosen;
+        // Google's key and Entra's client secret always are.
+        let aws = [("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_CREDENTIALS", "env")];
+        let keys = EnvStore::fixed(&[("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"), ("AWS_SECRET_ACCESS_KEY", "vault-bots-aws-secret")]);
+        Config::from_env(&settings(&aws), &keys).unwrap();
+        redact::forget("vault-bots-aws-secret");
+        for name in ["VAULT_TOKEN", "VAULT_SECRET_ID", "VAULT_ROLE_ID", "VAULT_JWT", "VAULT_KUBERNETES_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GCP_SERVICE_ACCOUNT_KEY", "AZURE_CLIENT_SECRET"] {
             assert!(super::super::check_name(name).is_err(), "{name} is reserved");
             let s = Secrets::new(vec![Box::new(EnvStore::fixed(&[(name, "hvs.0123456789abcdef")]))]);
             assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty() && s.list().unwrap().is_empty(), "{name}");

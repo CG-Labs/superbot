@@ -270,7 +270,8 @@ async fn bearer(label: &str, req: reqwest::RequestBuilder, what: &str) -> Result
 
 /// botd's own token for `resource`, however it signs in.
 async fn sign_in(label: &str, http: &reqwest::Client, local: &reqwest::Client, auth: &Auth, authority: &str, identity: &Identity, resource: &str) -> Result<Bearer, Error> {
-    let scope = format!("{resource}/.default");
+    // `https://management.azure.com/` is how a managed identity's resource is written.
+    let scope = format!("{}/.default", resource.trim_end_matches('/'));
     let req = match auth {
         Auth::ManagedIdentity { client_id } => managed_identity(local, identity, resource, client_id.as_deref())?,
         Auth::ClientSecret { tenant, client_id, secret } => {
@@ -339,6 +340,31 @@ impl Entra {
         Ok(value)
     }
 
+    /// Whether botd's identity is a VM's (or scale set's), through its instance metadata
+    /// service, which can say which VM this is.
+    pub fn on_vm(&self) -> bool {
+        matches!((&self.auth, &self.identity), (Auth::ManagedIdentity { .. }, Identity::Imds(_)))
+    }
+
+    /// The VM botd runs on, from its instance metadata service: for Vault's `azure`
+    /// method, whose roles may be bound to subscriptions, resource groups or scale sets.
+    pub async fn vm(&self) -> Result<Vm, String> {
+        let Identity::Imds(base) = &self.identity else { return Err(format!("{}: only a VM's instance metadata service says which VM this is", self.label)) };
+        let what = format!("{}: the VM's instance metadata", self.label);
+        let url = http::with_query(&format!("{base}/metadata/instance/compute"), &[("api-version", "2021-02-01")]).map_err(|e| e.to_string())?;
+        let res = self.local.get(url).header("Metadata", "true").send().await.map_err(|e| format!("{what}: {e}"))?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(format!("{what} answered {status}"));
+        }
+        let v: Value = res.json().await.map_err(|e| format!("{what}: {e}"))?;
+        let field = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() <= 256 && !s.contains(|c: char| c.is_control())).map(String::from);
+        let (Some(subscription), Some(resource_group), Some(name)) = (field("subscriptionId"), field("resourceGroupName"), field("name")) else {
+            return Err(format!("{what} has no subscription, resource group or VM name"));
+        };
+        Ok(Vm { subscription, resource_group, name, scale_set: field("vmScaleSetName") })
+    }
+
     /// Signs in at `base` instead: a stand-in for Entra ID and the instance metadata service.
     #[cfg(test)]
     pub fn point_at(&mut self, base: &str) {
@@ -347,6 +373,15 @@ impl Entra {
             self.identity = Identity::Imds(base.to_string());
         }
     }
+}
+
+/// A VM, as its instance metadata service describes it.
+pub struct Vm {
+    pub subscription: String,
+    pub resource_group: String,
+    pub name: String,
+    /// Set for a scale set's instances.
+    pub scale_set: Option<String>,
 }
 
 impl Drop for Entra {

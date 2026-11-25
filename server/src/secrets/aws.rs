@@ -8,7 +8,8 @@
 //! access keys in the environment, a web identity token (EKS IRSA), the container
 //! endpoint (ECS, EKS Pod Identity) or the instance profile (IMDSv2 only). Temporary
 //! keys are renewed two thirds of the way through their life, and once more whenever
-//! Secrets Manager says they have expired.
+//! Secrets Manager says they have expired. That chain (`Credentials`) also signs Vault's
+//! `aws` logins (ADR 0260).
 //!
 //! It is also the `leases::Issuer` of `AWS_RUN_CREDENTIALS` (ADR 0194): an STS
 //! `AssumeRole` session for each run, signed with the same keys, named after the Bot so
@@ -226,11 +227,50 @@ pub fn reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String
     if !var("AWS_WEB_IDENTITY_TOKEN_FILE").trim().is_empty() || !var("AWS_RUN_CREDENTIALS").trim().is_empty() {
         out.push(("AWS_ENDPOINT_URL_STS", sts, "AWS STS, for web identity and runs' sessions"));
     }
-    if let Some(url) = container_url(var)? {
-        out.push(("AWS_CONTAINER_CREDENTIALS_FULL_URI", url, "the container's credentials endpoint"));
-    }
-    if !var("AWS_EC2_METADATA_SERVICE_ENDPOINT").trim().is_empty() {
-        out.push(("AWS_EC2_METADATA_SERVICE_ENDPOINT", metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))?, "the instance metadata service"));
+    out.extend(credentials_reach(var, "AWS_SECRETS_MANAGER_AUTH")?);
+    Ok(out)
+}
+
+/// The source `source_from_env` takes botd's keys from, judged from the settings alone:
+/// the one `method_var` names, or for `chain` the first that is set, as it picks them.
+pub fn chosen_source(var: &dyn Fn(&str) -> String, method_var: &str) -> Result<&'static str, String> {
+    let set = |k: &str| !var(k).trim().is_empty();
+    // As the environment store reads it: an empty key file is no key, so the chain goes on;
+    // one that can't be read stops botd at startup, so the chain ends there.
+    let key_set = || match var("AWS_ACCESS_KEY_ID").trim() {
+        "" => match var("AWS_ACCESS_KEY_ID_FILE").trim() {
+            "" => false,
+            f => std::fs::read_to_string(f).map(|v| !v.trim().is_empty()).unwrap_or(true),
+        },
+        _ => true,
+    };
+    Ok(match var(method_var).trim() {
+        "" | "chain" if key_set() => "env",
+        "" | "chain" if set("AWS_WEB_IDENTITY_TOKEN_FILE") => "web-identity",
+        "" | "chain" if set("AWS_CONTAINER_CREDENTIALS_FULL_URI") || set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") => "container",
+        "" | "chain" | "instance-profile" => "instance-profile",
+        "env" => "env",
+        "web-identity" => "web-identity",
+        "container" => "container",
+        other => return Err(format!("{method_var} must be chain, env, web-identity, container or instance-profile, not {other:?}")),
+    })
+}
+
+/// Where botd's keys come from beyond STS for web identity, for the source `method_var`
+/// chooses only: the container's endpoint, or the instance metadata service when it is set
+/// (its default is link-local).
+pub fn credentials_reach(var: &dyn Fn(&str) -> String, method_var: &str) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+    let mut out = Vec::new();
+    match chosen_source(var, method_var)? {
+        "container" => {
+            if let Some(url) = container_url(var)? {
+                out.push(("AWS_CONTAINER_CREDENTIALS_FULL_URI", url, "the container's credentials endpoint"));
+            }
+        }
+        "instance-profile" if !var("AWS_EC2_METADATA_SERVICE_ENDPOINT").trim().is_empty() => {
+            out.push(("AWS_EC2_METADATA_SERVICE_ENDPOINT", metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))?, "the instance metadata service"));
+        }
+        _ => {}
     }
     Ok(out)
 }
@@ -239,93 +279,102 @@ impl Config {
     /// `AWS_*` settings; credentials come from `store` (the environment), so `_FILE` works.
     pub fn from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Config, String> {
         let (region, endpoint, sts) = endpoints(var)?;
-        let secret = |k: &str| -> Result<Option<Zeroizing<String>>, String> {
-            let v = store.get(k).map_err(|e| format!("{k}: {e}"))?;
-            Ok(v.map(|v| Zeroizing::new(v.expose().trim().to_string())).filter(|v| !v.is_empty()))
-        };
-        let env_keys = || -> Result<Option<Keys>, String> {
-            match (secret("AWS_ACCESS_KEY_ID")?, secret("AWS_SECRET_ACCESS_KEY")?) {
-                (None, None) => Ok(None),
-                (Some(id), Some(key)) => {
-                    if id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
-                        return Err("AWS_ACCESS_KEY_ID must be an access key id like AKIAIOSFODNN7EXAMPLE".into());
-                    }
-                    let token = secret("AWS_SESSION_TOKEN")?;
-                    if !plain(&key) || token.as_ref().is_some_and(|t| !plain(t)) {
-                        return Err("AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN can't have spaces in them".into());
-                    }
-                    redact::register(&key);
-                    if let Some(t) = &token {
-                        redact::register(t);
-                    }
-                    Ok(Some(Keys { id: id.to_string(), secret: key, token }))
-                }
-                _ => Err("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together".into()),
-            }
-        };
-        let web_identity = || -> Result<Option<Source>, String> {
-            let file = var("AWS_WEB_IDENTITY_TOKEN_FILE");
-            if file.trim().is_empty() {
-                return Ok(None);
-            }
-            let role_arn = var("AWS_ROLE_ARN").trim().to_string();
-            if !(role_arn.starts_with("arn:aws") && role_arn.contains(":role/") && role_arn.len() <= 2048 && plain(&role_arn)) {
-                return Err("AWS_WEB_IDENTITY_TOKEN_FILE needs AWS_ROLE_ARN, the role to assume, like arn:aws:iam::123456789012:role/botd".into());
-            }
-            let session_name = match var("AWS_ROLE_SESSION_NAME").trim() {
-                "" => "superbot-botd".to_string(),
-                s if (2..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b)) => s.to_string(),
-                s => return Err(format!("AWS_ROLE_SESSION_NAME must be 2 to 64 letters, digits and +=,.@_-, not {s:?}")),
-            };
-            Ok(Some(Source::WebIdentity { role_arn, session_name, token_file: PathBuf::from(file.trim()), sts: sts.clone() }))
-        };
-        let container = || -> Result<Option<Source>, String> {
-            let Some(url) = container_url(var)? else { return Ok(None) };
-            let file = var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
-            let token = match file.trim() {
-                "" => match secret("AWS_CONTAINER_AUTHORIZATION_TOKEN")? {
-                    Some(t) if !plain(&t) => return Err("AWS_CONTAINER_AUTHORIZATION_TOKEN can't have spaces in it".into()),
-                    Some(t) => ContainerToken::Value(t),
-                    None => ContainerToken::None,
-                },
-                _ if !var("AWS_CONTAINER_AUTHORIZATION_TOKEN").trim().is_empty() => {
-                    return Err("Set AWS_CONTAINER_AUTHORIZATION_TOKEN or AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, not both.".into());
-                }
-                f => ContainerToken::File(PathBuf::from(f)),
-            };
-            Ok(Some(Source::Container { url, token }))
-        };
-        let metadata_off = var("AWS_EC2_METADATA_DISABLED").trim().eq_ignore_ascii_case("true");
-        let instance_profile = || -> Result<Source, String> {
-            if metadata_off {
-                return Err("AWS_EC2_METADATA_DISABLED is true, so botd can't use the instance profile".into());
-            }
-            Ok(Source::InstanceProfile { endpoint: metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))? })
-        };
-        let source = match var("AWS_SECRETS_MANAGER_AUTH").trim() {
-            // In order, and only as far as the first that has credentials: settings for a
-            // later source botd won't use can't stop it.
-            "" | "chain" => {
-                if let Some(k) = env_keys()? {
-                    Source::Env(k)
-                } else if let Some(w) = web_identity()? {
-                    w
-                } else if let Some(c) = container()? {
-                    c
-                } else if metadata_off {
-                    return Err("SECRETS_BACKEND=aws found no AWS credentials: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN, or the container's credential settings, or unset AWS_EC2_METADATA_DISABLED for the instance profile".into());
-                } else {
-                    instance_profile()?
-                }
-            }
-            "env" => Source::Env(env_keys()?.ok_or("AWS_SECRETS_MANAGER_AUTH=env needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or their _FILE)")?),
-            "web-identity" => web_identity()?.ok_or("AWS_SECRETS_MANAGER_AUTH=web-identity needs AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN (EKS sets them)")?,
-            "container" => container()?.ok_or("AWS_SECRETS_MANAGER_AUTH=container needs AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or AWS_CONTAINER_CREDENTIALS_FULL_URI (ECS and EKS set them)")?,
-            "instance-profile" => instance_profile()?,
-            other => return Err(format!("AWS_SECRETS_MANAGER_AUTH must be chain, env, web-identity, container or instance-profile, not {other:?}")),
-        };
+        let source = source_from_env(var, store, "AWS_SECRETS_MANAGER_AUTH", "SECRETS_BACKEND=aws", &sts)?;
         Ok(Config { region, endpoint, prefix: prefix_setting(&var("AWS_SECRETS_MANAGER_PREFIX"))?, source, sts })
     }
+}
+
+/// Where botd's own AWS keys come from: the source `method_var` names (`chain`, the
+/// default, takes the first of AWS's standard chain that has credentials), from the
+/// standard `AWS_*` settings. `needed_by` names what wants them in errors; `sts` is where
+/// a web identity token is traded. Secrets Manager reads `AWS_SECRETS_MANAGER_AUTH`;
+/// Vault's `aws` sign-in, `VAULT_AWS_CREDENTIALS` (ADR 0260).
+pub fn source_from_env(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, method_var: &str, needed_by: &str, sts: &str) -> Result<Source, String> {
+    let secret = |k: &str| -> Result<Option<Zeroizing<String>>, String> {
+        let v = store.get(k).map_err(|e| format!("{k}: {e}"))?;
+        Ok(v.map(|v| Zeroizing::new(v.expose().trim().to_string())).filter(|v| !v.is_empty()))
+    };
+    let env_keys = || -> Result<Option<Keys>, String> {
+        match (secret("AWS_ACCESS_KEY_ID")?, secret("AWS_SECRET_ACCESS_KEY")?) {
+            (None, None) => Ok(None),
+            (Some(id), Some(key)) => {
+                if id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return Err("AWS_ACCESS_KEY_ID must be an access key id like AKIAIOSFODNN7EXAMPLE".into());
+                }
+                let token = secret("AWS_SESSION_TOKEN")?;
+                if !plain(&key) || token.as_ref().is_some_and(|t| !plain(t)) {
+                    return Err("AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN can't have spaces in them".into());
+                }
+                redact::register(&key);
+                if let Some(t) = &token {
+                    redact::register(t);
+                }
+                Ok(Some(Keys { id: id.to_string(), secret: key, token }))
+            }
+            _ => Err("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together".into()),
+        }
+    };
+    let web_identity = || -> Result<Option<Source>, String> {
+        let file = var("AWS_WEB_IDENTITY_TOKEN_FILE");
+        if file.trim().is_empty() {
+            return Ok(None);
+        }
+        let role_arn = var("AWS_ROLE_ARN").trim().to_string();
+        if !(role_arn.starts_with("arn:aws") && role_arn.contains(":role/") && role_arn.len() <= 2048 && plain(&role_arn)) {
+            return Err("AWS_WEB_IDENTITY_TOKEN_FILE needs AWS_ROLE_ARN, the role to assume, like arn:aws:iam::123456789012:role/botd".into());
+        }
+        let session_name = match var("AWS_ROLE_SESSION_NAME").trim() {
+            "" => "superbot-botd".to_string(),
+            s if (2..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b)) => s.to_string(),
+            s => return Err(format!("AWS_ROLE_SESSION_NAME must be 2 to 64 letters, digits and +=,.@_-, not {s:?}")),
+        };
+        Ok(Some(Source::WebIdentity { role_arn, session_name, token_file: PathBuf::from(file.trim()), sts: sts.to_string() }))
+    };
+    let container = || -> Result<Option<Source>, String> {
+        let Some(url) = container_url(var)? else { return Ok(None) };
+        let file = var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+        let token = match file.trim() {
+            "" => match secret("AWS_CONTAINER_AUTHORIZATION_TOKEN")? {
+                Some(t) if !plain(&t) => return Err("AWS_CONTAINER_AUTHORIZATION_TOKEN can't have spaces in it".into()),
+                Some(t) => ContainerToken::Value(t),
+                None => ContainerToken::None,
+            },
+            _ if !var("AWS_CONTAINER_AUTHORIZATION_TOKEN").trim().is_empty() => {
+                return Err("Set AWS_CONTAINER_AUTHORIZATION_TOKEN or AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, not both.".into());
+            }
+            f => ContainerToken::File(PathBuf::from(f)),
+        };
+        Ok(Some(Source::Container { url, token }))
+    };
+    let metadata_off = var("AWS_EC2_METADATA_DISABLED").trim().eq_ignore_ascii_case("true");
+    let instance_profile = || -> Result<Source, String> {
+        if metadata_off {
+            return Err("AWS_EC2_METADATA_DISABLED is true, so botd can't use the instance profile".into());
+        }
+        Ok(Source::InstanceProfile { endpoint: metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))? })
+    };
+    Ok(match var(method_var).trim() {
+        // In order, and only as far as the first that has credentials: settings for a
+        // later source botd won't use can't stop it.
+        "" | "chain" => {
+            if let Some(k) = env_keys()? {
+                Source::Env(k)
+            } else if let Some(w) = web_identity()? {
+                w
+            } else if let Some(c) = container()? {
+                c
+            } else if metadata_off {
+                return Err(format!("{needed_by} found no AWS credentials: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN, or the container's credential settings, or unset AWS_EC2_METADATA_DISABLED for the instance profile"));
+            } else {
+                instance_profile()?
+            }
+        }
+        "env" => Source::Env(env_keys()?.ok_or(format!("{method_var}=env needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or their _FILE)"))?),
+        "web-identity" => web_identity()?.ok_or(format!("{method_var}=web-identity needs AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN (EKS sets them)"))?,
+        "container" => container()?.ok_or(format!("{method_var}=container needs AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or AWS_CONTAINER_CREDENTIALS_FULL_URI (ECS and EKS set them)"))?,
+        "instance-profile" => instance_profile()?,
+        other => return Err(format!("{method_var} must be chain, env, web-identity, container or instance-profile, not {other:?}")),
+    })
 }
 
 /// What Secrets Manager answered: the body, or a refusal with its error type
@@ -353,21 +402,25 @@ fn refused(status: reqwest::StatusCode, code: &str, what: &str) -> Error {
     Error::Unavailable(format!("AWS Secrets Manager answered {status}{} for {what}", http::code_suffix(code)))
 }
 
+fn failed(label: &str, what: &str, e: impl std::fmt::Display) -> Error {
+    Error::Unavailable(format!("{label}: {what}: {e}"))
+}
+
 /// Keys from IMDS or the container endpoint, and when to renew them.
-fn keys_from_json(body: &str, what: &str) -> Result<(Keys, Instant), Error> {
-    let v: Value = serde_json::from_str(body).map_err(|e| unavailable(what, e))?;
+fn keys_from_json(label: &str, body: &str, what: &str) -> Result<(Keys, Instant), Error> {
+    let v: Value = serde_json::from_str(body).map_err(|e| failed(label, what, e))?;
     if let Some(code) = v["Code"].as_str().filter(|c| *c != "Success") {
-        return Err(Error::Unavailable(format!("AWS Secrets Manager: {what} answered{}", http::code_suffix(code))));
+        return Err(Error::Unavailable(format!("{label}: {what} answered{}", http::code_suffix(code))));
     }
-    keys(v["AccessKeyId"].as_str(), v["SecretAccessKey"].as_str(), v["Token"].as_str(), v["Expiration"].as_str(), what)
+    keys(label, v["AccessKeyId"].as_str(), v["SecretAccessKey"].as_str(), v["Token"].as_str(), v["Expiration"].as_str(), what)
 }
 
 /// Keys from STS's `AssumeRoleWithWebIdentityResponse`.
-fn keys_from_xml(body: &str, what: &str) -> Result<(Keys, Instant), Error> {
-    let doc = roxmltree::Document::parse(body).map_err(|e| unavailable(what, e))?;
+fn keys_from_xml(label: &str, body: &str, what: &str) -> Result<(Keys, Instant), Error> {
+    let doc = roxmltree::Document::parse(body).map_err(|e| failed(label, what, e))?;
     let creds = doc.descendants().find(|n| n.tag_name().name() == "Credentials");
     let field = |name: &str| creds.and_then(|c| c.children().find(|n| n.tag_name().name() == name)).and_then(|n| n.text()).map(str::trim);
-    keys(field("AccessKeyId"), field("SecretAccessKey"), field("SessionToken"), field("Expiration"), what)
+    keys(label, field("AccessKeyId"), field("SecretAccessKey"), field("SessionToken"), field("Expiration"), what)
 }
 
 /// The short error code in STS's `ErrorResponse`, safe to log, as ` (Code)`.
@@ -422,13 +475,13 @@ fn session_from_xml(body: &str, fields: &[String], run_for: u64, what: &str) -> 
     Ok(Lease { id: arn.to_string(), ttl, renewable: false, fields })
 }
 
-fn keys(id: Option<&str>, secret: Option<&str>, token: Option<&str>, expiration: Option<&str>, what: &str) -> Result<(Keys, Instant), Error> {
+fn keys(label: &str, id: Option<&str>, secret: Option<&str>, token: Option<&str>, expiration: Option<&str>, what: &str) -> Result<(Keys, Instant), Error> {
     let (Some(id), Some(secret)) = (id.filter(|i| plain(i)), secret.filter(|s| plain(s))) else {
-        return Err(Error::Unavailable(format!("AWS Secrets Manager: {what} gave no access key")));
+        return Err(Error::Unavailable(format!("{label}: {what} gave no access key")));
     };
     let token = token.filter(|t| !t.is_empty());
     if token.is_some_and(|t| !plain(t)) {
-        return Err(Error::Unavailable(format!("AWS Secrets Manager: {what} gave a session token that can't be sent")));
+        return Err(Error::Unavailable(format!("{label}: {what} gave a session token that can't be sent")));
     }
     let now = chrono::Utc::now().timestamp();
     let lifetime = expiration.and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok()).map(|e| e.timestamp() - now).and_then(|s| u64::try_from(s).ok());
@@ -436,18 +489,161 @@ fn keys(id: Option<&str>, secret: Option<&str>, token: Option<&str>, expiration:
     Ok((keys, http::renew_at(lifetime)))
 }
 
+/// Sends `req`; its status and text.
+async fn fetch(label: &str, req: reqwest::RequestBuilder, what: &str) -> Result<(reqwest::StatusCode, Zeroizing<String>), Error> {
+    let res = req.send().await.map_err(|e| failed(label, what, e))?;
+    let status = res.status();
+    let body = Zeroizing::new(res.bytes().await.map_err(|e| failed(label, what, e))?.to_vec());
+    let text = std::str::from_utf8(&body).map_err(|_| failed(label, what, "the answer isn't text"))?;
+    Ok((status, Zeroizing::new(text.to_string())))
+}
+
+/// `fetch`, failing on anything but success.
+async fn fetch_ok(label: &str, req: reqwest::RequestBuilder, what: &str) -> Result<Zeroizing<String>, Error> {
+    let (status, text) = fetch(label, req, what).await?;
+    if !status.is_success() {
+        return Err(Error::Unavailable(format!("{label}: {what} answered {status}{}", http::error_code(text.as_bytes()))));
+    }
+    Ok(text)
+}
+
+/// botd's own AWS keys from one `Source`, kept while they last: Secrets Manager's, and
+/// those Vault's `aws` sign-in signs with (ADR 0260). `label` names the service in errors,
+/// and `store` the backend in the `secret.backend_login` audit.
+pub struct Credentials {
+    label: &'static str,
+    store: &'static str,
+    source: Source,
+    http: reqwest::Client,
+    /// For IMDS and the container endpoint, never through a proxy, as in AWS's SDKs: both
+    /// are on this host or its network, where a proxy may not reach.
+    local: reqwest::Client,
+    keys: Mutex<Option<(Keys, Instant)>>,
+}
+
+impl Credentials {
+    pub fn new(label: &'static str, store: &'static str, source: Source) -> Result<Credentials, String> {
+        Ok(Credentials { label, store, source, http: http::client(label, None, false)?, local: http::client(label, None, true)?, keys: Mutex::new(None) })
+    }
+
+    /// Whether keys can be fetched again: not for those fixed in the environment.
+    pub fn renews(&self) -> bool {
+        !matches!(self.source, Source::Env(_))
+    }
+
+    /// The keys to sign with; new ones if `fresh` (the last were refused) or they are due.
+    pub async fn keys(&self, fresh: bool) -> Result<Keys, Error> {
+        if let Source::Env(k) = &self.source {
+            return Ok(k.clone());
+        }
+        if !fresh && let Some((k, _)) = self.keys.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(_, at)| Instant::now() < *at) {
+            return Ok(k.clone());
+        }
+        let result = self.sign_in().await;
+        http::audit_login(self.store, self.source.method(), &result);
+        let (k, at) = result?;
+        // Held rather than registered: Secrets Manager and Vault's sign-in may hold the
+        // same instance profile keys, and one replacing them mustn't unmask the other's.
+        // Under the lock, so overlapping sign-ins can't release the keys that end up kept.
+        let mut kept = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        for v in k.secrets() {
+            redact::hold(v);
+        }
+        if let Some((old, _)) = kept.replace((k.clone(), at)) {
+            for v in old.secrets() {
+                redact::release(v);
+            }
+        }
+        Ok(k)
+    }
+
+    async fn sign_in(&self) -> Result<(Keys, Instant), Error> {
+        let label = self.label;
+        let what = format!("{} sign-in", self.source.method());
+        match &self.source {
+            Source::Env(k) => Ok((k.clone(), Instant::now())),
+            Source::InstanceProfile { endpoint } => {
+                // IMDSv2 only: a session token first, which a forwarded request can't get.
+                let token = fetch_ok(label, self.local.put(format!("{endpoint}/latest/api/token")).header("x-aws-ec2-metadata-token-ttl-seconds", "21600"), &what).await?;
+                let base = format!("{endpoint}/latest/meta-data/iam/security-credentials/");
+                let roles = fetch_ok(label, self.local.get(&base).header("x-aws-ec2-metadata-token", token.as_str()), &what).await?;
+                let role = roles.lines().map(str::trim).find(|l| !l.is_empty());
+                let role = role.filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b)));
+                let role = role.ok_or_else(|| Error::Unavailable(format!("{label}: {what}: this instance has no instance profile")))?;
+                let body = fetch_ok(label, self.local.get(format!("{base}{role}")).header("x-aws-ec2-metadata-token", token.as_str()), &what).await?;
+                keys_from_json(label, &body, &what)
+            }
+            Source::Container { url, token } => {
+                let mut req = self.local.get(url);
+                match token {
+                    ContainerToken::None => {}
+                    ContainerToken::Value(t) => req = req.header("authorization", t.as_str()),
+                    ContainerToken::File(path) => {
+                        let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| failed(label, "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", e))?);
+                        if !plain(text.trim()) {
+                            return Err(Error::Unavailable(format!("{label}: AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE is empty or has spaces in it")));
+                        }
+                        req = req.header("authorization", text.trim());
+                    }
+                }
+                let body = fetch_ok(label, req, &what).await?;
+                keys_from_json(label, &body, &what)
+            }
+            Source::WebIdentity { role_arn, session_name, token_file, sts } => {
+                let text = Zeroizing::new(std::fs::read_to_string(token_file).map_err(|e| failed(label, "AWS_WEB_IDENTITY_TOKEN_FILE", e))?);
+                let jwt = text.trim();
+                if jwt.is_empty() {
+                    return Err(Error::Unavailable(format!("{label}: AWS_WEB_IDENTITY_TOKEN_FILE is empty")));
+                }
+                let form = [
+                    ("Action", "AssumeRoleWithWebIdentity"),
+                    ("Version", "2011-06-15"),
+                    ("RoleArn", role_arn.as_str()),
+                    ("RoleSessionName", session_name.as_str()),
+                    ("WebIdentityToken", jwt),
+                ];
+                let (status, body) = fetch(label, self.http.post(format!("{sts}/")).form(&form), &what).await?;
+                if !status.is_success() {
+                    return Err(Error::Unavailable(format!("{label}: {what} answered {status}{}", xml_code(&body))));
+                }
+                keys_from_xml(label, &body, &what)
+            }
+        }
+    }
+
+    /// Who botd signs in as, for startup lines: never a credential.
+    pub fn describe(&self) -> String {
+        match &self.source {
+            Source::Env(k) if k.token.is_some() => "temporary access keys from the environment".to_string(),
+            Source::Env(_) => "access keys from the environment".to_string(),
+            Source::WebIdentity { role_arn, .. } => format!("web identity as {role_arn}"),
+            Source::Container { .. } => "the container's credentials".to_string(),
+            Source::InstanceProfile { .. } => "the instance profile (IMDSv2)".to_string(),
+        }
+    }
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        if let Some((k, _)) = self.keys.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            for v in k.secrets() {
+                redact::release(v);
+            }
+        }
+    }
+}
+
 struct Inner {
-    cfg: Config,
+    region: String,
+    endpoint: String,
+    prefix: String,
     url: url::Url,
     /// What the `Host` header carries, and so what is signed.
     host: String,
     sts_url: url::Url,
     sts_host: String,
     http: reqwest::Client,
-    /// For IMDS and the container endpoint, never through a proxy, as in AWS's SDKs: both
-    /// are on this host or its network, where a proxy may not reach.
-    local: reqwest::Client,
-    keys: Mutex<Option<(Keys, Instant)>>,
+    creds: Credentials,
 }
 
 #[derive(Clone)]
@@ -469,11 +665,12 @@ fn url_and_host(key: &str, endpoint: &str) -> Result<(url::Url, String), String>
 
 impl SecretsManager {
     pub fn new(cfg: Config) -> Result<SecretsManager, String> {
-        let (url, host) = url_and_host("AWS_ENDPOINT_URL_SECRETS_MANAGER", &cfg.endpoint)?;
-        let (sts_url, sts_host) = url_and_host("AWS_ENDPOINT_URL_STS", &cfg.sts)?;
+        let Config { region, endpoint, prefix, source, sts } = cfg;
+        let (url, host) = url_and_host("AWS_ENDPOINT_URL_SECRETS_MANAGER", &endpoint)?;
+        let (sts_url, sts_host) = url_and_host("AWS_ENDPOINT_URL_STS", &sts)?;
         let http = http::client("AWS Secrets Manager", None, false)?;
-        let local = http::client("AWS Secrets Manager", None, true)?;
-        let inner = Inner { cfg, url, host, sts_url, sts_host, http, local, keys: Mutex::new(None) };
+        let creds = Credentials::new("AWS Secrets Manager", "aws", source)?;
+        let inner = Inner { region, endpoint, prefix, url, host, sts_url, sts_host, http, creds };
         Ok(SecretsManager { inner: Arc::new(inner), worker: Arc::new(Worker::new("AWS Secrets Manager", "aws-secrets")?) })
     }
 }
@@ -481,103 +678,12 @@ impl SecretsManager {
 impl Inner {
     /// The secret's name, or None if it would be too long to exist.
     fn secret_id(&self, scope: &Scope, name: &str) -> Option<String> {
-        let id = format!("{}/{}/{name}", self.cfg.prefix, scope.folder('/'));
+        let id = format!("{}/{}/{name}", self.prefix, scope.folder('/'));
         (id.len() <= MAX_NAME).then_some(id)
     }
 
-    /// The keys to sign with; new ones if `fresh` (the last were refused) or they are due.
     async fn keys(&self, fresh: bool) -> Result<Keys, Error> {
-        if let Source::Env(k) = &self.cfg.source {
-            return Ok(k.clone());
-        }
-        if !fresh && let Some((k, _)) = self.keys.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(_, at)| Instant::now() < *at) {
-            return Ok(k.clone());
-        }
-        let result = self.sign_in().await;
-        http::audit_login("aws", self.cfg.source.method(), &result);
-        let (k, at) = result?;
-        // Under the lock, so overlapping sign-ins can't forget the keys that end up kept.
-        let mut kept = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-        for v in k.secrets() {
-            redact::register(v);
-        }
-        if let Some((old, _)) = kept.replace((k.clone(), at)) {
-            for v in old.secrets().filter(|v| !k.secrets().any(|n| n == *v)) {
-                redact::forget(v);
-            }
-        }
-        Ok(k)
-    }
-
-    /// Sends `req`; its status and text.
-    async fn fetch(&self, req: reqwest::RequestBuilder, what: &str) -> Result<(reqwest::StatusCode, Zeroizing<String>), Error> {
-        let res = req.send().await.map_err(|e| unavailable(what, e))?;
-        let status = res.status();
-        let body = Zeroizing::new(res.bytes().await.map_err(|e| unavailable(what, e))?.to_vec());
-        let text = std::str::from_utf8(&body).map_err(|_| unavailable(what, "the answer isn't text"))?;
-        Ok((status, Zeroizing::new(text.to_string())))
-    }
-
-    /// `fetch`, failing on anything but success.
-    async fn fetch_ok(&self, req: reqwest::RequestBuilder, what: &str) -> Result<Zeroizing<String>, Error> {
-        let (status, text) = self.fetch(req, what).await?;
-        if !status.is_success() {
-            return Err(Error::Unavailable(format!("AWS Secrets Manager: {what} answered {status}{}", http::error_code(text.as_bytes()))));
-        }
-        Ok(text)
-    }
-
-    async fn sign_in(&self) -> Result<(Keys, Instant), Error> {
-        let what = format!("{} sign-in", self.cfg.source.method());
-        match &self.cfg.source {
-            Source::Env(k) => Ok((k.clone(), Instant::now())),
-            Source::InstanceProfile { endpoint } => {
-                // IMDSv2 only: a session token first, which a forwarded request can't get.
-                let token = self.fetch_ok(self.local.put(format!("{endpoint}/latest/api/token")).header("x-aws-ec2-metadata-token-ttl-seconds", "21600"), &what).await?;
-                let base = format!("{endpoint}/latest/meta-data/iam/security-credentials/");
-                let roles = self.fetch_ok(self.local.get(&base).header("x-aws-ec2-metadata-token", token.as_str()), &what).await?;
-                let role = roles.lines().map(str::trim).find(|l| !l.is_empty());
-                let role = role.filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b)));
-                let role = role.ok_or_else(|| Error::Unavailable(format!("AWS Secrets Manager: {what}: this instance has no instance profile")))?;
-                let body = self.fetch_ok(self.local.get(format!("{base}{role}")).header("x-aws-ec2-metadata-token", token.as_str()), &what).await?;
-                keys_from_json(&body, &what)
-            }
-            Source::Container { url, token } => {
-                let mut req = self.local.get(url);
-                match token {
-                    ContainerToken::None => {}
-                    ContainerToken::Value(t) => req = req.header("authorization", t.as_str()),
-                    ContainerToken::File(path) => {
-                        let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| unavailable("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", e))?);
-                        if !plain(text.trim()) {
-                            return Err(Error::Unavailable("AWS Secrets Manager: AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE is empty or has spaces in it".into()));
-                        }
-                        req = req.header("authorization", text.trim());
-                    }
-                }
-                let body = self.fetch_ok(req, &what).await?;
-                keys_from_json(&body, &what)
-            }
-            Source::WebIdentity { role_arn, session_name, token_file, sts } => {
-                let text = Zeroizing::new(std::fs::read_to_string(token_file).map_err(|e| unavailable("AWS_WEB_IDENTITY_TOKEN_FILE", e))?);
-                let jwt = text.trim();
-                if jwt.is_empty() {
-                    return Err(Error::Unavailable("AWS Secrets Manager: AWS_WEB_IDENTITY_TOKEN_FILE is empty".into()));
-                }
-                let form = [
-                    ("Action", "AssumeRoleWithWebIdentity"),
-                    ("Version", "2011-06-15"),
-                    ("RoleArn", role_arn.as_str()),
-                    ("RoleSessionName", session_name.as_str()),
-                    ("WebIdentityToken", jwt),
-                ];
-                let (status, body) = self.fetch(self.http.post(format!("{sts}/")).form(&form), &what).await?;
-                if !status.is_success() {
-                    return Err(Error::Unavailable(format!("AWS Secrets Manager: {what} answered {status}{}", xml_code(&body))));
-                }
-                keys_from_xml(&body, &what)
-            }
-        }
+        self.creds.keys(fresh).await
     }
 
     /// Calls `target` (`GetSecretValue`, ...) with `body`, signed. When Secrets Manager
@@ -589,7 +695,7 @@ impl Inner {
         for fresh in [false, true] {
             let keys = self.keys(fresh).await?;
             let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-            let scope = sigv4::Scope { amz_date: &amz_date, region: &self.cfg.region, service: "secretsmanager" };
+            let scope = sigv4::Scope { amz_date: &amz_date, region: &self.region, service: "secretsmanager" };
             let mut headers = vec![("content-type", JSON), ("host", self.host.as_str()), ("x-amz-date", amz_date.as_str()), ("x-amz-target", target.as_str())];
             if let Some(t) = &keys.token {
                 headers.push(("x-amz-security-token", t.as_str()));
@@ -607,7 +713,7 @@ impl Inner {
                 return Ok(Reply::Ok(reply));
             }
             let code = error_type(header.as_deref(), &reply);
-            if !fresh && !matches!(self.cfg.source, Source::Env(_)) && EXPIRED.contains(&code.as_str()) {
+            if !fresh && self.creds.renews() && EXPIRED.contains(&code.as_str()) {
                 continue;
             }
             return Ok(Reply::Refused(status, code));
@@ -649,7 +755,7 @@ impl Inner {
         for fresh in [false, true] {
             let keys = self.keys(fresh).await?;
             let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-            let scope = sigv4::Scope { amz_date: &amz_date, region: &self.cfg.region, service: "sts" };
+            let scope = sigv4::Scope { amz_date: &amz_date, region: &self.region, service: "sts" };
             let mut headers = vec![("content-type", FORM), ("host", self.sts_host.as_str()), ("x-amz-date", amz_date.as_str())];
             if let Some(t) = &keys.token {
                 headers.push(("x-amz-security-token", t.as_str()));
@@ -659,12 +765,12 @@ impl Inner {
             for (k, v) in headers.iter().filter(|(k, _)| *k != "host") {
                 req = req.header(*k, *v);
             }
-            let (status, text) = self.fetch(req, &what).await?;
+            let (status, text) = fetch("AWS Secrets Manager", req, &what).await?;
             if status.is_success() {
                 return session_from_xml(&text, fields, secs, &what);
             }
             let code = xml_error(&text);
-            if !fresh && !matches!(self.cfg.source, Source::Env(_)) && STS_EXPIRED.contains(&code.as_str()) {
+            if !fresh && self.creds.renews() && STS_EXPIRED.contains(&code.as_str()) {
                 continue;
             }
             let hint = match code.as_str() {
@@ -711,7 +817,7 @@ impl Inner {
     }
 
     async fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
-        let head = format!("{}/{}/", self.cfg.prefix, scope.folder('/'));
+        let head = format!("{}/{}/", self.prefix, scope.folder('/'));
         let mut out = Vec::new();
         let mut next: Option<String> = None;
         for _ in 0..1000 {
@@ -776,15 +882,8 @@ impl Provider for SecretsManager {
     }
 
     fn describe(&self) -> String {
-        let c = &self.inner.cfg;
-        let auth = match &c.source {
-            Source::Env(k) if k.token.is_some() => "temporary access keys from the environment".to_string(),
-            Source::Env(_) => "access keys from the environment".to_string(),
-            Source::WebIdentity { role_arn, .. } => format!("web identity as {role_arn}"),
-            Source::Container { .. } => "the container's credentials".to_string(),
-            Source::InstanceProfile { .. } => "the instance profile (IMDSv2)".to_string(),
-        };
-        format!("AWS Secrets Manager in {} at {}, secrets {}/{{bots,server}}/<NAME>, {auth}", c.region, c.endpoint, c.prefix)
+        let c = &self.inner;
+        format!("AWS Secrets Manager in {} at {}, secrets {}/{{bots,server}}/<NAME>, {}", c.region, c.endpoint, c.prefix, c.creds.describe())
     }
 
     fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {

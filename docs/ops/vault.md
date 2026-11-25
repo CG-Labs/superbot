@@ -139,6 +139,77 @@ The startup line, `botctl secrets backend` and the setup report say how botd log
 
 When a login fails, botd logs the status (`Kubernetes login at auth/kubernetes answered 403 Forbidden`). Vault's own log, or its audit device, has the reason: a role bound to another service account or namespace, the wrong audience, or a cluster Vault can't reach for TokenReview.
 
+## Cloud sign-in (AWS, Google Cloud, Azure)
+
+Design: [ADR 0260](../adr/0260-vault-cloud-sign-in.md). On a cloud VM or container, botd logs in to Vault as its own cloud identity, so it holds no Vault credential. It logs in at startup, two thirds of the way through each Vault token's lease, and whenever Vault refuses the token, and each login proves who it is afresh.
+
+**AWS** (`VAULT_AUTH=aws`, Vault's `aws` method, `iam` type). botd signs an STS `GetCallerIdentity` request with its own AWS keys and sends it to Vault, which sends it on to STS. The keys come from AWS's standard chain, as for Secrets Manager: the instance profile (IMDSv2), the container's credentials (ECS, EKS Pod Identity), web identity (EKS IRSA) or access keys in the environment.
+
+```sh
+vault auth enable aws
+vault write auth/aws/config/client iam_server_id_header_value=vault.example.com
+vault write auth/aws/role/superbot auth_type=iam \
+  bound_iam_principal_arn=arn:aws:iam::<account-id>:role/botd \
+  token_policies=superbot token_ttl=1h
+```
+
+```sh
+SECRETS_BACKEND=vault
+VAULT_ADDR=https://vault.example.com:8200
+VAULT_AUTH=aws
+VAULT_AWS_ROLE=superbot                   # or leave it out for the role named after botd's IAM role
+VAULT_AWS_HEADER_VALUE=vault.example.com  # the mount's iam_server_id_header_value, if set
+# VAULT_AWS_REGION=us-east-1              # the region of the mount's sts_endpoint
+# VAULT_AWS_CREDENTIALS=chain             # or instance-profile, container, web-identity, env
+# VAULT_AWS_MOUNT=aws
+```
+
+Set `iam_server_id_header_value`: without it, anyone holding a signed request botd made for this Vault could replay it to another. `VAULT_AWS_REGION` must match the mount's `sts_endpoint` and `sts_region`. With Vault's default (the global endpoint), leave it as `us-east-1`; with a regional endpoint such as `https://sts.eu-west-2.amazonaws.com`, set both to `eu-west-2`. Vault, not botd, must reach STS. botd needs no IAM permission: `GetCallerIdentity` is always allowed.
+
+**Google Cloud** (`VAULT_AUTH=gcp`, Vault's `gcp` method, `iam` type). botd asks IAM Credentials to sign a JWT for `vault/<role>` as its service account, lasting 10 minutes, and logs in with it. The token for that comes from the metadata server, or a service account key.
+
+```sh
+vault auth enable gcp
+vault write auth/gcp/role/superbot type=iam \
+  bound_service_accounts=botd@<project>.iam.gserviceaccount.com \
+  token_policies=superbot token_ttl=1h
+```
+
+```sh
+VAULT_AUTH=gcp
+VAULT_GCP_ROLE=superbot
+# VAULT_GCP_SERVICE_ACCOUNT=vault-login@<project>.iam.gserviceaccount.com  # default: botd's own
+# VAULT_GCP_CREDENTIALS=metadata          # or service-account-key, with GCP_SERVICE_ACCOUNT_KEY_FILE
+# VAULT_GCP_MOUNT=gcp
+```
+
+botd's service account needs `iam.serviceAccounts.signJwt` on the account it signs as (the Service Account Token Creator role, on itself by default), and the IAM Credentials API must be on. A 403 says so. Vault checks the JWT against the account's public keys, so Vault's own Google credentials need `iam.serviceAccounts.get` and `iam.serviceAccountKeys.get`. Leave the role's `max_jwt_exp` at its default (15 minutes) or more.
+
+**Azure** (`VAULT_AUTH=azure`, Vault's `azure` method). botd logs in with its managed identity's token for the mount's `resource`. It can also use a service principal or AKS workload identity, as Key Vault does.
+
+```sh
+vault auth enable azure
+vault write auth/azure/config tenant_id=<tenant-id> resource=https://management.azure.com/
+vault write auth/azure/role/superbot \
+  bound_service_principal_ids=<managed-identity-object-id> \
+  token_policies=superbot token_ttl=1h
+```
+
+```sh
+VAULT_AUTH=azure
+VAULT_AZURE_ROLE=superbot
+# VAULT_AZURE_RESOURCE=https://management.azure.com/  # the mount's resource
+# VAULT_AZURE_CREDENTIALS=managed-identity            # or client-secret, workload-identity
+# VAULT_AZURE_INSTANCE=1                              # send the VM's details, for roles bound to them
+# VAULT_AZURE_MOUNT=azure
+```
+
+A role bound only to service principal ids needs nothing more. A role bound to a subscription, resource group or scale set needs `VAULT_AZURE_INSTANCE=1`: botd reads the VM's subscription, resource group and name (or scale set) from the instance metadata service and sends them with each login. That needs a managed identity on a VM or scale set, and Vault's own Azure credentials need read access to it.
+
+**What botd shows.** The startup line, `botctl secrets backend` and the setup report say how botd logs in, for example `AWS login as role superbot at auth/aws, an STS request signed for us-east-1, with the server id header with the instance profile (IMDSv2)`. Logins are audited as `secret.vault_login` with `method` (`aws`, `gcp` or `azure`), `role` and `namespace`. Fetching AWS keys is also audited as `secret.backend_login` against the `vault` store. The audit log never has keys, signatures, JWTs or tokens. botd's AWS keys are masked in Bots' output while botd holds them. The credentials botd signs in with, and the settings that lead to them (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` from the environment, `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, the container's token, Google's key, Entra's client secret), are removed from everything botd starts and can't be saved as Bot secrets. `botd offline check` lists the endpoints botd reaches to log in (the metadata servers, IAM Credentials, Entra ID).
+
+When a login fails, botd logs the status only (`Vault: AWS login at auth/aws answered 400 Bad Request`), since Vault's text can echo what was sent. Vault's log has the reason: usually a principal the role doesn't bind, a missing or wrong server id header, or a region that doesn't match the mount's.
+
 ## Each user's own secrets
 
 Off by default ([ADR 0174](../adr/0174-users-secrets-in-the-external-store.md)). With `SECRETS_USER_FOLDERS=1`, botd also reads `secret/superbot/users/<user id>/<NAME>`, and gives those values only to Bots that user owns:
