@@ -1699,7 +1699,8 @@ mod tests {
         put(&f, "superbot-server-SMTP-PASSWORD", "smtp-from-azure-pfx-1");
         let (a, b, c) = (TestCert::new(-1, 30), TestCert::new(-1, 60), TestCert::new(-1, 90));
         f.certs.lock().unwrap().extend([(a.x5t.clone(), a.public.clone()), (b.x5t.clone(), b.public.clone()), (c.x5t.clone(), c.public.clone())]);
-        let password = "pfx-password-0123456789";
+        let (password, another, empty) = (crate::random_hex(12), crate::random_hex(12), String::new());
+        let password = password.as_str();
         let file = cert_file("azure-pfx", a.pfx(password, Aes));
         let dir = file.parent().unwrap().to_path_buf();
         let password_file = dir.join("password");
@@ -1722,7 +1723,7 @@ mod tests {
         // A file the password doesn't open fails closed before Entra is asked, never with
         // the key read before, and never naming the password.
         let calls = f.entra_calls.load(Ordering::SeqCst);
-        for (contents, err) in [(b.pfx("another-password", Aes), "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open it"), (b.encrypted_pem("another-password").into_bytes(), "doesn't open its private key"), (b.pem().into_bytes(), "isn't encrypted")] {
+        for (contents, err) in [(b.pfx(&another, Aes), "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open it"), (b.encrypted_pem(&another).into_bytes(), "doesn't open its private key"), (b.pem().into_bytes(), "isn't encrypted")] {
             std::fs::write(&file, contents).unwrap();
             f.tokens.lock().unwrap().clear();
             let e = s.get("SMTP_PASSWORD").unwrap_err().to_string();
@@ -1734,7 +1735,7 @@ mod tests {
         assert!(!format!("{logins:?}").contains(password));
 
         // A PFX with the empty password needs no setting.
-        let file = cert_file("azure-pfx-empty", b.pfx("", Aes));
+        let file = cert_file("azure-pfx-empty", b.pfx(&empty, Aes));
         let creds = [("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "tenant-1"), ("AZURE_CLIENT_ID", "client-1"), ("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap())];
         let s = Arc::new(ExternalStore::new(Box::new(KeyVault::new(config(&url, &creds)).unwrap()), Duration::ZERO));
         assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
@@ -1851,6 +1852,7 @@ mod tests {
         let (other, ca) = (TestCert::new(-1, 30), TestCert::new(-1, 3650));
         let ec = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap().serialize_pem();
         let kv = "https://kv1.vault.azure.net";
+        let (pfx_pw, pem_pw, wrong, empty) = (crate::random_hex(12), crate::random_hex(12), crate::random_hex(12), String::new());
         let with = |extra: &[(&str, &str)]| {
             let pairs = [&[("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c")][..], extra].concat();
             Config::from_env(&settings(&pairs), &EnvStore::fixed(extra))
@@ -1870,7 +1872,7 @@ mod tests {
             (format!("{}{}", good.pem(), other.key_pem), "more than one private key"),
             (format!("{}{ec}", good.cert_pem), "isn't an RSA key"),
             (format!("{}-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n", good.cert_pem), "EC key"),
-            (good.encrypted_pem("pem-password"), "its private key is encrypted; set AZURE_CLIENT_CERTIFICATE_PASSWORD"),
+            (good.encrypted_pem(&pem_pw), "its private key is encrypted; set AZURE_CLIENT_CERTIFICATE_PASSWORD"),
             (format!("{}-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n", good.cert_pem), "encrypted the legacy OpenSSL way"),
             (format!("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n{}", good.key_pem), "isn't base64"),
             (format!("{}-----END CERTIFICATE-----\n", good.key_pem), "no matching BEGIN"),
@@ -1885,30 +1887,30 @@ mod tests {
         // PFX files: the password opens them; their key and certificates are checked as a PEM file's.
         use p12_keystore::EncryptionAlgorithm::PbeWithHmacSha256AndAes256 as Aes;
         let ec_pkcs8 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap().serialize_der();
-        let pw = ("AZURE_CLIENT_CERTIFICATE_PASSWORD", "pfx-password");
+        let pw = ("AZURE_CLIENT_CERTIFICATE_PASSWORD", pfx_pw.as_str());
         let pfx_with = |contents: Vec<u8>, extra: &[(&str, &str)]| {
             let file = cert_file("azure-pfx-check", contents);
             with(&[&[("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap())][..], extra].concat())
         };
-        assert!(pfx_with(good.pfx("pfx-password", Aes), &[pw]).is_ok());
-        assert!(pfx_with(pfx_of(&[(&good.pkcs8, &[&ca.cert_der, &good.cert_der])], "pfx-password", Aes), &[pw]).is_ok(), "with its chain, in any order");
-        assert!(in_file(&good.encrypted_pem("pem-password")).is_err() && with(&[("AZURE_CLIENT_CERTIFICATE_PATH", cert_file("azure-enc-ok", good.encrypted_pem("pem-password")).to_str().unwrap()), ("AZURE_CLIENT_CERTIFICATE_PASSWORD", "pem-password")]).is_ok());
-        let mut cut = good.pfx("", Aes);
+        assert!(pfx_with(good.pfx(&pfx_pw, Aes), &[pw]).is_ok());
+        assert!(pfx_with(pfx_of(&[(&good.pkcs8, &[&ca.cert_der, &good.cert_der])], &pfx_pw, Aes), &[pw]).is_ok(), "with its chain, in any order");
+        assert!(in_file(&good.encrypted_pem(&pem_pw)).is_err() && with(&[("AZURE_CLIENT_CERTIFICATE_PATH", cert_file("azure-enc-ok", good.encrypted_pem(&pem_pw)).to_str().unwrap()), ("AZURE_CLIENT_CERTIFICATE_PASSWORD", pem_pw.as_str())]).is_ok());
+        let mut cut = good.pfx(&empty, Aes);
         cut.truncate(cut.len() / 2);
         for (contents, extra, err) in [
-            (good.pfx("pfx-password", Aes), vec![], "it is a PFX file with a password; set AZURE_CLIENT_CERTIFICATE_PASSWORD"),
-            (good.pfx("pfx-password", Aes), vec![("AZURE_CLIENT_CERTIFICATE_PASSWORD", "wrong-password")], "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open it"),
-            (pfx_of(&[(&good.pkcs8, &[&good.cert_der]), (&other.pkcs8, &[&other.cert_der])], "pfx-password", Aes), vec![pw], "more than one private key"),
-            (pfx_of(&[(&good.pkcs8, &[&other.cert_der])], "pfx-password", Aes), vec![pw], "none of its certificates is for its private key"),
-            (pfx_of(&[(&ec_pkcs8, &[&good.cert_der])], "pfx-password", Aes), vec![pw], "isn't an RSA key"),
-            (pfx_of(&[(&good.pkcs8, &[])], "pfx-password", Aes), vec![pw], "no certificate"),
-            (TestCert::new(-30, -1).pfx("pfx-password", Aes), vec![pw], "expired on"),
+            (good.pfx(&pfx_pw, Aes), vec![], "it is a PFX file with a password; set AZURE_CLIENT_CERTIFICATE_PASSWORD"),
+            (good.pfx(&pfx_pw, Aes), vec![("AZURE_CLIENT_CERTIFICATE_PASSWORD", wrong.as_str())], "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open it"),
+            (pfx_of(&[(&good.pkcs8, &[&good.cert_der]), (&other.pkcs8, &[&other.cert_der])], &pfx_pw, Aes), vec![pw], "more than one private key"),
+            (pfx_of(&[(&good.pkcs8, &[&other.cert_der])], &pfx_pw, Aes), vec![pw], "none of its certificates is for its private key"),
+            (pfx_of(&[(&ec_pkcs8, &[&good.cert_der])], &pfx_pw, Aes), vec![pw], "isn't an RSA key"),
+            (pfx_of(&[(&good.pkcs8, &[])], &pfx_pw, Aes), vec![pw], "no certificate"),
+            (TestCert::new(-30, -1).pfx(&pfx_pw, Aes), vec![pw], "expired on"),
             (cut, vec![], "neither a PEM file nor a PFX file"),
             (vec![0x30, 0x03, 0x02, 0x01, 0x03], vec![], "neither a PEM file nor a PFX file"),
             (vec![0xff, 0xfe, 0x00], vec![], "no private key"),
         ] {
             let e = pfx_with(contents, &extra).err().unwrap_or_default();
-            assert!(e.starts_with("AZURE_CLIENT_CERTIFICATE_PATH: ") && e.contains(err) && !e.contains("pfx-password") && !e.contains("wrong-password"), "expected {err:?}: {e}");
+            assert!(e.starts_with("AZURE_CLIENT_CERTIFICATE_PATH: ") && e.contains(err) && !e.contains(&pfx_pw) && !e.contains(&wrong), "expected {err:?}: {e}");
         }
         let file = cert_file("azure-cert-settings", good.pem());
         let path = ("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap());
