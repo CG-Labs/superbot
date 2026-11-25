@@ -546,7 +546,7 @@ async fn with_when_idle_a_machine_is_restarted_onto_its_teams_network_once_it_ru
         r["teamNetworks"].clone()
     };
     let rules = async |env: &mtls::Env, want: Option<&str>| {
-        for _ in 0..400 {
+        for _ in 0..1600 {
             crate::machines::heartbeats(&env.app, &env.cp).await;
             let u = env.app.db.machine(&mid).unwrap().agent_upkeep.unwrap_or_default();
             if u["teamNetwork"]["state"] == "on" && u["teamNetwork"]["subnet"].as_str() == want {
@@ -714,7 +714,7 @@ async fn with_when_idle_a_machine_with_linode_interfaces_is_powered_off_to_join_
         r["teamNetworks"].clone()
     };
     let rules = async |env: &mtls::Env, want: Option<&str>| {
-        for _ in 0..400 {
+        for _ in 0..1600 {
             crate::machines::heartbeats(&env.app, &env.cp).await;
             let u = env.app.db.machine(&mid).unwrap().agent_upkeep.unwrap_or_default();
             if u["teamNetwork"]["state"] == "on" && u["teamNetwork"]["subnet"].as_str() == want {

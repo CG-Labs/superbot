@@ -14,7 +14,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod chats;
-pub use chats::{ChatMove, ChatStore, Doc, Held, MovesOut, Whose, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy, kept_in_region, sign_ins_from, upgrade_copy};
+pub use chats::{
+    ChatMove, ChatStore, Doc, Held, MovesOut, SECRETS, Whose, attach_to, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy, kept_in_region, places,
+    sign_ins_from, upgrade_copy, user_place,
+};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 
@@ -196,8 +199,8 @@ fn erase_requested_by() -> String {
 }
 
 /// Runs an erasure of `user_id` (pseudonym `pseudonym`, whose Bots were `bots`) on a copy
-/// of a regional chat store opened on `c` (ADR 0256): their routines, facts and sign-ins
-/// deleted, what they and their Bots wrote replaced, their approval decisions
+/// of a regional chat store opened on `c` (ADR 0256): their routines, facts, sign-ins and
+/// own secrets deleted, what they and their Bots wrote replaced, their approval decisions
 /// pseudonymised. What it changed.
 pub(crate) fn erase_in_copy(c: &Connection, user_id: &str, pseudonym: &str, bots: &[String]) -> rusqlite::Result<Held> {
     let bots = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
@@ -216,7 +219,8 @@ pub(crate) fn erase_in_copy(c: &Connection, user_id: &str, pseudonym: &str, bots
         }
     }
     let [push_devices, saml_sessions, sessions] = signed;
-    Ok(Held { messages, routines, approvals, facts, sessions, saml_sessions, push_devices, ..Held::default() })
+    let user_secrets = if has(chats::SECRETS)? { c.execute("DELETE FROM main.user_secrets WHERE user_id = ?1", [user_id])? as i64 } else { 0 };
+    Ok(Held { messages, routines, approvals, facts, sessions, saml_sessions, push_devices, user_secrets, ..Held::default() })
 }
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
