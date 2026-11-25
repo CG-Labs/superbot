@@ -25,7 +25,7 @@ It runs botd's own code, not a copy, so it can't drift from what botd does at st
 It reads settings as the systemd unit gives them to botd:
 
 - `--home DIR` reads `DIR/superbot/.env` and works in `DIR/superbot`, as `EnvironmentFile` and `WorkingDirectory` do.
-- A line ending in `\` goes on in the next, as systemd joins them, so a bundle list split over lines reads as botd gets it. `botd offline check` reads `.env` the same way.
+- A line ending in `\` goes on in the next, as systemd joins them, so a bundle list split over lines reads as botd gets it. A comment line never takes the next with it, as from systemd 254. `botd offline check` reads `.env` the same way.
 - The file's values are set in the process environment, over what botd was started with, so settings read by prefix (named backup stores, for example) are seen too.
 - `--set` puts values over both, as the next `.env` will have them.
 - Secrets come from the process environment and the external secrets manager `SECRETS_BACKEND` names, as at start. The secrets saved in botd's database aren't part of startup's store, so they aren't read here either.
@@ -62,7 +62,7 @@ Machine bundles without `MACHINE_CONTROL_URL` are ignored by botd, so the check 
 - Online upgrades (`install.sh --upgrade`) are unchanged, and so are fresh offline installs, which have no `.env` yet.
 - Tested:
   - `machines::settings_check::tests`: the lines for no control plane, a provider without enrollment, and enrollment with bundles; a Hermes bundle at another commit refused as at start, with the plan from `MACHINE_HARNESSES` and defaulted from the tiers; `MACHINE_APT_MIRROR`, `MACHINE_REGIONS` and `MACHINE_CONTROL_URL` refused with their area's prefix; the options, including `--set` names and `--home` with `--env-file`.
-  - `support_check::tests`: `.env` lines ending in `\` are joined to the next, as systemd does, and an escaped `\` isn't; a two-arch bundle list split over two lines passes the check.
+  - `support_check::tests`: `.env` lines ending in `\` are joined to the next, as systemd does, and an escaped `\` or a comment isn't; a two-arch bundle list split over two lines passes the check.
   - `deploy/test-offline.sh`, with a stand-in botd: the check runs as botd's user with only `PATH` and `HOME`, from `/`, with `--set` for the new flags; a refusal stops the upgrade with its reason, or warns in a dry run; an older botd is never run; a check that fails to run warns; nothing runs online or without a `.env`. The flags need `--offline --upgrade`, and write and replace their `.env` lines.
   - `offline.yml`, with no network: the installed botd passes the real harness bundle as botd's user and refuses it against another claude pin. An upgrade with `--machine-harness-bundle` checks and writes it. An upgrade over a `.env` botd would refuse stops with "Nothing has changed", and botd isn't restarted.
 - Not covered:
