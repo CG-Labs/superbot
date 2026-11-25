@@ -191,12 +191,12 @@ impl Calendar {
         total
     }
 
-    fn hours(&self) -> String {
+    pub fn hours(&self) -> String {
         let hm = |m: i64| format!("{:02}:{:02}", m / 60, m % 60);
         format!("{}-{}", hm(self.open), hm(self.close))
     }
 
-    fn weekday_names(&self) -> Vec<&'static str> {
+    pub fn weekday_names(&self) -> Vec<&'static str> {
         WEEKDAYS.iter().zip(self.weekdays).filter(|(_, on)| *on).map(|(d, _)| *d).collect()
     }
 }
@@ -548,8 +548,18 @@ pub struct Report {
     tickets: Vec<Ticket>,
 }
 
-/// The report on `csv`'s tickets, as `o` says.
-pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
+/// Every readable ticket in an export (the customer's, with `--customer`), whenever it
+/// was opened, in the export's order, and the rows skipped by line.
+#[derive(Debug)]
+pub struct Read {
+    pub tickets: Vec<Ticket>,
+    pub skipped: Vec<(usize, &'static str)>,
+    /// Whether the export has a resolved column, without which nothing is known to be open.
+    pub has_resolved: bool,
+}
+
+/// Reads `csv`'s tickets as `o` says: its columns, plan and customer.
+pub fn read_tickets(csv: &str, o: &Options) -> Result<Read, String> {
     let rows = parse_csv(csv)?;
     let ((_, header), body) = rows.split_first().ok_or("the CSV is empty")?;
     let headers: Vec<String> = header.iter().map(|h| normalize(h)).collect();
@@ -576,17 +586,7 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
         return Err("--customer needs a customer column; name it with --column customer=<header>".into());
     }
 
-    let end = o.to + Months::new(1);
-    let month_of = |t: DateTime<Utc>| t.date_naive().with_day(1).unwrap();
-    let in_period = |t: DateTime<Utc>| (o.from..end).contains(&t.date_naive());
-    let mut months: BTreeMap<NaiveDate, [Counts; 4]> = BTreeMap::new();
-    let mut m = o.from;
-    while m < end {
-        months.insert(m, Default::default());
-        m = m + Months::new(1);
-    }
-    let (mut missed, mut plans, mut skipped, mut tickets) = (Vec::new(), BTreeSet::new(), Vec::new(), Vec::new());
-    let mut open_at_end = col.contains_key("resolved").then_some([0u32; 4]);
+    let (mut skipped, mut tickets) = (Vec::new(), Vec::new());
     let wanted = o.customer.as_deref().map(normalize);
     if wanted.as_deref() == Some("") {
         return Err("--customer needs a name with letters or digits in it".into());
@@ -617,13 +617,30 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
             }
             Ok((id, severity, plan, opened, responded, resolved))
         })();
-        let (id, severity, plan, opened, responded, resolved) = match ticket {
-            Ok(t) => t,
-            Err(why) => {
-                skipped.push((line, why));
-                continue;
-            }
-        };
+        match ticket {
+            Ok((id, severity, plan, opened, responded, resolved)) => tickets.push(Ticket { id: id.to_string(), severity, plan, opened, responded, resolved }),
+            Err(why) => skipped.push((line, why)),
+        }
+    }
+    Ok(Read { tickets, skipped, has_resolved: col.contains_key("resolved") })
+}
+
+/// The report on `csv`'s tickets, as `o` says.
+pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
+    let Read { tickets: read, skipped, has_resolved } = read_tickets(csv, o)?;
+    let end = o.to + Months::new(1);
+    let month_of = |t: DateTime<Utc>| t.date_naive().with_day(1).unwrap();
+    let in_period = |t: DateTime<Utc>| (o.from..end).contains(&t.date_naive());
+    let mut months: BTreeMap<NaiveDate, [Counts; 4]> = BTreeMap::new();
+    let mut m = o.from;
+    while m < end {
+        months.insert(m, Default::default());
+        m = m + Months::new(1);
+    }
+    let (mut missed, mut plans, mut tickets) = (Vec::new(), BTreeSet::new(), Vec::new());
+    let mut open_at_end = has_resolved.then_some([0u32; 4]);
+    for ticket in read {
+        let Ticket { severity, plan, opened, responded, resolved, .. } = ticket;
         let s = severity as usize - 1;
         if let Some(open) = &mut open_at_end {
             if opened.date_naive() < end && resolved.is_none_or(|t| t.date_naive() >= end) {
@@ -637,7 +654,8 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
             continue;
         }
         plans.insert(plan);
-        tickets.push(Ticket { id: id.to_string(), severity, plan, opened, responded, resolved });
+        let id = ticket.id.clone();
+        tickets.push(ticket);
         let target = o.targets.get(&severity).copied().unwrap_or_else(|| Target::default_for(plan, severity));
         let limit = target.limit_secs(&o.calendar);
         let c = &mut months.get_mut(&month_of(opened)).unwrap()[s];
@@ -655,7 +673,7 @@ pub fn report(csv: &str, o: &Options) -> Result<Report, String> {
             c.waiting += 1;
         } else {
             c.missed += 1;
-            missed.push(Miss { id: id.to_string(), severity, plan, opened, answered, took, target });
+            missed.push(Miss { id, severity, plan, opened, answered, took, target });
         }
     }
     missed.sort_by(|a, b| a.opened.cmp(&b.opened).then(a.id.cmp(&b.id)));
