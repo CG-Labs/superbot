@@ -955,6 +955,90 @@ async fn a_pinned_persons_bots_memory_is_kept_in_their_regions_chat_store_not_in
 }
 
 #[tokio::test]
+async fn a_pinned_persons_facts_are_kept_in_their_regions_chat_store_not_in_data_dir() {
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private);
+    let file = app.data_user_file(&ada).unwrap();
+    let word = "facts-4b8e20-ada-works-from-leeds";
+    app.keep_facts_text(&ada, word).unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), word, "unpinned: kept in the file in DATA_DIR");
+    let count = || rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM facts", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(count(), 0);
+
+    // A pin moves them into London's store and deletes the file, audited.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    assert_eq!((count(), file.exists()), (1, false));
+    assert_eq!(app.kept_facts(&ada).as_deref(), Some(word));
+    let moved = audit(port, &admin, chat_stores::MOVED).await;
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["facts"].as_i64()), (Some("gb-lon"), Some(1)), "{moved:?}");
+    // Saved there from now on, and a new Bot's first facts never land in DATA_DIR.
+    app.keep_facts_text(&ada, "learned on the machine").unwrap();
+    app.init_bot_files(&bot);
+    assert_eq!((count(), file.exists(), app.kept_facts(&ada).as_deref()), (1, false, Some("learned on the machine")));
+
+    // The report, the app and the regions page count them.
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    let c = &r["chats"];
+    assert_eq!((c["inRegion"].as_bool(), c["facts"]["inStore"].as_i64(), c["facts"]["inServerDatabase"].as_i64()), (Some(true), Some(1), Some(0)), "{r}");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("- **Owners' facts in it:** 1"), "{md}");
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
+    assert_eq!(lon_row["chatStore"]["facts"].as_i64(), Some(1), "{regions}");
+
+    // A file left in DATA_DIR makes the pin unkept until reconcile deletes it; the store's
+    // copy is the newer one.
+    std::fs::write(&file, "stale").unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert!(r["outside"].to_string().contains("their facts are in botd's own database or its files, not gb-lon's chat store"), "{r}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!(me["chats"]["moving"].as_bool(), Some(true), "{me}");
+    reconcile_as(port, &admin).await;
+    assert_eq!((file.exists(), app.kept_facts(&ada).as_deref()), (false, Some("learned on the machine")));
+    // A row left in botd's own table is moved by reconcile.
+    app.db.conn_for_tests().execute_batch("INSERT INTO main.facts SELECT * FROM chats_0.facts; DELETE FROM chats_0.facts;").unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert_eq!(reconcile_as(port, &admin).await["factsMoved"].as_i64(), Some(1));
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("kept"), "{r}");
+
+    // Unpinned, they are written back to the file.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!((count(), std::fs::read_to_string(&file).unwrap().as_str()), (0, "learned on the machine"));
+    assert!(app.db.facts(&ada).is_none());
+
+    // When a pass can't take them back to the file, a save goes to the row, never past it,
+    // and a later pass writes it.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-2")).await.0, 200);
+    app.db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    app.keep_facts_text(&ada, "saved while the file was blocked").unwrap();
+    assert_eq!(app.kept_facts(&ada).as_deref(), Some("saved while the file was blocked"));
+    std::fs::remove_dir(&file).unwrap();
+    chat_stores::place(&app.db, &app.cfg.data_dir);
+    assert_eq!((app.db.facts(&ada), std::fs::read_to_string(&file).unwrap().as_str()), (None, "saved while the file was blocked"));
+
+    // Erased while pinned, their facts leave the store and aren't written back.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-3")).await.0, 200);
+    assert_eq!((count(), file.exists()), (1, false));
+    let (status, erased) = call_json(port, "POST", &format!("/api/users/{ada}/erase"), &admin, "{}").await;
+    assert_eq!(status, 200, "{erased}");
+    reconcile_as(port, &admin).await;
+    assert_eq!((count(), file.exists(), app.db.facts(&ada)), (0, false, None));
+}
+
+#[tokio::test]
 async fn a_pinned_persons_store_backups_are_copied_off_the_host_into_a_bucket_in_their_region() {
     use crate::machines::chat_store_copies::{self, COPIED, Copies};
     use crate::machines::chat_stores::{self, CLEARED, Settings};

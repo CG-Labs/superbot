@@ -1,15 +1,17 @@
-//! Pinned people's chats, routines, approvals and Bots' memory in a database in their region
-//! (ADR 0215, ADR 0228, ADR 0276), the first part of splitting botd's database by region.
-//! Each region in REGION_DATA_DIRS has a SQLite file of its own (`chats.sqlite`, keyed like
-//! botd's database), attached to botd's connection. A Bot's messages, routines, approvals
-//! and memory are kept in the store of its owner's residency pin (their team's, else their
-//! own, as `residency::of_user`), or in botd's own database when that region has no store or
-//! the owner isn't pinned. botd's own copy of a Bot's memory is a file in DATA_DIR
-//! (`DATA_DIR/bots/<id>/MEMORY.md`); its `memories` table only holds one on its way between
-//! that file and a store (`machines::chat_stores::place`).
+//! Pinned people's chats, routines, approvals, Bots' memory and owners' facts in a database
+//! in their region (ADR 0215, ADR 0228, ADR 0276, ADR 0277), the first part of splitting
+//! botd's database by region. Each region in REGION_DATA_DIRS has a SQLite file of its own
+//! (`chats.sqlite`, keyed like botd's database), attached to botd's connection. A Bot's
+//! messages, routines, approvals and memory are kept in the store of its owner's residency
+//! pin (their team's, else their own, as `residency::of_user`), and a person's facts in the
+//! store of their own pin by the same rule, or in botd's own database when that region has
+//! no store or the person isn't pinned. botd's own copy of a Bot's memory is a file in
+//! DATA_DIR (`DATA_DIR/bots/<id>/MEMORY.md`), and of a person's facts too
+//! (`DATA_DIR/users/<id>/USER.md`); its `memories` and `facts` tables only hold one on its
+//! way between that file and a store (`machines::chat_stores::place`).
 //!
 //! Reads see every place at once: a TEMP view per table (`messages`, `routines`,
-//! `approvals`, `memories`) puts botd's own table and each store's together, and unqualified names
+//! `approvals`, `memories`, `facts`) puts botd's own table and each store's together, and unqualified names
 //! find TEMP objects first. Writes name the table they change: new rows go where their
 //! Bot's data belongs, and updates and deletes by id run on each place. Ids stay unique
 //! across all of them: a store's messages take the next id after botd's own sequence and
@@ -31,20 +33,39 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-/// A table whose rows are kept, by Bot, in the store of its owner's pin.
+/// What a kept table's rows are kept by: their Bot (in the store of its owner's pin), or
+/// their person (in the store of their own pin, ADR 0277).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Bot,
+    User,
+}
+
+impl Key {
+    fn column(self) -> &'static str {
+        match self {
+            Key::Bot => "bot_id",
+            Key::User => "user_id",
+        }
+    }
+}
+
+/// A table whose rows are kept in the store of a pin.
 struct Kept {
     name: &'static str,
+    key: Key,
     /// The indexes a store's copy gets, as `(name, columns)`.
     indexes: &'static [(&'static str, &'static str)],
     /// Reads order by its rowid, which a view has only as a column of that name.
     rowid: bool,
 }
 
-const KEPT: [Kept; 4] = [
-    Kept { name: "messages", indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], rowid: false },
-    Kept { name: "routines", indexes: &[("routines_bot", "bot_id")], rowid: false },
-    Kept { name: "approvals", indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], rowid: true },
-    Kept { name: "memories", indexes: &[("memories_bot", "bot_id")], rowid: false },
+const KEPT: [Kept; 5] = [
+    Kept { name: "messages", key: Key::Bot, indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], rowid: false },
+    Kept { name: "routines", key: Key::Bot, indexes: &[("routines_bot", "bot_id")], rowid: false },
+    Kept { name: "approvals", key: Key::Bot, indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], rowid: true },
+    Kept { name: "memories", key: Key::Bot, indexes: &[("memories_bot", "bot_id")], rowid: false },
+    Kept { name: "facts", key: Key::User, indexes: &[("facts_user", "user_id")], rowid: false },
 ];
 const MESSAGES: usize = 0;
 const APPROVALS: usize = 2;
@@ -58,8 +79,49 @@ pub(super) const MEMORIES: &str = "CREATE TABLE IF NOT EXISTS memories (
   updated_at INTEGER NOT NULL
 );";
 
+/// botd's table for people's facts on their way between a store and their file in
+/// DATA_DIR (ADR 0277): one row per person, whose id is theirs.
+pub(super) const FACTS: &str = "CREATE TABLE IF NOT EXISTS facts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);";
+
+/// A text botd keeps as a file in DATA_DIR, and as a row while a pin keeps it in a store:
+/// a Bot's memory (ADR 0276) or a person's facts (ADR 0277).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Doc {
+    Memory,
+    Facts,
+}
+
+impl Doc {
+    fn table(self) -> &'static str {
+        match self {
+            Doc::Memory => "memories",
+            Doc::Facts => "facts",
+        }
+    }
+
+    fn key(self) -> Key {
+        match self {
+            Doc::Memory => Key::Bot,
+            Doc::Facts => Key::User,
+        }
+    }
+
+    /// botd's table of what a row is kept by.
+    fn owners(self) -> &'static str {
+        match self {
+            Doc::Memory => "main.bots",
+            Doc::Facts => "main.users",
+        }
+    }
+}
+
 /// The token for `table` in a statement run on every place (`on_places`): `{messages}`,
-/// `{routines}`, `{approvals}` or `{memories}`.
+/// `{routines}`, `{approvals}`, `{memories}` or `{facts}`.
 fn token(table: &str) -> String {
     format!("{{{table}}}")
 }
@@ -80,6 +142,13 @@ CREATE TABLE IF NOT EXISTS main.chat_moves_out (
   moved_at INTEGER NOT NULL,
   cleared_at INTEGER,
   PRIMARY KEY (bot_id, region)
+);
+CREATE TABLE IF NOT EXISTS main.facts_moves_out (
+  user_id TEXT NOT NULL,
+  region TEXT NOT NULL,
+  moved_at INTEGER NOT NULL,
+  cleared_at INTEGER,
+  PRIMARY KEY (user_id, region)
 );";
 
 /// A region's chat store, attached to botd's connection as `schema`.
@@ -120,15 +189,16 @@ pub struct Held {
     pub routines: i64,
     pub approvals: i64,
     pub memories: i64,
+    pub facts: i64,
 }
 
 impl Held {
-    fn of(n: [i64; 4]) -> Held {
-        Held { messages: n[0], routines: n[1], approvals: n[2], memories: n[3] }
+    fn of(n: [i64; 5]) -> Held {
+        Held { messages: n[0], routines: n[1], approvals: n[2], memories: n[3], facts: n[4] }
     }
 
     pub fn total(&self) -> i64 {
-        self.messages + self.routines + self.approvals + self.memories
+        self.messages + self.routines + self.approvals + self.memories + self.facts
     }
 
     pub fn add(&mut self, o: Held) {
@@ -136,15 +206,23 @@ impl Held {
         self.routines += o.routines;
         self.approvals += o.approvals;
         self.memories += o.memories;
+        self.facts += o.facts;
     }
 
-    /// "3 chat messages, 1 routine, 2 approvals and 1 Bot memory", leaving out tables with none.
+    /// What of it is kept by Bot: all but people's facts.
+    pub fn of_bots(&self) -> Held {
+        Held { facts: 0, ..*self }
+    }
+
+    /// "3 chat messages, 1 routine, 2 approvals, 1 Bot memory and 1 person's facts", leaving
+    /// out tables with none.
     pub fn describe(&self) -> String {
         let parts: Vec<String> = [
             (self.messages, "chat message", "chat messages"),
             (self.routines, "routine", "routines"),
             (self.approvals, "approval", "approvals"),
             (self.memories, "Bot memory", "Bot memories"),
+            (self.facts, "person's facts", "people's facts"),
         ]
         .into_iter()
         .filter(|(n, _, _)| *n > 0)
@@ -169,6 +247,8 @@ pub struct ChatMove {
     pub routines: usize,
     pub approvals: usize,
     pub memories: usize,
+    /// People whose facts moved (one row each).
+    pub facts: usize,
 }
 
 /// One place chats are kept, and what of theirs is there.
@@ -255,19 +335,32 @@ fn region_of<'a>(stores: &'a [ChatStore], schema: &str) -> Option<&'a str> {
 /// The region of `bot`'s owner's pin, their team's first, from botd's own tables. `bot` is
 /// an SQL expression for the Bot's id.
 fn pinned_region(bot: &str) -> String {
+    pinned_region_of(&format!("(SELECT owner_id FROM main.bots WHERE id = {bot})"))
+}
+
+/// The region of `user`'s pin, their team's first, from botd's own tables. `user` is an
+/// SQL expression for the person's id.
+fn pinned_region_of(user: &str) -> String {
     format!(
         "COALESCE(
            (SELECT p.region FROM main.team_members tm JOIN main.residency_pins p ON p.subject_type = 'team' AND p.subject_id = tm.team_id
-             WHERE tm.user_id = (SELECT owner_id FROM main.bots WHERE id = {bot})),
-           (SELECT p.region FROM main.residency_pins p WHERE p.subject_type = 'user' AND p.subject_id = (SELECT owner_id FROM main.bots WHERE id = {bot})))"
+             WHERE tm.user_id = {user}),
+           (SELECT p.region FROM main.residency_pins p WHERE p.subject_type = 'user' AND p.subject_id = {user}))"
     )
 }
 
-/// How many rows of each kept table in `schema` (where they exist) match `filter`, an SQL
-/// condition on the table's columns.
-fn held_in(c: &Connection, schema: &str, filter: &str, p: &[&dyn ToSql]) -> rusqlite::Result<Held> {
-    let mut n = [0; 4];
+/// An SQL condition on a kept table's columns, with its parameters.
+#[derive(Clone, Copy)]
+struct Filter<'a>(&'a str, &'a [&'a dyn ToSql]);
+
+const ALL: Filter<'static> = Filter("1", &[]);
+
+/// How many rows of each kept table in `schema` (where they exist) match `bots` (tables kept
+/// by Bot) or `users` (kept by person).
+fn held_in(c: &Connection, schema: &str, bots: Filter, users: Filter) -> rusqlite::Result<Held> {
+    let mut n = [0; 5];
     for (i, k) in KEPT.iter().enumerate() {
+        let Filter(filter, p) = if k.key == Key::Bot { bots } else { users };
         if has_table(c, schema, k.name)? {
             n[i] = c.query_row(&format!("SELECT COUNT(*) FROM {schema}.{} WHERE {filter}", k.name), p, |r| r.get(0))?;
         }
@@ -335,7 +428,7 @@ impl Db {
                 }
             } else {
                 c.execute("ATTACH DATABASE ?1 AS chats_dropped KEY ?2", params![path, key.unwrap_or("")]).map_err(|err| not_a_store(p, &err))?;
-                let held = held_in(&c, "chats_dropped", "1", &[]);
+                let held = held_in(&c, "chats_dropped", ALL, ALL);
                 let has = c.query_row("SELECT COUNT(*) FROM chats_dropped.sqlite_master WHERE type = 'table' AND name = 'chat_store'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0);
                 let own: rusqlite::Result<Option<String>> = match has {
                     Ok(true) => c.query_row("SELECT id FROM chats_dropped.chat_store LIMIT 1", [], |r| r.get(0)).optional(),
@@ -352,7 +445,7 @@ impl Db {
                 }
                 if held.total() > 0 {
                     return Err(format!(
-                        "REGION_DATA_DIRS no longer names {region}, but its chat store ({path}) still holds {} of pinned people's Bots. \
+                        "REGION_DATA_DIRS no longer names {region}, but its chat store ({path}) still holds {} of pinned people and their Bots. \
                          Put {region}=<its folder> back. To retire a store, end the pins in {region} first, let botd move their data back, then remove it (ADR 0215, ADR 0228).",
                         held.describe()
                     ));
@@ -448,11 +541,20 @@ impl Db {
 
     /// The schema a new row of `bot_id`'s goes to.
     fn place_for(&self, c: &Connection, bot_id: &str) -> rusqlite::Result<&str> {
+        self.place_by(c, Key::Bot, bot_id)
+    }
+
+    /// The schema a new row kept by `key` `id` (a Bot's, or a person's) goes to.
+    fn place_by(&self, c: &Connection, key: Key, id: &str) -> rusqlite::Result<&str> {
         let stores = self.chat_stores_set();
         if stores.is_empty() {
             return Ok("main");
         }
-        let region: Option<String> = c.query_row(&format!("SELECT {}", pinned_region("?1")), [bot_id], |r| r.get(0))?;
+        let region = match key {
+            Key::Bot => pinned_region("?1"),
+            Key::User => pinned_region_of("?1"),
+        };
+        let region: Option<String> = c.query_row(&format!("SELECT {region}"), [id], |r| r.get(0))?;
         Ok(region.and_then(|r| stores.iter().find(|s| s.region == r)).map_or("main", |s| s.schema.as_str()))
     }
 
@@ -540,15 +642,21 @@ impl Db {
         tx.execute_batch(&format!(
             "CREATE TEMP TABLE IF NOT EXISTS chat_place (bot_id TEXT PRIMARY KEY, schema TEXT NOT NULL);
              DELETE FROM temp.chat_place;
-             INSERT INTO temp.chat_place (bot_id, schema) SELECT b.id, CASE {}{case} ELSE 'main' END FROM main.bots b;",
-            pinned_region("b.id")
+             INSERT INTO temp.chat_place (bot_id, schema) SELECT b.id, CASE {}{case} ELSE 'main' END FROM main.bots b;
+             CREATE TEMP TABLE IF NOT EXISTS user_place (user_id TEXT PRIMARY KEY, schema TEXT NOT NULL);
+             DELETE FROM temp.user_place;
+             INSERT INTO temp.user_place (user_id, schema) SELECT u.id, CASE {}{case} ELSE 'main' END FROM main.users u;",
+            pinned_region("b.id"),
+            pinned_region_of("u.id")
         ))?;
-        let here = |to: &str| format!("bot_id IN (SELECT bot_id FROM temp.chat_place WHERE schema = {})", literal(to));
+        let here = |k: &Kept, to: &str| match k.key {
+            Key::Bot => format!("bot_id IN (SELECT bot_id FROM temp.chat_place WHERE schema = {})", literal(to)),
+            Key::User => format!("user_id IN (SELECT user_id FROM temp.user_place WHERE schema = {})", literal(to)),
+        };
         let pairs: Vec<(&str, &str)> = schemas(&set.stores).flat_map(|to| schemas(&set.stores).filter(move |f| *f != to).map(move |from| (from, to))).collect();
         for &(from, to) in &pairs {
-            let here = here(to);
             for (k, cols) in KEPT.iter().zip(&set.cols) {
-                tx.execute(&format!("INSERT OR IGNORE INTO {to}.{t} ({cols}) SELECT {cols} FROM {from}.{t} WHERE {here} ORDER BY rowid", t = k.name), [])?;
+                tx.execute(&format!("INSERT OR IGNORE INTO {to}.{t} ({cols}) SELECT {cols} FROM {from}.{t} WHERE {here} ORDER BY rowid", t = k.name, here = here(k, to)), [])?;
             }
         }
         tx.commit()?;
@@ -561,32 +669,44 @@ impl Db {
             let mut moves = Vec::new();
             let at = now();
             for &(from, to) in &pairs {
-                let copied = |t: &str| format!("{} AND id IN (SELECT id FROM {to}.{t})", here(to));
-                let theirs = KEPT.iter().map(|k| format!("SELECT bot_id FROM {from}.{t} WHERE {w}", t = k.name, w = copied(k.name))).collect::<Vec<_>>().join(" UNION ");
-                let bots: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM ({theirs})"), [], |r| r.get(0))?;
-                if bots == 0 {
+                let copied = |k: &Kept| format!("{} AND id IN (SELECT id FROM {to}.{t})", here(k, to), t = k.name);
+                // Whose rows move, by key: the Bots' (`chat_moves_out`) and the people's (`facts_moves_out`).
+                let theirs = |key: Key| {
+                    let col = key.column();
+                    KEPT.iter().filter(|k| k.key == key).map(|k| format!("SELECT {col} FROM {from}.{t} WHERE {w}", t = k.name, w = copied(k))).collect::<Vec<_>>().join(" UNION ")
+                };
+                let (bot_rows, user_rows) = (theirs(Key::Bot), theirs(Key::User));
+                let bots: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM ({bot_rows})"), [], |r| r.get(0))?;
+                let users: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM ({user_rows})"), [], |r| r.get(0))?;
+                if bots == 0 && users == 0 {
                     continue;
                 }
                 let from_region = region_of(&set.stores, from).map(str::to_string);
                 if let Some(r) = &from_region {
-                    tx.execute(
-                        &format!(
-                            "INSERT INTO main.chat_moves_out (bot_id, region, moved_at) SELECT bot_id, ?1, ?2 FROM ({theirs}) WHERE true
-                             ON CONFLICT(bot_id, region) DO UPDATE SET moved_at = excluded.moved_at, cleared_at = NULL"
-                        ),
-                        params![r, at],
-                    )?;
+                    for (table, col, rows) in [("chat_moves_out", "bot_id", &bot_rows), ("facts_moves_out", "user_id", &user_rows)] {
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO main.{table} ({col}, region, moved_at) SELECT {col}, ?1, ?2 FROM ({rows}) WHERE true
+                                 ON CONFLICT({col}, region) DO UPDATE SET moved_at = excluded.moved_at, cleared_at = NULL"
+                            ),
+                            params![r, at],
+                        )?;
+                    }
                 }
-                let mut n = [0; 4];
+                let mut n = [0; 5];
                 for (i, k) in KEPT.iter().enumerate() {
-                    n[i] = tx.execute(&format!("DELETE FROM {from}.{} WHERE {}", k.name, copied(k.name)), [])?;
+                    n[i] = tx.execute(&format!("DELETE FROM {from}.{} WHERE {}", k.name, copied(k)), [])?;
                 }
                 let to = region_of(&set.stores, to).map(str::to_string);
-                moves.push(ChatMove { from: from_region, to, bots: bots as usize, messages: n[0], routines: n[1], approvals: n[2], memories: n[3] });
+                moves.push(ChatMove { from: from_region, to, bots: bots as usize, messages: n[0], routines: n[1], approvals: n[2], memories: n[3], facts: n[4] });
             }
             for s in &set.stores {
                 for k in &KEPT {
-                    tx.execute(&format!("DELETE FROM {}.{} WHERE bot_id NOT IN (SELECT id FROM main.bots)", s.schema, k.name), [])?;
+                    let (col, owners) = match k.key {
+                        Key::Bot => ("bot_id", "main.bots"),
+                        Key::User => ("user_id", "main.users"),
+                    };
+                    tx.execute(&format!("DELETE FROM {}.{} WHERE {col} NOT IN (SELECT id FROM {owners})", s.schema, k.name), [])?;
                 }
             }
             tx.commit()?;
@@ -611,74 +731,121 @@ impl Db {
     /// botd's own table on its way between a store and its file. None: it is in its file in
     /// DATA_DIR, if anywhere.
     pub fn memory(&self, bot_id: &str) -> Option<String> {
-        self.c().query_row("SELECT text FROM memories WHERE id = ?1", [bot_id], |r| r.get(0)).optional().ok().flatten()
+        self.doc(Doc::Memory, bot_id)
     }
 
     /// Whether `bot_id`'s memory belongs in a store (its owner's pin region has one), rather
     /// than in its file in DATA_DIR.
     pub fn memory_in_store(&self, bot_id: &str) -> bool {
-        let c = self.c();
-        self.place_for(&c, bot_id).is_ok_and(|s| s != "main")
+        self.doc_in_store(Doc::Memory, bot_id)
     }
 
-    /// Saves `bot_id`'s memory, which belongs in a store (`memory_in_store`): every row of it
-    /// changed, else a row made where it belongs.
+    /// Saves `bot_id`'s memory, which belongs in a store (`memory_in_store`).
     pub fn set_memory(&self, bot_id: &str, text: &str) -> rusqlite::Result<()> {
+        self.set_doc(Doc::Memory, bot_id, text)
+    }
+
+    /// `user_id`'s facts where a row holds them (ADR 0277), as `memory` for a Bot's memory.
+    pub fn facts(&self, user_id: &str) -> Option<String> {
+        self.doc(Doc::Facts, user_id)
+    }
+
+    /// Whether `user_id`'s facts belong in a store (their pin region has one).
+    pub fn facts_in_store(&self, user_id: &str) -> bool {
+        self.doc_in_store(Doc::Facts, user_id)
+    }
+
+    /// Saves `user_id`'s facts, which belong in a store (`facts_in_store`).
+    pub fn set_facts(&self, user_id: &str, text: &str) -> rusqlite::Result<()> {
+        self.set_doc(Doc::Facts, user_id, text)
+    }
+
+    /// Deletes every row of `user_id`'s facts, zeroed: once their file holds them, or when
+    /// they are erased. How many.
+    pub fn delete_facts(&self, user_id: &str) -> rusqlite::Result<usize> {
+        self.delete_doc(Doc::Facts, user_id)
+    }
+
+    /// botd's copy of `doc` kept by `id` where a row holds it: in a store, or in botd's own
+    /// table on its way between a store and its file. None: it is in its file, if anywhere.
+    pub fn doc(&self, doc: Doc, id: &str) -> Option<String> {
+        self.c().query_row(&format!("SELECT text FROM {} WHERE id = ?1", doc.table()), [id], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// Whether `doc` kept by `id` belongs in a store, rather than in its file in DATA_DIR.
+    pub fn doc_in_store(&self, doc: Doc, id: &str) -> bool {
+        let c = self.c();
+        self.place_by(&c, doc.key(), id).is_ok_and(|s| s != "main")
+    }
+
+    /// Saves `doc` kept by `id`, which belongs in a store: every row of it changed, else a
+    /// row made where it belongs.
+    pub fn set_doc(&self, doc: Doc, id: &str, text: &str) -> rusqlite::Result<()> {
         let c = self.c();
         let at = now();
-        if self.on_places(&c, "UPDATE {memories} SET text = ?1, updated_at = ?2 WHERE id = ?3", params![text, at, bot_id])? == 0 {
-            self.insert_kept(&c, "memories", bot_id, &["id", "bot_id", "text", "updated_at"], params![bot_id, bot_id, text, at])?;
+        let t = doc.table();
+        if self.on_places(&c, &format!("UPDATE {{{t}}} SET text = ?1, updated_at = ?2 WHERE id = ?3"), params![text, at, id])? == 0 {
+            let schema = self.place_by(&c, doc.key(), id)?;
+            c.execute(&format!("INSERT INTO {schema}.{t} (id, {}, text, updated_at) VALUES (?1, ?1, ?2, ?3)", doc.key().column()), params![id, text, at])?;
         }
         Ok(())
     }
 
-    /// Deletes every row of `bot_id`'s memory, zeroed in its file and the WAL emptied, once
-    /// its file in DATA_DIR holds it. How many.
-    pub fn delete_memory(&self, bot_id: &str) -> rusqlite::Result<usize> {
+    /// Deletes every row of `doc` kept by `id`, zeroed in its file and the WAL emptied. How many.
+    pub fn delete_doc(&self, doc: Doc, id: &str) -> rusqlite::Result<usize> {
         let c = self.c();
-        let n = zeroing(&c, || self.on_places(&c, "DELETE FROM {memories} WHERE id = ?1", &[&bot_id]))?;
+        let n = zeroing(&c, || self.on_places(&c, &format!("DELETE FROM {{{}}} WHERE id = ?1", doc.table()), &[&id]))?;
         if n > 0 {
             self.flush_places(&c);
         }
         Ok(n)
     }
 
-    /// The Bots whose memory belongs in a store now.
-    pub fn bots_with_memory_in_stores(&self) -> rusqlite::Result<Vec<String>> {
+    /// The Bots (memory) or people (facts) whose `doc` belongs in a store now.
+    pub fn with_doc_in_stores(&self, doc: Doc) -> rusqlite::Result<Vec<String>> {
         let stores = self.chat_stores_set();
         if stores.is_empty() {
             return Ok(Vec::new());
         }
         let c = self.c();
-        let mut s = c.prepare(&format!("SELECT b.id, {} FROM main.bots b ORDER BY b.id", pinned_region("b.id")))?;
+        let sql = match doc.key() {
+            Key::Bot => format!("SELECT b.id, {} FROM main.bots b ORDER BY b.id", pinned_region("b.id")),
+            Key::User => format!("SELECT u.id, {} FROM main.users u ORDER BY u.id", pinned_region_of("u.id")),
+        };
+        let mut s = c.prepare(&sql)?;
         let rows: Vec<(String, Option<String>)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows.into_iter().filter(|(_, r)| r.as_ref().is_some_and(|r| stores.iter().any(|s| s.region == *r))).map(|(id, _)| id).collect())
     }
 
-    /// Takes `bot_id`'s memory from its file into botd's own table, for the next
+    /// Takes `doc` kept by `id` from its file into botd's own table, for the next
     /// `place_chats` to move to its store, unless a row of it is kept somewhere already: that
-    /// one is newer, as its memory is saved there while it belongs in a store. Whether it was.
-    pub fn memory_from_file(&self, bot_id: &str, text: &str) -> rusqlite::Result<bool> {
+    /// one is newer, as it is saved there while it belongs in a store. Whether it was.
+    pub fn doc_from_file(&self, doc: Doc, id: &str, text: &str) -> rusqlite::Result<bool> {
+        let t = doc.table();
         let n = self.c().execute(
-            "INSERT INTO main.memories (id, bot_id, text, updated_at) SELECT ?1, ?1, ?2, ?3
-             WHERE EXISTS (SELECT 1 FROM main.bots WHERE id = ?1) AND NOT EXISTS (SELECT 1 FROM memories WHERE id = ?1)",
-            params![bot_id, text, now()],
+            &format!(
+                "INSERT INTO main.{t} (id, {}, text, updated_at) SELECT ?1, ?1, ?2, ?3
+                 WHERE EXISTS (SELECT 1 FROM {} WHERE id = ?1) AND NOT EXISTS (SELECT 1 FROM {t} WHERE id = ?1)",
+                doc.key().column(),
+                doc.owners()
+            ),
+            params![id, text, now()],
         )?;
         Ok(n > 0)
     }
 
-    /// The rows in botd's own `memories` whose Bot's memory belongs in its file now (its
-    /// owner unpinned, or their region without a store), as `(bot_id, text)`, for
-    /// `machines::chat_stores::place` to write to the file and then delete.
-    pub fn memories_for_files(&self) -> rusqlite::Result<Vec<(String, String)>> {
+    /// The rows of `doc` in botd's own table that belong in their file now (unpinned, or
+    /// their region without a store), as `(id, text)`, for `machines::chat_stores::place`
+    /// to write to the file and then delete.
+    pub fn docs_for_files(&self, doc: Doc) -> rusqlite::Result<Vec<(String, String)>> {
         let c = self.c();
         let rows: Vec<(String, String)> = {
-            let mut s = c.prepare("SELECT id, text FROM main.memories ORDER BY id")?;
+            let mut s = c.prepare(&format!("SELECT id, text FROM main.{} ORDER BY id", doc.table()))?;
             s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         };
         let mut out = Vec::new();
         for (id, text) in rows {
-            if self.place_for(&c, &id)? == "main" {
+            if self.place_by(&c, doc.key(), &id)? == "main" {
                 out.push((id, text));
             }
         }
@@ -691,64 +858,81 @@ impl Db {
         self.5.get().is_some_and(|s| s.unflushed.load(Ordering::Relaxed))
     }
 
-    /// What of the Bots `owners` own is in each place: botd's own database first, then each
-    /// store, places with none left out.
+    /// What of the Bots `owners` own, and of their own facts, is in each place: botd's own
+    /// database first, then each store, places with none left out.
     pub fn chat_counts(&self, owners: &[String]) -> Vec<ChatCount> {
         let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
         let c = self.c();
         let stores = self.chat_stores_set();
-        let theirs = "bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1)))";
+        let bots = "bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1)))";
+        let users = "user_id IN (SELECT value FROM json_each(?1))";
         schemas(stores)
             .filter_map(|s| {
-                let held = held_in(&c, s, theirs, &[&owners]).ok()?;
+                let held = held_in(&c, s, Filter(bots, &[&owners]), Filter(users, &[&owners])).ok()?;
                 (held.total() > 0).then(|| ChatCount { region: region_of(stores, s).map(str::to_string), held })
             })
             .collect()
     }
 
-    /// When the chats of Bots `owners` own last left each store other than `except`'s, as
-    /// `(region, moved_at)`: that store's backups from before then still hold them, until
-    /// botd has cleared them out of those backups (ADR 0238).
+    /// When the chats of Bots `owners` own, or their own facts (ADR 0277), last left each
+    /// store other than `except`'s, as `(region, moved_at)`: that store's backups from before
+    /// then still hold them, until botd has cleared them out of those backups (ADR 0238).
     pub fn chat_moves_out(&self, owners: &[String], except: &str) -> Vec<(String, i64)> {
         let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
         let c = self.c();
         let Ok(mut s) = c.prepare(
-            "SELECT region, MAX(moved_at) FROM main.chat_moves_out WHERE region != ?2 AND cleared_at IS NULL
-             AND bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1))) GROUP BY region ORDER BY region",
+            "SELECT region, MAX(moved_at) FROM (
+               SELECT region, moved_at FROM main.chat_moves_out WHERE region != ?2 AND cleared_at IS NULL
+                 AND bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1)))
+               UNION ALL
+               SELECT region, moved_at FROM main.facts_moves_out WHERE region != ?2 AND cleared_at IS NULL
+                 AND user_id IN (SELECT value FROM json_each(?1))
+             ) GROUP BY region ORDER BY region",
         ) else {
             return Vec::new();
         };
         s.query_map(params![owners, except], |r| Ok((r.get(0)?, r.get(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
-    /// The Bots whose rows left `store` and that its backups may still hold, as `(bot_id,
-    /// moved_at)` (ADR 0238): not yet cleared, kept somewhere else now (or deleted since),
-    /// and with nothing of theirs left in the store itself, so a move still pending never
-    /// takes the only other copy.
-    pub fn moves_out_to_clear(&self, store: &ChatStore) -> rusqlite::Result<Vec<(String, i64)>> {
-        let none_left: String = KEPT.iter().map(|k| format!(" AND NOT EXISTS (SELECT 1 FROM {}.{} WHERE bot_id = m.bot_id)", store.schema, k.name)).collect();
+    /// The Bots and people whose rows left `store` and that its backups may still hold
+    /// (ADR 0238, ADR 0277): not yet cleared, kept somewhere else now (or deleted since), and
+    /// with nothing of theirs left in the store itself, so a move still pending never takes
+    /// the only other copy.
+    pub fn moves_out_to_clear(&self, store: &ChatStore) -> rusqlite::Result<MovesOut> {
         let c = self.c();
-        let mut s = c.prepare(&format!(
-            "SELECT m.bot_id, m.moved_at FROM main.chat_moves_out m
-             WHERE m.region = ?1 AND m.cleared_at IS NULL AND ({}) IS NOT ?1{none_left}
-             ORDER BY m.bot_id",
-            pinned_region("m.bot_id")
-        ))?;
-        s.query_map([&store.region], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        let mut out = MovesOut::default();
+        for (key, table, list) in [(Key::Bot, "chat_moves_out", &mut out.bots), (Key::User, "facts_moves_out", &mut out.users)] {
+            let col = key.column();
+            let none_left: String =
+                KEPT.iter().filter(|k| k.key == key).map(|k| format!(" AND NOT EXISTS (SELECT 1 FROM {}.{} WHERE {col} = m.{col})", store.schema, k.name)).collect();
+            let region = match key {
+                Key::Bot => pinned_region("m.bot_id"),
+                Key::User => pinned_region_of("m.user_id"),
+            };
+            let mut s = c.prepare(&format!(
+                "SELECT m.{col}, m.moved_at FROM main.{table} m
+                 WHERE m.region = ?1 AND m.cleared_at IS NULL AND ({region}) IS NOT ?1{none_left}
+                 ORDER BY m.{col}"
+            ))?;
+            *list = s.query_map([&store.region], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        }
+        Ok(out)
     }
 
     /// Records that `region`'s backups no longer hold the rows of these moves (from
-    /// `moves_out_to_clear`). A Bot that moved out again since keeps its newer move. How
-    /// many were recorded.
-    pub fn moves_out_cleared(&self, region: &str, moves: &[(String, i64)], at: i64) -> rusqlite::Result<usize> {
+    /// `moves_out_to_clear`). A Bot or person that moved out again since keeps its newer
+    /// move. How many were recorded.
+    pub fn moves_out_cleared(&self, region: &str, moves: &MovesOut, at: i64) -> rusqlite::Result<usize> {
         let c = self.c();
         let tx = c.unchecked_transaction()?;
         let mut n = 0;
-        for (bot, moved_at) in moves {
-            n += tx.execute(
-                "UPDATE main.chat_moves_out SET cleared_at = ?4 WHERE region = ?1 AND bot_id = ?2 AND moved_at = ?3 AND cleared_at IS NULL",
-                params![region, bot, moved_at, at],
-            )?;
+        for (table, col, list) in [("chat_moves_out", "bot_id", &moves.bots), ("facts_moves_out", "user_id", &moves.users)] {
+            for (id, moved_at) in list {
+                n += tx.execute(
+                    &format!("UPDATE main.{table} SET cleared_at = ?4 WHERE region = ?1 AND {col} = ?2 AND moved_at = ?3 AND cleared_at IS NULL"),
+                    params![region, id, moved_at, at],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(n)
@@ -757,7 +941,7 @@ impl Db {
     /// Every store and what it holds.
     pub fn chat_store_counts(&self) -> Vec<(ChatStore, Held)> {
         let c = self.c();
-        self.chat_stores_set().iter().map(|s| (s.clone(), held_in(&c, &s.schema, "1", &[]).unwrap_or_default())).collect()
+        self.chat_stores_set().iter().map(|s| (s.clone(), held_in(&c, &s.schema, ALL, ALL).unwrap_or_default())).collect()
     }
 
     /// Redacts known secrets from the stores' chats and approval subjects, as startup does
@@ -816,37 +1000,75 @@ impl Db {
 }
 
 
-/// How many rows of `bots` a copy of a store opened on `c` (one of its backups) holds.
-pub fn held_in_copy(c: &Connection, bots: &[String]) -> rusqlite::Result<Held> {
-    let bots = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
-    held_in(c, "main", "bot_id IN (SELECT value FROM json_each(?1))", &[&bots])
+/// Bots and people, whose rows a copy of a store holds by their ids.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Whose {
+    pub bots: Vec<String>,
+    pub users: Vec<String>,
 }
 
-/// Deletes the rows of `bots` from a copy of a store opened on `c`, zeroing them
+impl Whose {
+    fn lists(&self) -> (String, String) {
+        let list = |ids: &[String]| serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
+        (list(&self.bots), list(&self.users))
+    }
+}
+
+/// The moves out of a store whose rows its backups may still hold, as `(id, moved_at)`:
+/// Bots' (ADR 0238) and people's facts (ADR 0277).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MovesOut {
+    pub bots: Vec<(String, i64)>,
+    pub users: Vec<(String, i64)>,
+}
+
+impl MovesOut {
+    pub fn len(&self) -> usize {
+        self.bots.len() + self.users.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn whose(&self) -> Whose {
+        let ids = |l: &[(String, i64)]| l.iter().map(|(id, _)| id.clone()).collect();
+        Whose { bots: ids(&self.bots), users: ids(&self.users) }
+    }
+}
+
+/// How many rows of `whose` a copy of a store opened on `c` (one of its backups) holds.
+pub fn held_in_copy(c: &Connection, whose: &Whose) -> rusqlite::Result<Held> {
+    let (bots, users) = whose.lists();
+    held_in(c, "main", Filter("bot_id IN (SELECT value FROM json_each(?1))", &[&bots]), Filter("user_id IN (SELECT value FROM json_each(?1))", &[&users]))
+}
+
+/// Deletes the rows of `whose` from a copy of a store opened on `c`, zeroing them
 /// (`secure_delete`), and rebuilds the file so no page of theirs is left in it (ADR 0238).
 /// What was deleted.
-pub fn drop_from_copy(c: &Connection, bots: &[String]) -> rusqlite::Result<Held> {
-    let held = delete_in_copy(c, "IN", bots)?;
+pub fn drop_from_copy(c: &Connection, whose: &Whose) -> rusqlite::Result<Held> {
+    let held = delete_in_copy(c, "IN", whose)?;
     c.execute_batch("VACUUM")?;
     Ok(held)
 }
 
-/// Deletes the rows of every Bot but `keep` from a copy of a store opened on `c`, zeroing
-/// them (`secure_delete`), for a backup about to be restored (ADR 0256): rows of Bots kept
-/// elsewhere now, or deleted, would otherwise come back. The caller VACUUMs. What was deleted.
-pub fn keep_only_in_copy(c: &Connection, keep: &[String]) -> rusqlite::Result<Held> {
+/// Deletes the rows of every Bot and person but `keep` from a copy of a store opened on
+/// `c`, zeroing them (`secure_delete`), for a backup about to be restored (ADR 0256): rows
+/// of Bots and people kept elsewhere now, or deleted, would otherwise come back. The caller
+/// VACUUMs. What was deleted.
+pub fn keep_only_in_copy(c: &Connection, keep: &Whose) -> rusqlite::Result<Held> {
     delete_in_copy(c, "NOT IN", keep)
 }
 
-fn delete_in_copy(c: &Connection, op: &str, bots: &[String]) -> rusqlite::Result<Held> {
-    let list = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
+fn delete_in_copy(c: &Connection, op: &str, whose: &Whose) -> rusqlite::Result<Held> {
+    let (bots, users) = whose.lists();
     c.execute_batch("PRAGMA secure_delete = ON")?;
     let tx = c.unchecked_transaction()?;
-    let mut n = [0; 4];
+    let mut n = [0; 5];
     for (i, k) in KEPT.iter().enumerate() {
-        let exists: bool = tx.query_row("SELECT COUNT(*) > 0 FROM main.sqlite_master WHERE type = 'table' AND name = ?1", [k.name], |r| r.get(0))?;
-        if exists {
-            n[i] = tx.execute(&format!("DELETE FROM main.{} WHERE bot_id {op} (SELECT value FROM json_each(?1))", k.name), [&list])? as i64;
+        let list = if k.key == Key::Bot { &bots } else { &users };
+        if has_table(&tx, "main", k.name)? {
+            n[i] = tx.execute(&format!("DELETE FROM main.{} WHERE {} {op} (SELECT value FROM json_each(?1))", k.name, k.key.column()), [list])? as i64;
         }
     }
     tx.commit()?;
@@ -867,18 +1089,22 @@ pub fn upgrade_copy(c: &Connection, botd: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// The Bots whose chats, routines and approvals belong in `region`'s store: those whose
-/// owner's pin (their team's, else their own) is in it. `c` is botd's own database.
-pub fn bots_kept_in(c: &Connection, region: &str) -> rusqlite::Result<Vec<String>> {
+/// The Bots whose chats, routines, approvals and memory belong in `region`'s store (those
+/// whose owner's pin, their team's else their own, is in it), and the people whose facts
+/// do (their own pin is). `c` is botd's own database.
+pub fn kept_in_region(c: &Connection, region: &str) -> rusqlite::Result<Whose> {
     let mut s = c.prepare(&format!("SELECT b.id FROM main.bots b WHERE ({}) = ?1 ORDER BY b.id", pinned_region("b.id")))?;
-    s.query_map([region], |r| r.get(0))?.collect()
+    let bots = s.query_map([region], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let mut s = c.prepare(&format!("SELECT u.id FROM main.users u WHERE ({}) = ?1 ORDER BY u.id", pinned_region_of("u.id")))?;
+    let users = s.query_map([region], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    Ok(Whose { bots, users })
 }
 
 /// What a copy of a store opened on `c` holds that the store attached as `schema` doesn't
 /// (it would come back), and what that store holds that the copy doesn't (it would go),
 /// by id. Either may be from before botd kept a table.
 pub fn compare_copy(c: &Connection, schema: &str) -> rusqlite::Result<(Held, Held)> {
-    let (mut back, mut gone) = ([0; 4], [0; 4]);
+    let (mut back, mut gone) = ([0; 5], [0; 5]);
     for (i, k) in KEPT.iter().enumerate() {
         let t = k.name;
         let count = |from: &str, other: Option<&str>| {
@@ -895,11 +1121,11 @@ pub fn compare_copy(c: &Connection, schema: &str) -> rusqlite::Result<(Held, Hel
     Ok((Held::of(back), Held::of(gone)))
 }
 
-/// The rows of Bots other than `kept` in the store attached as `schema` (rows a restore
-/// would leave behind in a backup, ADR 0256).
-pub fn held_apart_from(c: &Connection, schema: &str, kept: &[String]) -> rusqlite::Result<Held> {
-    let list = serde_json::to_string(kept).unwrap_or_else(|_| "[]".into());
-    held_in(c, schema, "bot_id NOT IN (SELECT value FROM json_each(?1))", &[&list])
+/// The rows of Bots and people other than `kept` in the store attached as `schema` (rows a
+/// restore would leave behind in a backup, ADR 0256).
+pub fn held_apart_from(c: &Connection, schema: &str, kept: &Whose) -> rusqlite::Result<Held> {
+    let (bots, users) = kept.lists();
+    held_in(c, schema, Filter("bot_id NOT IN (SELECT value FROM json_each(?1))", &[&bots]), Filter("user_id NOT IN (SELECT value FROM json_each(?1))", &[&users]))
 }
 
 fn has_table(c: &Connection, schema: &str, table: &str) -> rusqlite::Result<bool> {
@@ -983,7 +1209,7 @@ mod tests {
     }
 
     fn mv(from: Option<&str>, to: Option<&str>, bots: usize, n: [usize; 3]) -> ChatMove {
-        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2], memories: 0 }
+        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2], memories: 0, facts: 0 }
     }
 
     fn rows_in(path: &Path) -> i64 {
@@ -1340,7 +1566,7 @@ mod tests {
         assert_eq!(db.routine(&before.id).unwrap().instruction, "made before the pin");
         assert_eq!(db.approval(&asked).unwrap().input["command"], "ls before", "sealed by its id, so it opens wherever it is kept");
         let held = db.chat_counts(std::slice::from_ref(&ada));
-        assert_eq!(held, vec![ChatCount { region: Some("gb-lon".into()), held: Held { messages: 0, routines: 2, approvals: 2, memories: 0 } }]);
+        assert_eq!(held, vec![ChatCount { region: Some("gb-lon".into()), held: Held { messages: 0, routines: 2, approvals: 2, memories: 0, facts: 0 } }]);
         db.unpin_residency(PinOn::User, &ada).unwrap();
         assert_eq!(db.place_chats().unwrap(), vec![mv(Some("gb-lon"), None, 1, [0, 2, 2])]);
         assert_eq!((count(&db, "chats_0", "routines"), count(&db, "chats_0", "approvals")), (0, 0));
@@ -1482,7 +1708,7 @@ mod tests {
             approve(&db, &bot, "pwd");
         }
         let e = d.db().attach_chat_stores(&d.both()[..1], &[], None).unwrap_err();
-        assert!(e.contains("still holds 1 routine and 2 approvals of pinned people's Bots"), "{e}");
+        assert!(e.contains("still holds 1 routine and 2 approvals of pinned people and their Bots"), "{e}");
     }
 
     fn memory_move(from: Option<&str>, to: Option<&str>) -> ChatMove {
@@ -1496,19 +1722,19 @@ mod tests {
         let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
         let (bot, other) = (bot_of(&db, &ada), bot_of(&db, &cy));
         let word = "memory-58b1e0-the-plan";
-        assert!(db.bots_with_memory_in_stores().unwrap().is_empty() && !db.memory_in_store(&bot));
+        assert!(db.with_doc_in_stores(Doc::Memory).unwrap().is_empty() && !db.memory_in_store(&bot));
         db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
-        assert_eq!(db.bots_with_memory_in_stores().unwrap(), vec![bot.clone()]);
+        assert_eq!(db.with_doc_in_stores(Doc::Memory).unwrap(), vec![bot.clone()]);
         assert!(db.memory_in_store(&bot) && !db.memory_in_store(&other));
 
         // Taken from its file into botd's own table, then moved to the store like any row.
-        assert!(db.memory_from_file(&bot, word).unwrap());
-        assert!(!db.memory_from_file(&bot, "older").unwrap(), "a row kept already is newer than a file");
-        assert!(!db.memory_from_file("no-such-bot", "x").unwrap());
+        assert!(db.doc_from_file(Doc::Memory, &bot, word).unwrap());
+        assert!(!db.doc_from_file(Doc::Memory, &bot, "older").unwrap(), "a row kept already is newer than a file");
+        assert!(!db.doc_from_file(Doc::Memory, "no-such-bot", "x").unwrap());
         assert_eq!(db.place_chats().unwrap(), vec![memory_move(None, Some("gb-lon"))]);
         assert_eq!((count(&db, "main", "memories"), count(&db, "chats_0", "memories")), (0, 1));
         assert_eq!(db.memory(&bot).as_deref(), Some(word));
-        assert!(db.memories_for_files().unwrap().is_empty());
+        assert!(db.docs_for_files(Doc::Memory).unwrap().is_empty());
         let app = d.dir.path().join("app.sqlite");
         let holds = |path: &Path| std::fs::read(path).is_ok_and(|b| b.windows(word.len()).any(|x| x == word.as_bytes()));
         assert!(!holds(&app) && !holds(&d.dir.path().join("app.sqlite-wal")), "no copy left in botd's own database");
@@ -1526,9 +1752,9 @@ mod tests {
         db.unpin_residency(PinOn::User, &ada).unwrap();
         assert_eq!(db.place_chats().unwrap(), vec![memory_move(Some("gb-lon"), None)]);
         assert_eq!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").len(), 1, "recorded for the store's earlier backups");
-        assert_eq!(db.memories_for_files().unwrap(), vec![(bot.clone(), "updated".to_string())]);
-        assert_eq!(db.delete_memory(&bot).unwrap(), 1);
-        assert_eq!((db.memory(&bot), db.memories_for_files().unwrap()), (None, Vec::new()));
+        assert_eq!(db.docs_for_files(Doc::Memory).unwrap(), vec![(bot.clone(), "updated".to_string())]);
+        assert_eq!(db.delete_doc(Doc::Memory, &bot).unwrap(), 1);
+        assert_eq!((db.memory(&bot), db.docs_for_files(Doc::Memory).unwrap()), (None, Vec::new()));
         assert!(!holds(&d.lon.join("chats.sqlite")) && !holds(&app));
         // Deleting a Bot deletes its memory in a store.
         assert!(db.delete_bot_unless_held(&other));
@@ -1545,7 +1771,7 @@ mod tests {
             db.set_memory(&bot_of(&db, &ada), "x").unwrap();
         }
         let e = d.db().attach_chat_stores(&d.both()[..1], &[], None).unwrap_err();
-        assert!(e.contains("still holds 1 Bot memory of pinned people's Bots"), "{e}");
+        assert!(e.contains("still holds 1 Bot memory of pinned people and their Bots"), "{e}");
     }
 
     #[test]
@@ -1565,6 +1791,141 @@ mod tests {
     fn describing_what_a_place_holds_names_bots_memory() {
         assert_eq!(Held { memories: 1, ..Held::default() }.describe(), "1 Bot memory");
         assert_eq!(Held { messages: 2, memories: 3, ..Held::default() }.describe(), "2 chat messages and 3 Bot memories");
+        assert_eq!(Held { memories: 1, facts: 1, ..Held::default() }.describe(), "1 Bot memory and 1 person's facts");
+        assert_eq!(Held { facts: 2, ..Held::default() }.describe(), "2 people's facts");
+        assert_eq!(Held { messages: 1, facts: 2, ..Held::default() }.of_bots(), Held { messages: 1, ..Held::default() });
+    }
+
+    fn facts_move(from: Option<&str>, to: Option<&str>) -> ChatMove {
+        ChatMove { facts: 1, ..mv(from, to, 0, [0, 0, 0]) }
+    }
+
+    #[test]
+    fn a_pinned_persons_facts_are_kept_in_their_store_and_move_with_the_pin() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let word = "facts-58c2f1-ada-banks-here";
+        assert!(db.with_doc_in_stores(Doc::Facts).unwrap().is_empty() && !db.facts_in_store(&ada));
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.with_doc_in_stores(Doc::Facts).unwrap(), vec![ada.clone()]);
+        assert!(db.facts_in_store(&ada) && !db.facts_in_store(&cy));
+
+        // Taken from the file into botd's own table, then moved to the store with no Bot.
+        assert!(db.doc_from_file(Doc::Facts, &ada, word).unwrap());
+        assert!(!db.doc_from_file(Doc::Facts, &ada, "older").unwrap(), "a row kept already is newer than a file");
+        assert!(!db.doc_from_file(Doc::Facts, "no-such-user", "x").unwrap());
+        assert_eq!(db.place_chats().unwrap(), vec![facts_move(None, Some("gb-lon"))]);
+        assert_eq!((count(&db, "main", "facts"), count(&db, "chats_0", "facts")), (0, 1));
+        assert_eq!(db.facts(&ada).as_deref(), Some(word));
+        assert!(db.docs_for_files(Doc::Facts).unwrap().is_empty());
+        let app = d.dir.path().join("app.sqlite");
+        let holds = |path: &Path| std::fs::read(path).is_ok_and(|b| b.windows(word.len()).any(|x| x == word.as_bytes()));
+        assert!(!holds(&app) && !holds(&d.dir.path().join("app.sqlite-wal")), "no copy left in botd's own database");
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), held: Held { facts: 1, ..Held::default() } }]);
+
+        // Saved where they are kept; someone pinned with no row yet gets one in their store.
+        db.set_facts(&ada, "updated").unwrap();
+        assert_eq!((db.facts(&ada).as_deref(), count(&db, "chats_0", "facts")), (Some("updated"), 1));
+        db.pin_residency(PinOn::User, &cy, "de-fra-2", "DPA-2", None).unwrap();
+        db.set_facts(&cy, "cy's").unwrap();
+        assert_eq!(count(&db, "chats_1", "facts"), 1);
+
+        // Unpinned, they come back to botd's own table on their way to the file, and the
+        // move is recorded for the store's earlier backups.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![facts_move(Some("gb-lon"), None)]);
+        assert_eq!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").len(), 1, "recorded for the store's earlier backups");
+        let lon = db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
+        assert_eq!(db.moves_out_to_clear(&lon).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert_eq!(db.docs_for_files(Doc::Facts).unwrap(), vec![(ada.clone(), "updated".to_string())]);
+        assert_eq!(db.delete_facts(&ada).unwrap(), 1);
+        assert_eq!((db.facts(&ada), db.docs_for_files(Doc::Facts).unwrap()), (None, Vec::new()));
+        assert!(!holds(&d.lon.join("chats.sqlite")) && !holds(&app));
+        let moves = db.moves_out_to_clear(&lon).unwrap();
+        assert_eq!(db.moves_out_cleared("gb-lon", &moves, now()).unwrap(), 1);
+        assert!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").is_empty());
+    }
+
+    #[test]
+    fn a_team_pin_keeps_its_members_facts_and_a_member_leaving_takes_theirs_out() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let t = db.create_team("Acme", None);
+        assert!(db.add_team_member(&t.id, &ada, "member", None));
+        db.pin_residency(PinOn::User, &cy, "gb-lon", "DPA-1", None).unwrap();
+        db.pin_residency(PinOn::Team, &t.id, "de-fra-2", "MSA-1", None).unwrap();
+        db.set_facts(&ada, "ada's").unwrap();
+        assert_eq!(db.place_of("facts", &ada), Some(Some("de-fra-2".into())));
+        assert_eq!(kept_in_region(&db.c(), "de-fra-2").unwrap(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert!(db.remove_team_member(&t.id, &ada, false));
+        assert_eq!(db.place_chats().unwrap(), vec![facts_move(Some("de-fra-2"), None)]);
+        assert_eq!(db.docs_for_files(Doc::Facts).unwrap(), vec![(ada.clone(), "ada's".to_string())]);
+    }
+
+    #[test]
+    fn a_dropped_store_holding_a_persons_facts_stops_botd() {
+        let d = Dirs::new();
+        {
+            let db = d.up();
+            let ada = user(&db, "ada");
+            db.pin_residency(PinOn::User, &ada, "de-fra-2", "DPA-1", None).unwrap();
+            db.set_facts(&ada, "x").unwrap();
+        }
+        let e = d.db().attach_chat_stores(&d.both()[..1], &[], None).unwrap_err();
+        assert!(e.contains("still holds 1 person's facts of pinned people and their Bots"), "{e}");
+    }
+
+    #[test]
+    fn a_store_from_before_owners_facts_gains_its_table() {
+        let d = Dirs::new();
+        drop(d.up());
+        Connection::open(d.lon.join("chats.sqlite")).unwrap().execute_batch("DROP TABLE facts").unwrap();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        db.set_facts(&ada, "kept").unwrap();
+        assert_eq!((db.facts(&ada).as_deref(), count(&db, "chats_0", "facts")), (Some("kept"), 1));
+    }
+
+    #[test]
+    fn copies_of_a_store_are_cleared_and_kept_by_person_as_well_as_by_bot() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        for u in [&ada, &cy] {
+            db.pin_residency(PinOn::User, u, "gb-lon", "DPA-1", None).unwrap();
+            db.set_facts(u, &format!("{u}'s facts")).unwrap();
+        }
+        let bot = bot_of(&db, &ada);
+        db.set_memory(&bot, "memory").unwrap();
+        let copy = d.dir.path().join("copy.sqlite");
+        db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        std::fs::copy(d.lon.join("chats.sqlite"), &copy).unwrap();
+        let c = Connection::open(&copy).unwrap();
+        let only_cy = Whose { bots: Vec::new(), users: vec![cy.clone()] };
+        assert_eq!(held_in_copy(&c, &only_cy).unwrap(), Held { facts: 1, ..Held::default() });
+        assert_eq!(held_apart_from(&db.c(), "chats_0", &only_cy).unwrap(), Held { memories: 1, facts: 1, ..Held::default() });
+        assert_eq!(keep_only_in_copy(&c, &Whose { bots: vec![bot.clone()], users: vec![ada.clone()] }).unwrap(), Held { facts: 1, ..Held::default() });
+        assert_eq!(drop_from_copy(&c, &Whose { bots: vec![bot], users: vec![ada.clone()] }).unwrap(), Held { memories: 1, facts: 1, ..Held::default() });
+        assert_eq!(held_in_copy(&c, &Whose { bots: Vec::new(), users: vec![ada, cy] }).unwrap(), Held::default());
+    }
+
+    #[test]
+    fn an_erasure_deletes_a_persons_facts_in_a_store_and_in_copies_of_it() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        db.set_facts(&ada, "erase me").unwrap();
+        let copy = d.dir.path().join("copy.sqlite");
+        db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        std::fs::copy(d.lon.join("chats.sqlite"), &copy).unwrap();
+        let c = Connection::open(&copy).unwrap();
+        assert_eq!(crate::db::erase_in_copy(&c, &ada, "erased-00", &[]).unwrap().facts, 1);
+        db.erase_user(&ada, "erased-00", None, &[]).unwrap();
+        assert_eq!((db.facts(&ada), count(&db, "chats_0", "facts")), (None, 0));
     }
 
     #[test]
