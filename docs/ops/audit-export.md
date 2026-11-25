@@ -197,6 +197,14 @@ With Compose, run the collector on the `superbot_default` network and set `AUDIT
 
 ### Changing the sink
 
+Each change is on the chain ([ADR 0264](../adr/0264-audit-export-starts-and-stops-on-the-chain.md)), so the export can't be stopped quietly:
+
+- **`audit.export_started`** when a sink with no cursor first starts: its `sink`, `kind`, `name`, `start` (`all` or `new`), `after` (it gets every event after this id) and `skipped` (events kept that it never gets, 0 with `all`). A sink starting with `new` still gets this event.
+- **`audit.export_stopped`** once, when botd starts without a sink that has a cursor: `reason` is `removed` while other sinks run, or `export_off`; `delivered` is the last event it took and `pending` how many it hadn't. The sinks still running deliver it, and botd logs a warning.
+- **`audit.export_resumed`** when a stopped sink is set again, or retention has deleted events after its cursor: `stoppedEvent`, and `missed: {after, through}`, the ids it will never get.
+
+`botctl audit siem` lists sinks recorded as stopped under `stopped`. Events and the API name a sink by what it shows, never a webhook's path. Alert in your SIEM on `audit.export_stopped`, and on `audit.export_started` with `skipped` above 0. For the evidence bundle, a sink started with `new` past events of the month, or back with events missed, means `audit-integrity.json` doesn't name CC2.1-2 that month; start a replacement SIEM with `all`, the default.
+
 The cursor is kept per sink URL. A new URL starts as `AUDIT_EXPORT_START` (or its `AUDIT_EXPORT_START_<NAME>`) says; switching back to an old URL resumes where it stopped. A name isn't part of the cursor, so naming a running sink, or renaming it, resumes it. To send everything again to the same sink, use a different path or remove its row from `settings` while botd is stopped. The row's key is `audit_export:` and the sink with its port always written, defaults included, and for a webhook its path: `https://<collector>/ingest` is saved as `audit_export:https://<collector>:443/ingest`, and `syslog+tls://<host>` as `audit_export:syslog+tls://<host>:6514`.
 
 ## Archive events to write-once S3
