@@ -36,7 +36,7 @@ The names are the Azure SDKs' own, so a file and settings that work with `az log
 
 Two of the SDKs' settings are refused at startup rather than ignored:
 
-- `AZURE_CLIENT_CERTIFICATE_PASSWORD`. botd doesn't read PFX files or encrypted keys. The error shows how to convert a PFX with `openssl pkcs12 -nodes`. A password stored next to the file it unlocks protects nothing that the file's mode doesn't.
+- `AZURE_CLIENT_CERTIFICATE_PASSWORD`. botd doesn't read PFX files or encrypted keys. The error shows how to convert a PFX with `openssl pkcs12 -nodes`. A password stored next to the file it unlocks protects nothing that the file's mode doesn't. ([ADR 0280](0280-pfx-files-and-encrypted-keys-for-entra-sign-in.md) later accepted it, for PFX files and encrypted keys.)
 - `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN`. Subject name and issuer sign-in mostly serves Microsoft's own first-party apps. Uploading the certificate to the app registration is the supported path for others.
 
 ### Checking the file

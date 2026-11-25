@@ -76,7 +76,26 @@ AZURE_CLIENT_ID=<app-client-id>
 AZURE_CLIENT_CERTIFICATE_PATH=/etc/superbot/azure/botd.pem
 ```
 
-The key must be RSA and unencrypted (`PRIVATE KEY` or `RSA PRIVATE KEY`). From a PFX: `openssl pkcs12 -in botd.pfx -nodes -out botd.pem`. botd checks the file when it starts and again at each sign-in, so it stops on a missing key, a certificate for another key, or one out of date. To rotate, upload the new certificate with `--append`, replace the file, then delete the old certificate from the app. botd uses the new file from its next sign-in, with no restart. If Entra refuses the certificate, botd's error gives its SHA-1 thumbprint, which the app's **Certificates & secrets** page lists. The same setting works for Vault's `azure` sign-in (`VAULT_AZURE_CREDENTIALS=client-certificate`) and the Azure Monitor audit sink (`AUDIT_EXPORT_AZURE_AUTH=client-certificate`). `AZURE_RUN_CREDENTIALS` needs a managed identity or workload identity instead.
+The key must be RSA (`PRIVATE KEY` or `RSA PRIVATE KEY`). botd checks the file when it starts and again at each sign-in, so it stops on a missing key, a certificate for another key, or one out of date.
+
+To rotate, upload the new certificate with `--append`, replace the file, then delete the old certificate from the app. botd uses the new file from its next sign-in, with no restart. If Entra refuses the certificate, botd's error gives its SHA-1 thumbprint, which the app's **Certificates & secrets** page lists. The same setting works for Vault's `azure` sign-in (`VAULT_AZURE_CREDENTIALS=client-certificate`) and the Azure Monitor audit sink (`AUDIT_EXPORT_AZURE_AUTH=client-certificate`). `AZURE_RUN_CREDENTIALS` needs a managed identity or workload identity instead.
+
+##### A PFX file or an encrypted key
+
+`AZURE_CLIENT_CERTIFICATE_PATH` can also be a PFX (PKCS#12) file, as Windows, Key Vault and most certificate authorities hand them out, or a PEM file whose key is encrypted (`ENCRYPTED PRIVATE KEY`). Give botd the password the same way the Azure SDKs take it ([ADR 0280](../adr/0280-pfx-files-and-encrypted-keys-for-entra-sign-in.md)):
+
+```sh
+AZURE_CLIENT_CERTIFICATE_PATH=/etc/superbot/azure/botd.pfx
+AZURE_CLIENT_CERTIFICATE_PASSWORD_FILE=/run/credentials/botd.service/pfx_password
+```
+
+`AZURE_CLIENT_CERTIFICATE_PASSWORD` works too. Keep the password apart from the file it opens, for example in a systemd credential or a Kubernetes secret mounted on its own, so a copy of the certificate file alone is no use. A PFX with an empty password needs no setting. To download a certificate Key Vault made: `az keyvault secret download --vault-name <vault> --name <cert> --encoding base64 --file botd.pfx`.
+
+- PFX files: AES-256 with PBKDF2 (OpenSSL 3's and Windows' `AES256-SHA256` default) and the older 3DES and RC2 schemes. The file's MAC is checked. It must hold one private key and its certificate, with or without the chain.
+- Encrypted PEM keys: PKCS#8 with PBES2, as `openssl pkcs8 -topk8 -v2 aes-256-cbc` writes them. Older `Proc-Type: 4,ENCRYPTED` keys are refused, with that command to convert them.
+- A wrong password fails closed before Entra is asked. botd says the password doesn't open the file and never logs the password. A password set for a PEM file whose key isn't encrypted is refused, so a wrong file isn't taken for the right one.
+- If botd says a PFX file you gave no password is "a PFX file with a password", it was written with a null password rather than an empty one. Write it again: `openssl pkcs12 -in old.pfx -passin pass: -nodes | openssl pkcs12 -export -passout pass:<password> -out botd.pfx`.
+- botd reads the password once, at startup. A renewed file must use the same password, or botd must restart.
 
 With AKS workload identity, use `AZURE_KEYVAULT_AUTH=workload-identity`. AKS sets `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_FEDERATED_TOKEN_FILE`. Sovereign clouds: use the vault's own URL (`.vault.azure.cn`, `.vault.usgovcloudapi.net`) and set `AZURE_AUTHORITY_HOST`.
 
