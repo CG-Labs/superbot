@@ -211,6 +211,8 @@ The Provider pins the covered team or users to the Agreed Region in the Service,
 
 (h) **[Only if the Provider keeps a chat store in the Agreed Region; otherwise delete.]** the chat history, routines and approvals (the tool calls a Bot asked to make, with their input and the decision's note) of the covered team's or users' Bots are kept in a database in the Agreed Region, separate from the Service's own database, with its backups in the same region; what moved there when the pin is made is recorded in the audit log, and the residency report's "Chats, routines and approvals" section shows where it is ([ADR 0215](../adr/0215-pinned-chats-in-a-store-in-their-region.md), [ADR 0228](../adr/0228-routines-and-approvals-in-the-regional-store.md)). When they leave another region's such database (moved into the Agreed Region's), the Service removes them from that database's backups, normally within the hour, records it in the audit log, and the residency report lists those backups until it has ([ADR 0238](../adr/0238-clearing-moved-rows-from-store-backups.md)).
 
+(i) Bots' runs for the covered team or users take place only on a computer in the Agreed Region: the user's machine there, or the Service's own server only where the Provider states it is in the Agreed Region (IV.1(g)); a run that would take place elsewhere, such as a covered user's run of a teammate's Bot whose machine is in another region, is refused ([ADR 0267](../adr/0267-runs-on-a-computer-in-the-pins-region.md)).
+
 ### IV.2 What the pin doesn't cover
 
 | Data | Where it is | Note |

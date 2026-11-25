@@ -2251,6 +2251,26 @@ pub struct ScimRevoked {
     pub role_after: Option<Role>,
 }
 
+/// Someone a mapping's new role was swapped in for (ADR 0265): their built-in role before
+/// and after, which differ across the server when the two roles' bases do.
+#[derive(Debug, PartialEq)]
+pub struct ScimSwapped {
+    pub user_id: String,
+    pub role_before: Option<Role>,
+    pub role_after: Option<Role>,
+}
+
+/// What changing a mapping's role did: the mapping as it is now, the role it gave before,
+/// the people now holding the new one instead, and grants forgotten because their holder
+/// no longer held the old role.
+#[derive(Debug)]
+pub struct ScimRemapped {
+    pub mapping: ScimRoleMapping,
+    pub from: String,
+    pub swapped: Vec<ScimSwapped>,
+    pub dropped: Vec<String>,
+}
+
 /// A role given or taken away by hand: what they held just before, read in the same
 /// transaction as the write, and the SCIM (or, across the server, SAML) mapping whose claim
 /// on it ended, if one had.
@@ -6374,15 +6394,19 @@ impl Db {
     }
 
     /// Gives `user_id` the mapping's role and records that SCIM gave it, in one
-    /// transaction, only while they're on its team, hold no custom role in its scope, and
-    /// (across the server) aren't an admin or the owner account. Across the server, the
-    /// role's base becomes their built-in role, and the one they had is kept to give back.
+    /// transaction, only while the mapping still gives that role, they're on its team, hold
+    /// no custom role in its scope, and (across the server) aren't an admin or the owner
+    /// account. Across the server, the role's base becomes their built-in role, and the one
+    /// they had is kept to give back.
     pub fn grant_scim_role(&self, m: &ScimRoleMapping, user_id: &str) -> bool {
         let c = self.c();
         let Ok(tx) = c.unchecked_transaction() else { return false };
         let at = now();
         let on_team = "EXISTS (SELECT 1 FROM team_members WHERE team_id = ?3 AND user_id = ?2) AND EXISTS (SELECT 1 FROM roles WHERE id = ?1)";
         let res = (|| {
+            if Self::scim_mapping_role_in(&tx, &m.id)?.as_deref() != Some(m.role_id.as_str()) {
+                return Ok(false);
+            }
             if role_perms_in(&tx, &m.role_id)?.is_none_or(|p| !p.reaching_admins(m.scope == "team").is_empty()) {
                 return Ok(false);
             }
@@ -6411,24 +6435,32 @@ impl Db {
         matches!(res, Ok(true)) && tx.commit().is_ok()
     }
 
+    /// The role the mapping `id` gives now, read in the caller's transaction, so a write
+    /// never acts on a role an admin changed since the caller read the mapping (ADR 0265).
+    fn scim_mapping_role_in(c: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+        c.query_row("SELECT role_id FROM scim_role_mappings WHERE id = ?", [id], |r| r.get(0)).optional()
+    }
+
     /// Takes away what the mapping gave `user_id`, and forgets the grant, in one
-    /// transaction. Only a role they still hold from it is cleared; across the server their
-    /// built-in role goes back to the one they had before. None if it gave them nothing.
-    /// `left`: they left the group, so nothing is taken if they're on its team again (a
-    /// join that raced the leave holds the grant now).
-    pub fn revoke_scim_role(&self, m: &ScimRoleMapping, user_id: &str, left: bool) -> Option<ScimRevoked> {
+    /// transaction. Only a role they still hold from it is cleared (the one the mapping gives
+    /// now); across the server their built-in role goes back to the one they had before.
+    /// The role it took, or None if it gave them nothing. `left`: they left the group, so
+    /// nothing is taken if they're on its team again (a join that raced the leave holds the
+    /// grant now).
+    pub fn revoke_scim_role(&self, m: &ScimRoleMapping, user_id: &str, left: bool) -> Option<(String, ScimRevoked)> {
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
         let res = (|| {
             if left && tx.query_row("SELECT EXISTS (SELECT 1 FROM team_members WHERE team_id = ?1 AND user_id = ?2)", [&m.team_id, user_id], |r| r.get::<_, bool>(0))? {
                 return Ok(None);
             }
+            let given = Self::scim_mapping_role_in(&tx, &m.id)?.unwrap_or_else(|| m.role_id.clone());
             let prior: Option<Option<String>> =
                 tx.query_row("DELETE FROM scim_role_grants WHERE mapping_id = ?1 AND user_id = ?2 RETURNING prior_role", [&m.id, user_id], |r| r.get(0)).optional()?;
             let Some(prior) = prior else { return Ok(None) };
             if m.scope == "team" {
-                let n = tx.execute("UPDATE team_members SET role_id = NULL WHERE team_id = ?1 AND user_id = ?2 AND role_id = ?3", params![m.team_id, user_id, m.role_id])?;
-                return Ok(Some(ScimRevoked { cleared: n > 0, role_before: None, role_after: None }));
+                let n = tx.execute("UPDATE team_members SET role_id = NULL WHERE team_id = ?1 AND user_id = ?2 AND role_id = ?3", params![m.team_id, user_id, given])?;
+                return Ok(Some((given, ScimRevoked { cleared: n > 0, role_before: None, role_after: None })));
             }
             let role = |tx: &Connection| tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get::<_, String>(0)).optional();
             let before = role(&tx)?;
@@ -6436,16 +6468,69 @@ impl Db {
             let prior = prior.filter(|p| Role::parse(p).is_some_and(|r| r != Role::Admin));
             let n = tx.execute(
                 "UPDATE users SET role_id = NULL, role = coalesce(?1, role), updated_at = ?2 WHERE id = ?3 AND role_id = ?4",
-                params![prior, now(), user_id, m.role_id],
+                params![prior, now(), user_id, given],
             )?;
             let after = role(&tx)?;
             let parse = |r: Option<String>| r.as_deref().and_then(Role::parse);
-            Ok::<_, rusqlite::Error>(Some(ScimRevoked { cleared: n > 0, role_before: parse(before), role_after: parse(after) }))
+            Ok::<_, rusqlite::Error>(Some((given, ScimRevoked { cleared: n > 0, role_before: parse(before), role_after: parse(after) })))
         })();
         match res {
             Ok(Some(r)) => tx.commit().ok().map(|_| r),
             _ => None,
         }
+    }
+
+    /// Makes the mapping `id` give `role_id` instead, in its scope (ADR 0265), while the
+    /// role's permissions as they are now don't reach admins there and it isn't time-bound,
+    /// and in the same transaction swaps it in for everyone still holding the old role from
+    /// the mapping, so nobody is left with neither. A grant whose holder no longer holds the
+    /// old role is forgotten. Nobody else is given anything. The same role again changes nothing.
+    pub fn set_scim_role_mapping_role(&self, id: &str, role_id: &str) -> Result<ScimRemapped, ScimRoleMapError> {
+        let err = |e: rusqlite::Error| ScimRoleMapError::Db(e.to_string());
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(err)?;
+        let mut m = tx.query_row("SELECT * FROM scim_role_mappings WHERE id = ?", [id], scim_role_mapping_row).optional().map_err(err)?.ok_or(ScimRoleMapError::Gone)?;
+        let perms = role_perms_in(&tx, role_id).map_err(err)?.ok_or(ScimRoleMapError::Gone)?;
+        let reach = perms.reaching_admins(m.scope == "team");
+        if !reach.is_empty() {
+            return Err(ScimRoleMapError::Reaches(reach));
+        }
+        if role_time_bound_in(&tx, role_id).map_err(err)? {
+            return Err(ScimRoleMapError::TimeBound);
+        }
+        let from = std::mem::replace(&mut m.role_id, role_id.to_string());
+        if from == role_id {
+            return Ok(ScimRemapped { mapping: m, from, swapped: Vec::new(), dropped: Vec::new() });
+        }
+        tx.execute("UPDATE scim_role_mappings SET role_id = ?1 WHERE id = ?2", params![role_id, id]).map_err(err)?;
+        let holders: Vec<String> = {
+            let mut s = tx.prepare("SELECT user_id FROM scim_role_grants WHERE mapping_id = ? ORDER BY granted_at, user_id").map_err(err)?;
+            s.query_map([id], |r| r.get(0)).map_err(err)?.collect::<rusqlite::Result<_>>().map_err(err)?
+        };
+        let at = now();
+        let role = |user_id: &str| tx.query_row("SELECT role FROM users WHERE id = ?", [user_id], |r| r.get::<_, String>(0)).optional().map(|r| r.as_deref().and_then(Role::parse));
+        let (mut swapped, mut dropped) = (Vec::new(), Vec::new());
+        for user_id in holders {
+            let before = role(&user_id).map_err(err)?;
+            let n = if m.scope == "org" {
+                tx.execute(
+                    "UPDATE users SET role_id = ?1, role = (SELECT base FROM roles WHERE id = ?1), updated_at = ?2 WHERE id = ?3 AND role_id = ?4 AND role != 'admin'",
+                    params![role_id, at, user_id, from],
+                )
+            } else {
+                tx.execute("UPDATE team_members SET role_id = ?1 WHERE team_id = ?2 AND user_id = ?3 AND role_id = ?4", params![role_id, m.team_id, user_id, from])
+            }
+            .map_err(err)?;
+            if n == 0 {
+                tx.execute("DELETE FROM scim_role_grants WHERE mapping_id = ?1 AND user_id = ?2", [id, user_id.as_str()]).map_err(err)?;
+                dropped.push(user_id);
+                continue;
+            }
+            let after = role(&user_id).map_err(err)?;
+            swapped.push(ScimSwapped { user_id, role_before: before, role_after: after });
+        }
+        tx.commit().map_err(err)?;
+        Ok(ScimRemapped { mapping: m, from, swapped, dropped })
     }
 
     // SCIM role groups (ADR 0180). Every query a SCIM request makes names its tenant.
@@ -11956,8 +12041,8 @@ mod tests {
         assert!(db.revoke_scim_role(&org, &a.id, true).is_none(), "a leave that a rejoin overtook keeps the server-wide grant");
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
         assert_eq!(db.scim_role_grants(&org.id).len(), 1);
-        let back = db.revoke_scim_role(&org, &a.id, false).unwrap();
-        assert_eq!((back.cleared, back.role_before, back.role_after), (true, Some(Role::Member), Some(Role::Readonly)));
+        let (took, back) = db.revoke_scim_role(&org, &a.id, false).unwrap();
+        assert_eq!((took.as_str(), back.cleared, back.role_before, back.role_after), (r.id.as_str(), true, Some(Role::Member), Some(Role::Readonly)));
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Readonly, None));
         assert!(db.revoke_scim_role(&org, &a.id, false).is_none());
 
@@ -11999,6 +12084,65 @@ mod tests {
         assert_eq!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2)));
         assert!(db.delete_scim_role_mapping(&org.id));
         assert!(db.scim_role_grants(&org.id).is_empty());
+    }
+
+    #[test]
+    fn a_mappings_role_is_swapped_in_for_its_holders_in_one_go() {
+        let db = Db::open(&temp_path("scim-remap").join("app.sqlite")).unwrap();
+        let a = db.create_user(None, Some("a@example.com"), "A", Role::Readonly).unwrap();
+        let b = db.create_user(None, Some("b@example.com"), "B", Role::Member).unwrap();
+        let c = db.create_user(None, Some("c@example.com"), "C", Role::Member).unwrap();
+        let team = db.create_team("Eng", None);
+        for u in [&a, &b, &c] {
+            assert!(db.add_team_member(&team.id, &u.id, "member", None));
+        }
+        db.link_scim_group("okta", &team.id, None, "Eng", None).unwrap();
+        let wide = db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+        let viewer = db.create_custom_role("Viewer", "", Role::Readonly, &["audit.view"], None, None).unwrap();
+        let bots = db.create_custom_role("Bots", "", Role::Member, &["bots.manage"], None, None).unwrap();
+        let brief = db.create_custom_role("Brief", "", Role::Member, &["audit.view"], Some(7), None).unwrap();
+        let org = db.create_scim_role_mapping("okta", &team.id, &wide.id, "org", None).unwrap();
+        for u in [&a, &b, &c] {
+            assert!(db.grant_scim_role(&org, &u.id));
+        }
+        // C's role changed without the grant being dropped: the swap forgets it, touching nothing.
+        db.c().execute("UPDATE users SET role_id = ?1 WHERE id = ?2", [&viewer.id, &c.id]).unwrap();
+
+        assert_eq!(db.set_scim_role_mapping_role(&org.id, &bots.id).err(), Some(ScimRoleMapError::Reaches(vec!["bots.manage"])));
+        assert_eq!(db.set_scim_role_mapping_role(&org.id, &brief.id).err(), Some(ScimRoleMapError::TimeBound));
+        assert_eq!(db.set_scim_role_mapping_role(&org.id, "r-nope").err(), Some(ScimRoleMapError::Gone));
+        assert_eq!(db.set_scim_role_mapping_role("sm-nope", &viewer.id).err(), Some(ScimRoleMapError::Gone));
+        assert_eq!(db.scim_role_mapping(&org.id).unwrap().role_id, wide.id, "a refusal changes nothing");
+        let same = db.set_scim_role_mapping_role(&org.id, &wide.id).unwrap();
+        assert!(same.swapped.is_empty() && same.dropped.is_empty() && same.from == wide.id);
+
+        let r = db.set_scim_role_mapping_role(&org.id, &viewer.id).unwrap();
+        assert_eq!((r.from.as_str(), r.mapping.role_id.as_str()), (wide.id.as_str(), viewer.id.as_str()));
+        let mut swapped = r.swapped;
+        swapped.sort_by(|x, y| x.user_id.cmp(&y.user_id));
+        let mut want: Vec<ScimSwapped> = [&a, &b].iter().map(|u| ScimSwapped { user_id: u.id.clone(), role_before: Some(Role::Member), role_after: Some(Role::Readonly) }).collect();
+        want.sort_by(|x, y| x.user_id.cmp(&y.user_id));
+        assert_eq!(swapped, want, "the role's base replaces the old one's");
+        assert_eq!(r.dropped, [c.id.clone()]);
+        assert_eq!(db.scim_role_grants(&org.id).len(), 2);
+        assert_eq!(db.user(&c.id).unwrap().role_id.as_deref(), Some(viewer.id.as_str()), "not the mapping's to take now");
+        let u = db.user(&a.id).unwrap();
+        assert_eq!((u.role, u.role_id.as_deref()), (Role::Readonly, Some(viewer.id.as_str())));
+
+        // A caller holding the mapping as it was can't give or take the old role any more.
+        assert!(!db.grant_scim_role(&org, &c.id), "the mapping no longer gives the role this copy names");
+        let (took, back) = db.revoke_scim_role(&org, &a.id, false).unwrap();
+        assert_eq!((took.as_str(), back.cleared, back.role_after), (viewer.id.as_str(), true, Some(Role::Readonly)), "the role it gives now is what goes");
+        assert_eq!(db.user(&a.id).unwrap().role_id, None);
+        let (_, back) = db.revoke_scim_role(&db.scim_role_mapping(&org.id).unwrap(), &b.id, false).unwrap();
+        assert_eq!((back.cleared, back.role_after), (true, Some(Role::Member)), "back to the role from before the mapping");
+
+        let in_team = db.create_scim_role_mapping("okta", &team.id, &wide.id, "team", None).unwrap();
+        assert!(db.grant_scim_role(&in_team, &b.id));
+        assert_eq!(db.set_scim_role_mapping_role(&in_team.id, &bots.id).unwrap().swapped.len(), 1, "bots.manage means nothing in a team");
+        assert_eq!(db.team_member(&b.id).unwrap().role_id.as_deref(), Some(bots.id.as_str()));
+        assert_eq!(db.user(&b.id).unwrap().role, Role::Member, "a team role leaves the built-in role alone");
+        assert_eq!(db.delete_custom_role(&wide.id), Ok(()), "the old role is no longer mapped");
     }
 
     #[test]
