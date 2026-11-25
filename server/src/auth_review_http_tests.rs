@@ -25,6 +25,8 @@ const PUBLIC: &[(&str, &str)] = &[
     ("GET", "/api/auth/sso/{id}/callback"),
     ("POST", "/api/auth/sso/{id}/callback"),
     ("POST", "/api/auth/sso/{id}/acs"),
+    // An artifact the IdP sends the browser back with, resolved at the IdP (ADR 0268).
+    ("GET", "/api/auth/sso/{id}/acs"),
     ("GET", "/api/auth/sso/{id}/metadata"),
     // The IdP's logout messages: signed, checked in `sso::saml_slo` (ADR 0137).
     ("GET", "/api/auth/sso/{id}/slo"),

@@ -1280,7 +1280,7 @@ fn message(f: &HashMap<String, String>) -> Option<Message<'_>> {
 /// response. A refusal says whether it counts against the client's address.
 async fn check_saml(a: &Auth, app: &AppState, p: &Provider, msg: &Message<'_>, request_id: Option<&str>, at: i64) -> Result<saml_sp::Checked, (Refused, bool)> {
     let Kind::SamlSp { sp_entity_id, attributes, encryption, aes_cbc, response_binding, .. } = &p.kind else {
-        return Err((Refused("wrong_binding", None), true));
+        return Err((Refused("wrong_provider", None), true));
     };
     if msg.binding != *response_binding {
         return Err((Refused("wrong_binding", None), true));
