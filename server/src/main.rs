@@ -155,6 +155,8 @@ mod machines_residency_tests;
 #[cfg(test)]
 mod residency_routes_http_tests;
 #[cfg(test)]
+mod residency_run_place_http_tests;
+#[cfg(test)]
 mod residency_report_http_tests;
 #[cfg(test)]
 mod residency_me_http_tests;
@@ -1294,7 +1296,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
         .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/scim/role-mappings", get(scim::roles::list).post(scim::roles::create))
-        .route("/scim/role-mappings/{id}", get(scim::roles::get).delete(scim::roles::delete))
+        .route("/scim/role-mappings/{id}", get(scim::roles::get).patch(scim::roles::update).delete(scim::roles::delete))
         .route("/scim/role-groups", get(scim::role_groups::list).post(scim::role_groups::create_api))
         .route("/scim/role-groups/{id}", get(scim::role_groups::get_api).patch(scim::role_groups::update_api).delete(scim::role_groups::delete_api))
         .route("/scim/google", get(scim::google::status))

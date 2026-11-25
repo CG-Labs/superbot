@@ -1485,6 +1485,8 @@ export interface MyResidency {
   machine?: { id: string; state: string; region: string; inRegion: boolean; host?: string | null; hostRegion?: string | null } | null;
   backups?: { kept: number; inRegion: number; outside: number };
   modelRoutes?: { inRegion: boolean; gap: string | null };
+  /** Where your own Bots run (the server itself, your computer, or nowhere yet) and whether that is in the pin's region; runs outside it are refused (ADR 0267). Missing from servers before it. */
+  runs?: { on: "server" | "machine" | "nowhere"; inRegion: boolean | null };
   /** Where the server's own copy of your account, chats, routines and approvals is, as its operator states it (ADR 0184). Missing from servers before it. */
   serverData?: {
     region: string | null;
