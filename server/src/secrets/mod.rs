@@ -636,6 +636,11 @@ pub fn forget_sealed() -> bool {
     std::env::var("SUPERBOT_FORGET_SEALED").is_ok_and(|v| v == "1")
 }
 
+/// Whether a master key rotation renews derived keys rather than keeping them (ADR 0096).
+pub fn rotate_derived_keys() -> bool {
+    std::env::var("SUPERBOT_ROTATE_DERIVED_KEYS").is_ok_and(|v| v == "1")
+}
+
 /// Startup: check the master key (`keys`, made here if there's none and nothing is
 /// sealed), seal plaintext left by older versions, and redact known secrets already
 /// saved. Runs after `Db::open`, before anything is served. An error means botd must not start.
@@ -657,7 +662,7 @@ pub fn init(db_path: &Path, keys: Keys, external: Option<Arc<external::ExternalS
     };
     let (previous, previous_source) = match keys.previous {
         Some((k, source)) => {
-            let new_derived_keys = std::env::var("SUPERBOT_ROTATE_DERIVED_KEYS").is_ok_and(|v| v == "1");
+            let new_derived_keys = rotate_derived_keys();
             (Some(sealed::Previous { key: k, new_derived_keys }), Some(source))
         }
         None => (None, None),

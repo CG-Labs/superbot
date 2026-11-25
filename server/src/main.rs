@@ -372,7 +372,7 @@ fn random_hex(n: usize) -> String {
 /// botd's database, its sealed secrets and every regional chat store (ADR 0215, `stores`
 /// re-encrypted from the previous key) are under the new key, with what the stores seal
 /// (`sealed`, each with what it is): approvals' tool inputs (ADR 0228), push tokens (ADR
-/// 0283) and people's own secrets (ADR 0293).
+/// 0283), people's own secrets (ADR 0293) and second factors (ADR 0299).
 fn rotation_lines(r: &secrets::Report, stores: usize, sealed: &[(&str, &secrets::sealed::StoreApprovals)]) -> Vec<(bool, String)> {
     let mut out = Vec::new();
     let resealed: usize = sealed.iter().map(|(_, s)| s.resealed).sum();
@@ -405,8 +405,8 @@ fn rotation_lines(r: &secrets::Report, stores: usize, sealed: &[(&str, &secrets:
 }
 
 /// What regional chat stores seal under the master key, for `rotation_lines`.
-fn store_sealed(o: &machines::chat_stores::Opened) -> [(&'static str, &secrets::sealed::StoreApprovals); 3] {
-    [("approvals' tool inputs", &o.approvals), ("push tokens", &o.push_tokens), ("people's own secrets", &o.user_secrets)]
+fn store_sealed(o: &machines::chat_stores::Opened) -> [(&'static str, &secrets::sealed::StoreApprovals); 4] {
+    [("approvals' tool inputs", &o.approvals), ("push tokens", &o.push_tokens), ("people's own secrets", &o.user_secrets), ("people's second factors", &o.second_factors)]
 }
 
 pub fn short_id() -> String {
@@ -580,7 +580,12 @@ async fn main() {
         log_info!("Regional chat stores: backups copied off the host, {} (ADR 0246).", c.describe());
     }
     let current_cipher = secrets::sealed::cipher();
-    let store_keys = machines::chat_stores::Keys { current: &current_cipher, previous: previous_cipher.as_ref(), forget: secrets::forget_sealed() };
+    let store_keys = machines::chat_stores::Keys {
+        current: &current_cipher,
+        previous: previous_cipher.as_ref(),
+        forget: secrets::forget_sealed(),
+        new_derived_keys: previous_cipher.is_some() && secrets::rotate_derived_keys(),
+    };
     let opened = machines::chat_stores::open(&db, &control_plane.chat_stores, &data_dir, previous_db_key.as_ref(), store_keys)
         .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
     for line in &opened.lines {
@@ -3806,6 +3811,12 @@ mod tests {
         assert!(!l[0].0 && l[0].1.contains("sealed 5 people's own secrets in regional chat stores again under the new key. Remove the previous key now"), "{l:?}");
         let l = lines(&report(false, false), 0, &opened(none.clone(), none.clone(), unreadable(1)));
         assert!(l[0].0 && l[0].1.contains("1 people's own secrets in regional chat stores open with neither key"), "{l:?}");
+        // And people's second factors (ADR 0299).
+        let factors = |s: secrets::sealed::StoreApprovals| machines::chat_stores::Opened { second_factors: s, ..Default::default() };
+        let l = lines(&report(false, true), 0, &factors(resealed(2)));
+        assert!(!l[0].0 && l[0].1.contains("sealed 2 people's second factors in regional chat stores again under the new key. Remove the previous key now"), "{l:?}");
+        let l = lines(&report(false, false), 0, &factors(unreadable(3)));
+        assert!(l[0].0 && l[0].1.contains("3 people's second factors in regional chat stores open with neither key"), "{l:?}");
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
