@@ -15,8 +15,8 @@ use std::sync::Mutex;
 
 mod chats;
 pub use chats::{
-    ChatMove, ChatStore, Doc, Held, MovesOut, SECRETS, Whose, attach_to, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy, kept_in_region, places,
-    sign_ins_from, upgrade_copy, user_place,
+    ChatMove, ChatStore, Doc, Held, MovesOut, SECOND_FACTOR, SECRETS, Whose, attach_to, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy,
+    kept_in_region, places, sign_ins_from, upgrade_copy, user_place,
 };
 #[cfg(test)]
 pub(crate) use chats::Scratch;
@@ -183,6 +183,9 @@ const ERASE_SIGN_INS: [(&str, &str); 3] = [
     ("saml_sessions", "DELETE FROM {saml_sessions} WHERE user_id = ?1"),
     ("sessions", "DELETE FROM {sessions} WHERE user_id = ?1"),
 ];
+/// `?1` the erased user: their second factor (ADR 0299), its recovery codes before it.
+const ERASE_SECOND_FACTOR: [(&str, &str); 2] =
+    [(chats::RECOVERY_CODE, "DELETE FROM {mfa_recovery_codes} WHERE user_id = ?1"), (chats::SECOND_FACTOR, "DELETE FROM {user_mfa} WHERE user_id = ?1")];
 
 /// `?1` the erased user, `?2` their Bots as a JSON array.
 fn erase_messages() -> String {
@@ -199,8 +202,8 @@ fn erase_requested_by() -> String {
 }
 
 /// Runs an erasure of `user_id` (pseudonym `pseudonym`, whose Bots were `bots`) on a copy
-/// of a regional chat store opened on `c` (ADR 0256): their routines, facts, sign-ins and
-/// own secrets deleted, what they and their Bots wrote replaced, their approval decisions
+/// of a regional chat store opened on `c` (ADR 0256): their routines, facts, sign-ins, own
+/// secrets and second factor deleted, what they and their Bots wrote replaced, their approval decisions
 /// pseudonymised. What it changed.
 pub(crate) fn erase_in_copy(c: &Connection, user_id: &str, pseudonym: &str, bots: &[String]) -> rusqlite::Result<Held> {
     let bots = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
@@ -220,7 +223,14 @@ pub(crate) fn erase_in_copy(c: &Connection, user_id: &str, pseudonym: &str, bots
     }
     let [push_devices, saml_sessions, sessions] = signed;
     let user_secrets = if has(chats::SECRETS)? { c.execute("DELETE FROM main.user_secrets WHERE user_id = ?1", [user_id])? as i64 } else { 0 };
-    Ok(Held { messages, routines, approvals, facts, sessions, saml_sessions, push_devices, user_secrets, ..Held::default() })
+    let mut factor = [0; 2];
+    for (n, (table, sql)) in factor.iter_mut().zip(ERASE_SECOND_FACTOR) {
+        if has(table)? {
+            *n = c.execute(&sql.replace(&format!("{{{table}}}"), &format!("main.{table}")), [user_id])? as i64;
+        }
+    }
+    let [recovery_codes, second_factors] = factor;
+    Ok(Held { messages, routines, approvals, facts, sessions, saml_sessions, push_devices, user_secrets, second_factors, recovery_codes, ..Held::default() })
 }
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
@@ -7502,8 +7512,9 @@ impl Db {
         }
         out.login_codes = run("DELETE FROM login_codes WHERE user_id = ?", &[&user_id])?;
         out.identities = run("DELETE FROM user_identities WHERE user_id = ?", &[&user_id])?;
-        out.mfa = run("DELETE FROM user_mfa WHERE user_id = ?", &[&user_id])? > 0;
-        out.recovery_codes = run("DELETE FROM mfa_recovery_codes WHERE user_id = ?", &[&user_id])?;
+        let [codes, factor] = ERASE_SECOND_FACTOR;
+        out.recovery_codes = self.on_places(&tx, codes.1, &[&user_id]).map_err(db_err)?;
+        out.mfa = self.on_places(&tx, factor.1, &[&user_id]).map_err(db_err)? > 0;
         out.scim = run("DELETE FROM scim_users WHERE user_id = ?", &[&user_id])? > 0;
         run("UPDATE scim_users SET manager_id = NULL WHERE manager_id = ?", &[&user_id])?;
         out.grants = run("DELETE FROM bot_grants WHERE user_id = ?", &[&user_id])?;
@@ -9231,7 +9242,9 @@ impl Db {
     }
 
     // Second factor (ADR 0094). Secrets are sealed under the user's id; recovery codes
-    // are kept as keyed hashes only.
+    // are kept as keyed hashes only. A pinned person's are kept in their region's chat
+    // store (ADR 0299): reads see every place, a new one goes to the person's pin's store,
+    // its recovery codes go wherever it is, and changes reach every copy.
 
     pub fn mfa(&self, user_id: &str) -> Option<MfaRow> {
         self.c()
@@ -9253,15 +9266,43 @@ impl Db {
     /// Starts (or restarts) enrolment with a new sealed secret. False when the user
     /// already has a confirmed one: that must be turned off first.
     pub fn mfa_begin(&self, user_id: &str, sealed: &str) -> bool {
-        let at = now();
-        self.c()
-            .execute(
-                "INSERT INTO user_mfa (user_id, secret, confirmed_at, last_step, created_at, updated_at) VALUES (?1, ?2, NULL, 0, ?3, ?3)
-                 ON CONFLICT(user_id) DO UPDATE SET secret = ?2, last_step = 0, created_at = ?3, updated_at = ?3 WHERE confirmed_at IS NULL",
-                params![user_id, sealed, at],
-            )
-            .unwrap_or(0)
-            == 1
+        self.put_mfa(user_id, sealed, None, 0, &[]).is_ok_and(|put| put)
+    }
+
+    /// Writes `user_id`'s second factor unless they have a confirmed one: every copy of a
+    /// pending one replaced, else a new row where their pin keeps it; `confirmed` (with its
+    /// first step and recovery codes) or pending. Whether it was written.
+    fn put_mfa(&self, user_id: &str, sealed: &str, confirmed: Option<i64>, step: i64, recovery: &[String]) -> rusqlite::Result<bool> {
+        let c = self.c();
+        let tx = c.unchecked_transaction()?;
+        let have: Option<Option<i64>> = tx.query_row("SELECT confirmed_at FROM user_mfa WHERE user_id = ?", [user_id], |r| r.get(0)).optional()?;
+        match have {
+            Some(Some(_)) => return Ok(false),
+            Some(None) => {
+                let n = self.on_places(
+                    &tx,
+                    "UPDATE {user_mfa} SET secret = ?2, confirmed_at = ?3, last_step = ?4, created_at = coalesce(?3, ?5), updated_at = coalesce(?3, ?5)
+                     WHERE user_id = ?1 AND confirmed_at IS NULL",
+                    params![user_id, sealed, confirmed, step, now()],
+                )?;
+                if n == 0 {
+                    return Ok(false);
+                }
+            }
+            None => {
+                let place = self.place_for_user(&tx, user_id)?;
+                let at = confirmed.unwrap_or_else(now);
+                tx.execute(
+                    &format!("INSERT INTO {place}.user_mfa (user_id, secret, confirmed_at, last_step, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)"),
+                    params![user_id, sealed, confirmed, step, at],
+                )?;
+            }
+        }
+        if let Some(at) = confirmed {
+            self.write_recovery(&tx, user_id, recovery, at)?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Confirms the pending secret `sealed` with the step its first code was for, and
@@ -9271,35 +9312,31 @@ impl Db {
         let c = self.c();
         let Ok(tx) = c.unchecked_transaction() else { return false };
         let at = now();
-        let n = tx
-            .execute(
-                "UPDATE user_mfa SET confirmed_at = ?1, last_step = ?2, updated_at = ?1 WHERE user_id = ?3 AND secret = ?4 AND confirmed_at IS NULL",
+        let n = self
+            .on_places(
+                &tx,
+                "UPDATE {user_mfa} SET confirmed_at = ?1, last_step = ?2, updated_at = ?1 WHERE user_id = ?3 AND secret = ?4 AND confirmed_at IS NULL",
                 params![at, step, user_id, sealed],
             )
             .unwrap_or(0);
-        n == 1 && Self::write_recovery(&tx, user_id, recovery, at).is_ok() && tx.commit().is_ok()
+        n > 0 && self.write_recovery(&tx, user_id, recovery, at).is_ok() && tx.commit().is_ok()
     }
 
     /// Enrols in one go, from a sign-in that had to enrol. False when the user already
     /// has a confirmed second factor.
     pub fn mfa_enable(&self, user_id: &str, sealed: &str, step: i64, recovery: &[String]) -> bool {
-        let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
-        let at = now();
-        let n = tx
-            .execute(
-                "INSERT INTO user_mfa (user_id, secret, confirmed_at, last_step, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?3, ?3)
-                 ON CONFLICT(user_id) DO UPDATE SET secret = ?2, confirmed_at = ?3, last_step = ?4, created_at = ?3, updated_at = ?3 WHERE confirmed_at IS NULL",
-                params![user_id, sealed, at, step],
-            )
-            .unwrap_or(0);
-        n == 1 && Self::write_recovery(&tx, user_id, recovery, at).is_ok() && tx.commit().is_ok()
+        self.put_mfa(user_id, sealed, Some(now()), step, recovery).is_ok_and(|put| put)
     }
 
-    fn write_recovery(tx: &rusqlite::Transaction, user_id: &str, recovery: &[String], at: i64) -> rusqlite::Result<()> {
-        tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user_id])?;
-        for h in recovery {
-            tx.execute("INSERT INTO mfa_recovery_codes (user_id, code_hash, used_at, created_at) VALUES (?, ?, NULL, ?)", params![user_id, h, at])?;
+    /// Replaces `user_id`'s recovery codes with `recovery` in every place their second
+    /// factor is (both, while a move cut off between its copy and its delete waits for the
+    /// next pass), so the codes always move with it (ADR 0299).
+    fn write_recovery(&self, tx: &rusqlite::Transaction, user_id: &str, recovery: &[String], at: i64) -> rusqlite::Result<()> {
+        self.on_places(tx, "DELETE FROM {mfa_recovery_codes} WHERE user_id = ?", &[&user_id])?;
+        for place in self.places_holding(tx, chats::SECOND_FACTOR, user_id)? {
+            for h in recovery {
+                tx.execute(&format!("INSERT INTO {place}.mfa_recovery_codes (user_id, code_hash, used_at, created_at) VALUES (?, ?, NULL, ?)"), params![user_id, h, at])?;
+            }
         }
         Ok(())
     }
@@ -9307,32 +9344,36 @@ impl Db {
     /// Replaces a confirmed user's recovery codes. False when they have no second factor.
     pub fn mfa_replace_recovery(&self, user_id: &str, recovery: &[String]) -> bool {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let Ok(tx) = c.unchecked_transaction() else {
+            return false;
+        };
         let on: bool = tx.query_row("SELECT COUNT(*) FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL", [user_id], |r| r.get(0)).unwrap_or(false);
-        on && Self::write_recovery(&tx, user_id, recovery, now()).is_ok() && tx.commit().is_ok()
+        on && self.write_recovery(&tx, user_id, recovery, now()).is_ok() && tx.commit().is_ok()
     }
 
     /// Spends a TOTP step: only a step later than the last one used, so a code works once.
     pub fn mfa_use_step(&self, user_id: &str, step: i64) -> bool {
-        self.c()
-            .execute(
-                "UPDATE user_mfa SET last_step = ?1, updated_at = ?2 WHERE user_id = ?3 AND confirmed_at IS NOT NULL AND last_step < ?1",
-                params![step, now(), user_id],
-            )
-            .unwrap_or(0)
-            == 1
+        let c = self.c();
+        self.on_places(
+            &c,
+            "UPDATE {user_mfa} SET last_step = ?1, updated_at = ?2 WHERE user_id = ?3 AND confirmed_at IS NOT NULL AND last_step < ?1",
+            params![step, now(), user_id],
+        )
+        .unwrap_or(0)
+            > 0
     }
 
     /// Spends a recovery code, once, for a user whose second factor is on.
     pub fn mfa_use_recovery(&self, user_id: &str, code_hash: &str) -> bool {
-        self.c()
-            .execute(
-                "UPDATE mfa_recovery_codes SET used_at = ?1 WHERE user_id = ?2 AND code_hash = ?3 AND used_at IS NULL
-                   AND user_id IN (SELECT user_id FROM user_mfa WHERE confirmed_at IS NOT NULL)",
-                params![now(), user_id, code_hash],
-            )
-            .unwrap_or(0)
-            == 1
+        let c = self.c();
+        self.on_places(
+            &c,
+            "UPDATE {mfa_recovery_codes} SET used_at = ?1 WHERE user_id = ?2 AND code_hash = ?3 AND used_at IS NULL
+               AND user_id IN (SELECT user_id FROM user_mfa WHERE confirmed_at IS NOT NULL)",
+            params![now(), user_id, code_hash],
+        )
+        .unwrap_or(0)
+            > 0
     }
 
     pub fn mfa_recovery_left(&self, user_id: &str) -> i64 {
@@ -9342,10 +9383,12 @@ impl Db {
     /// Removes the user's second factor and recovery codes. True if they had a confirmed one.
     pub fn mfa_delete(&self, user_id: &str) -> bool {
         let c = self.c();
-        let Ok(tx) = c.unchecked_transaction() else { return false };
-        let confirmed = tx.execute("DELETE FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL", [user_id]).unwrap_or(0) == 1;
-        let _ = tx.execute("DELETE FROM user_mfa WHERE user_id = ?", [user_id]);
-        let _ = tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user_id]);
+        let Ok(tx) = c.unchecked_transaction() else {
+            return false;
+        };
+        let confirmed = self.on_places(&tx, "DELETE FROM {user_mfa} WHERE user_id = ? AND confirmed_at IS NOT NULL", &[&user_id]).unwrap_or(0) > 0;
+        let _ = self.on_places(&tx, "DELETE FROM {user_mfa} WHERE user_id = ?", &[&user_id]);
+        let _ = self.on_places(&tx, "DELETE FROM {mfa_recovery_codes} WHERE user_id = ?", &[&user_id]);
         tx.commit().is_ok() && confirmed
     }
 

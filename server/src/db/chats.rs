@@ -1,12 +1,13 @@
 //! Pinned people's chats, routines, approvals, Bots' memory, owners' facts, sign-in
-//! sessions and own secrets in a database in their region (ADR 0215, ADR 0228, ADR 0276,
-//! ADR 0277, ADR 0283, ADR 0293), the first part of splitting botd's database by region.
-//! Each region in REGION_DATA_DIRS has a SQLite file of its own (`chats.sqlite`, keyed like
-//! botd's database), attached to botd's connection. A Bot's messages, routines, approvals
-//! and memory are kept in the store of its owner's residency pin (their team's, else their
-//! own, as `residency::of_user`), and a person's facts, sessions (with each session's SAML
-//! sign-in and push device) and own secrets in the store of their own pin by the same rule,
-//! or in botd's own database when that region has no store or the person isn't pinned.
+//! sessions, own secrets and second factors in a database in their region (ADR 0215, ADR
+//! 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299), the first part of splitting
+//! botd's database by region. Each region in REGION_DATA_DIRS has a SQLite file of its own
+//! (`chats.sqlite`, keyed like botd's database), attached to botd's connection. A Bot's
+//! messages, routines, approvals and memory are kept in the store of its owner's residency
+//! pin (their team's, else their own, as `residency::of_user`), and a person's facts,
+//! sessions (with each session's SAML sign-in and push device), own secrets and second
+//! factor (with its recovery codes) in the store of their own pin by the same rule, or in
+//! botd's own database when that region has no store or the person isn't pinned.
 //! Their secrets are read and written on the users' secrets' own connection, which attaches
 //! the stores too (`attach_to`, `secrets::sealed::UserSecrets`). botd's own copy of a
 //! Bot's memory is a file in DATA_DIR (`DATA_DIR/bots/<id>/MEMORY.md`), and of a person's
@@ -14,7 +15,8 @@
 //! one on its way between that file and a store (`machines::chat_stores::place`).
 //!
 //! Reads see every place at once: a TEMP view per table (`messages`, `routines`,
-//! `approvals`, `memories`, `facts`, `sessions`, `saml_sessions`, `push_devices`) puts
+//! `approvals`, `memories`, `facts`, `sessions`, `saml_sessions`, `push_devices`,
+//! `user_mfa`, `mfa_recovery_codes`) puts
 //! botd's own table and each store's together, and unqualified names find TEMP objects
 //! first. Writes name the table they change: new rows go where their Bot's or person's data
 //! belongs (a session's SAML sign-in and push device where the session is), and updates
@@ -74,7 +76,7 @@ struct Kept {
 
 /// A parent comes before the tables that point at it, so a move into botd's own database
 /// copies it first, and deletes run in reverse.
-const KEPT: [Kept; 9] = [
+const KEPT: [Kept; 11] = [
     Kept { name: "messages", key: Key::Bot, pk: "id", indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], unique: &[], parent: None, rowid: false },
     Kept { name: "routines", key: Key::Bot, pk: "id", indexes: &[("routines_bot", "bot_id")], unique: &[], parent: None, rowid: false },
     Kept { name: "approvals", key: Key::Bot, pk: "id", indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], unique: &[], parent: None, rowid: true },
@@ -100,12 +102,16 @@ const KEPT: [Kept; 9] = [
         rowid: false,
     },
     Kept { name: "user_secrets", key: Key::User, pk: "user_id, name", indexes: &[], unique: &[], parent: None, rowid: false },
+    Kept { name: "user_mfa", key: Key::User, pk: "user_id", indexes: &[], unique: &[], parent: None, rowid: false },
+    Kept { name: "mfa_recovery_codes", key: Key::User, pk: "user_id, code_hash", indexes: &[], unique: &[], parent: Some(("user_id", "user_mfa")), rowid: false },
 ];
 const N: usize = KEPT.len();
 const MESSAGES: usize = 0;
 const APPROVALS: usize = 2;
 const PUSH_DEVICES: usize = 7;
 const USER_SECRETS: usize = 8;
+const SECOND_FACTORS: usize = 9;
+const RECOVERY_CODES: usize = 10;
 
 /// The tables of a person's sign-ins (ADR 0283): their sessions, and each one's SAML
 /// sign-in and push device.
@@ -113,6 +119,15 @@ const SIGN_INS: [&str; 3] = ["sessions", "saml_sessions", "push_devices"];
 
 /// The table of each person's own secrets (ADR 0029, ADR 0293).
 pub const SECRETS: &str = "user_secrets";
+
+/// The tables of each person's second factor (ADR 0094, ADR 0299): its sealed TOTP secret,
+/// and its recovery codes' keyed hashes.
+pub const SECOND_FACTOR: &str = "user_mfa";
+pub const RECOVERY_CODE: &str = "mfa_recovery_codes";
+
+/// Tables a restore takes from the store it replaces, but keeps from the backup when that
+/// store is gone, as the only copy left (ADR 0293, ADR 0299).
+const KEPT_WHEN_GONE: [&str; 3] = [SECRETS, SECOND_FACTOR, RECOVERY_CODE];
 
 fn kept(table: &str) -> Option<&'static Kept> {
     KEPT.iter().find(|k| k.name == table)
@@ -255,6 +270,10 @@ pub struct Held {
     /// because the audit log hides the values of keys naming secrets.
     #[serde(rename = "personalKeys")]
     pub user_secrets: i64,
+    /// People's second factors (ADR 0094, ADR 0299), each with its sealed TOTP secret.
+    pub second_factors: i64,
+    /// Their recovery codes, as keyed hashes.
+    pub recovery_codes: i64,
 }
 
 impl Held {
@@ -269,11 +288,25 @@ impl Held {
             saml_sessions: n[6],
             push_devices: n[7],
             user_secrets: n[USER_SECRETS],
+            second_factors: n[SECOND_FACTORS],
+            recovery_codes: n[RECOVERY_CODES],
         }
     }
 
     fn each(&self) -> [i64; N] {
-        [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices, self.user_secrets]
+        [
+            self.messages,
+            self.routines,
+            self.approvals,
+            self.memories,
+            self.facts,
+            self.sessions,
+            self.saml_sessions,
+            self.push_devices,
+            self.user_secrets,
+            self.second_factors,
+            self.recovery_codes,
+        ]
     }
 
     pub fn total(&self) -> i64 {
@@ -296,6 +329,11 @@ impl Held {
         Held { sessions: self.sessions, saml_sessions: self.saml_sessions, push_devices: self.push_devices, ..Held::default() }
     }
 
+    /// A person's second factor (ADR 0299), with its recovery codes.
+    pub fn second_factor(&self) -> Held {
+        Held { second_factors: self.second_factors, recovery_codes: self.recovery_codes, ..Held::default() }
+    }
+
     /// "3 chat messages, 1 routine, 2 approvals, 1 Bot memory and 1 person's facts", leaving
     /// out tables with none.
     pub fn describe(&self) -> String {
@@ -309,6 +347,8 @@ impl Held {
             (self.saml_sessions, "SAML sign-in", "SAML sign-ins"),
             (self.push_devices, "push device", "push devices"),
             (self.user_secrets, "personal secret", "personal secrets"),
+            (self.second_factors, "second factor", "second factors"),
+            (self.recovery_codes, "recovery code", "recovery codes"),
         ]
         .into_iter()
         .filter(|(n, _, _)| *n > 0)
@@ -341,12 +381,27 @@ pub struct ChatMove {
     pub push_devices: usize,
     /// Secrets people saved for their own Bots (ADR 0293).
     pub user_secrets: usize,
+    /// Second factors, and their recovery codes (ADR 0299).
+    pub second_factors: usize,
+    pub recovery_codes: usize,
 }
 
 impl ChatMove {
     /// What moved, as counts.
     pub fn held(&self) -> Held {
-        let n = [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices, self.user_secrets];
+        let n = [
+            self.messages,
+            self.routines,
+            self.approvals,
+            self.memories,
+            self.facts,
+            self.sessions,
+            self.saml_sessions,
+            self.push_devices,
+            self.user_secrets,
+            self.second_factors,
+            self.recovery_codes,
+        ];
         Held::of(n.map(|n| n as i64))
     }
 }
@@ -915,6 +970,8 @@ impl Db {
                     saml_sessions: n[6],
                     push_devices: n[PUSH_DEVICES],
                     user_secrets: n[USER_SECRETS],
+                    second_factors: n[SECOND_FACTORS],
+                    recovery_codes: n[RECOVERY_CODES],
                 });
             }
             for s in &set.stores {
@@ -1207,6 +1264,19 @@ impl Db {
         self.seal_in_stores(SECRETS, |c, table| sealed::user_secrets_in(c, table, current, previous, forget))
     }
 
+    /// Brings people's second factors in the stores (ADR 0299) under the master key, as
+    /// `seal_store_approvals` does approvals' inputs; with `forget`, a second factor neither
+    /// key opens is deleted with its recovery codes, so its owner sets it up again. With
+    /// `new_derived_keys` (a rotation that renews them, ADR 0096), the recovery codes of a
+    /// second factor sealed again are deleted, as botd's own are: their keyed hashes no
+    /// longer match.
+    pub fn seal_store_second_factors(&self, current: &Cipher, previous: Option<&Cipher>, forget: bool, new_derived_keys: bool) -> Result<StoreApprovals, String> {
+        self.seal_in_stores(SECOND_FACTOR, |c, table| {
+            let codes = table.replacen(SECOND_FACTOR, RECOVERY_CODE, 1);
+            sealed::second_factors_in(c, table, &codes, current, previous, forget, new_derived_keys)
+        })
+    }
+
     fn seal_in_stores(&self, table: &str, seal: impl Fn(&Connection, &str) -> Result<StoreApprovals, String>) -> Result<StoreApprovals, String> {
         let c = self.c();
         let mut done = StoreApprovals::default();
@@ -1324,21 +1394,25 @@ fn delete_in_copy(c: &Connection, op: &str, whose: &Whose) -> rusqlite::Result<H
 /// `c`, a backup about to be restored, in place of the copy's own: a session revoked after
 /// the backup was made would otherwise work again, and one made since would end; a secret
 /// deleted since would come back, and one replaced since would turn back to its old value.
+/// Second factors and their recovery codes (ADR 0299) go as secrets do: one turned off or
+/// reset since, or a recovery code spent since, would otherwise come back.
 /// Without `now`, the copy's sessions are dropped (their people sign in again) and its
-/// secrets kept, the only copy of them left. The caller has `secure_delete` on and VACUUMs.
-/// What of the copy's own was dropped, and what was taken from `now`.
+/// secrets and second factors kept, the only copy of them left. The caller has
+/// `secure_delete` on and VACUUMs. What of the copy's own was dropped, and what was taken
+/// from `now`.
 pub fn sign_ins_from(c: &Connection, now: Option<&str>, keep: &Whose) -> rusqlite::Result<(Held, Held)> {
     let users = keep.lists().1;
     let tx = c.unchecked_transaction()?;
     let (mut dropped, mut taken) = ([0; N], [0; N]);
-    for (i, k) in KEPT.iter().enumerate().filter(|(_, k)| SIGN_INS.contains(&k.name) || k.name == SECRETS) {
+    for (i, k) in KEPT.iter().enumerate().filter(|(_, k)| SIGN_INS.contains(&k.name) || KEPT_WHEN_GONE.contains(&k.name)) {
         let t = k.name;
         if !has_table(&tx, "main", t)? {
             continue;
         }
-        // A store from before ADR 0293 has no secrets to put in place of the copy's.
+        // A store from before ADR 0293 (secrets) or ADR 0299 (second factors) has none to put
+        // in place of the copy's.
         let replaced = now.map(|now| has_table(&tx, now, t)).transpose()?.unwrap_or(false);
-        if t == SECRETS && !replaced {
+        if KEPT_WHEN_GONE.contains(&t) && !replaced {
             continue;
         }
         dropped[i] = tx.execute(&format!("DELETE FROM main.{t}"), [])? as i64;
@@ -1489,7 +1563,22 @@ mod tests {
     }
 
     fn mv(from: Option<&str>, to: Option<&str>, bots: usize, n: [usize; 3]) -> ChatMove {
-        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2], memories: 0, facts: 0, sessions: 0, saml_sessions: 0, push_devices: 0, user_secrets: 0 }
+        ChatMove {
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+            bots,
+            messages: n[0],
+            routines: n[1],
+            approvals: n[2],
+            memories: 0,
+            facts: 0,
+            sessions: 0,
+            saml_sessions: 0,
+            push_devices: 0,
+            user_secrets: 0,
+            second_factors: 0,
+            recovery_codes: 0,
+        }
     }
 
     fn rows_in(path: &Path) -> i64 {
@@ -2597,6 +2686,168 @@ mod tests {
         assert_eq!(Held { sessions: 1, user_secrets: 2, ..Held::default() }.describe(), "1 sign-in session and 2 personal secrets");
         assert_eq!(Held { sessions: 1, user_secrets: 2, ..Held::default() }.sign_ins(), Held { sessions: 1, ..Held::default() });
         assert_eq!(Held { messages: 1, user_secrets: 2, ..Held::default() }.of_bots(), Held { messages: 1, ..Held::default() });
+    }
+
+    fn factor_move(from: Option<&str>, to: Option<&str>, codes: usize) -> ChatMove {
+        ChatMove { second_factors: 1, recovery_codes: codes, ..mv(from, to, 0, [0, 0, 0]) }
+    }
+
+    /// Second factors and recovery codes in `schema`.
+    fn factors(db: &Db, schema: &str) -> [i64; 2] {
+        [count(db, schema, SECOND_FACTOR), count(db, schema, RECOVERY_CODE)]
+    }
+
+    fn codes(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_pinned_persons_second_factor_and_recovery_codes_are_kept_in_their_store_and_move_with_the_pin() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let secret = "sb1:totp-0299-adas-first";
+        assert!(db.mfa_begin(&ada, secret));
+        assert!(db.mfa_confirm(&ada, secret, 10, &codes(&["h1", "h2"])));
+        assert_eq!(factors(&db, "main"), [1, 2]);
+
+        // Pinned, they move to the store together, and still check a code.
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![factor_move(None, Some("gb-lon"), 2)]);
+        assert_eq!((factors(&db, "main"), factors(&db, "chats_0")), ([0, 0], [1, 2]));
+        let row = db.mfa(&ada).unwrap();
+        assert_eq!((row.secret.as_str(), row.confirmed_at.is_some(), row.last_step), (secret, true, 10));
+        assert!(db.mfa_use_step(&ada, 11) && !db.mfa_use_step(&ada, 11), "a step works once");
+        assert!(db.mfa_use_recovery(&ada, "h1") && !db.mfa_use_recovery(&ada, "h1"), "a code works once");
+        assert_eq!(db.mfa_recovery_left(&ada), 1);
+        assert!(db.mfa_replace_recovery(&ada, &codes(&["h3", "h4", "h5"])));
+        assert_eq!((factors(&db, "main"), factors(&db, "chats_0")), ([0, 0], [1, 3]));
+        assert!(!db.mfa_begin(&ada, "sb1:other"), "a confirmed one must be turned off first");
+        assert_eq!(
+            db.chat_counts(std::slice::from_ref(&ada)),
+            vec![ChatCount { region: Some("gb-lon".into()), held: Held { second_factors: 1, recovery_codes: 3, ..Held::default() } }]
+        );
+
+        // Turned off and set up again where it is kept; someone unpinned stays in botd's own.
+        assert!(db.mfa_delete(&ada));
+        assert_eq!(factors(&db, "chats_0"), [0, 0]);
+        assert!(db.mfa_begin(&ada, "sb1:pending") && db.mfa_begin(&ada, "sb1:pending-again"));
+        assert_eq!((factors(&db, "main"), factors(&db, "chats_0")), ([0, 0], [1, 0]));
+        assert!(db.mfa_enable(&ada, "sb1:totp-0299-adas-second", 20, &codes(&["h6"])));
+        assert_eq!(factors(&db, "chats_0"), [1, 1]);
+        assert_eq!(db.mfa(&ada).unwrap().secret, "sb1:totp-0299-adas-second");
+        assert!(db.mfa_enable(&cy, "sb1:totp-0299-cys", 5, &codes(&["c1"])));
+        assert!(!db.mfa_enable(&cy, "sb1:again", 6, &[]));
+        assert_eq!(factors(&db, "main"), [1, 1]);
+        let mut on: Vec<String> = db.mfa_enabled().into_keys().collect();
+        on.sort();
+        let mut both = vec![ada.clone(), cy.clone()];
+        both.sort();
+        assert_eq!(on, both);
+
+        // A store has no foreign keys, so a pass sweeps recovery codes whose second factor is gone.
+        db.c().execute("INSERT INTO chats_0.mfa_recovery_codes (user_id, code_hash, created_at) VALUES ('gone', 'h', 0)", []).unwrap();
+        db.place_chats().unwrap();
+        assert_eq!(factors(&db, "chats_0"), [1, 1]);
+
+        // Unpinned, they come back, and the move is recorded for the store's earlier backups.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![factor_move(Some("gb-lon"), None, 1)]);
+        assert_eq!((factors(&db, "main"), factors(&db, "chats_0")), ([2, 2], [0, 0]));
+        let lon = db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
+        assert_eq!(db.moves_out_to_clear(&lon).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert!(db.mfa_use_recovery(&ada, "h6"));
+    }
+
+    #[test]
+    fn a_move_cut_off_after_its_copy_keeps_second_factor_changes() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        assert!(db.mfa_enable(&ada, "sb1:t", 10, &codes(&["h1", "h2"])));
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!((factors(&db, "main"), factors(&db, "chats_0")), ([1, 2], [1, 2]), "in both places");
+        // Spent once, and changes meanwhile reach both copies, so the next pass keeps them whichever it keeps.
+        assert_eq!(db.mfa_recovery_left(&ada), 2, "read once");
+        assert!(db.mfa_use_step(&ada, 11) && !db.mfa_use_step(&ada, 11));
+        assert!(db.mfa_use_recovery(&ada, "h1") && !db.mfa_use_recovery(&ada, "h1"));
+        assert_eq!(db.place_chats().unwrap(), vec![factor_move(None, Some("gb-lon"), 2)]);
+        assert_eq!((db.mfa(&ada).unwrap().last_step, db.mfa_recovery_left(&ada)), (11, 1));
+        assert!(!db.mfa_use_recovery(&ada, "h1"), "a spent code stays spent");
+
+        // Cut off again on the way back, new codes and turning it off reach both copies.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert!(db.mfa_replace_recovery(&ada, &codes(&["h3"])));
+        assert_eq!((factors(&db, "main"), factors(&db, "chats_0")), ([1, 1], [1, 1]));
+        assert!(db.mfa_delete(&ada));
+        assert_eq!((factors(&db, "main"), factors(&db, "chats_0")), ([0, 0], [0, 0]));
+        assert!(db.mfa(&ada).is_none());
+    }
+
+    #[test]
+    fn startup_seals_a_stores_second_factors_under_the_current_master_key() {
+        use crate::secrets::key::MasterKey;
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let (current, previous) = (sealed::cipher(), Cipher::new(&MasterKey::generate()));
+        let context = sealed::mfa_context(&ada);
+        let set = |v: &str| db.c().execute("UPDATE chats_0.user_mfa SET secret = ?1 WHERE user_id = ?2", params![v, ada]).unwrap();
+        let open = || current.open_text(&context, &db.mfa(&ada).unwrap().secret).ok().map(|s| s.expose().to_string());
+        assert!(db.mfa_enable(&ada, &previous.seal(&context, b"JBSWY3DP-old"), 1, &codes(&["h1"])));
+        let e = db.seal_store_second_factors(&current, None, false, false).unwrap_err();
+        assert!(e.contains("gb-lon's chat store") && e.contains("SUPERBOT_FORGET_SEALED=1") && e.contains("ADR 0299"), "{e}");
+        assert_eq!(db.seal_store_second_factors(&current, Some(&previous), false, false).unwrap(), StoreApprovals { resealed: 1, ..Default::default() });
+        assert_eq!((open().as_deref(), factors(&db, "chats_0")), (Some("JBSWY3DP-old"), [1, 1]), "derived keys kept: the codes stay");
+        assert_eq!(db.seal_store_second_factors(&current, Some(&previous), false, true).unwrap(), StoreApprovals::default());
+        assert_eq!(factors(&db, "chats_0"), [1, 1], "already under the new key: nothing to drop");
+        // A rotation that renews derived keys drops the recovery codes it seals again, as botd's own.
+        set(&previous.seal(&context, b"JBSWY3DP-old"));
+        assert_eq!(db.seal_store_second_factors(&current, Some(&previous), false, true).unwrap(), StoreApprovals { resealed: 1, ..Default::default() });
+        assert_eq!((open().as_deref(), factors(&db, "chats_0")), (Some("JBSWY3DP-old"), [1, 0]));
+        assert!(db.mfa_replace_recovery(&ada, &codes(&["h2"])));
+        set(&Cipher::new(&MasterKey::generate()).seal(&context, b"x"));
+        assert_eq!(db.seal_store_second_factors(&current, Some(&previous), false, false).unwrap(), StoreApprovals { unreadable: 1, ..Default::default() });
+        assert_eq!(db.seal_store_second_factors(&current, None, true, false).unwrap(), StoreApprovals { discarded: 1, ..Default::default() });
+        assert_eq!(factors(&db, "chats_0"), [0, 0], "dropped with its codes; its owner sets it up again");
+        assert!(db.mfa_enable(&ada, "JBSWY3DP-plain", 1, &[]));
+        assert_eq!(db.seal_store_second_factors(&current, None, false, false).unwrap(), StoreApprovals { sealed: 1, ..Default::default() });
+        assert!(sealed::is_sealed(&db.mfa(&ada).unwrap().secret) && open().as_deref() == Some("JBSWY3DP-plain"));
+    }
+
+    #[test]
+    fn an_erasure_deletes_a_persons_second_factor_in_the_store_and_in_copies_of_it() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        for u in [&ada, &cy] {
+            db.pin_residency(PinOn::User, u, "gb-lon", "DPA-1", None).unwrap();
+            assert!(db.mfa_enable(u, "sb1:t", 1, &codes(&["h1", "h2"])));
+        }
+        assert_eq!(factors(&db, "chats_0"), [2, 4]);
+        db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        let copy = d.dir.path().join("copy.sqlite");
+        std::fs::copy(d.lon.join("chats.sqlite"), &copy).unwrap();
+        let c = Connection::open(&copy).unwrap();
+        let erased = crate::db::erase_in_copy(&c, &ada, "erased-01", &[]).unwrap();
+        assert_eq!((erased.second_factors, erased.recovery_codes), (1, 2));
+        let left: Vec<String> = c.prepare("SELECT user_id FROM user_mfa").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(left, [cy.clone()]);
+        let out = db.erase_user(&ada, "erased-01", None, &[]).unwrap();
+        assert_eq!((out.mfa, out.recovery_codes), (true, 2));
+        assert_eq!(factors(&db, "chats_0"), [1, 2]);
+    }
+
+    #[test]
+    fn describing_what_a_place_holds_names_second_factors() {
+        assert_eq!(Held { user_secrets: 1, second_factors: 1, recovery_codes: 2, ..Held::default() }.describe(), "1 personal secret, 1 second factor and 2 recovery codes");
+        assert_eq!(Held { sessions: 1, second_factors: 1, recovery_codes: 2, ..Held::default() }.second_factor(), Held { second_factors: 1, recovery_codes: 2, ..Held::default() });
+        assert_eq!(Held { second_factors: 1, ..Held::default() }.sign_ins(), Held::default());
     }
 
     #[test]
