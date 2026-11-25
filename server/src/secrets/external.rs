@@ -534,6 +534,25 @@ pub fn diagnostics() -> serde_json::Value {
     diagnose(ACTIVE.get().map(Arc::as_ref))
 }
 
+/// The backend botd started with, as the evidence bundle keeps it (ADR 0285): its kind
+/// and settings, never a path or an address, and without asking it anything.
+pub fn configured() -> serde_json::Value {
+    configured_view(ACTIVE.get().map(Arc::as_ref))
+}
+
+fn configured_view(x: Option<&ExternalStore>) -> serde_json::Value {
+    match x {
+        None => json!({ "backend": "local", "external": false }),
+        Some(x) => json!({
+            "backend": x.kind(),
+            "external": true,
+            "cacheSeconds": x.ttl.as_secs(),
+            "userFolders": x.user_folders,
+            "runCredentialPaths": x.run_credentials.as_ref().map_or(0, |rc| rc.paths().len()),
+        }),
+    }
+}
+
 fn diagnose(x: Option<&ExternalStore>) -> serde_json::Value {
     let Some(x) = x else {
         return json!({
@@ -938,5 +957,16 @@ pub(crate) mod tests {
         assert_eq!(d["ok"], false);
         assert!(d["detail"].as_str().unwrap().contains("fake is down"), "{d}");
         assert!(!d.to_string().contains("diag-value-1"));
+    }
+
+    #[test]
+    fn the_evidence_bundle_sees_the_backend_without_asking_it() {
+        assert_eq!(configured_view(None), json!({ "backend": "local", "external": false }));
+        let f = Arc::new(Fake::default());
+        f.down.store(true, Ordering::SeqCst);
+        let s = ExternalStore::new(Box::new(Arc::clone(&f)), Duration::from_secs(60)).with_user_folders(true);
+        let v = configured_view(Some(&s));
+        assert_eq!(v, json!({ "backend": "fake", "external": true, "cacheSeconds": 60, "userFolders": true, "runCredentialPaths": 0 }));
+        assert_eq!((f.reads.load(Ordering::SeqCst), f.lists.load(Ordering::SeqCst)), (0, 0), "a down backend isn't asked");
     }
 }
