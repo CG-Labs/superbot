@@ -5,7 +5,7 @@
 //! there (keyed like its own database) and its backups in `backups/` beside it, never in
 //! DATA_DIR. A Bot's chat, routines, approvals and memory live in the store of its owner's
 //! pin (their team's, else their own), a person's facts (`USER.md`) and sessions (with each
-//! one's SAML sign-in and push device) in the store of their own pin, and they move when
+//! one's SAML sign-in and push device) in the store of the person's pin, and they move when
 //! that changes: at startup, after a pin or unpin, and on every reconcile pass. botd's own
 //! copy of a Bot's memory or a person's facts is otherwise its file in DATA_DIR. Accounts
 //! and the audit log stay where botd runs; botd still reads and writes the stores from
