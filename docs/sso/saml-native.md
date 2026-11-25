@@ -171,10 +171,11 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `SSO_<ID>_TYPE` | (required) | `saml`, without `SSO_<ID>_ISSUER`. |
-| `SSO_<ID>_IDP_ENTITY_ID` | (required) | The IdP's entity ID. Responses from any other issuer are refused, and identities are stored under it. |
+| `SSO_<ID>_IDP_ENTITY_ID` | (required, or `IDP_ENTITY_IDS`) | The IdP's entity ID. Responses from any other issuer are refused, and identities are stored under it. |
+| `SSO_<ID>_IDP_ENTITY_IDS` | | Instead of `IDP_ENTITY_ID`: several IdPs of a federation, comma separated (2 to 100), each fetched from `IDP_MDQ_URL` and chosen at sign-in ([below](#several-idps-of-a-federation)). |
 | `SSO_<ID>_IDP_METADATA_URL` | | The IdP's metadata, https, refreshed daily. |
 | `SSO_<ID>_IDP_METADATA_FILE` | | Or a metadata file, read at startup. Without either, import it with `botctl sso saml <id> import`. |
-| `SSO_<ID>_IDP_MDQ_URL` | | Or a federation's MDQ server, its https base URL (InCommon: `https://mdq.incommon.org`): botd asks it for `IDP_ENTITY_ID` alone, daily. Needs `METADATA_SIGNING_CERT_FILE` ([below](#metadata-from-a-federation-mdq)). |
+| `SSO_<ID>_IDP_MDQ_URL` | | Or a federation's MDQ server, its https base URL (InCommon: `https://mdq.incommon.org`): botd asks it for each IdP alone, daily. Needs `METADATA_SIGNING_CERT_FILE` ([below](#metadata-from-a-federation-mdq)). |
 | `SSO_<ID>_SP_ENTITY_ID` | `<SSO_PUBLIC_URL>/api/auth/sso/<id>/metadata` | Our entity ID (the audience), if the IdP needs another. |
 | `SSO_<ID>_EMAIL_ATTRIBUTE` | `email`, `mail`, or the emailaddress claim URI | The attribute with the email. |
 | `SSO_<ID>_NAME_ATTRIBUTE` | `displayName`, `name`, or the displayname claim URI | The attribute with the display name. |
@@ -359,6 +360,24 @@ SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
 
 Register SuperBot with the IdP's operators as they ask: some take SuperBot's metadata URL directly, others only through the federation's registry.
 
+#### Several IdPs of a federation
+
+A research platform often serves people from many institutions in one federation. One provider can take several of its IdPs, each fetched from the MDQ server on its own ([ADR 0282](../adr/0282-saml-several-idps-of-a-federation.md)). List their entity IDs in `IDP_ENTITY_IDS` instead of `IDP_ENTITY_ID`:
+
+```bash
+SSO_UNI_TYPE=saml
+SSO_UNI_IDP_ENTITY_IDS=https://idp.uni-a.example/idp/shibboleth,https://login.uni-b.example/idp/shibboleth
+SSO_UNI_IDP_MDQ_URL=https://mdq.incommon.org
+SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
+```
+
+- **People choose their institution.** The sign-in button opens a page on SuperBot listing the IdPs by the name the federation publishes for each (`mdui:DisplayName`, else the organization's name, else the entity ID). It runs no script. Each choice sends an AuthnRequest to that IdP only, and only its signed answer to that request is taken. A start URL can skip the page with `&idp=<entity ID>`; an `idp` that isn't listed fails as `unknown_idp`.
+- **Each identity is the IdP's.** People are stored under the IdP that signed them in (its entity ID is the `issuer`), so the same NameID at two institutions is two people. To link someone by hand, say which IdP: `botctl user link <user> uni <NameID> --idp https://idp.uni-a.example/idp/shibboleth`.
+- **Emails only from the IdP's own domains.** Any IdP in the federation could send any email, so botd takes an email only at a domain the federation's metadata lists for that IdP (its `shibmd:Scope`s, exact domains; patterns are ignored). Another email is dropped. With `ALLOWED_DOMAINS` set, where the email decides who gets in, the sign-in is refused as `email_out_of_scope` instead.
+- **Logout reaches the right IdP.** Signing out goes to the IdP that signed the session in; a logout message from an IdP is checked against that IdP's metadata, and one naming an IdP that isn't listed is refused as `unknown_idp`.
+- **Each IdP's metadata is its own.** It's fetched when first needed and daily after, a refusal is audited with its `entityId`, and [certificate warnings](#certificates-that-are-ending) name the IdP. `botctl sso saml uni` lists every IdP with its name, email domains and certificates, and `botctl offline check` lists each MDQ URL.
+- **Not with these settings:** `GROUPS_ATTRIBUTE` and `REQUIRED_GROUPS` (one institution's `admins` group isn't another's, so group names can't grant roles across IdPs), and `IDP_INITIATED=restart` (each sign-in starts at the chooser). SCIM can't link a provider with several IdPs either: link people by hand or with just in time. botd won't start with them, and lists at most 100 IdPs. Entity IDs with commas can't be listed.
+
 ## Single logout
 
 When the IdP's metadata has an HTTP-Redirect or HTTP-POST `SingleLogoutService` on https, botd does single logout over the browser ([HTTP-POST below](#logout-over-http-post)):
@@ -471,6 +490,8 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `replayed` | The same assertion was posted twice. |
 | `transient_subject`, `missing_subject` | Use a persistent NameID. |
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
+| `email_out_of_scope` | With [several IdPs](#several-idps-of-a-federation) and `ALLOWED_DOMAINS`: the IdP sent an email at a domain the federation doesn't list for it (`botctl sso saml <id>` shows each IdP's email domains). Its operators must add the scope in the federation's registry. |
+| `unknown_idp` | With several IdPs: the start URL's `idp` isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was). |
 | `idp_metadata_expired` | The IdP's signed metadata in use has passed its `validUntil`, and no fresh copy loaded. From a file or an import, give botd a fresh signed copy; from a URL or MDQ, look for `sso.saml_metadata_refused` or an unreachable server in the log ([above](#signed-idp-metadata)). |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
 | `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |
@@ -486,6 +507,7 @@ Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action
 |--------|-----|
 | `unsigned`, `bad_signature` | The IdP must sign logout messages with a certificate in its metadata: refresh or import it. |
 | `wrong_issuer` | The message came from another entity than `SSO_<ID>_IDP_ENTITY_ID`. |
+| `unknown_idp` | With several IdPs: the message's `Issuer` isn't one of `IDP_ENTITY_IDS`. |
 | `wrong_destination` | The IdP's logout URL for SuperBot isn't the SLO URL botctl shows (the SOAP SLO URL for the back channel), or it sends no `Destination`. |
 | `must_understand` | The IdP's SOAP envelope has a header botd must understand to answer: send none. |
 | `expired`, `not_yet_valid` | The message is older than five minutes, or clocks differ by more than two: fix NTP. |
