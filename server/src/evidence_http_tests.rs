@@ -587,8 +587,8 @@ async fn egress_is_evidence_only_while_every_run_was_held_to_an_allow_list() {
 
     // Ada let out on her own for part of the period: her runs weren't held to it then.
     let user_changed = |from: &str, to: &str| Event::new(Actor::operator(), "user.egress_policy_changed").target("user", &uid).details(json!({ "from": { "mode": from, "allow": [] }, "to": { "mode": to, "allow": [] }, "userEmail": "ada@example.com" }));
-    app.db.record(&user_changed("inherit", "open"));
-    app.db.record(&user_changed("open", "inherit"));
+    app.db.record_at(&user_changed("inherit", "open"), p.start_ms() + 60_000).unwrap();
+    app.db.record_at(&user_changed("open", "inherit"), p.start_ms() + 120_000).unwrap();
     let (v, (_, rows)) = egress(&app);
     assert_eq!(rows, json!([]), "{v}");
     assert_eq!(v["exceptions"]["usersOpen"][0]["user"].as_str(), Some(uid.as_str()), "{v}");
