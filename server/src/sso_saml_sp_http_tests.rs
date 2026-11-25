@@ -3309,3 +3309,74 @@ async fn with_several_idps_a_group_scoped_to_another_idps_domain_never_counts() 
     assert_eq!(sp.app.db.user(&bob.id).unwrap().role_id, None);
     std::fs::remove_dir_all(dir).ok();
 }
+
+// IdP-initiated sign-in at each IdP of a federation (ADR 0290)
+
+#[tokio::test]
+async fn each_federation_idps_tile_restarts_a_sign_in_at_that_idp() {
+    let (sp, dir, _) = serve_federation(&[("IDP_INITIATED", "restart")], 2).await;
+    assert_eq!(sp.view().await["idpInitiated"], "restart");
+    let (bob, _) = sp.link_at(IDP_B, "00ubob", "bob@uni-b.example", Role::Member);
+    sp.link();
+    let tile_at = |idp: &str| {
+        let mut t = sp.unsolicited();
+        if idp == IDP_B {
+            from_b(&mut t);
+            t.name_id = "00uBOB".into();
+        }
+        t
+    };
+    let start_at = |idp: &str| format!("http://127.0.0.1:{}/api/auth/sso/{}/start?idp={}", sp.port, sp.id, url::form_urlencoded::byte_serialize(idp.as_bytes()).collect::<String>());
+    let marker_of = |idp: &str| format!("{}.{}", sp.id, &crate::users::hash(idp)[..16]);
+    let marker_set = |head: &str| set_cookies(head).into_iter().find(|c| c.starts_with(&format!("{RESTART}="))).map(|c| c.split(';').next().unwrap().to_string());
+
+    // B's tile is checked against B's metadata, then sends the browser to start at B, not the
+    // chooser, with a marker naming B.
+    let (code, to, head) = sp.post(Some(&tile_at(IDP_B).posted()), Some("https://evil.example/next"), "").await;
+    assert_eq!((code, to.as_str()), (303, start_at(IDP_B).as_str()));
+    assert!(signed_in_as(sp.port, &head).await.is_none());
+    assert_eq!(marker_set(&head), Some(format!("{RESTART}={}", marker_of(IDP_B))));
+    let restarted = &sp.audit("auth.saml_idp_initiated").await[0]["details"];
+    assert_eq!((restarted["issuer"].as_str(), restarted["subject"].as_str(), restarted["outcome"].as_str()), (Some(IDP_B), Some("00ubob"), Some("restarted")));
+
+    // The browser follows it: the AuthnRequest goes to B, and B's answer signs Bob in.
+    let (request, relay, binder, to_idp) = sp.start_at(IDP_B).await;
+    assert_eq!(to_idp, "https://login.uni-b.example/saml/sso");
+    let mut answer = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    from_b(&mut answer);
+    answer.name_id = "00uBOB".into();
+    let (code, _, head) = sp.post(Some(&answer.posted()), Some(&relay), &format!("{binder}; {RESTART}={}", marker_of(IDP_B))).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(bob.id.clone()));
+    assert_eq!(marker_set(&head), Some(format!("{RESTART}=")), "the marker is cleared");
+
+    // A's tile goes to A, with A's marker. B's marker doesn't make it a loop: only B answering
+    // its own restart unsolicited again is one.
+    let (code, to, head) = sp.post(Some(&tile_at(IDP).posted()), None, &format!("{RESTART}={}", marker_of(IDP_B))).await;
+    assert_eq!((code, to.as_str()), (303, start_at(IDP).as_str()));
+    assert_eq!(marker_set(&head), Some(format!("{RESTART}={}", marker_of(IDP))));
+    let (code, to, _) = sp.post(Some(&tile_at(IDP_B).posted()), None, &format!("{RESTART}={}", marker_of(IDP_B))).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_failed"));
+    assert_eq!(sp.last_failure().await["reason"], "idp_initiated_loop");
+    let (code, to, _) = sp.post(Some(&tile_at(IDP_B).posted()), None, &format!("{RESTART}={}", sp.id)).await;
+    assert_eq!((code, to.as_str()), (303, start_at(IDP_B).as_str()), "a marker without the IdP isn't B's");
+    assert_eq!(sp.audit("auth.saml_idp_initiated").await.len(), 3);
+
+    // A tile from an IdP the provider doesn't list is refused before anything is fetched or checked.
+    let mut other = sp.unsolicited();
+    other.issuer = "https://idp.other.example".into();
+    let (code, to, head) = sp.post(Some(&other.posted()), None, "").await;
+    assert_eq!((code, to.as_str(), marker_set(&head)), (303, "/login?error=sso_failed", Some(format!("{RESTART}="))), "no restart");
+    let f = sp.last_failure().await;
+    assert_eq!((f["reason"].as_str(), f["entityId"].as_str(), f["idpInitiated"].as_bool()), (Some("unknown_idp"), Some("https://idp.other.example"), Some(true)));
+    // The Issuer only picks whose keys check it: one naming B but signed by A is refused.
+    let mut forged = sp.unsolicited();
+    forged.issuer = IDP_B.into();
+    let (code, to, head) = sp.post(Some(&forged.posted()), None, "").await;
+    assert_eq!((code, to.as_str(), marker_set(&head)), (303, "/login?error=sso_failed", Some(format!("{RESTART}="))), "no restart");
+    // Nothing to read an IdP from.
+    let (code, to, _) = sp.post(Some("not base64 <xml>"), None, "").await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_failed"));
+    assert_eq!(sp.audit("auth.saml_idp_initiated").await.len(), 3);
+    std::fs::remove_dir_all(dir).ok();
+}
