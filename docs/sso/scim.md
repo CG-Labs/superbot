@@ -225,10 +225,13 @@ botctl scim role map <team id> "Support Lead"      # within the group's team (on
 botctl scim role map <team id> Auditor --org       # across the server
 botctl scim role-mappings                          # every mapping, how many people it gave the role to
 botctl scim role show <mapping id>                 # who holds it through the mapping
+botctl scim role remap <mapping id> Viewer         # gives another role instead, to whoever holds the old one from it
 botctl scim role unmap <mapping id>                # takes it back from them; roles given by hand stay
 ```
 
-Or in the console's SCIM section, under **Group roles**: pick a team group, where the role applies and the role, then **Map group**. It offers only the groups with a scope left to map and the custom roles SCIM may give there, each with what it gives there ([ADR 0253](../adr/0253-scim-group-roles-in-the-console.md)); it also lists the mappings and removes them. Or the admin API: `GET`/`POST /api/scim/role-mappings` (`{"team": "<id>", "role": "<id or name>", "scope": "team" | "org"}`, team by default), `GET`/`DELETE /api/scim/role-mappings/<id>`.
+Or in the console's SCIM section, under **Group roles**: pick a team group, where the role applies and the role, then **Map group**. It offers only the groups with a scope left to map and the custom roles SCIM may give there, each with what it gives there ([ADR 0253](../adr/0253-scim-group-roles-in-the-console.md)); it also lists the mappings, gives one another role from a picker on its row after a confirmation, and removes them. Or the admin API: `GET`/`POST /api/scim/role-mappings` (`{"team": "<id>", "role": "<id or name>", "scope": "team" | "org"}`, team by default), `GET`/`PATCH` (`{"role": ...}`)/`DELETE /api/scim/role-mappings/<id>`.
+
+**Changing a mapping's role** ([ADR 0265](../adr/0265-changing-a-scim-mappings-role.md)) keeps its group and scope. Everyone holding the old role from it holds the new one instead, swapped in one step, so nobody is left with neither and no role group steps in between. Across the server, their built-in role becomes the new role's base, audited and offboarded like any change of role. Nobody else is given it: people it skipped, and people whose role an admin took away, stay as they are until they join the group again. The new role is held to the same rules as a new mapping's (400 or 409, audited as `scim.role_map_refused` with the mapping), and the answer lists who now holds it (`swapped`). The same role again changes nothing.
 
 A group has at most one role in its team and one across the server. Mapping it gives the role to the members it has now, and the response lists who got it and who was skipped, and why.
 
@@ -244,7 +247,7 @@ Each skip is audited as `scim.role_skipped`. Taking a role away clears only one 
 
 **When it's taken away.** When they leave the group (by SCIM, by a team admin's removal, or a SCIM `DELETE` of the user), when the mapping is removed, and when the group goes (the IdP deletes it, or an admin unlinks it). Turning `SCIM_GROUP_ROLES` off stops new grants and new mappings; leaving still takes away what mappings gave, and a SCIM `DELETE` of the user takes away every mapped role they hold even with `SCIM_GROUPS` off.
 
-**Audit.** `scim.role_mapped`, `scim.role_unmapped` (reason `mapping_removed` or `group_removed`, with who lost the role), `scim.role_map_refused`, `scim.role_skipped`, and each grant as `role.assigned` and `role.unassigned` with `via: "scim"`, the mapping, the tenant and (for team roles) the team, and a reason when taken away (`left_group`, `user_deleted`, `mapping_removed`, `group_removed`). A change of built-in role is `user.role_changed` (reason `scim_group`), with the same offboarding as any other change of role. A join's grant has the SCIM token as its actor; a mapping's, the admin.
+**Audit.** `scim.role_mapped`, `scim.role_remapped` (`from`, the new `role`, and who holds it now, `swapped`), `scim.role_unmapped` (reason `mapping_removed` or `group_removed`, with who lost the role), `scim.role_map_refused`, `scim.role_skipped`, and each grant as `role.assigned` and `role.unassigned` with `via: "scim"`, the mapping, the tenant and (for team roles) the team, and a reason when taken away (`left_group`, `user_deleted`, `mapping_removed`, `group_removed`) or swapped (`mapping_changed`, with the old role as `from`). A change of built-in role is `user.role_changed` (reason `scim_group`), with the same offboarding as any other change of role. A join's grant has the SCIM token as its actor; a mapping's, the admin.
 
 ## Role groups
 
