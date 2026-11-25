@@ -222,7 +222,7 @@ It finds the image Compose runs botd from, as Compose does (`SUPERBOT_IMAGE`, el
 - that the image is there and for this arch;
 - that the bundle holds the exact Hermes commit that image's botd pins (`botd harness pins`, run in the image with no network).
 
-Then it copies the tree into a new volume, `superbot-hermes-<commit>` (the first 12 characters), root-owned and not writable by botd. It shares it as `install.sh` does, and runs `hermes --version` from it in the image, with no network, as the image's user and as another account. It marks the volume last, so one left by a failed load is made again. Run again for the same commit, it says the volume already has it. It needs about 2.7 GB free under `$TMPDIR` while it runs, and 2.7 GB for the volume. It prints two settings for `.env`:
+Then it copies the tree into a new volume, `superbot-hermes-<commit>` (the first 12 characters), root-owned and not writable by botd. It shares it as `install.sh` does, and runs `hermes --version` from it in the image, with no network, as the image's user and as another account. It marks the volume last, so one left by a failed load is made again. Run again for the same commit, it says the volume already has it. It refuses a volume it didn't make (a `--volume` naming a stack's data is left alone), and runs one load at a time per volume. If `.env` gives the image through a variable, such as `${MIRROR}/superbot:0.1.0`, give it with `--image`. It needs about 2.7 GB free under `$TMPDIR` while it runs, and 2.7 GB for the volume. It prints two settings for `.env`:
 
 ```sh
 COMPOSE_FILE=docker-compose.yml:docker-compose.hermes.yml
