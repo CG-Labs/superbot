@@ -207,8 +207,11 @@ fn external(backend: &str) -> bool {
 }
 
 /// The starts in force in `p`: the last one before it, then each in it, as `(at, backend)`.
-pub(crate) fn starts_in_force(before: Option<(i64, String)>, during: &[(i64, String)]) -> Vec<(i64, String)> {
-    before.into_iter().chain(during.iter().cloned()).collect()
+/// With none before it on record (never, or pruned), whatever ran from the period's start
+/// is unknown: `(None, "unknown")`.
+pub(crate) fn starts_in_force(before: Option<(i64, String)>, during: &[(i64, String)]) -> Vec<(Option<i64>, String)> {
+    let first = before.map_or((None, "unknown".to_string()), |(at, b)| (Some(at), b));
+    std::iter::once(first).chain(during.iter().map(|(at, b)| (Some(*at), b.clone()))).collect()
 }
 
 /// `secrets.json`, and the rows its manifest entry names.
@@ -216,15 +219,19 @@ pub fn secrets(app: &App, p: &Period, t: &Tally) -> (Value, Vec<&'static str>) {
     let start = Filter { actions: vec![STARTED.into()], to: Some(p.start_ms()), ..Default::default() };
     let before = app.db.audit_events(&start, 1, false).pop().map(|e| (e.at, backend_of(&e)));
     let during = Filter { actions: vec![STARTED.into()], from: Some(p.start_ms()), to: Some(p.end_ms()), ..Default::default() };
-    let during: Vec<(i64, String)> = app.db.audit_events(&during, MAX_CHANGES, true).iter().map(|e| (e.at, backend_of(e))).collect();
+    let mut during: Vec<(i64, String)> = app.db.audit_events(&during, MAX_CHANGES + 1, true).iter().map(|e| (e.at, backend_of(e))).collect();
+    let truncated = during.len() as i64 > MAX_CHANGES;
+    during.truncate(MAX_CHANGES as usize);
     let starts = starts_in_force(before, &during);
-    let without: Vec<Value> = starts.iter().filter(|(_, b)| !external(b)).map(|(at, b)| json!({ "startedAt": rfc3339(*at), "backend": b })).collect();
+    let start = |at: &Option<i64>, b: &str| json!({ "startedAt": at.map(rfc3339), "backend": b, "external": external(b) });
+    let without: Vec<Value> = starts.iter().filter(|(_, b)| !external(b)).map(|(at, b)| start(at, b)).collect();
     let (dropped, more_dropped) = ids(app, DROPPED, p);
     let count = |action: &str, outcome: &str| t.counts.get(action).and_then(|o| o.get(outcome)).copied().unwrap_or(0);
-    let held = !starts.is_empty() && without.is_empty();
+    let held = !truncated && without.is_empty();
     let v = json!({
         "now": crate::secrets::external::configured(),
-        "starts": starts.iter().map(|(at, b)| json!({ "startedAt": rfc3339(*at), "backend": b, "external": external(b) })).collect::<Vec<_>>(),
+        "starts": starts.iter().map(|(at, b)| start(at, b)).collect::<Vec<_>>(),
+        "startsTruncated": truncated,
         "summary": {
             "reads": count("secret.read", "success"),
             "readFailures": count("secret.read", "failure"),
@@ -280,7 +287,10 @@ mod tests {
         assert!(external("vault") && external("aws") && external("azure-keyvault") && external("gcp-secret-manager"));
         assert!(!external("local") && !external("unknown"));
         let s = starts_in_force(Some((1, "unknown".into())), &[(2, "vault".into())]);
-        assert_eq!(s, [(1, "unknown".to_string()), (2, "vault".to_string())]);
-        assert!(starts_in_force(None, &[]).is_empty());
+        assert_eq!(s, [(Some(1), "unknown".to_string()), (Some(2), "vault".to_string())]);
+        // No start before the period on record, as when retention pruned it: what ran
+        // until the first start in it is unknown.
+        assert_eq!(starts_in_force(None, &[(2, "vault".into())]), [(None, "unknown".to_string()), (Some(2), "vault".to_string())]);
+        assert_eq!(starts_in_force(None, &[]), [(None, "unknown".to_string())]);
     }
 }

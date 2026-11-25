@@ -637,6 +637,15 @@ async fn secrets_are_evidence_only_while_every_start_used_an_external_manager() 
     app.db.record_at(&started(None), p.start_ms() - 3_600_000).unwrap();
     let (v, (_, rows)) = secrets(&app);
     assert_eq!((rows, v["exceptions"]["startsWithoutExternalManager"][0]["backend"].as_str()), (json!([]), Some("unknown")), "{v}");
+
+    // No start before the period on record (pruned, or never): what ran until the first
+    // one in it is unknown, so a Vault start halfway through doesn't make the month.
+    let (_, app, _, _) = serve_app().await;
+    app.db.record(&started(Some("vault")));
+    let (v, (_, rows)) = secrets(&app);
+    assert_eq!(rows, json!([]), "{v}");
+    let gap = &v["exceptions"]["startsWithoutExternalManager"][0];
+    assert_eq!((gap["backend"].as_str(), gap["startedAt"].is_null()), (Some("unknown"), true), "{v}");
 }
 
 /// Custom roles (ADR 0285): `access-review.json` lists each one's definition and how

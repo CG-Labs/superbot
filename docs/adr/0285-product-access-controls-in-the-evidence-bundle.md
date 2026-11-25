@@ -38,7 +38,7 @@ The file holds the server's mode, how many entries, and the policy id (a digest 
 
 `SECRETS_BACKEND` is read once, at start. So botd now records the backend kind in each `server.started` event (`vaultBackend`: `local`, `vault`, `azure-keyvault`, `gcp-secret-manager` or `aws`). The detail is not called `secretsBackend` because the audit log redacts any detail key that says "secret".
 
-CC6.1-4 is named only when every start in force during the period used an external manager: the last start before the period and each start in it. A start recorded before this change has no backend and counts as `unknown`, so the first month after upgrading doesn't name the row. That is the honest answer: botd didn't record it then.
+CC6.1-4 is named only when every start in force during the period used an external manager: the last start before the period and each start in it. A start recorded before this change has no backend and counts as `unknown`, so the first month after upgrading doesn't name the row. That is the honest answer: botd didn't record it then. Likewise, with no start before the period on record (a new server, or audit retention pruned it), whatever ran until the period's first start is `unknown`, and a period with more than 10,000 starts, past what the file reads, names nothing.
 
 The file holds the backend now (kind, cache time, whether users' secrets live there, how many run-credential paths, read without calling the manager), each start in force with its backend, counts of reads, sign-ins and leases with failures, and the ids of any `secret.read_events_dropped` events. It never holds an address, path, role or secret name.
 
