@@ -171,6 +171,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0252-monthly-health-check.md"));
     files.push(repo().join("docs/adr/0262-business-review-draft.md"));
     files.push(repo().join("docs/adr/0271-health-check-in-the-support-bundle.md"));
+    files.push(repo().join("docs/adr/0278-tam-handover-draft.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -558,6 +559,32 @@ fn the_business_review_template_documents_its_draft() {
     for (name, needle) in [("README.md", "botctl business-review"), ("tam.md", "botctl business-review")] {
         assert!(read(name).contains(needle), "{name} doesn't point at botctl business-review");
     }
+}
+
+/// ADR 0278: the TAM page explains `botctl tam-handover`, each of its options, the route,
+/// the audit action and the console's link, and says what botd fills in for each part of
+/// the handover; the index points at the command.
+#[test]
+fn the_tam_page_documents_the_handover_draft() {
+    let page = read("tam.md");
+    let botctl = fs::read_to_string(repo().join("server/src/bin/botctl.rs")).unwrap();
+    let usage = botctl.lines().find(|l| l.contains("botctl tam-handover [")).expect("botctl's usage has tam-handover");
+    let options: Vec<&str> = usage.split(|c: char| c.is_whitespace() || "[]".contains(c)).filter(|w| w.starts_with('-')).collect();
+    assert_eq!(options, ["--json", "-o"], "the usage's options");
+    let draft = page.split("### Draft it first").nth(1).expect("tam.md has the handover draft").split("\n## ").next().unwrap();
+    for o in options {
+        assert!(draft.contains(&format!("| `{o}")), "tam.md doesn't explain {o}");
+    }
+    for needle in ["support.tam_handover_drafted", "GET /api/support/tam-handover", "Draft TAM handover"] {
+        assert!(draft.contains(needle), "tam.md's handover draft doesn't mention {needle}");
+    }
+    let code = fs::read_to_string(repo().join("server/src/tam_handover.rs")).unwrap();
+    let parts: Vec<&str> = code.lines().filter_map(|l| l.trim().strip_prefix("let _ = writeln!(m, \"## ")).filter_map(|l| l.split("\\n").next()).collect();
+    assert_eq!(parts.len(), 5, "the draft's parts: {parts:?}");
+    for p in parts {
+        assert!(draft.contains(&format!("| {p} |")), "tam.md's table doesn't say what botd fills in for {p}");
+    }
+    assert!(read("README.md").contains("botctl tam-handover"), "README.md doesn't point at botctl tam-handover");
 }
 
 /// ADR 0131, 0243: the support bundle's page lists every file `support::build` writes,

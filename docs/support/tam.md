@@ -54,6 +54,35 @@ When a customer changes TAM, or the TAM is away for more than two weeks, write i
 - the people and how they like to work (channel, meeting times, who decides);
 - upcoming dates: renewal, license end, upgrade windows, the next review.
 
+### Draft it first
+
+`botctl tam-handover` drafts this note from botd's records, so the outgoing TAM's time goes on what only they know: tickets, promises and the people.
+
+```sh
+# The handover note in Markdown, for the customer's record
+botctl tam-handover -o handover.md
+
+# For a CRM or the support system's hook
+botctl tam-handover --json
+```
+
+| Option | What it does |
+|---|---|
+| `--json` | The draft as botd sends it, from `GET /api/support/tam-handover` (admins only), instead of Markdown |
+| `-o <file>` | Save it, readable by you only, instead of printing it |
+
+It runs on the customer's server, signed in as an admin (`SUPERBOT_TOKEN`, or the password); on a self-hosted one, the customer's admin runs it and sends the file. The console's Support tab has the same as **Draft TAM handover**. It covers the deployment as it is when drafted, so draft it on the day of the handover. Each draft is recorded in the audit log as `support.tam_handover_drafted`, with the score, the open item ids, the number of incidents and the dates overdue; it isn't recorded as a monthly health check. Design: [ADR 0278](../adr/0278-tam-handover-draft.md).
+
+| Section | From botd's records | Left to fill in |
+|---|---|---|
+| 1. The deployment | botd's version, single sign-on providers by id and kind, SCIM and its working tokens, custom roles and who holds one, machines and data regions, backups, the approvals policy, Bots by harness, people active and licensed seats, the license | Where it runs and who operates it, the IdP's admin and MFA, model provider accounts, the network |
+| 2. Health | The [health score](health-score.md) and band now, each signal at watch or at risk with its summary, the last month's trend, the last [health check](health-check.md) (`support.health_checked`) with its open items, and the last [business review](qbr-template.md) draft | What's being done about each signal |
+| 3. Open work | Every item the health check finds open now, with what botd sees and its guide; status page incidents still open, or major or critical in the last 92 days with no [review](incident-review.md#the-review-draft) drafted | Open tickets (`botctl support-report`), open incident actions, promises made |
+| 4. The people | Nothing: botd names nobody | All of it, by role |
+| 5. Upcoming dates | The license's end, native SAML certificates ending within 60 days, SCIM tokens ending within 14 days, the next monthly health check (31 days after the last), the next quarterly review (the month after the quarter that follows the last draft's) and the next access review (92 days after the last), each marked when overdue | The renewal, upgrade windows, the next restore drill and check-in |
+
+The draft holds codes, counts, dates, provider ids, harness names, region ids and incident ids: never a person's name or email, a Bot's name, an incident's title, an address or a bucket.
+
 ## Records
 
 Everything about a customer (contacts, the onboarding record, health checks, reviews, handovers) is kept in the Provider's support system or CRM, with access limited to the people who work with them. Not in this repository, not in a ticket other customers' staff can see, and not in a Bot's chat. The health score, onboarding check, health check and support bundle carry no personal data, so they can be attached; anything copied from the console or the audit log can, so trim it first.
