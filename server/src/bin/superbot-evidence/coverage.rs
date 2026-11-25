@@ -131,7 +131,7 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 18] = [
+const EXCEPTION_FILES: [&str; 19] = [
     "pull-requests.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
@@ -148,6 +148,7 @@ const EXCEPTION_FILES: [&str; 18] = [
     "incidents.json",
     "access.json",
     "vulnerabilities.json",
+    "production-changes.json",
     "uptime.json",
     AUDIT_INTEGRITY,
 ];
@@ -1002,7 +1003,6 @@ mod tests {
     /// without it still checks, one of format 5 must have it, and its exceptions count.
     #[test]
     fn register_bundles_have_vulnerabilities_json_from_format_5() {
-        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 5);
         let old = register_bundle_with(4, "vulnerabilities.json", None);
         assert!(old.verified(), "made before vulnerabilities.json: {:?}", old.problems);
         let missing = register_bundle_with(5, "vulnerabilities.json", None);
@@ -1013,6 +1013,23 @@ mod tests {
         assert!(f.verified(), "{:?}", f.problems);
         assert_eq!((f.exceptions["vulnerabilities.json"]["fixOverdue"], f.exceptions["vulnerabilities.json"]["noPenTest"]), (1, 1));
         assert!(f.files.iter().any(|(n, _, r)| n == "vulnerabilities.json" && r == &rows.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+    }
+
+    /// Register bundles gained `production-changes.json` in format 6 (ADR 0270): one of
+    /// format 5 without it still checks, one of format 6 must have it, and its exceptions count.
+    #[test]
+    fn register_bundles_have_production_changes_json_from_format_6() {
+        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 6);
+        let old = register_bundle_with(5, "production-changes.json", None);
+        assert!(old.verified(), "made before production-changes.json: {:?}", old.problems);
+        let missing = register_bundle_with(6, "production-changes.json", None);
+        assert!(!missing.verified() && missing.problems.iter().any(|x| x.contains("it has no production-changes.json")), "{:?}", missing.problems);
+        let body = json_file(&json!({ "exceptions": { "notApproved": ["CHG-1 standard on botd-1 (made 2027-01-05)"], "reviewOverdue": ["CHG-2 emergency on hosting (made 2027-01-06, not reviewed, due 2027-01-08)", "CHG-3 emergency on hosting (made 2027-01-07, not reviewed, due 2027-01-11)"], "notChecked": [] } }));
+        let rows: &[&str] = &["CC8.1-2"];
+        let f = register_bundle_with(6, "production-changes.json", Some((&body, &["CC8.1"], rows)));
+        assert!(f.verified(), "{:?}", f.problems);
+        assert_eq!((f.exceptions["production-changes.json"]["notApproved"], f.exceptions["production-changes.json"]["reviewOverdue"]), (1, 2));
+        assert!(f.files.iter().any(|(n, _, r)| n == "production-changes.json" && r == &["CC8.1-2".to_string()]));
     }
 
     #[test]
@@ -1287,9 +1304,9 @@ mod tests {
         let row = |id: &str| r["rows"].as_array().unwrap().iter().find(|x| x["row"] == id).unwrap().clone();
         assert_eq!(row("CC8.1-1")["coveredDays"], 31);
         assert_eq!(row("CC8.1-1")["criterion"], "CC8.1");
-        // CC8.1-2 is in both the botd bundle and the change-management bundle.
+        // CC8.1-2 is in the botd bundle, the change-management bundle and the register bundle.
         assert_eq!(row("CC8.1-2")["complete"], true);
-        assert_eq!(strings(&row("CC8.1-2")["from"]), ["change-management", "evidence"]);
+        assert_eq!(strings(&row("CC8.1-2")["from"]), ["change-management", "evidence", "policy-register"]);
         assert_eq!(row("CC4.2-1")["complete"], true);
         assert_eq!((row("A1.3-1")["complete"].as_bool(), strings(&row("A1.3-1")["from"])), (Some(true), vec!["recovery-drills".to_string()]));
         assert_eq!(row("CC9.1-2")["coveredDays"], 90);

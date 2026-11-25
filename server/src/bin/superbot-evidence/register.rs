@@ -14,13 +14,15 @@
 //! a leaver's last day, a production system not reviewed in a quarter, a review finding
 //! not fixed in time, a SuperBot review with no sign-off in botd's audit log, a
 //! vulnerability found outside the scans acknowledged, assessed, or fixed or accepted
-//! late, a year without a penetration test or a retest overdue) and writes a dated
-//! bundle in the shape of the others, which the coverage report checks (ADR 0169).
+//! late, a year without a penetration test or a retest overdue, a production change made
+//! before it was recorded and approved by someone else, an emergency change not reviewed
+//! in time) and writes a dated bundle in the shape of the others, which the coverage
+//! report checks (ADR 0169).
 //!
 //! Never in it: names, titles, notes or reasons from the register, nor the register
-//! itself. People, risks, vendors, exceptions, incidents, systems, vulnerabilities and
-//! penetration tests are named by their register ids; the register's SHA-256 identifies
-//! the copy kept beside the bundle.
+//! itself. People, risks, vendors, exceptions, incidents, systems, vulnerabilities,
+//! penetration tests and changes are named by their register ids; the register's SHA-256
+//! identifies the copy kept beside the bundle.
 
 use crate::changes::{Bundle, Section, json_file, rfc3339, sha256};
 use crate::period::Period;
@@ -32,8 +34,8 @@ use std::path::Path;
 
 /// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214), 3
 /// `incidents.json` (ADR 0223), 4 `access.json` (ADR 0231), 5 `vulnerabilities.json`
-/// (ADR 0241).
-pub const FORMAT: u32 = 5;
+/// (ADR 0241), 6 `production-changes.json` (ADR 0270).
+pub const FORMAT: u32 = 6;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -126,6 +128,27 @@ pub const INFORMATION_SECURITY: &str = "information-security";
 /// the last of them being fixed.
 pub const RETEST_DAYS: i64 = 30;
 
+/// Production changes (ADR 0270), under the change management policy: a standard change
+/// is recorded and approved by someone other than whoever makes it, before it is made; an
+/// emergency change is approved by the incident commander and reviewed afterwards.
+pub const CHANGE_MANAGEMENT: &str = "change-management";
+pub const CHANGE_KINDS: [&str; 2] = ["standard", "emergency"];
+/// A planned change that may interrupt the service is announced on the status page at
+/// least this many hours before it starts.
+pub const MAINTENANCE_NOTICE_HOURS: i64 = 48;
+/// The operator checks the service and the configuration baseline after a change within
+/// this many business days: the same day or the next.
+pub const VERIFY_BUSINESS_DAYS: u32 = 1;
+/// An emergency change is reviewed by a second person within this many business days.
+pub const EMERGENCY_REVIEW_BUSINESS_DAYS: u32 = 2;
+/// An emergency change to code goes through a normal pull request within this many
+/// business days.
+pub const FOLLOW_UP_BUSINESS_DAYS: u32 = 5;
+/// Besides the incident's recorded commander, whoever holds or deputises this role may
+/// approve an emergency change: the security owner takes over command from the on-call
+/// operator (incident response plan, "Roles").
+pub const EMERGENCY_APPROVER: &str = "Security owner";
+
 /// Yearly: policy reviews, acknowledgements, training, risk and vendor reviews.
 pub const YEAR_DAYS: i64 = 365;
 /// Quarterly: management reviews and exception reviews.
@@ -146,7 +169,7 @@ pub const MAX_PERIOD_DAYS: i64 = 31;
 /// a file to a row only while the register holds a current record for it (a role filled
 /// in the period, an approval within a year, a management review within a quarter), so a
 /// register that stopped being kept shows as a gap in the coverage report.
-pub const SECTIONS: [Section; 11] = [
+pub const SECTIONS: [Section; 12] = [
     Section { file: "roles.json", criteria: &["CC1.3"], rows: &["CC1.3-1"] },
     Section { file: "policies.json", criteria: &["CC3.1", "CC5.3"], rows: &["CC3.1-1", "CC5.3-1"] },
     Section { file: "people.json", criteria: &["CC1.4", "CC2.2"], rows: &["CC1.4-1", "CC2.2-1"] },
@@ -158,11 +181,12 @@ pub const SECTIONS: [Section; 11] = [
     Section { file: "incidents.json", criteria: &["CC7.3", "CC7.4", "CC7.5"], rows: &["CC7.3-1", "CC7.4-1", "CC7.4-2", "CC7.5-1"] },
     Section { file: "access.json", criteria: &["CC6.1", "CC6.2", "CC6.3"], rows: &["CC6.1-2", "CC6.2-2", "CC6.3-2"] },
     Section { file: "vulnerabilities.json", criteria: &["CC2.3", "CC3.2", "CC4.2"], rows: &["CC2.3-1", "CC3.2-2", "CC4.2-1"] },
+    Section { file: "production-changes.json", criteria: &["CC8.1"], rows: &["CC8.1-2"] },
 ];
 
 /// Files bundles of an older format don't have, and the format that added each, so the
 /// coverage report still verifies bundles made before them.
-pub const SINCE_FORMAT: [(&str, u64); 4] = [("conduct.json", 2), ("incidents.json", 3), ("access.json", 4), ("vulnerabilities.json", 5)];
+pub const SINCE_FORMAT: [(&str, u64); 5] = [("conduct.json", 2), ("incidents.json", 3), ("access.json", 4), ("vulnerabilities.json", 5), ("production-changes.json", 6)];
 
 const README: &str = "SuperBot policy register bundle
 ===============================
@@ -199,6 +223,12 @@ after the period are left out.
                            tests, vendors), acknowledged, assessed, and fixed or accepted
                            within their windows, and the yearly penetration test and
                            its retest
+  production-changes.json  changes to production: each recorded and approved by someone
+                           else before it was made, announced when it could interrupt
+                           the service, and checked afterwards; emergency changes
+                           approved by the incident commander, reviewed by a second
+                           person, followed up in a pull request and listed at the next
+                           management review
   manifest.json            what is in this bundle, the period, the register's SHA-256,
                            and each file's SHA-256
   SHA256SUMS               the same digests, for `sha256sum -c SHA256SUMS`
@@ -286,6 +316,8 @@ pub struct Register {
     pub vulnerabilities: Vec<Vulnerability>,
     #[serde(default)]
     pub pen_tests: Vec<PenTest>,
+    #[serde(default)]
+    pub changes: Vec<Change>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -398,6 +430,9 @@ pub struct ManagementReview {
     /// The SHA-256 of the minutes, kept beside the register.
     #[serde(default)]
     pub minutes_sha256: Option<String>,
+    /// The emergency changes the review went through, by id.
+    #[serde(default)]
+    pub emergency_changes: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -675,6 +710,64 @@ pub struct PenTest {
     #[serde(default)]
     #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
     pub notes: Option<String>,
+}
+
+/// A change to a production system, by id only: what changed, why, the risk and how to
+/// roll it back stay in the change record (a pull request, issue or ticket), identified by
+/// its SHA-256.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Change {
+    pub id: String,
+    pub system: String,
+    #[serde(default = "standard_kind")]
+    pub kind: String,
+    /// The day the change record was written, and its SHA-256.
+    #[serde(deserialize_with = "day")]
+    pub recorded: NaiveDate,
+    pub record_sha256: String,
+    /// The day it was approved, and who approved it: these go together.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub approved: Option<NaiveDate>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(deserialize_with = "day")]
+    pub made: NaiveDate,
+    pub made_by: String,
+    /// The incident it was made in: required for an emergency change.
+    #[serde(default)]
+    pub incident: Option<String>,
+    /// It may interrupt the service: when it starts (on the day it is made), and when it
+    /// was announced on the status page.
+    #[serde(default)]
+    pub interrupts: bool,
+    #[serde(default, deserialize_with = "opt_time")]
+    pub starts_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "opt_time")]
+    pub announced_at: Option<DateTime<Utc>>,
+    /// The day the operator checked the service and the configuration baseline after it.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub verified: Option<NaiveDate>,
+    /// An emergency change's review by a second person: when, and by whom (together).
+    #[serde(default, deserialize_with = "opt_day")]
+    pub reviewed: Option<NaiveDate>,
+    #[serde(default)]
+    pub reviewed_by: Option<String>,
+    /// An emergency change to code, and the normal pull request that followed it:
+    /// its number and the day it merged (together).
+    #[serde(default)]
+    pub code: bool,
+    #[serde(default)]
+    pub pull_request: Option<u64>,
+    #[serde(default, deserialize_with = "opt_day")]
+    pub followed_up: Option<NaiveDate>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+fn standard_kind() -> String {
+    "standard".into()
 }
 
 /// A policy the register's approvals and acknowledgements may name.
@@ -1093,6 +1186,71 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
             bad.push(format!("{what}: dates out of order: received, then acknowledged and assessed, then fixed or accepted"));
         }
     }
+    unique("change", r.changes.iter().map(|x| x.id.as_str()).collect(), &mut bad);
+    for x in &r.changes {
+        let what = format!("change {}", x.id);
+        let emergency = x.kind == "emergency";
+        if !CHANGE_KINDS.contains(&x.kind.as_str()) {
+            bad.push(format!("{what}: kind is {}", CHANGE_KINDS.join(" or ")));
+        }
+        if system(&what, &x.system, &mut bad).is_some_and(|s| x.made < s.since || s.until.is_some_and(|u| x.made >= u)) {
+            bad.push(format!("{what}: made while the system wasn't in use (since to until)"));
+        }
+        if !hex(&x.record_sha256, 64..=64) {
+            bad.push(format!("{what}: recordSha256 is the change record's SHA-256, 64 lowercase hex digits"));
+        }
+        if x.approved.is_some() != x.approved_by.is_some() {
+            bad.push(format!("{what}: approved and approvedBy go together"));
+        }
+        for who in x.approved_by.iter().chain([&x.made_by]).chain(x.reviewed_by.iter()) {
+            known(&what, who, &mut bad);
+        }
+        match (emergency, x.incident.as_deref()) {
+            (true, None) => bad.push(format!("{what}: an emergency change names the incident it was made in")),
+            (_, Some(i)) => match r.incidents.iter().find(|p| p.id == i) {
+                None => bad.push(format!("{what} names the incident {i:.64}, which isn't in incidents")),
+                Some(inc) if emergency && x.made < inc.detected => bad.push(format!("{what}: an emergency change is made after its incident was detected")),
+                _ => {}
+            },
+            _ => {}
+        }
+        if x.interrupts != x.starts_at.is_some() {
+            bad.push(format!("{what}: interrupts and startsAt go together"));
+        }
+        if x.announced_at.is_some() && !x.interrupts {
+            bad.push(format!("{what}: announcedAt is for changes that may interrupt the service"));
+        }
+        if x.starts_at.is_some_and(|t| t.date_naive() != x.made) {
+            bad.push(format!("{what}: startsAt is a time on the day it was made (UTC)"));
+        }
+        if x.reviewed.is_some() != x.reviewed_by.is_some() {
+            bad.push(format!("{what}: reviewed and reviewedBy go together"));
+        }
+        if !emergency && (x.reviewed.is_some() || x.code) {
+            bad.push(format!("{what}: reviewed, reviewedBy and code are for emergency changes; a standard change is approved before it is made"));
+        }
+        if x.pull_request.is_some() != x.followed_up.is_some() {
+            bad.push(format!("{what}: pullRequest and followedUp go together"));
+        }
+        if (x.pull_request.is_some() || x.followed_up.is_some()) && !x.code {
+            bad.push(format!("{what}: pullRequest and followedUp are the follow-up of an emergency change to code"));
+        }
+        if x.pull_request == Some(0) {
+            bad.push(format!("{what}: pullRequest is the pull request's number"));
+        }
+        if x.verified.is_some_and(|d| d < x.made) || x.reviewed.is_some_and(|d| d < x.made) || x.followed_up.is_some_and(|d| d < x.made) {
+            bad.push(format!("{what}: verified, reviewed and followedUp can't be before made"));
+        }
+    }
+    for m in &r.management_reviews {
+        for id in &m.emergency_changes {
+            match r.changes.iter().find(|x| &x.id == id) {
+                Some(x) if x.kind == "emergency" && x.made <= m.at => {}
+                Some(_) => bad.push(format!("the management review on {} lists {id:.64}, which isn't an emergency change made by then", m.at)),
+                None => bad.push(format!("the management review on {} lists the change {id:.64}, which isn't in changes", m.at)),
+            }
+        }
+    }
     if bad.is_empty() {
         return Ok(r);
     }
@@ -1299,6 +1457,7 @@ impl Check<'_> {
             + r.access_reviews.iter().filter(|x| x.at >= c).count()
             + r.vulnerabilities.iter().filter(|x| x.received >= c).count()
             + r.pen_tests.iter().filter(|x| x.reported >= c).count()
+            + r.changes.iter().filter(|x| x.made >= c).count()
     }
 
     pub fn roles(&self) -> (Value, Vec<&'static str>) {
@@ -2222,6 +2381,157 @@ impl Check<'_> {
         });
         (v, rows)
     }
+
+    /// Production changes (ADR 0270), under the change management policy: a standard
+    /// change recorded and approved by someone other than whoever makes it before it is
+    /// made, announced 48 hours ahead when it may interrupt the service; an emergency
+    /// change approved by the incident commander, reviewed by a second person within 2
+    /// business days, followed by a normal pull request within 5 when it was code, and
+    /// listed at the next management review; each checked by the operator the same or the
+    /// next business day, by someone with recorded access to the system. How a change was
+    /// made and approved is judged in the bundle of the period it was made in; a check,
+    /// review or follow-up done late, in the bundle of the period it was done in, and one
+    /// overdue, in every bundle until it is done.
+    pub fn production_changes(&self) -> (Value, Vec<&'static str>) {
+        let (p, cut) = (self.p, self.cut());
+        let in_period = |d: NaiveDate| d >= p.from && d < cut;
+        let recent = |d: NaiveDate| d < cut && age(cut, d) <= YEAR_DAYS;
+        let before = |d: Option<NaiveDate>| d.is_some_and(|d| d < p.from);
+        let (mut not_recorded_first, mut not_approved, mut approved_after, mut self_approved) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut approver_not_personnel, mut not_commander, mut without_access, mut not_announced) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut not_verified, mut verified_late, mut review_overdue, mut review_late, mut reviewer_wrong) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut follow_up_overdue, mut follow_up_late, mut not_in_review) = (Vec::new(), Vec::new(), Vec::new());
+        let mut made_by_kind: BTreeMap<&str, usize> = CHANGE_KINDS.iter().map(|k| (*k, 0)).collect();
+        let mut out = Vec::new();
+        for x in self.r.changes.iter().filter(|x| x.made < cut) {
+            let emergency = x.kind == "emergency";
+            let label = format!("{} {} on {}", x.id, x.kind, x.system);
+            let approved = x.approved.filter(|d| *d < cut);
+            let approved_by = approved.and(x.approved_by.as_deref());
+            let verified = x.verified.filter(|d| *d < cut);
+            let reviewed = x.reviewed.filter(|d| *d < cut);
+            let reviewed_by = reviewed.and(x.reviewed_by.as_deref());
+            let followed_up = x.followed_up.filter(|d| *d < cut);
+            let verify_due = business_days(x.made, VERIFY_BUSINESS_DAYS);
+            let review_due = emergency.then(|| business_days(x.made, EMERGENCY_REVIEW_BUSINESS_DAYS));
+            let follow_up_due = (emergency && x.code).then(|| business_days(x.made, FOLLOW_UP_BUSINESS_DAYS));
+            if in_period(x.made) {
+                *made_by_kind.entry(x.kind.as_str()).or_default() += 1;
+            }
+            let finished = x.made < p.from && before(verified) && (review_due.is_none() || before(reviewed)) && (follow_up_due.is_none() || before(followed_up));
+            if finished {
+                continue;
+            }
+
+            let commander = x.incident.as_deref().and_then(|i| self.r.incidents.iter().find(|inc| inc.id == i)).and_then(|inc| inc.triaged.filter(|t| *t < cut).and(inc.commander.as_deref()));
+            let approver_roles: &[&str] = if emergency { &[EMERGENCY_APPROVER] } else { &ROLES };
+            let held = approved.zip(approved_by).and_then(|(at, by)| if emergency && commander == Some(by) { Some("Incident commander".to_string()) } else { self.held(by, approver_roles, at) });
+            let had_access = self.has_access(&x.made_by, &x.system, x.made);
+            let notice_hours = x.starts_at.zip(x.announced_at).map(|(s, a)| (s - a).num_minutes() as f64 / 60.0);
+            if in_period(x.made) {
+                if !emergency && x.recorded > x.made {
+                    not_recorded_first.push(json!(format!("{label} (made {}, recorded {})", x.made, x.recorded)));
+                }
+                match approved {
+                    Some(a) if a > x.made => approved_after.push(json!(format!("{label} (made {}, approved {a})", x.made))),
+                    None => not_approved.push(json!(format!("{label} (made {})", x.made))),
+                    _ => {}
+                }
+                if let (Some(a), Some(by)) = (approved, approved_by) {
+                    if emergency {
+                        if held.is_none() {
+                            not_commander.push(json!(format!("{label}, approved {a}: {by} was neither {}'s commander nor held {EMERGENCY_APPROVER}", x.incident.as_deref().unwrap_or_default())));
+                        }
+                    } else {
+                        if by == x.made_by {
+                            self_approved.push(json!(format!("{label}, approved {a} by {by}, who made it")));
+                        }
+                        if !self.personnel_on(by, a) {
+                            approver_not_personnel.push(json!(format!("{label}, approved {a}: {by} wasn't personnel")));
+                        }
+                    }
+                }
+                if !had_access {
+                    without_access.push(json!(format!("{label}: {} had no recorded access to {} on {}", x.made_by, x.system, x.made)));
+                }
+                if x.interrupts && !emergency && notice_hours.is_none_or(|h| h < MAINTENANCE_NOTICE_HOURS as f64) {
+                    let starts = x.starts_at.map(|t| rfc3339(t.timestamp_millis())).unwrap_or_default();
+                    not_announced.push(json!(match x.announced_at {
+                        Some(a) => format!("{label} (starts {starts}, announced {}, under {MAINTENANCE_NOTICE_HOURS} hours ahead)", rfc3339(a.timestamp_millis())),
+                        None => format!("{label} (starts {starts}, not announced)"),
+                    }));
+                }
+            }
+            match verified {
+                Some(v) if in_period(v) && v > verify_due => verified_late.push(json!(format!("{label} (made {}, checked {v}, due {verify_due})", x.made))),
+                None if verify_due < cut => not_verified.push(json!(format!("{label} (made {}, not checked, due {verify_due})", x.made))),
+                _ => {}
+            }
+            if let Some(due) = review_due {
+                match reviewed {
+                    Some(v) if in_period(v) && v > due => review_late.push(json!(format!("{label} (made {}, reviewed {v}, due {due})", x.made))),
+                    None if due < cut => review_overdue.push(json!(format!("{label} (made {}, not reviewed, due {due})", x.made))),
+                    _ => {}
+                }
+                if let (Some(v), Some(by)) = (reviewed.filter(|v| in_period(*v)), reviewed_by) {
+                    if by == x.made_by || Some(by) == approved_by || !self.personnel_on(by, v) {
+                        reviewer_wrong.push(json!(format!("{label}, reviewed {v} by {by}: not a second person (neither who made nor who approved it, and personnel)")));
+                    }
+                }
+            }
+            if let Some(due) = follow_up_due {
+                match followed_up {
+                    Some(f) if in_period(f) && f > due => follow_up_late.push(json!(format!("{label} (made {}, pull request merged {f}, due {due})", x.made))),
+                    None if due < cut => follow_up_overdue.push(json!(format!("{label} (made {}, no pull request, due {due})", x.made))),
+                    _ => {}
+                }
+            }
+            out.push(json!({
+                "id": x.id, "kind": x.kind, "system": x.system, "recorded": ds(x.recorded), "recordSha256": x.record_sha256, "recordedFirst": x.recorded <= x.made,
+                "approved": approved.map(ds), "approvedBy": approved_by, "heldRole": held, "made": ds(x.made), "madeBy": x.made_by, "makerHadAccess": had_access,
+                "incident": x.incident, "interrupts": x.interrupts, "startsAt": x.starts_at.map(|t| rfc3339(t.timestamp_millis())), "announcedAt": x.announced_at.map(|t| rfc3339(t.timestamp_millis())), "noticeHours": notice_hours,
+                "checkDue": ds(verify_due), "checked": verified.map(ds),
+                "reviewDue": review_due.map(ds), "reviewed": reviewed.map(ds), "reviewedBy": reviewed_by,
+                "code": x.code, "followUpDue": follow_up_due.map(ds), "pullRequest": followed_up.and(x.pull_request), "followedUp": followed_up.map(ds),
+            }));
+        }
+
+        let mut reviews: Vec<&ManagementReview> = self.r.management_reviews.iter().filter(|m| m.at < cut).collect();
+        reviews.sort_by_key(|m| m.at);
+        for x in self.r.changes.iter().filter(|x| x.kind == "emergency" && x.made < cut) {
+            let Some(next) = reviews.iter().find(|m| m.at > x.made) else { continue };
+            let listed = reviews.iter().any(|m| m.at >= x.made && m.at <= next.at && m.emergency_changes.contains(&x.id));
+            if in_period(next.at) && !listed {
+                not_in_review.push(json!(format!("{} (made {}, not listed by the management review on {})", x.id, x.made, next.at)));
+            }
+        }
+
+        let in_set = self.policies.iter().any(|q| q.id == CHANGE_MANAGEMENT);
+        let approved = self.r.policy_approvals.iter().filter(|a| a.policy == CHANGE_MANAGEMENT && a.approved_at < cut).map(|a| a.approved_at).max();
+        let current = in_set && approved.is_some_and(recent);
+        let rows = if current { vec!["CC8.1-2"] } else { vec![] };
+        let v = json!({
+            "basis": format!("every change to a production system in the register made before the period's end and still being handled in it, by register id: a standard change recorded (the change record's SHA-256) and approved by someone other than whoever made it, who was personnel, on or before the day it was made, and, when it may interrupt the service, announced at least {MAINTENANCE_NOTICE_HOURS} hours before it started; an emergency change made in an incident and approved by that incident's commander or someone holding or deputising {EMERGENCY_APPROVER}, reviewed within {EMERGENCY_REVIEW_BUSINESS_DAYS} business days by a second person (neither who made nor who approved it), followed by a normal pull request within {FOLLOW_UP_BUSINESS_DAYS} business days when it was code, and listed by the first management review after it; every change made by someone with recorded access to the system that day and checked (the service and the configuration baseline) within {VERIFY_BUSINESS_DAYS} business day. How a change was made and approved is judged in the bundle of the period it was made in. Business days are Monday to Friday; public holidays are not excluded. Something done late is an exception in the bundle of the period it was done in; something overdue, in every bundle until it is done"),
+            "changeManagementPolicy": { "inPolicySet": in_set, "lastApproved": approved.map(ds), "approvalCurrent": current },
+            "summary": {
+                "changes": out.len(),
+                "madeInPeriodByKind": made_by_kind,
+                "systemsChangedInPeriod": self.r.changes.iter().filter(|x| in_period(x.made)).map(|x| x.system.as_str()).collect::<BTreeSet<_>>().len(),
+                "interruptingInPeriod": self.r.changes.iter().filter(|x| in_period(x.made) && x.interrupts).count(),
+                "notCheckedAtEnd": out.iter().filter(|x| x["checked"].is_null()).count(),
+            },
+            "exceptions": {
+                "notRecordedFirst": not_recorded_first, "notApproved": not_approved, "approvedAfterMade": approved_after,
+                "selfApproved": self_approved, "approverNotPersonnel": approver_not_personnel, "emergencyApproverNotCommander": not_commander,
+                "madeWithoutAccess": without_access, "maintenanceNotAnnounced": not_announced,
+                "notChecked": not_verified, "checkedLate": verified_late,
+                "reviewOverdue": review_overdue, "reviewLate": review_late, "reviewerNotSecondPerson": reviewer_wrong,
+                "followUpOverdue": follow_up_overdue, "followUpLate": follow_up_late, "notInManagementReview": not_in_review,
+            },
+            "changes": out,
+        });
+        (v, rows)
+    }
 }
 
 /// The calendar quarters that overlap the period and have ended by its end.
@@ -2260,7 +2570,7 @@ pub fn name(p: &Period, now_ms: i64) -> String {
 /// Each file's JSON and the rows its manifest maps it to.
 pub fn files(c: &Check) -> Vec<(&'static str, Value, Vec<&'static str>)> {
     let period = json!({ "from": c.p.from.to_string(), "to": c.p.to.to_string(), "days": c.p.days() });
-    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct(), c.incidents(), c.access(), c.vulnerabilities()];
+    let parts = [c.roles(), c.policies(), c.people(), c.risks(), c.management_reviews(), c.vendors(), c.exceptions(), c.conduct(), c.incidents(), c.access(), c.vulnerabilities(), c.production_changes()];
     SECTIONS
         .iter()
         .zip(parts)
@@ -2484,7 +2794,7 @@ mod tests {
                 { "id": "R-03", "title": "Single botd, no failover", "owner": "Management", "likelihood": 2, "impact": 5, "treatment": "accept", "identified": "2027-01-05", "acceptedBy": "p-mgmt", "acceptedAt": "2027-01-06", "acceptedUntil": "2028-01-06", "notes": "secret reasoning" },
             ],
             "riskReviews": [{ "at": "2027-01-06", "by": "p-sec" }],
-            "managementReviews": [{ "at": "2027-03-20", "attendees": ["p-mgmt", "p-sec"], "minutesSha256": ZERO }],
+            "managementReviews": [{ "at": "2027-03-20", "attendees": ["p-mgmt", "p-sec"], "minutesSha256": ZERO, "emergencyChanges": ["CHG-02"] }],
             "vendors": [
                 { "id": "linode", "tier": "critical", "hosting": true, "since": "2027-01-15", "assessed": "2027-01-10", "approvedBy": "p-sec" },
                 { "id": "github", "tier": "low", "since": "2026-01-01" },
@@ -2530,6 +2840,16 @@ mod tests {
                 { "id": "V-02", "source": "pentest", "penTest": "PT-01", "received": "2027-02-10", "assessed": "2027-02-12", "severity": "high", "owner": "Engineering lead", "fixed": "2027-03-01" },
                 { "id": "V-03", "source": "vendor", "received": "2027-03-10", "assessed": "2027-03-12", "severity": "medium", "owner": "Operator" },
                 { "id": "V-04", "source": "pentest", "penTest": "PT-01", "received": "2027-02-10", "assessed": "2027-02-12", "severity": "low", "owner": "Engineering lead", "accepted": "2027-03-15", "acceptedBy": "p-sec" },
+            ],
+            "changes": [
+                {
+                    "id": "CHG-01", "system": "botd-eu", "recorded": "2027-03-04", "recordSha256": ZERO, "approved": "2027-03-04", "approvedBy": "p-mgmt", "made": "2027-03-05", "madeBy": "p-sec",
+                    "interrupts": true, "startsAt": "2027-03-05T22:00:00Z", "announcedAt": "2027-03-03T22:00:00Z", "verified": "2027-03-05", "notes": "upgrade to the release Oscar asked for",
+                },
+                {
+                    "id": "CHG-02", "system": "linode", "kind": "emergency", "incident": "INC-02", "recorded": "2027-03-11", "recordSha256": ZERO, "approved": "2027-03-10", "approvedBy": "p-ops",
+                    "made": "2027-03-10", "madeBy": "p-ops", "verified": "2027-03-11", "reviewed": "2027-03-12", "reviewedBy": "p-sec", "code": true, "pullRequest": 412, "followedUp": "2027-03-15",
+                },
             ],
         })
     }
@@ -3140,6 +3460,8 @@ mod tests {
         none["systems"] = json!([]);
         none["access"] = json!([]);
         none["accessReviews"] = json!([]);
+        none["changes"] = json!([]);
+        none["managementReviews"][0]["emergencyChanges"] = json!([]);
         check(&none, &|c| assert!(c.access().1.is_empty(), "no system on record maps nothing"));
     }
 
@@ -3386,6 +3708,157 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_changes_recorded_approved_announced_and_checked_in_time() {
+        let mut v = good();
+        v["people"].as_array_mut().unwrap().push(json!({ "id": "p-left", "joined": "2026-01-01", "left": "2027-03-01" }));
+        let list = v["changes"].as_array_mut().unwrap();
+        list.push(json!({ "id": "CHG-03", "system": "github", "recorded": "2027-03-16", "recordSha256": ZERO, "approved": "2027-03-16", "approvedBy": "p-eng", "made": "2027-03-15", "madeBy": "p-eng", "verified": "2027-03-17" }));
+        list.push(json!({ "id": "CHG-04", "system": "linode", "recorded": "2027-03-20", "recordSha256": ZERO, "made": "2027-03-22", "madeBy": "p-mgmt", "interrupts": true, "startsAt": "2027-03-22T20:00:00Z", "announcedAt": "2027-03-21T09:00:00Z" }));
+        list.push(json!({ "id": "CHG-05", "system": "github", "recorded": "2027-03-30", "recordSha256": ZERO, "approved": "2027-03-30", "approvedBy": "p-left", "made": "2027-03-31", "madeBy": "p-eng" }));
+        list.push(json!({ "id": "CHG-06", "system": "github", "recorded": "2027-02-11", "recordSha256": ZERO, "made": "2027-02-10", "madeBy": "p-eng", "verified": "2027-03-02" }));
+        list.push(json!({ "id": "CHG-07", "system": "github", "recorded": "2027-01-31", "recordSha256": ZERO, "approved": "2027-01-31", "approvedBy": "p-sec", "made": "2027-02-01", "madeBy": "p-eng", "verified": "2027-02-01" }));
+        list.push(json!({ "id": "CHG-08", "system": "github", "recorded": "2027-04-01", "recordSha256": ZERO, "made": "2027-04-02", "madeBy": "p-eng" }));
+        check(&v, &|c| {
+            let (x, rows) = c.production_changes();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["notRecordedFirst"], json!(["CHG-03 standard on github (made 2027-03-15, recorded 2027-03-16)"]));
+            assert_eq!(ex["approvedAfterMade"], json!(["CHG-03 standard on github (made 2027-03-15, approved 2027-03-16)"]));
+            assert_eq!(ex["selfApproved"], json!(["CHG-03 standard on github, approved 2027-03-16 by p-eng, who made it"]));
+            assert_eq!(ex["checkedLate"], json!(["CHG-03 standard on github (made 2027-03-15, checked 2027-03-17, due 2027-03-16)", "CHG-06 standard on github (made 2027-02-10, checked 2027-03-02, due 2027-02-11)"]), "a check late in the period counts in it, though the change was made before");
+            assert_eq!(ex["notApproved"], json!(["CHG-04 standard on linode (made 2027-03-22)"]), "CHG-06 was made before the period, so its bundle judged its approval");
+            assert_eq!(ex["madeWithoutAccess"], json!(["CHG-04 standard on linode: p-mgmt had no recorded access to linode on 2027-03-22"]));
+            assert_eq!(ex["maintenanceNotAnnounced"], json!(["CHG-04 standard on linode (starts 2027-03-22T20:00:00Z, announced 2027-03-21T09:00:00Z, under 48 hours ahead)"]));
+            assert_eq!(ex["notChecked"], json!(["CHG-04 standard on linode (made 2027-03-22, not checked, due 2027-03-23)"]), "CHG-05's check is due on the period's last day or after");
+            assert_eq!(ex["approverNotPersonnel"], json!(["CHG-05 standard on github, approved 2027-03-30: p-left wasn't personnel"]));
+            assert_eq!(exceptions(&x), 10, "{ex}");
+            let ids: Vec<&str> = x["changes"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+            assert_eq!(ids, ["CHG-01", "CHG-02", "CHG-03", "CHG-04", "CHG-05", "CHG-06"], "CHG-07 was finished before the period, CHG-08 came after it");
+            assert_eq!(x["summary"]["madeInPeriodByKind"], json!({ "standard": 4, "emergency": 1 }));
+            assert_eq!((x["summary"]["systemsChangedInPeriod"].as_u64(), x["summary"]["interruptingInPeriod"].as_u64(), x["summary"]["notCheckedAtEnd"].as_u64()), (Some(3), Some(2), Some(2)));
+            let first = &x["changes"][0];
+            assert_eq!((first["heldRole"].as_str(), first["noticeHours"].as_f64(), first["makerHadAccess"].as_bool(), first["recordedFirst"].as_bool()), (Some("Management"), Some(48.0), Some(true), Some(true)), "exactly 48 hours ahead is enough");
+            assert_eq!(x["changes"][1]["heldRole"], "Incident commander", "the commander approves an emergency change, even one they make");
+            assert_eq!(rows, ["CC8.1-2"], "late work is an exception, not a gap");
+            assert_eq!(c.after_period(), 1);
+            assert!(!x.to_string().contains("Oscar"), "no notes: {x}");
+        });
+
+        let mut stale = good();
+        for a in stale["policyApprovals"].as_array_mut().unwrap().iter_mut().filter(|a| a["policy"] == CHANGE_MANAGEMENT) {
+            a["approvedAt"] = json!("2026-02-01");
+        }
+        check(&stale, &|c| assert!(c.production_changes().1.is_empty(), "a policy approved over a year ago maps nothing"));
+        let set: Vec<Policy> = builtin_policies().into_iter().filter(|p| p.id != CHANGE_MANAGEMENT).collect();
+        let mut older = good();
+        older["policyApprovals"].as_array_mut().unwrap().retain(|a| a["policy"] != CHANGE_MANAGEMENT);
+        let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
+        let (x, rows) = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[] }.production_changes();
+        assert_eq!((x["changeManagementPolicy"]["inPolicySet"].as_bool(), rows.len()), (Some(false), 0), "a policy folder without the change management policy");
+    }
+
+    #[test]
+    fn emergency_changes_approved_by_the_commander_reviewed_followed_up_and_listed() {
+        let mut v = good();
+        let list = v["changes"].as_array_mut().unwrap();
+        list.push(json!({
+            "id": "CHG-10", "system": "botd-eu", "kind": "emergency", "incident": "INC-02", "recorded": "2027-03-09", "recordSha256": ZERO, "approved": "2027-03-08", "approvedBy": "p-eng",
+            "made": "2027-03-08", "madeBy": "p-sec", "verified": "2027-03-08", "reviewed": "2027-03-12", "reviewedBy": "p-sec", "code": true,
+        }));
+        list.push(json!({
+            "id": "CHG-11", "system": "github", "kind": "emergency", "incident": "INC-02", "recorded": "2027-03-09", "recordSha256": ZERO, "approved": "2027-03-09", "approvedBy": "p-mgmt",
+            "made": "2027-03-09", "madeBy": "p-eng", "verified": "2027-03-09", "code": true, "pullRequest": 77, "followedUp": "2027-03-20",
+        }));
+        check(&v, &|c| {
+            let (x, rows) = c.production_changes();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["emergencyApproverNotCommander"], json!(["CHG-10 emergency on botd-eu, approved 2027-03-08: p-eng was neither INC-02's commander nor held Security owner"]));
+            assert_eq!(ex["reviewLate"], json!(["CHG-10 emergency on botd-eu (made 2027-03-08, reviewed 2027-03-12, due 2027-03-10)"]));
+            assert_eq!(ex["reviewerNotSecondPerson"], json!(["CHG-10 emergency on botd-eu, reviewed 2027-03-12 by p-sec: not a second person (neither who made nor who approved it, and personnel)"]));
+            assert_eq!(ex["followUpOverdue"], json!(["CHG-10 emergency on botd-eu (made 2027-03-08, no pull request, due 2027-03-15)"]));
+            assert_eq!(ex["reviewOverdue"], json!(["CHG-11 emergency on github (made 2027-03-09, not reviewed, due 2027-03-11)"]));
+            assert_eq!(ex["followUpLate"], json!(["CHG-11 emergency on github (made 2027-03-09, pull request merged 2027-03-20, due 2027-03-16)"]));
+            assert_eq!(ex["notInManagementReview"], json!(["CHG-10 (made 2027-03-08, not listed by the management review on 2027-03-20)", "CHG-11 (made 2027-03-09, not listed by the management review on 2027-03-20)"]));
+            assert_eq!((ex["selfApproved"].clone(), ex["notRecordedFirst"].clone()), (json!([]), json!([])), "an emergency change may be approved by whoever makes it and recorded afterwards");
+            assert_eq!(exceptions(&x), 8, "{ex}");
+            let eleven = x["changes"].as_array().unwrap().iter().find(|c| c["id"] == "CHG-11").unwrap();
+            assert_eq!((eleven["heldRole"].as_str(), eleven["pullRequest"].as_u64(), eleven["followUpDue"].as_str()), (Some("Security owner (deputy)"), Some(77), Some("2027-03-16")));
+            assert_eq!(rows, ["CC8.1-2"]);
+        });
+
+        let mut april = good();
+        april["changes"][1]["made"] = json!("2027-03-29");
+        for k in ["approved", "verified", "reviewed", "followedUp"] {
+            april["changes"][1][k] = json!("2027-03-30");
+        }
+        april["managementReviews"] = json!([{ "at": "2027-03-20", "attendees": ["p-mgmt", "p-sec"], "minutesSha256": ZERO }, { "at": "2027-04-10", "attendees": ["p-mgmt", "p-sec"], "minutesSha256": ZERO }]);
+        let r = parse(&serde_json::to_vec(&april).unwrap(), &builtin_policies()).unwrap();
+        let listed = |p: Period| Check { r: &r, p, policies: &builtin_policies(), baselines: &[], sign_offs: &[] }.production_changes().0["exceptions"]["notInManagementReview"].clone();
+        assert_eq!(listed(period()), json!([]), "the next review is after the period");
+        assert_eq!(listed(Period { from: d("2027-04-01"), to: d("2027-05-01") }), json!(["CHG-02 (made 2027-03-29, not listed by the management review on 2027-04-10)"]), "flagged in the period of the review that missed it");
+    }
+
+    #[test]
+    fn change_records_that_dont_hold_together_are_refused() {
+        let mut v = good();
+        let list = v["changes"].as_array_mut().unwrap();
+        list.push(json!({ "id": "CHG-01", "system": "github", "recorded": "2027-03-01", "recordSha256": ZERO, "made": "2027-03-01", "madeBy": "p-eng" }));
+        list.push(json!({
+            "id": "CHG-X1", "system": "nas", "kind": "urgent", "recorded": "2027-03-01", "recordSha256": "abc", "approved": "2027-03-01", "made": "2027-03-01", "madeBy": "p-who",
+            "incident": "INC-99", "startsAt": "2027-03-02T10:00:00Z", "reviewed": "2027-03-02", "code": true, "pullRequest": 0,
+        }));
+        list.push(json!({
+            "id": "CHG-X2", "system": "github", "kind": "emergency", "recorded": "2027-03-01", "recordSha256": ZERO, "made": "2027-03-01", "madeBy": "p-eng",
+            "interrupts": true, "announcedAt": "2027-02-27T10:00:00Z", "verified": "2027-02-28", "reviewedBy": "p-sec", "followedUp": "2027-03-03",
+        }));
+        list.push(json!({ "id": "CHG-X3", "system": "github", "kind": "emergency", "incident": "INC-02", "recorded": "2027-03-01", "recordSha256": ZERO, "made": "2027-03-01", "madeBy": "p-eng", "interrupts": true, "startsAt": "2027-03-02T01:00:00Z" }));
+        list.push(json!({ "id": "CHG-X4", "system": "github", "recorded": "2027-03-01", "recordSha256": ZERO, "made": "2025-01-01", "madeBy": "p-eng", "announcedAt": "2024-12-01T00:00:00Z" }));
+        v["managementReviews"][0]["emergencyChanges"] = json!(["CHG-01", "CHG-99"]);
+        let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
+        for want in [
+            "change id CHG-01 is used twice",
+            "change CHG-X1: kind is standard or emergency",
+            "change CHG-X1 names the system nas, which isn't in systems",
+            "change CHG-X1: recordSha256 is the change record's SHA-256",
+            "change CHG-X1: approved and approvedBy go together",
+            "change CHG-X1 names p-who, who isn't in people",
+            "change CHG-X1 names the incident INC-99, which isn't in incidents",
+            "change CHG-X1: interrupts and startsAt go together",
+            "change CHG-X1: startsAt is a time on the day it was made",
+            "change CHG-X1: reviewed and reviewedBy go together",
+            "change CHG-X1: reviewed, reviewedBy and code are for emergency changes",
+            "change CHG-X1: pullRequest and followedUp go together",
+            "change CHG-X1: pullRequest is the pull request's number",
+            "change CHG-X2: an emergency change names the incident it was made in",
+            "change CHG-X2: interrupts and startsAt go together",
+            "change CHG-X2: reviewed and reviewedBy go together",
+            "change CHG-X2: pullRequest and followedUp go together",
+            "change CHG-X2: pullRequest and followedUp are the follow-up of an emergency change to code",
+            "change CHG-X2: verified, reviewed and followedUp can't be before made",
+            "change CHG-X3: an emergency change is made after its incident was detected",
+            "change CHG-X3: startsAt is a time on the day it was made",
+            "change CHG-X4: made while the system wasn't in use",
+            "change CHG-X4: announcedAt is for changes that may interrupt the service",
+            "the management review on 2027-03-20 lists CHG-01, which isn't an emergency change made by then",
+            "the management review on 2027-03-20 lists the change CHG-99, which isn't in changes",
+        ] {
+            assert!(e.contains(want), "{want}\n{e}");
+        }
+    }
+
+    /// The deadlines are the change management policy's.
+    #[test]
+    fn the_change_deadlines_are_the_policys() {
+        let policy = include_str!("../../../../docs/security/policies/change-management.md");
+        assert!(policy.contains(&format!("at least {MAINTENANCE_NOTICE_HOURS} hours ahead")), "the policy's maintenance notice");
+        assert!(policy.contains("the same or the next business day"), "the policy's check after a change");
+        assert!(policy.contains(&format!("reviewed by a second person within {EMERGENCY_REVIEW_BUSINESS_DAYS} business days")), "the policy's emergency review");
+        assert!(policy.contains(&format!("normal pull request within {FOLLOW_UP_BUSINESS_DAYS} business days")), "the policy's follow-up");
+        assert!(policy.contains("listed in the next quarterly management review"), "the policy's management review");
+        assert!(policy.contains("[policy register](../policy-register.md#production-changes)"), "the policy says where they are recorded");
+        assert_eq!(VERIFY_BUSINESS_DAYS, 1);
+    }
+
     /// The deadlines are `SECURITY.md`'s and the information security policy's.
     #[test]
     fn the_vulnerability_deadlines_are_the_policys() {
@@ -3426,7 +3899,7 @@ mod tests {
         assert!(![crate::changes::PREFIX, crate::vulns::PREFIX, crate::drills::PREFIX, "superbot-evidence-"].iter().any(|p| b.name.starts_with(p)));
         let entries = crate::coverage::untar(&b.tar).unwrap();
         let all: String = entries.iter().map(|(_, x)| String::from_utf8_lossy(x).into_owned()).collect();
-        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse", "on-call login", "code host's organisation", "Mallory", "Initrode"] {
+        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse", "on-call login", "code host's organisation", "Mallory", "Initrode", "Oscar"] {
             assert!(!all.contains(never), "{never:?} is in the bundle");
         }
         let manifest: Value = serde_json::from_slice(&entries.iter().find(|(n, _)| n.ends_with("/manifest.json")).unwrap().1).unwrap();
@@ -3467,6 +3940,7 @@ mod tests {
         assert!(r.risks.iter().any(|x| x.fraud), "the template has a fraud risk to start from");
         assert_eq!(r.systems.iter().map(|s| s.kind.as_str()).collect::<BTreeSet<_>>(), SYSTEM_KINDS.iter().copied().collect::<BTreeSet<_>>(), "the template has a system of each kind");
         assert!(!r.access.is_empty() && !r.access_reviews.is_empty());
+        assert!(r.changes.iter().any(|x| x.approved_by.as_deref().is_some_and(|by| by != x.made_by)), "the template has a change approved by someone else");
     }
 
     /// Every file maps to criteria the control mapping has and rows the readiness checklist
