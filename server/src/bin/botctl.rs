@@ -162,12 +162,13 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl license remove                            Remove it (no free tier: Bots stop unless TESTING_MODE=on)
   botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
   botctl user identities <user>                    The user's SSO identities
-  botctl user link <user> <provider> <subject> [--tenant <tenant-id>]
+  botctl user link <user> <provider> <subject> [--tenant <tenant-id>] [--idp <entity-id>]
                                                    Let an SSO identity sign in as the user. Entra:
                                                    <subject> is the user's object id; Google,
                                                    Apple, and OIDC: the sub claim (or the mapped
                                                    subject); GitHub: the numeric user id
-                                                   (gh api users/<login> --jq .id)
+                                                   (gh api users/<login> --jq .id); SAML with
+                                                   several IdPs: --idp says whose NameID it is
   botctl user unlink <user> <identity-id>
   botctl signup list [pending|approved|rejected|all]  Access requests from the get-started page
   botctl signup approve <id> [--role admin|member|readonly] [--ttl <minutes>]
@@ -1871,7 +1872,7 @@ fn license_summary(l: &Value) -> String {
 fn saml_summary(v: &Value) -> String {
     let s = |k: &str| v[k].as_str().unwrap_or("-").to_string();
     let mut out = format!(
-        "{} ({}): {}\n  SP entity ID (audience):  {}\n  ACS URL (reply URL):      {}\n  SLO URL (logout URL):     {}\n  SP metadata:              {}\n  IdP entity ID:            {}\n",
+        "{} ({}): {}\n  SP entity ID (audience):  {}\n  ACS URL (reply URL):      {}\n  SLO URL (logout URL):     {}\n  SP metadata:              {}\n",
         s("label"),
         s("provider"),
         v["problem"].as_str().unwrap_or("ready"),
@@ -1879,8 +1880,13 @@ fn saml_summary(v: &Value) -> String {
         s("acsUrl"),
         s("sloUrl"),
         s("metadataUrl"),
-        s("idpEntityId"),
     );
+    let several: Vec<&str> = v["idpEntityIds"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if several.len() > 1 {
+        out += &format!("  IdPs:                     {}, chosen at each sign-in\n", several.len());
+    } else {
+        out += &format!("  IdP entity ID:            {}\n", s("idpEntityId"));
+    }
     let warnings = v["certificateWarnings"].as_array().map(Vec::as_slice).unwrap_or_default();
     if !warnings.is_empty() {
         out += "  Certificate warnings:\n";
@@ -1893,6 +1899,7 @@ fn saml_summary(v: &Value) -> String {
             _ => "IdP metadata signing certificate",
         };
         let stage = if w["stage"] == "next" { " (next key)" } else { "" };
+        let what = if several.len() > 1 && let Some(e) = w["entityId"].as_str() { format!("{what} of {e}") } else { what.to_string() };
         out += &format!("    {what}{stage} SHA-256 {} expires {}{}\n      {}\n", w["certificate"].as_str().unwrap_or_default(), day(&w["notAfter"]), ending(w), w["action"].as_str().unwrap_or_default());
     }
     let key = &v["spKey"];
@@ -2003,28 +2010,53 @@ fn saml_summary(v: &Value) -> String {
     }
     let from = v["from"].as_str().map(|f| format!(" ({f})")).unwrap_or_default();
     out += &format!("  IdP metadata from {}{from}", s("source"));
+    if several.len() > 1 {
+        out += ":\n";
+        for idp in v["idps"].as_array().into_iter().flatten() {
+            let entity = idp["entityId"].as_str().unwrap_or_default();
+            match idp["name"].as_str() {
+                Some(name) => out += &format!("    {name} ({entity})"),
+                None => out += &format!("    {entity}"),
+            }
+            if idp["ssoUrl"].is_null() {
+                out += ": not loaded yet.\n";
+                continue;
+            }
+            let scopes: Vec<&str> = idp["scopes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            out += &format!(":\n      Email domains: {}\n", if scopes.is_empty() { "none (emails from it are dropped)".to_string() } else { scopes.join(", ") });
+            out += &idp_lines(idp, "      ");
+        }
+        return out;
+    }
     let idp = &v["idp"];
     if idp.is_null() {
         out += ": not loaded yet.\n";
         return out;
     }
-    out += &format!(":\n    Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
+    out += ":\n";
+    out += &idp_lines(idp, "    ");
+    out
+}
+
+/// One IdP's loaded metadata under `saml_summary`, each line after `indent`.
+fn idp_lines(idp: &Value, indent: &str) -> String {
+    let mut out = format!("{indent}Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
     if !idp["validUntil"].is_null() {
         let state = if idp["expired"].as_bool().unwrap_or(false) { " (expired: no longer used)" } else { "" };
-        out += &format!("    Valid until: {}{state}\n", day(&idp["validUntil"]));
+        out += &format!("{indent}Valid until: {}{state}\n", day(&idp["validUntil"]));
     }
     if let Some(slo) = idp["sloUrl"].as_str() {
         let post = if idp["sloBinding"] == "post" { " (HTTP-POST)" } else { "" };
-        out += &format!("    Logout URL:  {slo}{post}\n");
+        out += &format!("{indent}Logout URL:  {slo}{post}\n");
     }
     if let Some(slo) = idp["sloSoapUrl"].as_str() {
-        out += &format!("    SOAP logout URL:  {slo}\n");
+        out += &format!("{indent}SOAP logout URL:  {slo}\n");
     }
     for a in idp["artifactResolutionUrls"].as_array().into_iter().flatten() {
-        out += &format!("    Artifact resolution URL {}:  {}\n", a["index"], a["url"].as_str().unwrap_or_default());
+        out += &format!("{indent}Artifact resolution URL {}:  {}\n", a["index"], a["url"].as_str().unwrap_or_default());
     }
     for c in idp["certificates"].as_array().into_iter().flatten() {
-        out += &format!("    Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
+        out += &format!("{indent}Certificate SHA-256 {} ({}), expires {}{}\n", c["sha256"].as_str().unwrap_or_default(), c["subject"].as_str().unwrap_or_default(), day(&c["notAfter"]), ending(c));
     }
     out
 }
@@ -2605,7 +2637,7 @@ fn run(args: &[String]) -> Result<String, String> {
         }
         ["user", "identities", key] => op("GET", &format!("/api/users/{}/identities", encode(key)), None),
         ["user", "link", key, provider, subject, rest @ ..] => {
-            let body = json!({ "provider": provider, "subject": subject, "tenant": flag(rest, "--tenant") });
+            let body = json!({ "provider": provider, "subject": subject, "tenant": flag(rest, "--tenant"), "idp": flag(rest, "--idp") });
             op("POST", &format!("/api/users/{}/identities", encode(key)), Some(body.to_string()))
         }
         ["user", "unlink", key, id] => op("DELETE", &format!("/api/users/{}/identities/{}", encode(key), encode(id)), None),
