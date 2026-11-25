@@ -625,8 +625,11 @@ cmd_load() {
   done
   [[ "$found" == true ]] || die "This bundle has no images: it is for install.sh --offline only"
   log "Run Compose from the bundle's docker/ folder with SUPERBOT_VERSION=$OFFLINE_VERSION in .env (docs/ops/air-gapped.md#docker-compose)"
-  local pins commit tag volume
-  pins=$(harness_pins "$OFFLINE_DIR/bin/botd" 2>/dev/null) || return 0
+  local pins commit tag volume ref
+  ref=$(cat "$OFFLINE_DIR/images/superbot.ref" 2>/dev/null) || return 0
+  # Asked of the image just loaded, in a container with no network, not of the bundle's bin/botd on
+  # this host: the .sha256 beside a bundle could have been replaced with it.
+  pins=$(docker run --rm --network none --entrypoint botd "$ref" harness pins 2>/dev/null) || return 0
   read -r commit tag < <(awk '$1 == "hermes" { print $3, $4; exit }' <<<"$pins") || true
   [[ "${commit:-}" =~ ^[0-9a-f]{40}$ ]] || return 0
   volume=$(hermes_volume_name "$commit")
@@ -641,12 +644,22 @@ cmd_load() {
 
 hermes_volume_name() { printf 'superbot-hermes-%s\n' "${1:0:12}"; }
 
-# The last NAME=value in a Compose env FILE, without the quotes around it.
+# The last NAME=value in a Compose env FILE, as Compose reads it: without the quotes around it,
+# and unquoted, without a " # comment" after it or the spaces around it.
 compose_env_value() {
-  local v
-  v=$(sed -n "s/^$2=//p" "$1" | tail -n 1)
-  v=${v%$'\r'}
-  if [[ "$v" =~ ^\'(.*)\'$ || "$v" =~ ^\"(.*)\"$ ]]; then v=${BASH_REMATCH[1]}; fi
+  local line v="" re="^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=[[:space:]]*(.*)$"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    [[ "$line" =~ $re ]] || continue
+    v=${BASH_REMATCH[2]}
+    if [[ "$v" =~ ^\'([^\']*)\' || "$v" =~ ^\"([^\"]*)\" ]]; then
+      v=${BASH_REMATCH[1]}
+    else
+      [[ "$v" != \#* ]] || v=""
+      v=${v%%[[:space:]]#*}
+      v=${v%"${v##*[![:space:]]}"}
+    fi
+  done <"$1"
   printf '%s\n' "$v"
 }
 
@@ -659,7 +672,21 @@ compose_botd_image() {
     [[ -n "$image" ]] || image=$(compose_env_value "$env" SUPERBOT_IMAGE)
     [[ -n "$version" ]] || version=$(compose_env_value "$env" SUPERBOT_VERSION)
   fi
-  printf '%s\n' "${image:-ghcr.io/cg-labs/superbot:${version:-main}}"
+  image=${image:-ghcr.io/cg-labs/superbot:${version:-main}}
+  [[ "$image" != *'$'* ]] \
+    || die "The image Compose runs botd from is $image here, with a variable Compose fills in: give it with --image"
+  printf '%s\n' "$image"
+}
+
+# One load-hermes at a time per volume: while one fills it, the volume has no marker yet, and
+# another would take it for a failed load and remove it.
+hermes_volume_lock() {
+  local lock="/tmp/superbot-load-hermes-$1.lock"
+  command -v flock >/dev/null 2>&1 || return 0
+  [[ -e "$lock" ]] || (umask 0; set -C; : >"$lock") 2>/dev/null || true
+  [[ -f "$lock" && ! -L "$lock" ]] || die "Couldn't use the lock file $lock"
+  exec 9<"$lock"
+  flock -n 9 || die "Another load-hermes is filling the Docker volume $1: wait for it to finish, then run this again"
 }
 
 # Runs IMAGE with VOLUME at $HERMES_SHARED_DIR and no network: docker run's own options, then
@@ -723,7 +750,7 @@ cmd_load_hermes() {
   tag=$(manifest_value "$HERMES_BUNDLE_DIR/MANIFEST" hermes_tag)
 
   command -v docker >/dev/null 2>&1 || die "load-hermes needs docker"
-  [[ -n "$image" ]] || image=$(compose_botd_image "$env_file")
+  [[ -n "$image" ]] || image=$(compose_botd_image "$env_file") || exit 1
   docker image inspect "$image" >/dev/null 2>&1 \
     || die "No image $image here: load the release's images first ($0 load), or give --image"
   img_arch=$(docker image inspect --format '{{.Architecture}}' "$image" 2>/dev/null) || true
@@ -734,8 +761,12 @@ cmd_load_hermes() {
   [[ "$pinned" == "$commit" ]] \
     || die "The Hermes bundle holds Hermes Agent ${commit:0:12}, but $image pins ${pinned:0:12}: use the Hermes bundle made for the image's release (docs/ops/air-gapped.md#hermes-agent-with-docker-compose)"
   volume=${volume:-$(hermes_volume_name "$commit")}
+  hermes_volume_lock "$volume"
 
-  if docker volume inspect "$volume" >/dev/null 2>&1; then
+  local label
+  if label=$(docker volume inspect --format '{{ index .Labels "org.superbot.hermes-commit" }}' "$volume" 2>/dev/null); then
+    [[ "$label" == "$commit" ]] \
+      || die "The Docker volume $volume wasn't made by load-hermes for Hermes Agent ${commit:0:12}${label:+ (it is for ${label:0:12})}: give another --volume, or remove it yourself"
     if [[ "$(HERMES_VOLUME_MODE=:ro hermes_volume_run "$image" "$volume" -- cat "$HERMES_SHARED_DIR/$HERMES_VOLUME_MARK" 2>/dev/null)" == "$commit" ]]; then
       version=$(hermes_volume_probe "$image" "$volume")
       log "Hermes Agent ${commit:0:12} is already in the Docker volume $volume, and runs in $image: $version"
