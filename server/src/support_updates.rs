@@ -190,8 +190,16 @@ pub fn judge(tickets: &[Ticket], csv: &str, o: &Options, u: &UpdateOptions) -> R
     let mut seen: HashSet<String> = HashSet::new();
     for (line, r) in body {
         let cell = |f: Field| col.get(f.name()).and_then(|&c| r.get(c)).map(|s| s.trim()).filter(|s| !s.is_empty());
+        let Some(ticket) = cell(Field::Ticket).map(key) else {
+            skipped.push((*line, "no ticket id"));
+            continue;
+        };
+        if !wanted.contains(&ticket) {
+            unmatched += 1;
+            continue;
+        }
+        seen.insert(ticket.clone());
         let row = (|| -> Result<_, &'static str> {
-            let ticket = key(cell(Field::Ticket).ok_or("no ticket id")?);
             let time = parse_time(cell(Field::Time).ok_or("no time")?, o.calendar.offset).ok_or("a time that can't be read")?;
             let flag = |f: Field, why: &'static str| -> Result<Option<bool>, &'static str> {
                 if !col.contains_key(f.name()) {
@@ -205,17 +213,12 @@ pub fn judge(tickets: &[Ticket], csv: &str, o: &Options, u: &UpdateOptions) -> R
                 true => cell(Field::Author).map(from_support).ok_or("an author it doesn't know")?.ok_or("an author it doesn't know")?,
                 false => true,
             };
-            Ok((ticket, time, public && !private && support))
+            Ok((time, public && !private && support))
         })();
         match row {
             Err(why) => skipped.push((*line, why)),
-            Ok((ticket, _, _)) if !wanted.contains(&ticket) => unmatched += 1,
-            Ok((ticket, time, counts)) => {
-                seen.insert(ticket.clone());
-                if counts {
-                    times.entry(ticket).or_default().push(time);
-                }
-            }
+            Ok((time, true)) => times.entry(ticket).or_default().push(time),
+            Ok((_, false)) => {}
         }
     }
 
@@ -234,7 +237,7 @@ pub fn judge(tickets: &[Ticket], csv: &str, o: &Options, u: &UpdateOptions) -> R
         if !seen.contains(&k) {
             without_rows += 1;
         }
-        let mut points: Vec<DateTime<Utc>> = times.get(&k).into_iter().flatten().copied().filter(|x| *x > first && *x < end).collect();
+        let mut points: Vec<DateTime<Utc>> = times.get(&k).into_iter().flatten().copied().filter(|x| *x > first && *x <= end).collect();
         points.sort_unstable();
         points.insert(0, first);
         points.push(end);
@@ -539,6 +542,22 @@ c9,T-3,Cy,agent,true,last week,odd
         let v = judge(r.tickets(), "Ticket,Created,Direction\nA,2026-09-01T11:00:00Z,sideways\n", &o, &with_file()).unwrap().json();
         assert_eq!(v["skipped"][0]["reason"], "an author it doesn't know");
         assert_eq!(v["late"][0]["longestGapMinutes"], 110, "with its only update skipped");
+    }
+
+    #[test]
+    fn a_reply_at_the_cutoff_isnt_overdue_and_other_tickets_rows_arent_read() {
+        let o = september("2026-09-01T14:00:00Z");
+        let csv = "id,severity,opened,first response\nA,1,2026-09-01T10:00:00Z,2026-09-01T10:10:00Z\n";
+        let r = report(csv, &Options { plan: Some(Plan::Pro), ..o.clone() }).unwrap();
+        let updates = "ticket,time,public\nA,2026-09-01T14:00:00Z,true\nB,never,maybe\nA,soon,true\n";
+        let v = judge(r.tickets(), updates, &o, &with_file()).unwrap().json();
+        assert_eq!(v["late"][0]["longestGapMinutes"], 230, "10:10 to 14:00 is still late");
+        assert_eq!(v["late"][0]["overdueNow"], false, "but answered at --as-of, so nothing's overdue now");
+        assert_eq!(v["unmatchedRows"], 1, "B's unreadable row isn't the report's business");
+        assert_eq!(v["skipped"], json!([{ "line": 4, "reason": "a time that can't be read" }]));
+        assert_eq!(v["withoutRows"], 0);
+        let v = judge(r.tickets(), "ticket,time\nA,soon\n", &o, &with_file()).unwrap().json();
+        assert_eq!((v["withoutRows"].as_u64(), v["skipped"].as_array().unwrap().len()), (Some(0), 1), "rows it can't read aren't no rows");
     }
 
     #[test]
