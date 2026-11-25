@@ -6,7 +6,7 @@
 //! record of its id and region), open with the master key (or the previous one, mid-
 //! rotation) and pass its integrity check, and a bucket copy must match the SHA-256 in its
 //! name. It is prepared in a work file in the store's own folder, never the host's temp
-//! folder: rows of Bots that aren't kept in the region now (moved out, or deleted) are
+//! folder: rows of Bots and people that aren't kept in the region now (moved out, or deleted) are
 //! taken out, and erasures made since are run on it again, so a restore never brings back
 //! what a move or an erasure took out. The store it replaces is kept as a backup made now,
 //! so it is cleared and copied off the host like any other and the restore can be undone.
@@ -513,7 +513,7 @@ fn current(place: &Place) -> Current {
 pub struct Plan {
     /// What the restored store holds.
     held: Held,
-    /// Rows of Bots kept elsewhere now, or deleted, taken out of it.
+    /// Rows of Bots and people kept elsewhere now, or deleted, taken out of it.
     dropped: Held,
     /// What erasures made since rewrote or deleted in it.
     erased: Held,
@@ -604,7 +604,7 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
     crate::db::upgrade_copy(&c, "botd").map_err(err)?;
     c.execute("DETACH DATABASE botd", []).map_err(err)?;
     let db = place.db()?;
-    let kept = crate::db::bots_kept_in(&db, &place.region).map_err(|e| format!("botd's database: {e}"))?;
+    let kept = crate::db::kept_in_region(&db, &place.region).map_err(|e| format!("botd's database: {e}"))?;
     let (people, bots) = erasures(&db, at)?;
     drop(db);
     c.execute_batch("PRAGMA secure_delete = ON").map_err(err)?;
@@ -632,7 +632,7 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
             let waiting = crate::db::held_apart_from(&c, "now_store", &kept).map_err(err)?;
             if waiting.total() > 0 {
                 return Err(format!(
-                    "the store now holds {} of Bots kept elsewhere now that botd hasn't moved yet, which a restore would leave behind in a backup. Start botd, let it move them, stop it, then restore",
+                    "the store now holds {} of Bots or people kept elsewhere now that botd hasn't moved yet, which a restore would leave behind in a backup. Start botd, let it move them, stop it, then restore",
                     waiting.describe()
                 ));
             }
@@ -845,9 +845,9 @@ impl Restore {
             Source::Bucket(n) => format!("in its bucket ({n})"),
         };
         let mut out = format!("{} {region}'s chat store from {} {from}, made {}:\n", if self.done { "Restored" } else { "Would restore" }, self.chosen.name, date(self.chosen.at));
-        out.push_str(&format!("  It holds {} of the Bots kept in {region} now.\n", p.held.describe()));
+        out.push_str(&format!("  It holds {} of the Bots and people kept in {region} now.\n", p.held.describe()));
         if p.dropped.total() > 0 {
-            out.push_str(&format!("  Taken out of it: {} of Bots kept elsewhere now, or deleted since.\n", p.dropped.describe()));
+            out.push_str(&format!("  Taken out of it: {} of Bots and people kept elsewhere now, or deleted since.\n", p.dropped.describe()));
         }
         if p.erased.total() > 0 {
             out.push_str(&format!("  Erased in it again: {} of people erased since.\n", p.erased.describe()));
@@ -1151,7 +1151,7 @@ mod tests {
         drop(db);
 
         let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
-        assert_eq!(r.plan.erased, Held { messages: 1, routines: 1, approvals: 1, memories: 0 }, "{r:?}");
+        assert_eq!(r.plan.erased, Held { messages: 1, routines: 1, approvals: 1, memories: 0, facts: 0 }, "{r:?}");
         assert!(r.text("gb-lon").contains("Erased in it again: 1 chat message, 1 routine and 1 approval"), "{}", r.text("gb-lon"));
         assert_eq!(texts(&w.store()), ["[erased]", "chat-6f-adas-own"]);
         let c = Connection::open(w.store()).unwrap();
@@ -1370,6 +1370,34 @@ mod tests {
         let db = Db::open(&w.app).unwrap();
         db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
         assert_eq!((db.memory(&ada).as_deref(), db.memory(&bobs).as_deref()), (Some("memory-15p-adas"), Some("memory-16q-moved-to-frankfurt")));
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_keeps_facts_only_of_people_still_kept_in_the_store_and_none_of_the_erased() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
+        let (cy, _) = pinned_bot(&db, "cy", "gb-lon");
+        db.set_facts(&ada, "facts-21a-adas").unwrap();
+        db.set_facts(&bob, "facts-22b-moved-to-frankfurt").unwrap();
+        db.set_facts(&cy, "facts-23c-erased-since").unwrap();
+        backup_pass(&db, 7, now() - DAY);
+        db.set_facts(&ada, "facts-24d-after-the-backup").unwrap();
+        db.pin_residency(PinOn::User, &bob, "de-fra-2", "DPA-2", None).unwrap();
+        db.place_chats().unwrap();
+        db.delete_facts(&cy).unwrap();
+        db.erase_user(&cy, "erased-f00d", None, &[]).unwrap();
+        drop(db);
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.facts, r.plan.dropped.facts, r.plan.erased.facts), (1, 1, 1), "{r:?}");
+        for gone in ["facts-22b", "facts-23c", "facts-24d"] {
+            assert!(!holds(&w.store(), gone), "no page of {gone} is left in it");
+        }
+        assert!(holds(&w.store(), "facts-21a-adas"));
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!((db.facts(&ada).as_deref(), db.facts(&bob).as_deref(), db.facts(&cy)), (Some("facts-21a-adas"), Some("facts-22b-moved-to-frankfurt"), None));
     }
 
     #[test]

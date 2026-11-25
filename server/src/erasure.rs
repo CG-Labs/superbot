@@ -1,7 +1,7 @@
 //! Erasing a user's personal data on request (GDPR article 17; SOC 2 CC6.5-1). An admin
 //! erases a user with `POST /api/users/{key}/erase` (`botctl user erase`): their Bots with
-//! their chats, routines and approvals, their sign-ins, second factor, sealed secrets and
-//! files in botd's folders go; what they wrote in others' chats is replaced; the user row
+//! their chats, routines and approvals, their sign-ins, second factor, sealed secrets,
+//! facts (in a regional chat store too, ADR 0277) and files in botd's folders go; what they wrote in others' chats is replaced; the user row
 //! stays as a tombstone with no personal data; and every audit event about them names
 //! them by a pseudonym instead. A legal hold on chat they're in, a team they're the
 //! only owner of, a plan they pay for, a machine not yet destroyed, or their machines'
@@ -287,6 +287,9 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
     let secrets = crate::secrets::global().user_forget(&u.id).map_err(crate::secret_error)?;
     let users_dir = |root: &std::path::Path| crate::paths::child(&crate::paths::child(&crate::paths::canonical(root)?, crate::isolation::USERS)?, &u.id);
     files += usize::from(remove(users_dir(&app.cfg.data_dir))?);
+    // Their facts in a regional chat store, zeroed there (ADR 0277); once unpinned below,
+    // a row left would otherwise be written back to their folder.
+    app.db.delete_facts(&u.id).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("Deleting their facts: {e}. Nothing is marked erased yet, so erase them again.")))?;
     let isolation_left = match app.isolation() {
         None => {
             files += usize::from(remove(users_dir(&app.cfg.workspace))?);

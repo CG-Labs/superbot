@@ -1,13 +1,14 @@
-//! Regional chat stores (ADR 0215, ADR 0228, ADR 0276): pinned people's chats, routines,
-//! approvals and Bots' memory in a database in their region, the first part of splitting
-//! botd's database by region. REGION_DATA_DIRS names a folder per region, which the operator
-//! puts on storage in that region; botd keeps `chats.sqlite` there (keyed like its own
-//! database) and its backups in `backups/` beside it, never in DATA_DIR. A Bot's chat,
-//! routines, approvals and memory live in the store of its owner's pin (their team's, else
-//! their own), and move when that changes: at startup, after a pin or unpin, and on every
-//! reconcile pass. botd's own copy of a Bot's memory is otherwise its file in DATA_DIR.
-//! Accounts, sessions, the audit log and owners' facts (`USER.md`) stay where botd runs;
-//! botd still reads and writes the stores from wherever it runs.
+//! Regional chat stores (ADR 0215, ADR 0228, ADR 0276, ADR 0277): pinned people's chats,
+//! routines, approvals, Bots' memory and their own facts in a database in their region, the
+//! first part of splitting botd's database by region. REGION_DATA_DIRS names a folder per
+//! region, which the operator puts on storage in that region; botd keeps `chats.sqlite`
+//! there (keyed like its own database) and its backups in `backups/` beside it, never in
+//! DATA_DIR. A Bot's chat, routines, approvals and memory live in the store of its owner's
+//! pin (their team's, else their own), a person's facts (`USER.md`) in the store of their
+//! own pin, and they move when that changes: at startup, after a pin or unpin, and on every
+//! reconcile pass. botd's own copy of a Bot's memory or a person's facts is otherwise its
+//! file in DATA_DIR. Accounts, sessions and the audit log stay where botd runs; botd still
+//! reads and writes the stores from wherever it runs.
 //!
 //! The storage itself is `db::chats`. This module reads the settings, opens the stores
 //! at startup (sealing their approvals' tool inputs under the master key), audits each
@@ -20,7 +21,7 @@ use super::ControlPlane;
 use super::server_data::{Policy, ServerData};
 use crate::audit::{Outcome, Who, clip};
 use crate::database_encryption::{self, DbKey};
-use crate::db::{ChatMove, ChatStore, Db, Held, now};
+use crate::db::{ChatMove, ChatStore, Db, Doc, Held, MovesOut, now};
 use crate::secrets::sealed::{Cipher, StoreApprovals};
 use crate::obs::log::{log_info, log_warn};
 use crate::runner::App;
@@ -213,29 +214,29 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
 }
 
 fn moved(m: &ChatMove) -> String {
-    Held { messages: m.messages as i64, routines: m.routines as i64, approvals: m.approvals as i64, memories: m.memories as i64 }.describe()
+    Held { messages: m.messages as i64, routines: m.routines as i64, approvals: m.approvals as i64, memories: m.memories as i64, facts: m.facts as i64 }.describe()
 }
 
 fn place_name(region: &Option<String>) -> String {
     region.as_ref().map_or("botd's own database".to_string(), |r| format!("{r}'s chat store"))
 }
 
-/// Moves every Bot's chat, routines, approvals and memory to where its owner's pin says they
-/// belong now, each move audited as `residency.chats_moved` by botd itself. A failure is
-/// logged and left for the next pass.
+/// Moves every Bot's chat, routines, approvals and memory, and every person's facts, to
+/// where their pin says they belong now, each move audited as `residency.chats_moved` by
+/// botd itself. A failure is logged and left for the next pass.
 ///
-/// botd's own copy of a Bot's memory is its file in DATA_DIR (ADR 0276). One that belongs in
-/// a store is first taken into botd's own table and its file deleted, so the move takes it
-/// there like any other row; one that came back out of a store is written to its file, then
-/// deleted from botd's table.
+/// botd's own copy of a Bot's memory or a person's facts is its file in DATA_DIR (ADR 0276,
+/// ADR 0277). One that belongs in a store is first taken into botd's own table and its file
+/// deleted, so the move takes it there like any other row; one that came back out of a
+/// store is written to its file, then deleted from botd's table.
 pub fn place(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
     let _held = memory_lock();
     place_held(db, data_dir)
 }
 
-/// Held while botd's copy of a Bot's memory is moved or saved (`place`,
-/// `App::keep_memory_text`), so a save can't land between a move reading a memory and
-/// writing it to its file, only to be overwritten with the older text.
+/// Held while botd's copy of a Bot's memory or a person's facts is moved or saved (`place`,
+/// `App::keep_memory_text`, `App::keep_facts_text`), so a save can't land between a move
+/// reading it and writing it to its file, only to be overwritten with the older text.
 pub(crate) fn memory_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -243,60 +244,83 @@ pub(crate) fn memory_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// `place`, with `memory_lock` already held.
 pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
-    memories_from_files(db, data_dir);
+    for doc in [Doc::Memory, Doc::Facts] {
+        from_files(db, data_dir, doc);
+    }
     let moves = match db.place_chats() {
         Ok(m) => m,
         Err(e) => {
-            log_warn!("Regional chat stores: chats, routines, approvals and Bots' memory couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215).");
+            log_warn!("Regional chat stores: chats, routines, approvals, Bots' memory and people's facts couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215).");
             return Vec::new();
         }
     };
-    memories_to_files(db, data_dir);
+    for doc in [Doc::Memory, Doc::Facts] {
+        to_files(db, data_dir, doc);
+    }
     if db.chat_stores_unflushed() {
         log_warn!("Regional chat stores: a reader kept botd from emptying a database's WAL after rows left it, so they may still be readable in its file; the next pass tries again (ADR 0228).");
     }
     for m in &moves {
         db.record(&Who::system(ACTOR).event(MOVED).details(json!({
-            "from": m.from, "to": m.to, "bots": m.bots, "messages": m.messages, "routines": m.routines, "approvals": m.approvals, "memories": m.memories,
+            "from": m.from, "to": m.to, "bots": m.bots, "messages": m.messages, "routines": m.routines, "approvals": m.approvals, "memories": m.memories, "facts": m.facts,
         })));
     }
     moves
 }
 
-/// Takes the memory files of Bots whose memory belongs in a store into botd's own table,
-/// for `place_chats` to move there, and deletes each file once it is (ADR 0276). A link or
-/// anything but a plain file is left alone.
-fn memories_from_files(db: &Db, data_dir: &Path) {
-    let bots = match db.bots_with_memory_in_stores() {
-        Ok(b) => b,
-        Err(e) => return log_warn!("Regional chat stores: couldn't list the Bots whose memory belongs in a store; the next pass tries again: {e} (ADR 0276)."),
+/// Where botd keeps `doc` of `id` as a file in DATA_DIR.
+fn doc_file(data_dir: &Path, doc: Doc, id: &str) -> Option<PathBuf> {
+    match doc {
+        Doc::Memory => crate::runner::memory_path(data_dir, id),
+        Doc::Facts => crate::runner::facts_path(data_dir, id),
+    }
+}
+
+/// What `doc` is in the log, one and all of them, and its ADR.
+fn doc_words(doc: Doc) -> (&'static str, &'static str, &'static str) {
+    match doc {
+        Doc::Memory => ("a Bot's memory", "Bots' memory", "ADR 0276"),
+        Doc::Facts => ("a person's facts", "people's facts", "ADR 0277"),
+    }
+}
+
+/// Takes the files of Bots' memory or people's facts that belong in a store into botd's own
+/// table, for `place_chats` to move there, and deletes each file once it is (ADR 0276, ADR
+/// 0277). A link or anything but a plain file is left alone.
+fn from_files(db: &Db, data_dir: &Path, doc: Doc) {
+    let (one, all, adr) = doc_words(doc);
+    let ids = match db.with_doc_in_stores(doc) {
+        Ok(ids) => ids,
+        Err(e) => return log_warn!("Regional chat stores: couldn't list the {all} that belongs in a store; the next pass tries again: {e} ({adr})."),
     };
-    for id in bots {
-        let Some(path) = crate::runner::memory_path(data_dir, &id) else { continue };
+    for id in ids {
+        let Some(path) = doc_file(data_dir, doc, &id) else { continue };
         if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
             continue;
         }
-        let taken = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| db.memory_from_file(&id, &text).map_err(|e| e.to_string()));
+        let taken = std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| db.doc_from_file(doc, &id, &text).map_err(|e| e.to_string()));
         let removed = taken.and_then(|_| std::fs::remove_file(&path).map_err(|e| e.to_string()));
         match removed {
             Ok(()) => sync_parent(&path),
-            Err(e) => log_warn!("Regional chat stores: a Bot's memory file ({}) couldn't be moved to its region's store; the next pass tries again: {e} (ADR 0276).", path.display()),
+            Err(e) => log_warn!("Regional chat stores: {one} file ({}) couldn't be moved to its region's store; the next pass tries again: {e} ({adr}).", path.display()),
         }
     }
 }
 
-/// Writes the memory of Bots that came back out of a store (`Db::memories_for_files`) to
-/// their files in DATA_DIR, then deletes it from botd's own table (ADR 0276).
-fn memories_to_files(db: &Db, data_dir: &Path) {
-    let rows = match db.memories_for_files() {
+/// Writes the Bots' memory or people's facts that came back out of a store
+/// (`Db::docs_for_files`) to their files in DATA_DIR, then deletes them from botd's own
+/// table (ADR 0276, ADR 0277).
+fn to_files(db: &Db, data_dir: &Path, doc: Doc) {
+    let (one, all, adr) = doc_words(doc);
+    let rows = match db.docs_for_files(doc) {
         Ok(r) => r,
-        Err(e) => return log_warn!("Regional chat stores: couldn't read the Bots' memory on its way back to their files; the next pass tries again: {e} (ADR 0276)."),
+        Err(e) => return log_warn!("Regional chat stores: couldn't read the {all} on its way back to its files; the next pass tries again: {e} ({adr})."),
     };
     for (id, text) in rows {
-        let Some(path) = crate::runner::memory_path(data_dir, &id) else { continue };
-        let done = crate::runner::write_memory_file(&path, &text).map_err(|e| e.to_string()).and_then(|()| db.delete_memory(&id).map(|_| ()).map_err(|e| e.to_string()));
+        let Some(path) = doc_file(data_dir, doc, &id) else { continue };
+        let done = crate::runner::write_kept_file(&path, &text).map_err(|e| e.to_string()).and_then(|()| db.delete_doc(doc, &id).map(|_| ()).map_err(|e| e.to_string()));
         if let Err(e) = done {
-            log_warn!("Regional chat stores: a Bot's memory couldn't be written back to its file ({}); the next pass tries again: {e} (ADR 0276).", path.display());
+            log_warn!("Regional chat stores: {one} couldn't be written back to its file ({}); the next pass tries again: {e} ({adr}).", path.display());
         }
     }
 }
@@ -388,21 +412,23 @@ pub fn backup_pass(db: &Db, keep: usize, at: i64) -> Vec<(String, Result<PathBuf
 pub struct Cleared {
     /// Bots whose rows left the store and were looked for.
     pub bots: usize,
+    /// People whose facts left the store and were looked for (ADR 0277).
+    pub users: usize,
     /// Backups that held some of them and were rewritten.
     pub backups: usize,
     /// What was taken out of them, together.
     pub held: Held,
 }
 
-/// Rewrites the backup at `path` without the rows of `bots`, under the same key: copied
+/// Rewrites the backup at `path` without the rows of `whose`, under the same key: copied
 /// beside it, cleared, checked and renamed over it, so a crash leaves the old file or the
 /// new one, never half of either. Left as it is when it holds none of them. What it took out.
-fn clear_backup(path: &Path, bots: &[String], key: Option<&DbKey>) -> Result<Held, String> {
+fn clear_backup(path: &Path, whose: &crate::db::Whose, key: Option<&DbKey>) -> Result<Held, String> {
     let db = |e: rusqlite::Error| format!("clearing {}: {e}", path.display());
     fn io(p: &Path) -> impl Fn(std::io::Error) -> String + '_ {
         move |e| format!("{}: {e}", p.display())
     }
-    let held = crate::db::held_in_copy(&database_encryption::open_read_only(path, key).map_err(db)?, bots).map_err(db)?;
+    let held = crate::db::held_in_copy(&database_encryption::open_read_only(path, key).map_err(db)?, whose).map_err(db)?;
     if held.total() == 0 {
         return Ok(held);
     }
@@ -415,7 +441,7 @@ fn clear_backup(path: &Path, bots: &[String], key: Option<&DbKey>) -> Result<Hel
         // VACUUM's working copy would otherwise go to the host's temp folder, outside the region.
         c.execute_batch("PRAGMA temp_store = MEMORY").map_err(db)?;
         c.query_row("PRAGMA journal_mode = MEMORY", [], |_| Ok(())).map_err(db)?;
-        let dropped = crate::db::drop_from_copy(&c, bots).map_err(db)?;
+        let dropped = crate::db::drop_from_copy(&c, whose).map_err(db)?;
         let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db)?;
         if check != "ok" {
             return Err(format!("clearing {}: the rewritten copy failed its integrity check ({check})", path.display()));
@@ -477,12 +503,12 @@ fn list_strictly(store: &ChatStore, drop_partial: bool) -> Result<Vec<(i64, Path
 /// One store's backups cleared of rows that left it, its moves not yet recorded as cleared.
 pub struct Clearing {
     store: ChatStore,
-    moves: Vec<(String, i64)>,
+    moves: MovesOut,
     done: Cleared,
     failed: Vec<String>,
 }
 
-/// Clears each store's backups of the rows of Bots that left it (`Db::moves_out_to_clear`),
+/// Clears each store's backups of the rows of Bots and people that left it (`Db::moves_out_to_clear`),
 /// then records those moves as cleared, so reports stop listing the backups as earlier
 /// copies. Each store that had backups rewritten is audited as
 /// `residency.chat_store_backups_cleared`; a failure is audited with it as a failure, the
@@ -506,14 +532,14 @@ pub fn clear_backups(db: &Db) -> Vec<(String, Result<Clearing, String>)> {
                 continue;
             }
         };
-        let bots: Vec<String> = moves.iter().map(|(b, _)| b.clone()).collect();
-        let mut done = Cleared { bots: bots.len(), ..Cleared::default() };
+        let whose = moves.whose();
+        let mut done = Cleared { bots: whose.bots.len(), users: whose.users.len(), ..Cleared::default() };
         let (listed, mut failed) = match backups_to_clear(&store) {
             Ok(b) => (b, Vec::new()),
             Err(e) => (Vec::new(), vec![e]),
         };
         for (_, path) in listed {
-            match clear_backup(&path, &bots, key) {
+            match clear_backup(&path, &whose, key) {
                 Ok(h) if h.total() > 0 => {
                     done.backups += 1;
                     done.held.add(h);
@@ -540,7 +566,12 @@ pub fn finish_clearing<T>(db: &Db, cleared: Vec<(String, Result<Clearing, String
                 continue;
             }
         };
-        let details = |done: &Cleared| json!({ "region": store.region, "bots": done.bots, "backups": done.backups, "messages": done.held.messages, "routines": done.held.routines, "approvals": done.held.approvals });
+        let details = |done: &Cleared| {
+            json!({
+                "region": store.region, "bots": done.bots, "users": done.users, "backups": done.backups, "messages": done.held.messages, "routines": done.held.routines,
+                "approvals": done.held.approvals, "memories": done.held.memories, "facts": done.held.facts,
+            })
+        };
         let r = match (failed.is_empty(), copies.get(&store.region)) {
             (false, _) => Err(failed.join("; ")),
             (true, Some(Err(e))) => Err(format!("the backups' copies off the host: {e}")),
@@ -548,7 +579,14 @@ pub fn finish_clearing<T>(db: &Db, cleared: Vec<(String, Result<Clearing, String
         };
         match &r {
             Ok(()) if done.backups > 0 => {
-                log_info!("Regional chat stores: took {} of {} Bots that left {}'s store out of {} of its backups (ADR 0238).", done.held.describe(), done.bots, store.region, done.backups);
+                log_info!(
+                    "Regional chat stores: took {} of {} Bots and {} people that left {}'s store out of {} of its backups (ADR 0238, ADR 0277).",
+                    done.held.describe(),
+                    done.bots,
+                    done.users,
+                    store.region,
+                    done.backups
+                );
                 db.record(&Who::system(ACTOR).event(CLEARED).details(details(&done)));
             }
             Ok(()) => {}
@@ -603,7 +641,7 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
 fn store_view(cp: &ControlPlane, store: &ChatStore, held: &Held) -> Value {
     let b = backups(store);
     json!({
-        "region": store.region, "messages": held.messages, "routines": held.routines, "approvals": held.approvals, "memories": held.memories,
+        "region": store.region, "messages": held.messages, "routines": held.routines, "approvals": held.approvals, "memories": held.memories, "facts": held.facts,
         "backups": b.len(), "lastBackupAt": b.first().map(|(t, _)| *t),
         "offHost": cp.chat_copies.as_deref().and_then(|c| c.view(store)),
     })
@@ -632,17 +670,25 @@ pub fn warnings(app: &App, cp: &ControlPlane, at: i64) -> Vec<String> {
         .map(|(s, _)| format!("{}'s chat store has no backup from the last day in its folder's backups/; check botd's log for {BACKUP_FAILED} (ADR 0215).", s.region));
     let uncleared = counts.iter().filter_map(|(s, _)| {
         let moves = app.db.moves_out_to_clear(s).ok()?;
-        let late = moves.iter().filter(|(_, moved_at)| at - moved_at > CLEAR_STALE_MS).count();
-        (late > 0 && !backups(s).is_empty()).then(|| {
-            let bots = if late == 1 { "1 Bot".to_string() } else { format!("{late} Bots") };
-            format!("{}'s chat store's backups may still hold the rows of {bots} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region)
+        let late = |l: &[(String, i64)]| l.iter().filter(|(_, moved_at)| at - moved_at > CLEAR_STALE_MS).count();
+        let (bots, users) = (late(&moves.bots), late(&moves.users));
+        (bots + users > 0 && !backups(s).is_empty()).then(|| {
+            let mut whose = Vec::new();
+            if bots > 0 {
+                whose.push(if bots == 1 { "the rows of 1 Bot".to_string() } else { format!("the rows of {bots} Bots") });
+            }
+            if users > 0 {
+                whose.push(if users == 1 { "the facts of 1 person".to_string() } else { format!("the facts of {users} people") });
+            }
+            format!("{}'s chat store's backups may still hold {} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region, whose.join(" and "))
         })
     });
     stale.chain(uncleared).chain(copies).collect()
 }
 
-/// What of the Bots `owners` own is in a pin to `region`'s store, in botd's own database
-/// (their memory files in DATA_DIR included, ADR 0276), and in other regions' stores.
+/// What of the Bots `owners` own, and of their own facts, is in a pin to `region`'s store, in
+/// botd's own database (memory and facts files in DATA_DIR included, ADR 0276, ADR 0277),
+/// and in other regions' stores.
 fn split(app: &App, region: &str, owners: &[String]) -> (Held, Held, Held) {
     let (mut store, mut database, mut elsewhere) = (Held::default(), Held::default(), Held::default());
     for c in app.db.chat_counts(owners) {
@@ -654,6 +700,8 @@ fn split(app: &App, region: &str, owners: &[String]) -> (Held, Held, Held) {
     }
     let files = owners.iter().flat_map(|o| app.db.owned_bot_ids(o)).filter(|id| app.data_memory_file(id).is_some_and(|p| std::fs::symlink_metadata(p).is_ok())).count();
     database.memories += files as i64;
+    let facts = owners.iter().filter(|o| crate::runner::facts_path(&app.cfg.data_dir, o).is_some_and(|p| std::fs::symlink_metadata(p).is_ok())).count();
+    database.facts += facts as i64;
     (store, database, elsewhere)
 }
 
@@ -686,6 +734,7 @@ pub fn against(app: &App, cp: &ControlPlane, region: &str, owners: &[String], se
         "routines": each(|h| h.routines),
         "approvals": each(|h| h.approvals),
         "memories": each(|h| h.memories),
+        "facts": each(|h| h.facts),
         "inRegion": elsewhere.total() == 0 && (database.total() == 0 || server_in) && earlier.is_empty(),
         "earlierCopies": earlier,
         "lastBackupAt": last,
@@ -701,12 +750,19 @@ pub fn outside(app: &App, region: &str, user_id: &str) -> Vec<String> {
     let has = app.db.chat_stores().iter().any(|s| s.region == region);
     let (_, database, elsewhere) = split(app, region, &[user_id.to_string()]);
     let mut out = Vec::new();
-    if has && database.total() > 0 {
-        let files = if database.memories > 0 { " or its files" } else { "" };
-        out.push(format!("their Bots have {} in botd's own database{files}, not {region}'s chat store (ADR 0215, ADR 0228, ADR 0276)", database.describe()));
+    let bots = database.of_bots();
+    if has && bots.total() > 0 {
+        let files = if bots.memories > 0 { " or its files" } else { "" };
+        out.push(format!("their Bots have {} in botd's own database{files}, not {region}'s chat store (ADR 0215, ADR 0228, ADR 0276)", bots.describe()));
     }
-    if elsewhere.total() > 0 {
-        out.push(format!("their Bots have {} in another region's chat store (ADR 0215, ADR 0228, ADR 0276)", elsewhere.describe()));
+    if has && database.facts > 0 {
+        out.push(format!("their facts are in botd's own database or its files, not {region}'s chat store (ADR 0277)"));
+    }
+    if elsewhere.of_bots().total() > 0 {
+        out.push(format!("their Bots have {} in another region's chat store (ADR 0215, ADR 0228, ADR 0276)", elsewhere.of_bots().describe()));
+    }
+    if elsewhere.facts > 0 {
+        out.push("their facts are in another region's chat store (ADR 0277)".to_string());
     }
     out
 }
@@ -715,7 +771,7 @@ pub fn outside(app: &App, region: &str, user_id: &str) -> Vec<String> {
 /// other stores' backups that still hold their chats.
 pub fn report_warnings(chats: &Value, region: &str, at: i64) -> Vec<String> {
     let mut out = Vec::new();
-    let in_store: i64 = ["messages", "routines", "approvals", "memories"].iter().filter_map(|k| chats[k]["inStore"].as_i64()).sum();
+    let in_store: i64 = ["messages", "routines", "approvals", "memories", "facts"].iter().filter_map(|k| chats[k]["inStore"].as_i64()).sum();
     if in_store > 0 && chats["lastBackupAt"].as_i64().is_none_or(|t| at - t > BACKUP_STALE_MS) {
         out.push(format!("{region}'s chat store has no backup from the last day (ADR 0215)"));
     }
@@ -878,7 +934,7 @@ mod tests {
         db.place_chats().unwrap();
         assert_eq!(db.chat_moves_out(std::slice::from_ref(&ada), "de-fra-2").len(), 1, "listed as an earlier copy until cleared");
         let r = clear_pass(&db, now());
-        let want = Cleared { bots: 1, backups: 2, held: Held { messages: 2, routines: 2, approvals: 2, memories: 0 } };
+        let want = Cleared { bots: 1, users: 0, backups: 2, held: Held { messages: 2, routines: 2, approvals: 2, memories: 0, facts: 0 } };
         assert_eq!(r, vec![("gb-lon".to_string(), Ok(want))]);
         assert_eq!(files_in(&dir), before, "the same restore points, no partial copies left");
         for f in &before {
@@ -941,11 +997,54 @@ mod tests {
         let moves = place(&db, data);
         assert_eq!(moves.iter().map(|m| (m.from.as_deref(), m.memories)).collect::<Vec<_>>(), vec![(Some("gb-lon"), 1)]);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), word);
-        assert!(db.memory(&bot).is_none() && db.memories_for_files().unwrap().is_empty());
+        assert!(db.memory(&bot).is_none() && db.docs_for_files(Doc::Memory).unwrap().is_empty());
         assert!(!holds(&lon.join("chats.sqlite"), word) && !holds(&t.path().join("app.sqlite"), word));
         let r = clear_pass(&db, now());
-        assert_eq!(r, vec![("gb-lon".to_string(), Ok(Cleared { bots: 1, backups: 1, held: Held { memories: 1, ..Held::default() } }))]);
+        assert_eq!(r, vec![("gb-lon".to_string(), Ok(Cleared { bots: 1, users: 0, backups: 1, held: Held { memories: 1, ..Held::default() } }))]);
         assert!(files_in(&dir).iter().all(|f| !holds(&dir.join(f), word)));
+    }
+
+    #[test]
+    fn a_persons_facts_file_moves_into_their_store_and_back_and_backups_are_cleared_of_it() {
+        let Two { t, db, lon } = two();
+        let data = t.path();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (cy, _) = pinned_bot(&db, "cy", "gb-lon");
+        let word = "facts-7d01e3-ada-is-in-london";
+        let file = crate::runner::facts_path(data, &ada).unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, word).unwrap();
+        let link = crate::runner::facts_path(data, &cy).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        let moves = place(&db, data);
+        assert_eq!(moves.iter().map(|m| (m.to.as_deref(), m.bots, m.facts)).collect::<Vec<_>>(), vec![(Some("gb-lon"), 0, 1)]);
+        assert!(!file.exists() && db.facts(&ada).as_deref() == Some(word), "taken into the store, the file deleted");
+        assert!(std::fs::symlink_metadata(&link).is_ok() && db.facts(&cy).is_none(), "a link is left alone");
+        let f = crate::audit::Filter { actions: vec![MOVED.into()], ..Default::default() };
+        let events: Vec<Value> = db.audit_events(&f, 10, true).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+        assert_eq!(events.iter().map(|e| e["details"]["facts"].as_i64()).collect::<Vec<_>>(), vec![Some(1)], "{events:?}");
+        assert!(place(&db, data).is_empty(), "once");
+
+        let start = chrono::DateTime::parse_from_rfc3339("2026-11-01T03:00:00Z").unwrap().timestamp_millis();
+        backup_pass(&db, 7, start);
+        let dir = lon.join("backups");
+        assert!(files_in(&dir).iter().all(|f| holds(&dir.join(f), word)));
+
+        // Unpinned, they are written back to the file and leave the store and its backups.
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        let moves = place(&db, data);
+        assert_eq!(moves.iter().map(|m| (m.from.as_deref(), m.facts)).collect::<Vec<_>>(), vec![(Some("gb-lon"), 1)]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), word);
+        assert!(db.facts(&ada).is_none() && db.docs_for_files(Doc::Facts).unwrap().is_empty());
+        assert!(!holds(&lon.join("chats.sqlite"), word) && !holds(&t.path().join("app.sqlite"), word));
+        let r = clear_pass(&db, now());
+        assert_eq!(r, vec![("gb-lon".to_string(), Ok(Cleared { bots: 0, users: 1, backups: 1, held: Held { facts: 1, ..Held::default() } }))]);
+        assert!(files_in(&dir).iter().all(|f| !holds(&dir.join(f), word)));
+        let f = crate::audit::Filter { actions: vec![CLEARED.into()], ..Default::default() };
+        let cleared: Vec<Value> = db.audit_events(&f, 10, true).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+        assert_eq!((cleared[0]["details"]["users"].as_i64(), cleared[0]["details"]["facts"].as_i64()), (Some(1), Some(1)), "{cleared:?}");
     }
 
     #[test]
@@ -966,7 +1065,7 @@ mod tests {
         assert!(db.moves_out_to_clear(&store).unwrap().is_empty());
         assert!(clear_pass(&db, now()).is_empty());
         let backup = &backups(&store)[0].1;
-        assert_eq!(crate::db::held_in_copy(&rusqlite::Connection::open(backup).unwrap(), std::slice::from_ref(&bot)).unwrap().messages, 1);
+        assert_eq!(crate::db::held_in_copy(&rusqlite::Connection::open(backup).unwrap(), &crate::db::Whose { bots: vec![bot.clone()], users: Vec::new() }).unwrap().messages, 1);
         // Moved, then the Bot deleted: still taken out of London's backups.
         db.place_chats().unwrap();
         db.delete_bot(&bot);

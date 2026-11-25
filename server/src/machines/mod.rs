@@ -1310,6 +1310,7 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
         ("routinesMoved", moves.iter().map(|m| m.routines).sum()),
         ("approvalsMoved", moves.iter().map(|m| m.approvals).sum()),
         ("memoriesMoved", moves.iter().map(|m| m.memories).sum()),
+        ("factsMoved", moves.iter().map(|m| m.facts).sum()),
     ] {
         if n > 0 {
             out[key] = n.into();

@@ -108,13 +108,20 @@ pub(crate) fn memory_path(data_dir: &Path, bot_id: &str) -> Option<PathBuf> {
     paths::child(&paths::child(&paths::child(&paths::canonical(data_dir)?, "bots")?, bot_id)?, "MEMORY.md")
 }
 
-/// Writes a Bot's memory file whole: a file beside it, synced, then renamed over it, so a
-/// crash leaves the old memory or the new one, never part of either.
-pub(crate) fn write_memory_file(path: &Path, text: &str) -> std::io::Result<()> {
+/// `data_dir/users/<id>/USER.md`, without making the folder. None when the id isn't one
+/// plain folder name.
+pub(crate) fn facts_path(data_dir: &Path, user_id: &str) -> Option<PathBuf> {
+    paths::child(&paths::child(&paths::child(&paths::canonical(data_dir)?, isolation::USERS)?, user_id)?, "USER.md")
+}
+
+/// Writes a Bot's memory file or a person's facts file whole: a file beside it, synced,
+/// then renamed over it, so a crash leaves the old text or the new one, never part of either.
+pub(crate) fn write_kept_file(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().ok_or_else(|| std::io::Error::other("no folder"))?;
+    let name = path.file_name().ok_or_else(|| std::io::Error::other("no file name"))?.to_string_lossy();
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".MEMORY.md.{}.tmp", crate::short_id()));
+    let tmp = dir.join(format!(".{name}.{}.tmp", crate::short_id()));
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         f.write_all(text.as_bytes())?;
         f.sync_all()
@@ -686,7 +693,7 @@ impl App {
                 return self.db.set_memory(bot_id, text).map_err(|e| format!("saving the Bot's memory until it moves back to its file: {e}"));
             }
         }
-        write_memory_file(&file, text).map_err(|e| format!("writing the Bot's memory: {e}"))
+        write_kept_file(&file, text).map_err(|e| format!("writing the Bot's memory: {e}"))
     }
 
     /// Facts about one user, for that user's Bots only: `DATA_DIR/users/<owner>/USER.md`,
@@ -697,9 +704,41 @@ impl App {
             None => self.data_user_file(owner_id),
         }
     }
-    /// `DATA_DIR/users/<owner>/USER.md`. With per-user accounts, botd's copy.
+    /// `DATA_DIR/users/<owner>/USER.md`, its folder made. With per-user accounts, botd's
+    /// copy. While the owner's pin keeps it in their region's chat store, it is there
+    /// instead (`kept_facts`).
     pub(crate) fn data_user_file(&self, owner_id: &str) -> Option<PathBuf> {
         paths::child(&isolation::user_dir(&self.cfg.data_dir, owner_id)?, "USER.md")
+    }
+
+    /// botd's copy of a person's facts (ADR 0277): in their region's chat store while their
+    /// pin keeps it there, else their file in DATA_DIR. A row wins over the file, as for a
+    /// Bot's memory (`kept_memory`).
+    pub(crate) fn kept_facts(&self, owner_id: &str) -> Option<String> {
+        self.db.facts(owner_id).or_else(|| facts_path(&self.cfg.data_dir, owner_id).and_then(|p| std::fs::read_to_string(p).ok()))
+    }
+
+    /// Saves botd's copy of a person's facts where they belong now (`kept_facts`), and drops
+    /// the copy kept in the other place, as `keep_memory_text` does for a Bot's memory.
+    pub(crate) fn keep_facts_text(&self, owner_id: &str, text: &str) -> Result<(), String> {
+        let _held = crate::machines::chat_stores::memory_lock();
+        if self.db.facts_in_store(owner_id) {
+            self.db.set_facts(owner_id, text).map_err(|e| format!("saving the owner's facts in their region's chat store: {e}"))?;
+            if let Some(f) = facts_path(&self.cfg.data_dir, owner_id).filter(|f| std::fs::symlink_metadata(f).is_ok()) {
+                std::fs::remove_file(&f).map_err(|e| format!("removing {}: {e}", f.display()))?;
+            }
+            return Ok(());
+        }
+        let file = self.data_user_file(owner_id).ok_or("the owner has no facts file")?;
+        // A row still in a store leaves it only by a move, which records it so that store's
+        // backups are cleared of it. Until one does, the row takes the save.
+        if self.db.facts(owner_id).is_some() {
+            crate::machines::chat_stores::place_held(&self.db, &self.cfg.data_dir);
+            if self.db.facts(owner_id).is_some() {
+                return self.db.set_facts(owner_id, text).map_err(|e| format!("saving the owner's facts until they move back to their file: {e}"));
+            }
+        }
+        write_kept_file(&file, text).map_err(|e| format!("writing the owner's facts: {e}"))
     }
 
     /// The folder every Bot of that user works in: `WORKSPACE_DIR/users/<owner>`, created,
@@ -734,17 +773,15 @@ impl App {
         if self.data_memory_file(&bot.id).is_some_and(|m| !m.exists()) && self.db.memory(&bot.id).is_none() {
             let _ = self.keep_memory_text(&bot.id, &format!("# {}\n\n## Job\n\nNot set yet. Ask the user.\n\n## Rules\n\n## Work log\n", bot.name));
         }
-        if let Some(user) = self.data_user_file(&bot.owner_id)
-            && !user.exists()
-        {
-            let _ = std::fs::write(&user, format!("# About the user\n\n- Name: {}\n", self.owner_name(bot)));
+        if self.data_user_file(&bot.owner_id).is_some_and(|f| !f.exists()) && self.db.facts(&bot.owner_id).is_none() {
+            let _ = self.keep_facts_text(&bot.owner_id, &format!("# About the user\n\n- Name: {}\n", self.owner_name(bot)));
         }
         // With per-user accounts the run edits copies in its owner's folder, made from
         // botd's. Until the account exists there's no folder, and nothing is made.
         if let Some(iso) = self.isolation() {
             let pairs = [
                 (iso.memory_file(&bot.owner_id, &bot.id), self.kept_memory(&bot.id)),
-                (iso.user_file(&bot.owner_id), self.data_user_file(&bot.owner_id).and_then(|p| std::fs::read_to_string(p).ok())),
+                (iso.user_file(&bot.owner_id), self.kept_facts(&bot.owner_id)),
             ];
             for (copy, kept) in pairs {
                 if let (Some(copy), Some(text)) = (copy, kept) {
@@ -786,11 +823,11 @@ impl App {
     /// folder back to `DATA_DIR`, so backups have them and memory follows the Bot.
     fn keep_memory(&self, bot: &Bot) {
         let Some(iso) = self.isolation() else { return };
-        if let (Some(from), Some(to)) = (iso.user_file(&bot.owner_id), self.data_user_file(&bot.owner_id))
-            && let Some(text) = accounts::read_plain(&from, accounts::MAX_FILE)
-            && std::fs::read_to_string(&to).ok().as_deref() != Some(text.as_str())
+        if let Some(text) = iso.user_file(&bot.owner_id).and_then(|from| accounts::read_plain(&from, accounts::MAX_FILE))
+            && self.kept_facts(&bot.owner_id).as_deref() != Some(text.as_str())
+            && let Err(e) = self.keep_facts_text(&bot.owner_id, &text)
         {
-            let _ = std::fs::write(&to, text);
+            crate::obs::log::log_warn!("WARNING: couldn't keep an owner's facts after a run: {e}");
         }
         // Handed over while it ran: hand_over_memory already kept the memory, and this
         // run's copy is the old owner's, so it's dropped, not copied over the Bot's.
@@ -2059,10 +2096,9 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     async fn run_there(&self, bot: &Bot, msg: &Message, spot: &Spot, to: &Assigned, adapter: Box<dyn adapters::Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, emit: impl FnMut(AgentEvent)) {
         let Some(cp) = self.control_plane.get() else { return };
-        let read = |p: Option<PathBuf>| p.and_then(|p| std::fs::read_to_string(p).ok());
         let own = spot.for_other.is_none();
         let memory = self.kept_memory(&bot.id);
-        let facts = if own { read(self.data_user_file(&bot.owner_id)) } else { None };
+        let facts = if own { self.kept_facts(&bot.owner_id) } else { None };
         let alone = {
             let mut on = self.on_machines.lock().unwrap_or_else(|e| e.into_inner());
             let n = on.entry(bot.owner_id.clone()).or_default();
@@ -2138,12 +2174,16 @@ impl App {
                 Err(e) => crate::obs::log::log_warn!("WARNING: couldn't keep the memory a Bot's run on its machine sent back: {e}"),
             }
         }
-        if let (Some(body), Some(here)) = (back.get(&user_at), self.data_user_file(&bot.owner_id))
-            && std::fs::read_to_string(&here).ok().as_ref() != Some(body)
+        if let Some(body) = back.get(&user_at)
+            && self.kept_facts(&bot.owner_id).as_ref() != Some(body)
         {
-            let _ = std::fs::write(here, body);
-            if let Some(copy) = iso.and_then(|i| i.user_file(&bot.owner_id)) {
-                accounts::remove(&copy);
+            match self.keep_facts_text(&bot.owner_id, body) {
+                Ok(()) => {
+                    if let Some(copy) = iso.and_then(|i| i.user_file(&bot.owner_id)) {
+                        accounts::remove(&copy);
+                    }
+                }
+                Err(e) => crate::obs::log::log_warn!("WARNING: couldn't keep the facts a Bot's run on its machine sent back: {e}"),
             }
         }
     }
@@ -2781,9 +2821,9 @@ impl App {
     /// facts in it are the run's own copies here, or botd's, which runs elsewhere send back.
     fn system_prompt_at(&self, bot: &Bot, spot: &Spot) -> String {
         let read = |p: &Option<PathBuf>| p.as_deref().and_then(|p| self.read_memory(p)).unwrap_or_default().trim().to_string();
-        let (mem, user_file) = match spot.machine {
-            None => (read(&Some(spot.memory.clone())), Some(spot.user_file.clone())),
-            Some(_) => (self.kept_memory(&bot.id).unwrap_or_default().trim().to_string(), self.data_user_file(&bot.owner_id)),
+        let (mem, user_facts) = match spot.machine {
+            None => (read(&Some(spot.memory.clone())), read(&Some(spot.user_file.clone()))),
+            Some(_) => (self.kept_memory(&bot.id).unwrap_or_default().trim().to_string(), self.kept_facts(&bot.owner_id).unwrap_or_default().trim().to_string()),
         };
         // Only the Bots its owner can see (ADR 0017), and that whoever it runs for can (ADR 0046).
         let others: Vec<String> = self
@@ -2803,7 +2843,7 @@ impl App {
         let (facts_line, facts, asking) = match &asker {
             None => (
                 format!("\n- Facts about {user}, shared by all of their Bots: {}. Name, time zone, and similar.", spot.user_file.display()),
-                format!("\n<user>\n{}\n</user>", read(&user_file)),
+                format!("\n<user>\n{user_facts}\n</user>"),
                 String::new(),
             ),
             Some(a) => (
