@@ -168,8 +168,8 @@ impl Integrity {
         }
     }
 
-    /// The first id a return's missed events must reach to be the period's.
-    fn missed_from(&self) -> Option<i64> {
+    /// The first id events a start skipped or a return missed must reach to be the period's.
+    fn reach_from(&self) -> Option<i64> {
         self.first_id.map(|first| if self.pruned_into { i64::MIN } else { first })
     }
 
@@ -227,8 +227,8 @@ impl Integrity {
                 self.export_changes.push(v.clone());
                 match action {
                     EXPORT_STOPPED => self.export_stopped.push(v),
-                    EXPORT_STARTED if self.first_id.is_some_and(|first| skipped_from(&v, first)) => self.export_skipped.push(v),
-                    EXPORT_RESUMED if self.missed_from().is_some_and(|first| missed_within(&v, first, e.id)) => self.export_missed.push(v),
+                    EXPORT_STARTED if self.reach_from().is_some_and(|first| skipped_from(&v, first)) => self.export_skipped.push(v),
+                    EXPORT_RESUMED if self.reach_from().is_some_and(|first| missed_within(&v, first, e.id)) => self.export_missed.push(v),
                     _ => {}
                 }
             }
@@ -251,7 +251,7 @@ impl Integrity {
     /// 0264): a sink set with `new` next month never had this month's, though its cursor is
     /// past them now.
     fn after_period(&mut self, app: &App, last_id: Option<i64>) {
-        let (Some(first), Some(from), Some(last)) = (self.first_id, self.missed_from(), last_id) else { return };
+        let (Some(from), Some(last)) = (self.reach_from(), last_id) else { return };
         let actions = vec![EXPORT_STARTED.to_string(), EXPORT_RESUMED.to_string()];
         let mut after = last;
         loop {
@@ -259,7 +259,7 @@ impl Integrity {
             for e in &page {
                 let v = change_of(e);
                 match e.action.as_str() {
-                    EXPORT_STARTED if skipped_from(&v, first) => self.export_skipped.push(v),
+                    EXPORT_STARTED if skipped_from(&v, from) => self.export_skipped.push(v),
                     EXPORT_RESUMED if missed_within(&v, from, last) => self.export_missed.push(v),
                     _ => {}
                 }
@@ -521,7 +521,8 @@ mod tests {
         let mut cut = Integrity { pruned_into: true, ..fresh(60) };
         cut.feed(&event(10, H, "user.created", "success", json!({})));
         cut.feed(&event(14, 3 * H, EXPORT_RESUMED, "success", json!({ "kind": "s3", "after": 2, "missed": { "after": 2, "through": 9 } })));
-        assert_eq!(cut.export_missed.len(), 1, "retention cut into the period, so event 10 may not be its first");
+        cut.feed(&event(15, 3 * H, EXPORT_STARTED, "success", json!({ "kind": "syslog", "start": "new", "after": 9, "skipped": 4 })));
+        assert_eq!((cut.export_missed.len(), cut.export_skipped.len()), (1, 1), "retention cut into the period, so event 10 may not be its first");
         let text = json!(i.export_changes).to_string();
         assert!(!text.contains("example.com") && !text.contains("s3://") && !text.contains("datadoghq"), "kinds and names, never addresses: {text}");
 
