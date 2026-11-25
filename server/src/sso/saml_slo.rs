@@ -72,6 +72,30 @@ pub enum Received {
     Response { id: String, in_response_to: String, status: Option<String>, until_ms: i64 },
 }
 
+/// The `Issuer` a message to the SLO URL names, before anything about it is checked: which of
+/// a provider's several IdPs to check it against (ADR 0282). `receive` then checks it as a
+/// message from that IdP, so nothing read here is trusted.
+pub fn claimed_issuer(incoming: &Incoming) -> Option<String> {
+    let xml = match incoming {
+        Incoming::Redirect(q) => saml_sp::from_redirect(q).ok()?.xml,
+        Incoming::Post(f) => {
+            let v = f.get("SAMLRequest").or_else(|| f.get("SAMLResponse"))?;
+            if v.len() > MAX_RESPONSE {
+                return None;
+            }
+            String::from_utf8(xmldsig::base64(v)?).ok()?
+        }
+        Incoming::Soap(body) if body.len() <= MAX_RESPONSE => body.to_string(),
+        Incoming::Soap(_) => return None,
+    };
+    let doc = xmldsig::parse(&xml).ok()?;
+    let root = match incoming {
+        Incoming::Soap(_) => soap_body(&doc).ok()?,
+        _ => doc.root_element(),
+    };
+    only(root, ASSERTION, "Issuer").and_then(text_of).map(|i| i.trim().to_string())
+}
+
 /// Checks a message the IdP sent to the SLO URL, as the module docs list.
 pub fn receive(incoming: &Incoming, e: &Expect) -> Result<Received, Refused> {
     let bad = || Refused("bad_message", None);

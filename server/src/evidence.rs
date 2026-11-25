@@ -4,7 +4,8 @@
 //! backup and restore runs, retention settings and passes, sign-in and alert events, a
 //! summary of the period's audit log with a digest, the configuration baseline checked
 //! when it was made (ADR 0195), the audit log's own integrity checks and export over the
-//! period (ADR 0261), and a manifest with every file's
+//! period (ADR 0261), machines' outbound allow-lists and the secrets manager through the
+//! period (ADR 0285), and a manifest with every file's
 //! SHA-256. Made on request by `GET /api/evidence/bundle` (admins), which `botctl evidence
 //! bundle` saves, and, with `EVIDENCE_BUNDLES=monthly`, by botd itself for each month
 //! into `EVIDENCE_DIR`, with retention. Each bundle is audited with its digests.
@@ -18,6 +19,7 @@
 use crate::access_review;
 use crate::audit::{self, Actor, Event, Outcome, Who};
 use crate::db::{AuditEvent, now};
+use crate::evidence_controls as controls;
 pub use crate::evidence_period::Period;
 use crate::mfa;
 use crate::runner::App;
@@ -37,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so tools reading bundles can tell them apart.
-pub const FORMAT: u32 = 3;
+pub const FORMAT: u32 = 4;
 pub const CREATED: &str = "evidence.bundle_created";
 pub const FAILED: &str = "evidence.bundle_failed";
 pub const PRUNED: &str = "evidence.bundles_pruned";
@@ -65,7 +67,7 @@ pub const SECTIONS: [Section; 5] = [
     Section {
         file: "access-review.json",
         criteria: &["CC1.3", "CC6.1", "CC6.2", "CC6.3"],
-        rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2"],
+        rows: &["CC6.1-1", "CC6.2-1", "CC6.3-1", "CC6.3-2", "CC6.3-3"],
         actions: &["user.*", "session.revoked*", "role.*", "team.invited", "team.member_*", "team.role_changed", "scim.*", "signup.approved", "signup.rejected", "access_review.*", "auth.mfa_policy_updated", "service_account.*", "service_token.*"],
     },
     Section {
@@ -159,6 +161,11 @@ of createdAt, which is after the period.
                             export in the period: each check, the gaps past their
                             deadlines, whether every export took every event, and the
                             last checkpoint to pin the period's events (ADR 0261)
+  egress.json               machines' outbound allow-lists: the server's policy and each
+                            running machine's, whether every run in the period was held
+                            to one, and changes and load failures (ADR 0285)
+  secrets.json              the secrets manager each botd start in the period read from,
+                            and its reads, sign-ins and run credentials (ADR 0285)
   manifest.json             what is in this bundle, the period, and each file's SHA-256
   SHA256SUMS                the same digests, for `sha256sum -c SHA256SUMS`
 
@@ -311,6 +318,11 @@ impl Tally {
         self.total += 1;
     }
 
+    /// `view` without the events themselves, for files that must not copy their details.
+    pub(crate) fn totals(&self) -> Value {
+        json!({ "counts": self.counts, "daily": self.daily, "eventsTotal": self.total })
+    }
+
     pub(crate) fn view(&self) -> Value {
         json!({
             "counts": self.counts,
@@ -332,13 +344,26 @@ struct Scan {
     starts: Vec<(String, Option<String>)>,
     all: BTreeMap<String, BTreeMap<String, u64>>,
     sections: Vec<Tally>,
+    egress: Tally,
+    secrets: Tally,
 }
 
 /// The period's audit events, oldest first, a page at a time: counted, digested, and
 /// each matching section's tally and `audit-integrity.json`'s checks fed.
 fn scan(app: &App, p: &Period, integrity: &mut crate::evidence_integrity::Integrity) -> Scan {
     let mut hash = Sha256::new();
-    let mut s = Scan { total: 0, first_id: None, last_id: None, digest: String::new(), truncated: false, starts: Vec::new(), all: BTreeMap::new(), sections: SECTIONS.iter().map(|_| Tally::default()).collect() };
+    let mut s = Scan {
+        total: 0,
+        first_id: None,
+        last_id: None,
+        digest: String::new(),
+        truncated: false,
+        starts: Vec::new(),
+        all: BTreeMap::new(),
+        sections: SECTIONS.iter().map(|_| Tally::default()).collect(),
+        egress: Tally::default(),
+        secrets: Tally::default(),
+    };
     let mut after = None;
     loop {
         let f = audit::Filter { from: Some(p.start_ms()), to: Some(p.end_ms()), after, ..Default::default() };
@@ -356,6 +381,12 @@ fn scan(app: &App, p: &Period, integrity: &mut crate::evidence_integrity::Integr
                 if sec.actions.iter().any(|a| matches(a, &e.action)) {
                     t.add(e);
                 }
+            }
+            if controls::EGRESS_ACTIONS.iter().any(|a| matches(a, &e.action)) {
+                s.egress.add(e);
+            }
+            if controls::SECRETS_ACTIONS.iter().any(|a| matches(a, &e.action)) {
+                s.secrets.add(e);
             }
             integrity.feed(e);
         }
@@ -440,6 +471,24 @@ fn service_account(s: &Value) -> Value {
     })
 }
 
+/// Every custom role's definition (ADR 0123, ADR 0285): what it is built on, its
+/// permissions, how long it may be held and how many hold it, never its name or
+/// description.
+fn custom_roles(app: &App) -> Vec<Value> {
+    app.db
+        .custom_roles()
+        .iter()
+        .map(|r| {
+            let (people, team) = app.db.custom_role_holders(&r.id);
+            json!({
+                "id": r.id, "base": r.base.as_str(), "permissions": r.permissions, "maxDays": r.max_days, "requestable": r.requestable,
+                "holders": { "server": people.len(), "team": team.len() },
+                "createdAt": rfc3339(r.created_at), "updatedAt": rfc3339(r.updated_at),
+            })
+        })
+        .collect()
+}
+
 fn access(app: &App, inputs: &Inputs, t: &Tally) -> Value {
     let r = access_review::build_with(app, &inputs.sessions);
     let reviews = t.counts.get(access_review::COMPLETED).map_or(0, |o| o.values().sum::<u64>());
@@ -450,6 +499,7 @@ fn access(app: &App, inputs: &Inputs, t: &Tally) -> Value {
         "summary": r.summary(),
         "people": r.people().map(person).collect::<Vec<_>>(),
         "serviceAccounts": r.service_accounts().map(service_account).collect::<Vec<_>>(),
+        "customRoles": custom_roles(app),
         "reviewsSignedOffInPeriod": reviews,
         "period": t.view(),
     })
@@ -552,6 +602,8 @@ pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: boo
     let mut integrity = crate::evidence_integrity::begin(app, p);
     let s = scan(app, p, &mut integrity);
     let (integrity, integrity_criteria, integrity_rows) = integrity.finish(app, s.last_id, !s.truncated, now_ms);
+    let (egress, egress_rows) = controls::egress(app, p, &s.egress);
+    let (secrets, secrets_rows) = controls::secrets(app, p, &s.secrets);
     let tally = |file: &str| SECTIONS.iter().position(|x| x.file == file).map(|i| &s.sections[i]).expect("a section");
     let period = json!({ "from": p.from.to_string(), "to": p.to.to_string(), "days": p.days() });
     let with_period = |mut v: Value| {
@@ -568,20 +620,24 @@ pub fn build(app: &App, inputs: &Inputs, p: &Period, now_ms: i64, scheduled: boo
         ("audit-summary.json", json_file(summary(app, p, &s))),
         (BASELINE_FILE, json_file(crate::baseline::run(app, inputs.mfa).view(&rfc3339(now_ms)))),
         (crate::evidence_integrity::FILE, json_file(with_period(integrity))),
+        (controls::EGRESS_FILE, json_file(with_period(egress))),
+        (controls::SECRETS_FILE, json_file(with_period(secrets))),
     ];
-    let controls = |file: &str| -> (Vec<&str>, Vec<&str>) {
+    let mapped = |file: &str| -> (Vec<&str>, Vec<&str>) {
         match SECTIONS.iter().find(|x| x.file == file) {
             Some(x) => (x.criteria.to_vec(), x.rows.to_vec()),
             None if file == "audit-summary.json" => (SUMMARY_CRITERIA.to_vec(), Vec::new()),
             None if file == BASELINE_FILE => (BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec()),
             None if file == crate::evidence_integrity::FILE => (integrity_criteria.clone(), integrity_rows.clone()),
+            None if file == controls::EGRESS_FILE => (controls::EGRESS_CRITERIA.to_vec(), egress_rows.clone()),
+            None if file == controls::SECRETS_FILE => (controls::SECRETS_CRITERIA.to_vec(), secrets_rows.clone()),
             None => (Vec::new(), Vec::new()),
         }
     };
     let listed: Vec<Value> = files
         .iter()
         .map(|(n, b)| {
-            let (criteria, rows) = controls(n);
+            let (criteria, rows) = mapped(n);
             json!({ "name": n, "bytes": b.len(), "sha256": sha256(b), "criteria": criteria, "checklist": rows })
         })
         .collect();
@@ -896,7 +952,13 @@ mod tests {
         let checklist = include_str!("../../docs/security/soc2-readiness-checklist.md");
         let plan = include_str!("../../docs/security/soc2-evidence-plan.md");
         let integrity = (crate::evidence_integrity::FILE, crate::evidence_integrity::CRITERIA.to_vec(), crate::evidence_integrity::ROWS.to_vec());
-        let files: Vec<(&str, Vec<&str>, Vec<&str>)> = SECTIONS.iter().map(|s| (s.file, s.criteria.to_vec(), s.rows.to_vec())).chain([("audit-summary.json", SUMMARY_CRITERIA.to_vec(), Vec::new()), (BASELINE_FILE, BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec()), integrity]).collect();
+        let egress = (controls::EGRESS_FILE, controls::EGRESS_CRITERIA.to_vec(), controls::EGRESS_ROWS.to_vec());
+        let secrets = (controls::SECRETS_FILE, controls::SECRETS_CRITERIA.to_vec(), controls::SECRETS_ROWS.to_vec());
+        let files: Vec<(&str, Vec<&str>, Vec<&str>)> = SECTIONS
+            .iter()
+            .map(|s| (s.file, s.criteria.to_vec(), s.rows.to_vec()))
+            .chain([("audit-summary.json", SUMMARY_CRITERIA.to_vec(), Vec::new()), (BASELINE_FILE, BASELINE_CRITERIA.to_vec(), BASELINE_ROWS.to_vec()), integrity, egress, secrets])
+            .collect();
         for (file, criteria, rows) in files {
             for c in &criteria {
                 assert!(mapping.contains(&format!("| {c} ")), "{file}: {c} isn't a criterion of the control mapping");
