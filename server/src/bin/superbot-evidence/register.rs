@@ -2402,9 +2402,12 @@ impl Check<'_> {
         let (mut not_verified, mut verified_late, mut review_overdue, mut review_late, mut reviewer_wrong) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut follow_up_overdue, mut follow_up_late, mut not_in_review) = (Vec::new(), Vec::new(), Vec::new());
         let mut made_by_kind: BTreeMap<&str, usize> = CHANGE_KINDS.iter().map(|k| (*k, 0)).collect();
+        let mut reviews: Vec<&ManagementReview> = self.r.management_reviews.iter().filter(|m| m.at < cut).collect();
+        reviews.sort_by_key(|m| m.at);
         let mut out = Vec::new();
         for x in self.r.changes.iter().filter(|x| x.made < cut) {
             let emergency = x.kind == "emergency";
+            let listed_by = reviews.iter().find(|m| emergency && m.at >= x.made && m.emergency_changes.contains(&x.id)).map(|m| ds(m.at));
             let label = format!("{} {} on {}", x.id, x.kind, x.system);
             let approved = x.approved.filter(|d| *d < cut);
             let approved_by = approved.and(x.approved_by.as_deref());
@@ -2425,7 +2428,7 @@ impl Check<'_> {
 
             let commander = x.incident.as_deref().and_then(|i| self.r.incidents.iter().find(|inc| inc.id == i)).and_then(|inc| inc.triaged.filter(|t| *t < cut).and(inc.commander.as_deref()));
             let approver_roles: &[&str] = if emergency { &[EMERGENCY_APPROVER] } else { &ROLES };
-            let held = approved.zip(approved_by).and_then(|(at, by)| if emergency && commander == Some(by) { Some("Incident commander".to_string()) } else { self.held(by, approver_roles, at) });
+            let held = approved.zip(approved_by).and_then(|(at, by)| if emergency && commander == Some(by) && self.personnel_on(by, at) { Some("Incident commander".to_string()) } else { self.held(by, approver_roles, at) });
             let had_access = self.has_access(&x.made_by, &x.system, x.made);
             let notice_hours = x.starts_at.zip(x.announced_at).map(|(s, a)| (s - a).num_minutes() as f64 / 60.0);
             if in_period(x.made) {
@@ -2440,7 +2443,7 @@ impl Check<'_> {
                 if let (Some(a), Some(by)) = (approved, approved_by) {
                     if emergency {
                         if held.is_none() {
-                            not_commander.push(json!(format!("{label}, approved {a}: {by} was neither {}'s commander nor held {EMERGENCY_APPROVER}", x.incident.as_deref().unwrap_or_default())));
+                            not_commander.push(json!(format!("{label}, approved {a}: {by} was neither {}'s commander nor held {EMERGENCY_APPROVER}, while personnel", x.incident.as_deref().unwrap_or_default())));
                         }
                     } else {
                         if by == x.made_by {
@@ -2493,11 +2496,15 @@ impl Check<'_> {
                 "checkDue": ds(verify_due), "checked": verified.map(ds),
                 "reviewDue": review_due.map(ds), "reviewed": reviewed.map(ds), "reviewedBy": reviewed_by,
                 "code": x.code, "followUpDue": follow_up_due.map(ds), "pullRequest": followed_up.and(x.pull_request), "followedUp": followed_up.map(ds),
+                "listedByManagementReview": listed_by,
             }));
         }
 
-        let mut reviews: Vec<&ManagementReview> = self.r.management_reviews.iter().filter(|m| m.at < cut).collect();
-        reviews.sort_by_key(|m| m.at);
+        let listings: Vec<Value> = reviews
+            .iter()
+            .filter(|m| in_period(m.at) && !m.emergency_changes.is_empty())
+            .map(|m| json!({ "at": ds(m.at), "minutesSha256": m.minutes_sha256, "emergencyChanges": m.emergency_changes }))
+            .collect();
         for x in self.r.changes.iter().filter(|x| x.kind == "emergency" && x.made < cut) {
             let Some(next) = reviews.iter().find(|m| m.at > x.made) else { continue };
             let listed = reviews.iter().any(|m| m.at >= x.made && m.at <= next.at && m.emergency_changes.contains(&x.id));
@@ -2520,6 +2527,7 @@ impl Check<'_> {
                 "interruptingInPeriod": self.r.changes.iter().filter(|x| in_period(x.made) && x.interrupts).count(),
                 "notCheckedAtEnd": out.iter().filter(|x| x["checked"].is_null()).count(),
             },
+            "managementReviews": listings,
             "exceptions": {
                 "notRecordedFirst": not_recorded_first, "notApproved": not_approved, "approvedAfterMade": approved_after,
                 "selfApproved": self_approved, "approverNotPersonnel": approver_not_personnel, "emergencyApproverNotCommander": not_commander,
@@ -3772,7 +3780,7 @@ mod tests {
         check(&v, &|c| {
             let (x, rows) = c.production_changes();
             let ex = &x["exceptions"];
-            assert_eq!(ex["emergencyApproverNotCommander"], json!(["CHG-10 emergency on botd-eu, approved 2027-03-08: p-eng was neither INC-02's commander nor held Security owner"]));
+            assert_eq!(ex["emergencyApproverNotCommander"], json!(["CHG-10 emergency on botd-eu, approved 2027-03-08: p-eng was neither INC-02's commander nor held Security owner, while personnel"]));
             assert_eq!(ex["reviewLate"], json!(["CHG-10 emergency on botd-eu (made 2027-03-08, reviewed 2027-03-12, due 2027-03-10)"]));
             assert_eq!(ex["reviewerNotSecondPerson"], json!(["CHG-10 emergency on botd-eu, reviewed 2027-03-12 by p-sec: not a second person (neither who made nor who approved it, and personnel)"]));
             assert_eq!(ex["followUpOverdue"], json!(["CHG-10 emergency on botd-eu (made 2027-03-08, no pull request, due 2027-03-15)"]));
@@ -3784,6 +3792,19 @@ mod tests {
             let eleven = x["changes"].as_array().unwrap().iter().find(|c| c["id"] == "CHG-11").unwrap();
             assert_eq!((eleven["heldRole"].as_str(), eleven["pullRequest"].as_u64(), eleven["followUpDue"].as_str()), (Some("Security owner (deputy)"), Some(77), Some("2027-03-16")));
             assert_eq!(rows, ["CC8.1-2"]);
+        });
+        check(&good(), &|c| {
+            let x = c.production_changes().0;
+            assert_eq!(x["managementReviews"], json!([{ "at": "2027-03-20", "minutesSha256": ZERO, "emergencyChanges": ["CHG-02"] }]), "the review that listed it, to follow to its minutes");
+            assert_eq!((x["changes"][1]["listedByManagementReview"].as_str(), x["changes"][0]["listedByManagementReview"].as_str()), (Some("2027-03-20"), None));
+        });
+
+        let mut gone = good();
+        gone["people"][3]["left"] = json!("2027-03-10");
+        check(&gone, &|c| {
+            let x = c.production_changes().0;
+            assert_eq!(x["exceptions"]["emergencyApproverNotCommander"], json!(["CHG-02 emergency on linode, approved 2027-03-10: p-ops was neither INC-02's commander nor held Security owner, while personnel"]), "a commander who has left can't approve");
+            assert!(x["changes"][1]["heldRole"].is_null());
         });
 
         let mut april = good();
