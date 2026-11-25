@@ -1234,7 +1234,7 @@ archive=$RB/dir/$(sed -n 's/^archive=//p' "$record")
 [[ "$archive" == "$RB/dir/superbot-pre-upgrade-$VERSION-"*.tar.gz && -f "$archive" ]] || fail "no plain backup archive: $archive"
 [[ $(sha256sum "$archive" | cut -c1-64) == $(sed -n 's/^archive_sha256=//p' "$record") ]] || fail "the record's SHA-256 isn't the archive's"
 cmp -s "$RH/superbot/.env" "$RB/dir/$(sed -n 's/^env=//p' "$record")" || fail "the .env wasn't kept as it was"
-[[ $(stat -c %a "$RB/dir") == 700 && $(stat -c %a "$record") == 600 ]] || fail "the rollback folder isn't root's only"
+[[ $(stat -c %a "$RB/dir") == 700 && $(stat -c %a "$record") == 600 && $(stat -c %a "$archive") == 600 ]] || fail "the rollback folder isn't root's only"
 [[ $(sort -u "$RB/as") == "$(id -un)" ]] || fail "the backup didn't run as botd's user"
 grep -Fq "Rollback point: $archive" <<<"$out" || fail "the upgrade didn't say how to go back: $out"
 grep -Fq "install.sh --offline <its bundle> --upgrade --rollback" <<<"$out" || fail "the upgrade didn't give the rollback command: $out"

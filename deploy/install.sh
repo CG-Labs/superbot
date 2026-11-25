@@ -2653,6 +2653,7 @@ offline_rollback_point() {
   install -d -m 0700 -o root -g root "$dir"
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   partial="$dir/.partial-$stamp"
+  install -m 0600 -o root -g root /dev/null "$partial"
   log "Backing up DATA_DIR and .env before the upgrade, so --rollback can go back to $OFFLINE_INSTALLED"
   if ! out=$( (cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" SUPERBOT_BOTD="$BIN_DIR/botd" "${backup[@]}" --home "$home" -) 2>&1 >"$partial"); then
     rm -f -- "$partial"
@@ -2710,7 +2711,7 @@ rollback_restore() {
   rm -f -- "$record" "$archive" "$env"
   log "Put back DATA_DIR and .env from before the upgrade to $OFFLINE_INSTALLED"
   grep -F 'Previous data kept' <<<"$out" | sed 's/^superbot-restore: /    /' || true
-  log "    The .env $OFFLINE_INSTALLED ran with is kept as $kept"
+  log "The .env $OFFLINE_INSTALLED ran with is kept as $kept"
 }
 
 finish() {
