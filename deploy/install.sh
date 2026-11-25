@@ -773,6 +773,13 @@ configure_env() {
   TZ_VALUE=${TZ_VALUE:-UTC}
   USER_NAME_VALUE=${USER_NAME_VALUE:-Owner}
 
+  # A rollback put back the .env from before the upgrade: its machine settings were checked,
+  # and DATA_DIR was restored where it points, so nothing in it is rewritten.
+  if [[ "$ROLLBACK_RESTORE" == true ]]; then
+    log "Keeping $env_file from before the upgrade as it is (--rollback): settings flags aren't written to it"
+    return 0
+  fi
+
   if [[ "$DRY_RUN" == true ]]; then
     local testing=""
     [[ "$TESTING_MODE_ON" != true ]] || testing=" (TESTING_MODE=on: no license, billing off)"
@@ -2564,6 +2571,21 @@ record_offline_release() {
 
 rollback_dir() { printf '%s\n' "${ROLLBACK_DIR:-$SHARE_DIR/rollback}"; }
 
+# DATA_DIR as superbot-restore reads it from an .env: the last value, unquoted, or the default.
+env_data_dir() {
+  local value
+  value=$(sed -n 's/^DATA_DIR=//p' "$1" | tail -n 1)
+  case $value in
+    \"*\" | \'*\') value=${value:1:-1} ;;
+  esac
+  printf '%s\n' "${value:-$2/superbot/data}"
+}
+
+# The .pre-restore-* folders in a DATA_DIR: superbot-restore makes one as it starts swapping.
+pre_restore_dirs() {
+  (cd / && find "$1" -mindepth 1 -maxdepth 1 -name '.pre-restore-*' 2>/dev/null | sort) || true
+}
+
 # Why the backup in rollback_dir can't take this host, running INSTALLED, back to the bundle's
 # release; nothing when it can. It must be that release's, from just before the upgrade to the
 # one running now, so no later release has opened the database since.
@@ -2680,11 +2702,14 @@ offline_rollback_point() {
 }
 
 # --rollback, once every check has passed: botd stops, and the .env and DATA_DIR from before
-# the upgrade go back, keeping what they replace beside them. If the restore fails, the .env
-# goes back too and botd starts again as it was. Then the install goes on with the bundle's
-# release, and botd stays stopped until its binaries are in place.
+# the upgrade go back, keeping what they replace beside them. If the restore fails before it
+# touches DATA_DIR, the .env goes back too and botd starts again as it was; if it fails while
+# swapping DATA_DIR, botd stays stopped. Then the install goes on with the bundle's release,
+# and botd stays stopped until its binaries are in place. The folder .env is in belongs to
+# botd's user, so root only replaces files there with install, which doesn't follow symlinks;
+# the copies are made as that user.
 rollback_restore() {
-  local dir record archive env home env_file stamp out kept
+  local dir record archive env home env_file stamp out kept was_active=false data_dir before_swap
   dir=$(rollback_dir)
   record="$dir/record"
   archive="$dir/$(manifest_value "$record" archive)"
@@ -2696,19 +2721,26 @@ rollback_restore() {
     return 0
   fi
   [[ ! -L "$env_file" ]] || die "Refusing symlinked $env_file. Nothing has changed."
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  kept="$env_file.before-rollback-$stamp"
+  (cd / && sudo -u "$SUPERBOT_USER" cp -p -- "$env_file" "$kept") \
+    || die "Couldn't keep $env_file as $kept. Nothing has changed."
+  data_dir=$(env_data_dir "$env" "$home")
+  before_swap=$(pre_restore_dirs "$data_dir")
   if systemctl is-active --quiet superbot.service 2>/dev/null; then
     log "Stopping superbot to put back the backup"
     systemctl stop superbot.service
+    was_active=true
   fi
-  stamp=$(date -u +%Y%m%dT%H%M%SZ)
-  kept="$env_file.before-rollback-$stamp"
-  cp -p -- "$env_file" "$kept"
-  install -m 0600 -o "$SUPERBOT_USER" -g "$(id -gn "$SUPERBOT_USER")" "$env" "$env_file"
-  if ! out=$(rollback_feed_restore "$home" "$archive" 2>&1); then
-    cat -- "$kept" >"$env_file" && rm -f -- "$kept"
+  if ! out=$(install -m 0600 -o "$SUPERBOT_USER" -g "$(id -gn "$SUPERBOT_USER")" -- "$env" "$env_file" 2>&1) \
+    || ! out=$(rollback_feed_restore "$home" "$archive" 2>&1); then
     printf '%s\n' "$out" >&2
-    systemctl start superbot.service || true
-    die "Couldn't put back the backup taken before the upgrade: $(tail -n 1 <<<"$out"). superbot was started again on $OFFLINE_INSTALLED, with its .env."
+    if [[ "$(pre_restore_dirs "$data_dir")" != "$before_swap" ]]; then
+      die "Putting back the backup taken before the upgrade stopped while swapping $data_dir: $(tail -n 1 <<<"$out"). superbot is left stopped. What $data_dir held is in its newest .pre-restore-* folder: as $SUPERBOT_USER, move everything else in $data_dir aside and that folder's contents back, then run the rollback again, or put back $kept as $env_file and start superbot on $OFFLINE_INSTALLED (docs/ops/air-gapped.md#going-back)"
+    fi
+    (cd / && sudo -u "$SUPERBOT_USER" cp -- "$kept" "$env_file") && rm -f -- "$kept"
+    [[ "$was_active" != true ]] || systemctl start superbot.service || true
+    die "Couldn't put back the backup taken before the upgrade: $(tail -n 1 <<<"$out"). DATA_DIR wasn't touched, and superbot is back as it was on $OFFLINE_INSTALLED, with its .env."
   fi
   # The data is the bundle's release's again: a run that stops after this is repeated as an
   # install of that release, with nothing left to restore.

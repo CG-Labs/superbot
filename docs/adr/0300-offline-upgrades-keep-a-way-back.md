@@ -37,7 +37,9 @@ Otherwise it stops, says which, and says that nothing has changed. Without `--ro
 
 Before anything changes, the bundle's `superbot-restore --check` reads the backup, decrypted by root with `BACKUP_IDENTITY_FILE` when it is encrypted, as botd's user from a pipe. botd's user can't read the rollback folder or the backup key. Machines' settings are checked as in ADR 0294, against the `.env` that will be put back, handed to botd's user as a temporary copy of its own (a pipe root made can't be reopened as `/dev/stdin` by another user) and read with `botd machines check --env-file` in botd's working directory.
 
-Then the installer stops botd, puts the `.env` back (keeping the current one as `.env.before-rollback-<stamp>`) and restores DATA_DIR with the bundle's `superbot-restore`. That script keeps what it replaces in `DATA_DIR/.pre-restore-<stamp>/`. If the restore fails, the current `.env` goes back and botd starts again as it was. Once the restore succeeds, the bundle's release is recorded and the backup is removed. The install then goes on as for any bundle: binaries, client, units, and a restart.
+Then the installer keeps the current `.env` as `.env.before-rollback-<stamp>`, stops botd, puts the old `.env` back and restores DATA_DIR with the bundle's `superbot-restore`. That script keeps what it replaces in `DATA_DIR/.pre-restore-<stamp>/`. The folder `.env` is in belongs to botd's user, so the copies there are made as that user, and root writes there only with `install`, which replaces a symlink rather than following it.
+
+If the restore fails before it starts swapping DATA_DIR, the current `.env` goes back and botd starts again as it was. If it fails while swapping (its `.pre-restore-*` folder has appeared), DATA_DIR may be half swapped, so botd stays stopped and the installer says how to put the data back. Once the restore succeeds, the bundle's release is recorded and the backup is removed. The install then goes on as for any bundle: binaries, client, units, and a restart. The `.env` put back is left as it is, with no settings rewritten, since it was checked and DATA_DIR was restored where it points.
 
 A rollback that stops after the restore is run again with the same command. The host then runs the bundle's release, so it reinstalls that release with nothing to restore. `--rollback` refuses a newer bundle, `--no-upgrade-backup`, and `--machine-hermes-bundle` or `--machine-harness-bundle`, since the old `.env` decides those.
 
@@ -60,7 +62,8 @@ A rollback that stops after the restore is run again with the same command. The 
     - no backup for the same release, a fresh install, an online install, a dry run or `--no-upgrade-backup`;
     - `--rollback` puts back the data and `.env`, keeps what they replace, records the older release and removes the backup, and running it again reinstalls;
     - it is refused, with nothing changed, for another release's or build's backup, a host upgraded since, a changed, incomplete, broken or missing backup, a newer bundle and no recorded release;
-    - a failed restore puts the `.env` back and starts botd;
+    - a restore that fails before the swap puts the `.env` back and starts botd; one that fails while swapping leaves botd stopped;
+    - the installer doesn't rewrite the `.env` a rollback put back;
     - an encrypted backup needs the backup key, and restores with it;
     - machines' settings are checked against the old `.env`, from a copy botd's user owns and that is removed after;
     - the flags need `--offline` and `--upgrade`, and refuse each other where they conflict.

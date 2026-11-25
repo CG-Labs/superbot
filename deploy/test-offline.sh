@@ -1286,6 +1286,11 @@ grep -qx "version=$VERSION" "$RB/offline-release" || fail "the rollback didn't r
 grep -qx "systemctl stop superbot.service" "$RB/systemctl" || fail "superbot wasn't stopped for the rollback"
 out=$(rollback) || fail "running the rollback again failed: $out"
 grep -Fq "This host already runs $VERSION: nothing to roll back" <<<"$out" || fail "a second rollback didn't say there's nothing to do: $out"
+sed -i "s,^DATA_DIR=.*,DATA_DIR=$RH/elsewhere," "$RH/superbot/.env"
+kept_env=$(cat "$RH/superbot/.env")
+out=$(rb "ROLLBACK_RESTORE=true DOMAIN=bots.example.test; configure_env") || fail "configure_env failed in a rollback: $out"
+[[ $(cat "$RH/superbot/.env") == "$kept_env" ]] || fail "configure_env rewrote the .env a rollback put back: $(cat "$RH/superbot/.env")"
+grep -Fq "Keeping $RH/superbot/.env from before the upgrade as it is (--rollback)" <<<"$out" || fail "configure_env didn't say it kept the .env: $out"
 ok "--rollback stops botd, puts back DATA_DIR and .env from before the upgrade, keeping what they replace, and records the older release"
 
 rb_host
@@ -1322,19 +1327,37 @@ printf '#!/bin/sh\ncase " $* " in *" --check "*) cat >/dev/null; exit 0 ;; esac\
 rm -f "$RB/systemctl" && touch "$RB/active"
 if out=$(rollback); then fail "a rollback whose restore failed went on: $out"; fi
 cp "$DIR/superbot-restore.sh" "$RB/bundle/deploy/"
-grep -Fq "Couldn't put back the backup taken before the upgrade: superbot-restore: disk full. superbot was started again on 0.2.0" <<<"$out" || fail "a failed restore didn't say so: $out"
+grep -Fq "Couldn't put back the backup taken before the upgrade: superbot-restore: disk full. DATA_DIR wasn't touched, and superbot is back as it was on 0.2.0" <<<"$out" || fail "a failed restore didn't say so: $out"
 grep -qx MACHINE_HARNESS_BUNDLE=/srv/b/new.tar.gz "$RH/superbot/.env" || fail "a failed restore didn't put the .env back"
 [[ -z $(compgen -G "$RH/superbot/.env.before-rollback-*") ]] || fail "a failed restore left the .env it kept"
 grep -qx "systemctl start superbot.service" "$RB/systemctl" || fail "a failed restore didn't start superbot again"
 grep -qx "version=0.2.0" "$RB/offline-release" || fail "a failed restore recorded the older release"
 [[ -f "$RB/dir/record" ]] || fail "a failed restore removed the backup"
+cat >"$RB/bundle/deploy/superbot-restore.sh" <<'EOF'
+#!/bin/sh
+case " $* " in *" --check "*) cat >/dev/null; exit 0 ;; esac
+cat >/dev/null
+mkdir "$2/superbot/data/.pre-restore-test"
+echo "superbot-restore: No space left on device" >&2
+exit 1
+EOF
+rm -f "$RB/systemctl" && touch "$RB/active"
+if out=$(rollback); then fail "a rollback whose restore failed while swapping went on: $out"; fi
+cp "$DIR/superbot-restore.sh" "$RB/bundle/deploy/"
+grep -Fq "stopped while swapping $RH/superbot/data: superbot-restore: No space left on device. superbot is left stopped" <<<"$out" || fail "a restore failed while swapping didn't say so: $out"
+! grep -q "systemctl start" "$RB/systemctl" || fail "superbot was started on data a failed swap left"
+[[ -n $(compgen -G "$RH/superbot/.env.before-rollback-*") ]] || fail "a failed swap didn't keep the .env it replaced"
+grep -qx "version=0.2.0" "$RB/offline-release" || fail "a failed swap recorded the older release"
+[[ -f "$RB/dir/record" ]] || fail "a failed swap removed the backup"
+rm -rf "$RH/superbot/data/.pre-restore-test" "$RH"/superbot/.env.before-rollback-*
+sed -i 's,^MACHINE_HARNESS_BUNDLE=.*,MACHINE_HARNESS_BUNDLE=/srv/b/new.tar.gz,' "$RH/superbot/.env"
 sed -i 's/^version=.*/version=0.0.9/' "$RB/offline-release"
 if out=$(rollback); then fail "--rollback took a newer bundle: $out"; fi
 grep -Fq -- "--rollback goes back to an older release, but this host runs 0.0.9 and the bundle is $VERSION" <<<"$out" || fail "--rollback to a newer bundle didn't say why: $out"
 rm "$RB/offline-release"
 if out=$(rollback); then fail "--rollback went on with no release recorded: $out"; fi
 grep -Fq "this host has no offline release recorded" <<<"$out" || fail "--rollback with no release recorded didn't say why: $out"
-ok "--rollback is refused, changing nothing, for another release's or build's backup, a host upgraded since, a changed or broken backup, or none; a failed restore puts the .env back and starts botd"
+ok "--rollback is refused, changing nothing, for another release's or build's backup, a host upgraded since, a changed or broken backup, or none; a restore that fails before the swap puts the .env back and starts botd, and one that fails while swapping leaves botd stopped"
 
 if command -v age-keygen >/dev/null 2>&1; then
   age-keygen -o "$RB/identity" 2>/dev/null
