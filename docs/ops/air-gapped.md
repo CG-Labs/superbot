@@ -409,7 +409,7 @@ It reads botd's settings and the `_FILE` each secret setting may name. Secrets s
 botctl offline check --internal corp.example,203.0.113.0/24
 ```
 
-- **Secrets:** `LINODE_TOKEN`, `ERROR_REPORT_DSN`, `NOTIFY_WEBHOOK_URL`, each `NOTIFY_WEBHOOK_URL_BOT_*` and the Anthropic settings are judged where botd finds them: `.env`, a `_FILE`, saved in botd or in the secrets manager. Each line says which, such as `NOTIFY_WEBHOOK_URL (saved in botd)`. Only hosts are shown. A store that doesn't answer is one `check` line naming what it couldn't read.
+- **Secrets:** `LINODE_TOKEN`, `ERROR_REPORT_DSN`, `NOTIFY_WEBHOOK_URL`, each `NOTIFY_WEBHOOK_URL_BOT_*` and the Anthropic settings are judged where botd finds them: `.env`, a `_FILE`, saved in botd or in the secrets manager. Each line says which, such as `NOTIFY_WEBHOOK_URL (saved in botd)`. Only hosts are shown. A store that doesn't answer is one `check` line naming what it couldn't read. `LINODE_TOKEN` and `ERROR_REPORT_DSN` are read only when botd starts, and not from what's saved in botd, so they are judged as botd read them then; a change since is a `check` line until botd restarts.
 - **Sign-in:** native SAML metadata saved with botctl, as loaded, and each OIDC provider's authorization, token and signing-key endpoints from its discovery document. The document comes from sign-in's cache, and isn't fetched for an issuer already on the internet.
 - `--internal` and `--json` work as for `botd offline check`, and it exits 1 while anything is `internet`. Each run is in the audit log as `offline.checked`.
 
