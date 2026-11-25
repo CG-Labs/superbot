@@ -1039,8 +1039,23 @@ export interface AuditExportSink {
   archive?: AuditArchiveState;
 }
 
-/** The export's progress (`GET /api/audit/siem`): the sink in the worst state, and every sink under `sinks` (ADR 0173). */
-export type AuditExportState = { enabled: false } | ({ enabled: true; sinks?: AuditExportSink[] } & AuditExportSink);
+/** A sink taken out of `AUDIT_EXPORT`, recorded as `audit.export_stopped` (ADR 0264, ADR 0273). */
+export interface AuditStoppedSink {
+  kind: string;
+  name?: string | null;
+  sink: string | null;
+  /** The last event it took. */
+  delivered: number;
+  /** Events since, which it hasn't taken. */
+  pending: number;
+  stoppedEvent: number;
+  /** When it was recorded as stopped and why; null once retention has deleted that event. */
+  stoppedAt?: number | null;
+  reason?: "removed" | "export_off" | null;
+}
+
+/** The export's progress (`GET /api/audit/siem`): the sink in the worst state, every sink under `sinks` (ADR 0173), and sinks taken out under `stopped` (ADR 0264). */
+export type AuditExportState = ({ enabled: false } | ({ enabled: true; sinks?: AuditExportSink[] } & AuditExportSink)) & { stopped?: AuditStoppedSink[] };
 
 /** The S3 archive's settings and last object, when the export is `s3://` (ADR 0154). */
 export interface AuditArchiveState {

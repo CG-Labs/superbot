@@ -868,10 +868,7 @@ pub fn view(app: &App) -> rusqlite::Result<Value> {
             "lastTry": s.last_try,
             "last": last_stamp.map(|c| json!({ "checkpoint": c.id, "event": c.tsa_event_id, "time": c.tsa_time, "tsa": c.tsa })),
         },
-        "export": match app.audit_export.get() {
-            Some(x) => x.view(events),
-            None => json!({ "enabled": false }),
-        },
+        "export": crate::audit_export::status(app, events),
         "verification": verification,
     }))
 }
