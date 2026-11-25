@@ -1162,6 +1162,221 @@ printf 'A=1\nMACHINE_HERMES_BUNDLE=/srv/b/old.tar.gz\n' >"$T/menv"
 [[ $(cat "$T/menv") == $'A=1\nMACHINE_HERMES_BUNDLE=/srv/b/new.tar.gz=abc\nMACHINE_HARNESS_BUNDLE=/srv/b/n.tar.gz' ]] || fail ".env changed without the flags"
 ok "--machine-hermes-bundle and --machine-harness-bundle are for --offline --upgrade, and set .env"
 
+# Offline upgrades back up DATA_DIR and .env first, and --rollback goes back with them (ADR 0300).
+# The real superbot-backup and superbot-restore, on a real SQLite database; root's commands are
+# stand-ins, and botd's user is this one.
+if out=$(flags --rollback); then fail "--rollback was taken online: $out"; fi
+grep -Fq "are for --offline upgrades" <<<"$out" || fail "--rollback online didn't say why: $out"
+if out=$(flags --upgrade --no-upgrade-backup); then fail "--no-upgrade-backup was taken online: $out"; fi
+if out=$(flags --offline "$B" --rollback); then fail "--rollback was taken without --upgrade: $out"; fi
+grep -Fq "use it with --upgrade" <<<"$out" || fail "--rollback without --upgrade didn't say why: $out"
+if out=$(flags --offline "$B" --upgrade --rollback --no-upgrade-backup); then fail "--rollback was taken with --no-upgrade-backup: $out"; fi
+if out=$(flags --offline "$B" --upgrade --rollback --machine-harness-bundle /srv/b/n.tar.gz); then fail "--rollback was taken with --machine-harness-bundle: $out"; fi
+grep -Fq "puts back the .env from before the upgrade" <<<"$out" || fail "--rollback with a machine bundle didn't say why: $out"
+flags --offline "$B" --upgrade --rollback >/dev/null || fail "--offline --upgrade --rollback was refused"
+flags --offline "$B" --upgrade --no-upgrade-backup >/dev/null || fail "--offline --upgrade --no-upgrade-backup was refused"
+flags --upgrade >/dev/null || fail "an online upgrade was refused"
+ok "--rollback and --no-upgrade-backup are for --offline upgrades only, and --rollback keeps the old .env's machine bundles"
+
+RB=$T/rollback
+RH=$RB/home
+COMMIT=$(tar -xOf "$B" "$TOP/MANIFEST" | sed -n 's/^commit=//p')
+mkdir -p "$RB/bin" "$RB/bundle/bin" "$RB/bundle/deploy"
+install -m 0755 "$DIR/superbot-backup.sh" "$RB/bin/superbot-backup"
+cp "$DIR/superbot-backup.sh" "$DIR/superbot-restore.sh" "$RB/bundle/deploy/"
+cp "$T/bin/botd" "$RB/bundle/bin/botd"
+tar -xOf "$B" "$TOP/MANIFEST" >"$RB/bundle/MANIFEST"
+# A host that runs the bundle's release, with chats in its database, and a .env as the installer
+# writes it.
+rb_host() {
+  rm -rf "$RH" "$RB/dir" "$RB/as" "$RB/systemctl" "$RB/active"
+  mkdir -p "$RH/superbot/data/bots"
+  printf 'DATA_DIR=%s\nPORT=9\nMACHINE_HARNESS_BUNDLE=/srv/b/old.tar.gz\n%s' "$RH/superbot/data" "${1:-}" >"$RH/superbot/.env"
+  chmod 0600 "$RH/superbot/.env"
+  sqlite3 "$RH/superbot/data/app.sqlite" "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('before')"
+  echo before >"$RH/superbot/data/bots/notes"
+  tar -xOf "$B" "$TOP/MANIFEST" >"$RB/offline-release"
+}
+# Runs CODE with install.sh's functions as root would, with DRY_RUN off unless CODE sets it.
+# shellcheck disable=SC2317 # the stand-ins are called from CODE, through eval
+rb() {
+  (
+    SUPERBOT_USER=$(id -un) BIN_DIR=$RB/bin ROLLBACK_DIR=$RB/dir OFFLINE_RELEASE_FILE=$RB/offline-release
+    BACKUP_IDENTITY_FILE=$RB/identity OFFLINE_BUNDLE=$B OFFLINE_DIR=$RB/bundle DRY_RUN=false
+    user_home() { echo "$RH"; }
+    sudo() { [[ $1 == -u ]] || { echo "sudo $*"; return 9; }; echo "$2" >>"$RB/as"; shift 2; "$@"; }
+    install() {
+      local a=()
+      while (($#)); do case $1 in -o | -g) shift 2 ;; *) a+=("$1"); shift ;; esac; done
+      command install "${a[@]}"
+    }
+    systemctl() { echo "systemctl $*" >>"$RB/systemctl"; [[ $1 != is-active ]] || [[ -e "$RB/active" ]]; }
+    eval "$1"
+  ) 2>&1
+}
+rows() { sqlite3 "$RH/superbot/data/app.sqlite" 'SELECT group_concat(v) FROM t'; }
+# What an upgrade to 0.2.0 leaves: the release recorded, a new chat, a changed .env.
+rb_upgraded() {
+  sed -i 's/^version=.*/version=0.2.0/' "$RB/offline-release"
+  sqlite3 "$RH/superbot/data/app.sqlite" "INSERT INTO t VALUES ('after')"
+  echo after >>"$RH/superbot/data/bots/notes"
+  sed -i 's,^MACHINE_HARNESS_BUNDLE=.*,MACHINE_HARNESS_BUNDLE=/srv/b/new.tar.gz,' "$RH/superbot/.env"
+}
+UPGRADE_TO="OFFLINE_INSTALLED=$VERSION OFFLINE_VERSION=0.2.0"
+
+rb_host
+out=$(rb "$UPGRADE_TO; offline_rollback_point") || fail "the backup before an upgrade failed: $out"
+record=$RB/dir/record
+for want in format=1 "from_version=$VERSION" "from_commit=$COMMIT" to_version=0.2.0 "env=env-"; do
+  grep -q "^$want" "$record" || fail "the rollback record has no $want: $(cat "$record")"
+done
+archive=$RB/dir/$(sed -n 's/^archive=//p' "$record")
+[[ "$archive" == "$RB/dir/superbot-pre-upgrade-$VERSION-"*.tar.gz && -f "$archive" ]] || fail "no plain backup archive: $archive"
+[[ $(sha256sum "$archive" | cut -c1-64) == $(sed -n 's/^archive_sha256=//p' "$record") ]] || fail "the record's SHA-256 isn't the archive's"
+cmp -s "$RH/superbot/.env" "$RB/dir/$(sed -n 's/^env=//p' "$record")" || fail "the .env wasn't kept as it was"
+[[ $(stat -c %a "$RB/dir") == 700 && $(stat -c %a "$record") == 600 ]] || fail "the rollback folder isn't root's only"
+[[ $(sort -u "$RB/as") == "$(id -un)" ]] || fail "the backup didn't run as botd's user"
+grep -Fq "Rollback point: $archive" <<<"$out" || fail "the upgrade didn't say how to go back: $out"
+grep -Fq "install.sh --offline <its bundle> --upgrade --rollback" <<<"$out" || fail "the upgrade didn't give the rollback command: $out"
+sleep 1
+out=$(rb "$UPGRADE_TO; offline_rollback_point") || fail "a second backup failed: $out"
+[[ $(find "$RB/dir" -mindepth 1 | wc -l) == 3 ]] || fail "a second backup didn't replace the first: $(ls -A "$RB/dir")"
+ok "an offline upgrade to a newer release first backs up DATA_DIR and .env, as botd's user, root-only, keeping one"
+
+rm -rf "$RB/dir"
+for code in "OFFLINE_INSTALLED=$VERSION OFFLINE_VERSION=$VERSION" "OFFLINE_INSTALLED= OFFLINE_VERSION=0.2.0" "$UPGRADE_TO OFFLINE_BUNDLE=" "$UPGRADE_TO DRY_RUN=true"; do
+  out=$(rb "$code; offline_rollback_point") || fail "$code stopped: $out"
+  [[ ! -e "$RB/dir" ]] || fail "$code backed up"
+done
+grep -Fq "[dry-run] would back up DATA_DIR and $RH/superbot/.env with $VERSION's superbot-backup into $RB/dir" <<<"$out" || fail "a dry run didn't say it would back up: $out"
+out=$(rb "$UPGRADE_TO NO_UPGRADE_BACKUP=true; offline_rollback_point") || fail "--no-upgrade-backup stopped: $out"
+[[ ! -e "$RB/dir" ]] || fail "--no-upgrade-backup backed up"
+grep -Fq -- "--rollback can't take this host back to $VERSION" <<<"$out" || fail "--no-upgrade-backup didn't warn: $out"
+printf '#!/bin/sh\necho "superbot-backup: No space left on device" >&2\nexit 2\n' >"$RB/bin/superbot-backup"
+if out=$(rb "$UPGRADE_TO; offline_rollback_point"); then fail "an upgrade went on though its backup failed: $out"; fi
+for want in "Couldn't back up before the upgrade: superbot-backup: No space left on device" "Nothing has changed" "--no-upgrade-backup"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a failed backup didn't say $want: $out"
+done
+[[ -z $(ls -A "$RB/dir") ]] || fail "a failed backup left files: $(ls -A "$RB/dir")"
+install -m 0755 "$DIR/superbot-backup.sh" "$RB/bin/superbot-backup"
+ok "no backup for the same release, a new install, an online install or a dry run; --no-upgrade-backup warns; a failed backup stops the upgrade"
+
+# prepare_offline unpacks the real bundle; the rest uses $RB/bundle, the same scripts and MANIFEST.
+rollback() { rb "ROLLBACK=true DRY_RUN=true; prepare_offline; OFFLINE_DIR=$RB/bundle DRY_RUN=false; prepare_rollback; offline_rollback_point"; }
+rb_host
+rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "the backup before an upgrade failed"
+kept_env=$(cat "$RH/superbot/.env")
+rb_upgraded
+if out=$(rb "DRY_RUN=true; prepare_offline"); then fail "an older bundle was taken without --rollback: $out"; fi
+grep -Fq "To go back to the backup taken before the upgrade to 0.2.0, losing everything since, add --rollback" <<<"$out" || fail "the downgrade refusal didn't offer --rollback: $out"
+touch "$RB/active"
+out=$(rollback) || fail "the rollback failed: $out"
+for want in "Offline rollback: 0.2.0 -> $VERSION, with the backup taken before the upgrade to 0.2.0" \
+  "the backup taken before the upgrade to 0.2.0 unpacks and checks out" "Put back DATA_DIR and .env from before the upgrade to 0.2.0" \
+  "Previous data kept in $RH/superbot/data/.pre-restore-" "The .env 0.2.0 ran with is kept as $RH/superbot/.env.before-rollback-"; do
+  grep -Fq -- "$want" <<<"$out" || fail "the rollback didn't say $want: $out"
+done
+[[ $(rows) == before && $(cat "$RH/superbot/data/bots/notes") == before ]] || fail "the rollback didn't put back the data: $(rows)"
+[[ $(cat "$RH/superbot/.env") == "$kept_env" ]] || fail "the rollback didn't put back the .env"
+[[ $(stat -c %a "$RH/superbot/.env") == 600 ]] || fail "the .env put back isn't 0600"
+grep -qx MACHINE_HARNESS_BUNDLE=/srv/b/new.tar.gz "$RH"/superbot/.env.before-rollback-* || fail "the .env it replaced wasn't kept"
+[[ $(sqlite3 "$RH"/superbot/data/.pre-restore-*/app.sqlite 'SELECT group_concat(v) FROM t') == before,after ]] || fail "the data it replaced wasn't kept"
+grep -qx "version=$VERSION" "$RB/offline-release" || fail "the rollback didn't record the bundle's release"
+[[ -z $(ls -A "$RB/dir") ]] || fail "the backup was left after the rollback: $(ls -A "$RB/dir")"
+grep -qx "systemctl stop superbot.service" "$RB/systemctl" || fail "superbot wasn't stopped for the rollback"
+out=$(rollback) || fail "running the rollback again failed: $out"
+grep -Fq "This host already runs $VERSION: nothing to roll back" <<<"$out" || fail "a second rollback didn't say there's nothing to do: $out"
+ok "--rollback stops botd, puts back DATA_DIR and .env from before the upgrade, keeping what they replace, and records the older release"
+
+rb_host
+rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "the backup before an upgrade failed"
+rb_upgraded
+cp -a "$RB/dir" "$RB/dir.good"
+cp "$RB/offline-release" "$RB/release.good"
+refused_rollback() {
+  local want=$1 why=$2 out
+  if out=$(rollback); then fail "$why: rolled back"; fi
+  grep -Fq -- "$want" <<<"$out" || fail "$why: refused for another reason: $out"
+  grep -Fq "Nothing has changed" <<<"$out" || fail "$why: didn't say nothing has changed: $out"
+  [[ $(rows) == before,after ]] || fail "$why: the data changed"
+  grep -qx MACHINE_HARNESS_BUNDLE=/srv/b/new.tar.gz "$RH/superbot/.env" || fail "$why: the .env changed"
+  rm -rf "$RB/dir" && cp -a "$RB/dir.good" "$RB/dir" && cp "$RB/release.good" "$RB/offline-release"
+}
+sed -i 's/^from_version=.*/from_version=0.0.9/' "$RB/dir/record"
+refused_rollback "the backup in $RB/dir is of 0.0.9, not $VERSION: roll back with the 0.0.9 bundle" "a backup of another release"
+sed -i 's/^from_commit=.*/from_commit=0123456789abcdef/' "$RB/dir/record"
+refused_rollback "built from 0123456789abcdef, but this bundle is built from $COMMIT" "a backup of another build"
+sed -i 's/^version=.*/version=0.3.0/' "$RB/offline-release"
+refused_rollback "taken before the upgrade to 0.2.0, but this host runs 0.3.0" "a host upgraded again since"
+echo x >>"$RB/dir/$(sed -n 's/^archive=//p' "$RB/dir/record")"
+refused_rollback "has changed since it was backed up" "a changed backup"
+rm "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")"
+refused_rollback "the backup's files aren't all in $RB/dir" "a backup without its .env"
+broken=$RB/dir/$(sed -n 's/^archive=//p' "$RB/dir/record")
+head -c 100 "$RB/dir.good/${broken##*/}" >"$broken"
+sed -i "s/^archive_sha256=.*/archive_sha256=$(sha256sum "$broken" | cut -c1-64)/" "$RB/dir/record"
+refused_rollback "doesn't restore: superbot-restore: could not unpack the archive" "a backup that doesn't unpack"
+rm -rf "$RB/dir"
+refused_rollback "no backup was taken before an offline upgrade on this host" "no backup"
+printf '#!/bin/sh\ncase " $* " in *" --check "*) cat >/dev/null; exit 0 ;; esac\ncat >/dev/null\necho "superbot-restore: disk full" >&2\nexit 1\n' >"$RB/bundle/deploy/superbot-restore.sh"
+rm -f "$RB/systemctl" && touch "$RB/active"
+if out=$(rollback); then fail "a rollback whose restore failed went on: $out"; fi
+cp "$DIR/superbot-restore.sh" "$RB/bundle/deploy/"
+grep -Fq "Couldn't put back the backup taken before the upgrade: superbot-restore: disk full. superbot was started again on 0.2.0" <<<"$out" || fail "a failed restore didn't say so: $out"
+grep -qx MACHINE_HARNESS_BUNDLE=/srv/b/new.tar.gz "$RH/superbot/.env" || fail "a failed restore didn't put the .env back"
+[[ -z $(compgen -G "$RH/superbot/.env.before-rollback-*") ]] || fail "a failed restore left the .env it kept"
+grep -qx "systemctl start superbot.service" "$RB/systemctl" || fail "a failed restore didn't start superbot again"
+grep -qx "version=0.2.0" "$RB/offline-release" || fail "a failed restore recorded the older release"
+[[ -f "$RB/dir/record" ]] || fail "a failed restore removed the backup"
+sed -i 's/^version=.*/version=0.0.9/' "$RB/offline-release"
+if out=$(rollback); then fail "--rollback took a newer bundle: $out"; fi
+grep -Fq -- "--rollback goes back to an older release, but this host runs 0.0.9 and the bundle is $VERSION" <<<"$out" || fail "--rollback to a newer bundle didn't say why: $out"
+rm "$RB/offline-release"
+if out=$(rollback); then fail "--rollback went on with no release recorded: $out"; fi
+grep -Fq "this host has no offline release recorded" <<<"$out" || fail "--rollback with no release recorded didn't say why: $out"
+ok "--rollback is refused, changing nothing, for another release's or build's backup, a host upgraded since, a changed or broken backup, or none; a failed restore puts the .env back and starts botd"
+
+if command -v age-keygen >/dev/null 2>&1; then
+  age-keygen -o "$RB/identity" 2>/dev/null
+  rb_host "SUPERBOT_BACKUP_AGE_RECIPIENTS=$(age-keygen -y "$RB/identity")"$'\n'
+  rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "an encrypted backup before an upgrade failed"
+  archive=$RB/dir/$(sed -n 's/^archive=//p' "$RB/dir/record")
+  [[ "$archive" == *.tar.gz.age && $(head -c 21 "$archive") == age-encryption.org/v1 ]] || fail "the backup wasn't encrypted as the server's backups are: $archive"
+  rb_upgraded
+  mv "$RB/identity" "$RB/identity.away"
+  if out=$(rollback); then fail "an encrypted backup was restored without its key: $out"; fi
+  grep -Fq "is encrypted: put the age identity that opens it at $RB/identity" <<<"$out" || fail "a missing backup key wasn't said: $out"
+  mv "$RB/identity.away" "$RB/identity"
+  out=$(rollback) || fail "the encrypted rollback failed: $out"
+  [[ $(rows) == before ]] || fail "the encrypted rollback didn't put back the data: $(rows)"
+  ok "the backup is encrypted to the server's backup recipients, and --rollback opens it with the backup key, as root"
+fi
+
+# A rollback checks machines' settings against the .env it puts back, which botd's user reads
+# from a pipe, in the folder the unit runs botd in.
+rb_host
+rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "the backup before an upgrade failed"
+rb_upgraded
+cat >"$RB/bundle/bin/botd" <<EOF
+#!/bin/sh
+# Usage: botd machines check
+[ "\$*" = "machines check --env-file /dev/stdin" ] || { echo "botd \$*"; exit 2; }
+[ "\$(pwd)" = "$RH/superbot" ] || { echo "botd ran in \$(pwd)"; exit 2; }
+cat >"$RB/checked"
+grep -q old.tar.gz "$RB/checked" && { echo "Machines: incus, enrolling at https://10.0.0.5:8443"; exit 0; }
+echo "botd wouldn't start with these settings: Machine enrollment: MACHINE_HARNESS_BUNDLE: can't read it"; exit 1
+EOF
+chmod 0755 "$RB/bundle/bin/botd"
+out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; machine_settings_check") || fail "a rollback's machine check failed: $out"
+grep -Fq "Machines' settings: the bundle's botd would start with them" <<<"$out" || fail "a rollback's machine check wasn't said: $out"
+cmp -s "$RB/checked" "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")" || fail "the rollback's machine check didn't read the .env from before the upgrade"
+sed -i 's/old.tar.gz/gone.tar.gz/' "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")"
+if out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; machine_settings_check"); then fail "a rollback went on with machine settings its botd refuses: $out"; fi
+grep -Fq "Nothing has changed. The .env from before the upgrade names something $VERSION's botd can't use now" <<<"$out" \
+  || fail "a rollback's refused machine check didn't say why: $out"
+cp "$T/bin/botd" "$RB/bundle/bin/botd"
+ok "a rollback checks machines' settings in the .env it puts back, read by botd's user from a pipe"
+
 # A dry run of the whole offline install, as main runs it, without root. With unprivileged
 # namespaces, it runs with no network at all.
 cat >"$T/run.sh" <<'EOF'
