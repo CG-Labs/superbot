@@ -21,6 +21,8 @@ The incident commander owns the status page note, the hourly updates and the cus
 - **Severity 3 and 4**: level 3 only for a confirmed bug, through the issue tracker. The ticket links the issue.
 - **A response target about to be missed**: the support engineer tells the support manager before it is, not after.
 
+`botctl support-escalations` lists the open tickets these rules apply to now, from the ticket system's export, with who to tell: response targets missed or about to be, Severity 1 for the on-call engineer and after 2 hours for management, Severity 2 in the runbook over 2 hours, and, with the replies export, updates overdue or about to be. Run it every few minutes from the Provider's own job and at each shift handover ([escalation check](escalation-check.md#where-it-fits)).
+
 ### Security incidents
 
 A suspected breach, leaked secret or cross-tenant exposure is Severity 1 and goes to `<security-email>` and the incident commander at once, whoever raised it. Follow the Provider's incident response plan and the breach notice terms in its DPA ([template](../security/dpa-template.md)). Support doesn't discuss details on an open ticket until the security lead says what may be shared.

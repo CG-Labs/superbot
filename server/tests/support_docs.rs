@@ -173,6 +173,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0271-health-check-in-the-support-bundle.md"));
     files.push(repo().join("docs/adr/0278-tam-handover-draft.md"));
     files.push(repo().join("docs/adr/0286-update-targets-from-a-replies-export.md"));
+    files.push(repo().join("docs/adr/0289-escalations-due-now-from-the-ticket-exports.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -341,6 +342,31 @@ fn the_support_report_page_documents_update_targets() {
     }
     for page in ["severity.md", "qbr-template.md", "escalation.md", "README.md"] {
         assert!(read(page).contains("(support-report.md#update-targets)"), "{page} doesn't point at the update targets");
+    }
+}
+
+#[test]
+fn the_escalation_check_page_documents_every_option_and_code() {
+    let code = fs::read_to_string(repo().join("server/src/support_escalations.rs")).unwrap();
+    let usage = code.split("pub const USAGE: &str = \"").nth(1).unwrap().split("\";").next().unwrap();
+    let page = read("escalation-check.md");
+    let options: HashSet<&str> = usage.split(|c: char| c.is_whitespace() || "[]|".contains(c)).filter(|w| w.starts_with("--")).collect();
+    assert!(options.len() >= 14, "the usage's options: {options:?}");
+    for o in options {
+        assert!(page.contains(&format!("`{o}")), "escalation-check.md doesn't explain {o}");
+    }
+    let flags = page.split("\n## What it flags\n").nth(1).expect("escalation-check.md has a What it flags section").split("\n## ").next().unwrap();
+    let codes = code.split("pub fn code(self) -> &'static str {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let codes: Vec<&str> = codes.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(codes.len(), 7, "{codes:?}");
+    for c in codes {
+        assert!(flags.contains(&format!("| `{c}` |")), "escalation-check.md has no row for {c}");
+    }
+    for needle in ["ADR 0289", "tells nobody", "exits 1", "Severity 1", "Severity 2", "about to be missed", "(support-report.md#the-export)", "(support-report.md#update-targets)"] {
+        assert!(page.contains(needle), "escalation-check.md doesn't mention {needle}");
+    }
+    for name in ["escalation.md", "README.md", "runbook-major-incident.md"] {
+        assert!(read(name).contains("(escalation-check.md"), "{name} doesn't point at the escalation check");
     }
 }
 
