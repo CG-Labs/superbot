@@ -323,7 +323,7 @@ pub struct Draft {
     pub machines: Option<Machines>,
 }
 
-fn plural(n: u64, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -331,25 +331,25 @@ fn share(part: u64, whole: u64) -> String {
     (part * 100).checked_div(whole).map_or_else(|| part.to_string(), |pct| format!("{part} ({pct}%)"))
 }
 
-fn cell(s: &str) -> String {
+pub(crate) fn cell(s: &str) -> String {
     s.replace('\\', "\\\\").replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
 /// A code, an id or a harness name as botd keeps them, or `[text]`.
-fn code(s: &str) -> &str {
+pub(crate) fn code(s: &str) -> &str {
     let plain = !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b));
     if plain { s } else { "[text]" }
 }
 
-fn date(ms: i64) -> String {
+pub(crate) fn date(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default()
 }
 
-fn utc(ms: i64) -> String {
+pub(crate) fn utc(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
 }
 
-fn duration(m: i64) -> String {
+pub(crate) fn duration(m: i64) -> String {
     match (m / 60, m % 60) {
         (0, m) => format!("{m} min"),
         (h, _) if h >= 48 => format!("{} days {} h", h / 24, h % 24),

@@ -43,6 +43,9 @@ mod baseline;
 mod business_review;
 #[cfg(test)]
 mod business_review_http_tests;
+mod tam_handover;
+#[cfg(test)]
+mod tam_handover_http_tests;
 #[cfg(test)]
 mod backup_encryption_http_tests;
 #[cfg(test)]
@@ -1114,6 +1117,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/database", get(database_encryption::get))
         .route("/support/bundle", get(support::bundle))
         .route("/support/business-review", get(business_review::get))
+        .route("/support/tam-handover", get(tam_handover::get))
         .route("/support/health-check", get(health_check::get))
         .route("/support/health-score", get(health_score::get))
         .route("/support/health-score/history", get(health_history::get))

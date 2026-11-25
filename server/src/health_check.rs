@@ -686,8 +686,14 @@ fn days_since(ms: i64, now_ms: i64) -> i64 {
 /// The inputs, from the health score, its history, the database, botd's settings and the setup wizard's checklist.
 pub fn gather(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
     let report = crate::health_score::build(app, now_ms, SCORE_DAYS);
-    let score = score_of(&report);
     let history = crate::health_history::history(app, now_ms, MONTH_DAYS).ok();
+    gather_with(app, a, setup, now_ms, &report, history.as_ref())
+}
+
+/// `gather`, given the 30-day health score report and the last month's history (None
+/// when botd couldn't read it).
+pub fn gather_with(app: &AppState, a: &Auth, setup: &Value, now_ms: i64, report: &Value, history: Option<&Value>) -> Inputs {
+    let score = score_of(report);
     let month = now_ms - MONTH_DAYS * DAY_MS;
     let window = now_ms - SCORE_DAYS * DAY_MS;
 
@@ -786,7 +792,7 @@ pub fn gather(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
 
     Inputs {
         score,
-        trend: trend_of(history.as_ref()),
+        trend: trend_of(history),
         version: env!("CARGO_PKG_VERSION").into(),
         setup_open: setup["checklist"].as_array().into_iter().flatten().filter(|c| c["done"] != true).filter_map(|c| c["id"].as_str().map(String::from)).collect(),
         incidents,

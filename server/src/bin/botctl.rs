@@ -316,6 +316,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    each month's score, health checks, runs and failures, and
                                                    the quarter's incidents, access reviews and changes; goals,
                                                    tickets and actions left "To fill in"
+  botctl tam-handover [--json] [-o <file>]         Draft the TAM handover note (ADR 0278) as Markdown: the
+                                                   deployment, the health score and its trend, the last health
+                                                   check and business review, what's open now, incidents to
+                                                   resolve or review, and the dates coming up; tickets,
+                                                   promises and people left "To fill in"
   botctl support-report <tickets.csv | -> [--plan <plan>] [--customer <name>] [--from <YYYY-MM> --to <YYYY-MM>]
     [--hours <HH:MM-HH:MM>] [--weekdays <mon-fri>] [--utc-offset <+HH:MM>] [--holidays <dates>]
     [--target <sev>=<30m|1h|4bh|1bd>]... [--column <field>=<header>]... [--as-of <time>] [--markdown | --json]
@@ -2412,6 +2417,15 @@ fn run(args: &[String]) -> Result<String, String> {
                 None => Ok(res),
             }
         }
+        ["tam-handover", rest @ ..] => {
+            let (path, json, out) = tam_handover_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let res = if json { pretty(res) } else { res };
+            match out {
+                Some(file) => save_private(file, res.as_bytes()).map(|_| format!("Saved {file}. Fill in what's marked \"To fill in\" and keep it in the customer's record.")),
+                None => Ok(res),
+            }
+        }
         ["incidents"] => Ok(incidents_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/status/incidents", None)?).map_err(|e| e.to_string())?)),
         ["incidents", "json"] => op("GET", "/api/status/incidents", None),
         ["incident", "review", rest @ ..] => {
@@ -2878,6 +2892,21 @@ fn business_review_request<'a>(rest: &[&'a str]) -> Result<(String, bool, Option
     }
     let q = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
     Ok((format!("/api/support/business-review{q}"), json, out))
+}
+
+/// `botctl tam-handover [--json] [-o <file>]`: the path, whether to print JSON, and the file to save to.
+fn tam_handover_request<'a>(rest: &[&'a str]) -> Result<(String, bool, Option<&'a str>), String> {
+    let usage = || "Usage: botctl tam-handover [--json] [-o <file>]".to_string();
+    let (mut json, mut out) = (false, None);
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        match *flag {
+            "--json" | "json" if !json => json = true,
+            "-o" | "--out" if out.is_none() => out = Some(*it.next().filter(|f| !f.starts_with('-')).ok_or_else(usage)?),
+            _ => return Err(usage()),
+        }
+    }
+    Ok((if json { "/api/support/tam-handover".into() } else { "/api/support/tam-handover?format=markdown".into() }, json, out))
 }
 
 /// `botctl incidents`: one line each, open ones first as botd lists them.
@@ -3590,6 +3619,16 @@ mod tests {
         assert_eq!(business_review_request(&["--json", "--to", "2026-12"]), Ok(("/api/support/business-review?to=2026-12".into(), true, None)));
         for bad in [&["--to"][..], &["--to", "Q3"], &["--to", "2026-9"], &["--to", "2026-09&x=1"], &["--to", "2026-09", "--to", "2026-10"], &["-o"], &["-o", "--json"], &["--days", "90"], &["markdown"]] {
             assert!(business_review_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_tam_handover_is_markdown_unless_asked_for_json() {
+        assert_eq!(tam_handover_request(&[]), Ok(("/api/support/tam-handover?format=markdown".into(), false, None)));
+        assert_eq!(tam_handover_request(&["-o", "handover.md"]), Ok(("/api/support/tam-handover?format=markdown".into(), false, Some("handover.md"))));
+        assert_eq!(tam_handover_request(&["--json"]), Ok(("/api/support/tam-handover".into(), true, None)));
+        for bad in [&["-o"][..], &["-o", "--json"], &["--json", "--json"], &["--to", "2026-09"], &["markdown"], &["-o", "a.md", "-o", "b.md"]] {
+            assert!(tam_handover_request(bad).is_err(), "{bad:?}");
         }
     }
 
