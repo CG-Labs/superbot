@@ -13,7 +13,7 @@
 //! IdP's next certificate already in its metadata, or botd's next key. Each notice is audited
 //! once per certificate, claimed in the transaction that records it.
 
-use super::provider::{IdpSource, Kind, Provider};
+use super::provider::{Kind, Provider};
 use super::saml_keys::{self, Stage};
 use super::saml_sp::{Encryption, KeyUse};
 use super::xmldsig::Cert;
@@ -194,6 +194,7 @@ pub fn action(p: &Provider, f: &Finding) -> String {
         },
         Role::IdpSigning => match (f.replacement, c.from) {
             (Some(r), _) => format!("The IdP's metadata already has a newer certificate (SHA-256 {r}): nothing to do unless the IdP keeps signing with this one."),
+            (None, "mdq") => "Renew it at the IdP, and have the IdP's operators publish its new certificate in the federation's metadata. botd asks the MDQ server again daily and takes it by itself; nothing to import.".into(),
             (None, "url") => "Renew it at the IdP. Its metadata URL lists no newer certificate yet; botd reads it again daily and takes the new one by itself.".into(),
             (None, "file") => format!("Renew it at the IdP, then put its new metadata (listing both certificates) in SSO_{up}_IDP_METADATA_FILE and restart botd, before the IdP switches."),
             (None, _) => format!("Renew it at the IdP, then import its new metadata (listing both certificates) before the IdP switches: botctl sso saml {id} import < metadata.xml."),
@@ -236,7 +237,7 @@ fn details(p: &Provider, f: &Finding) -> Value {
 pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::Client, gap: Duration, now: i64) -> usize {
     let mut n = 0;
     for p in providers.iter().filter(|p| p.saml_sp()) {
-        if matches!(&p.kind, Kind::SamlSp { source: IdpSource::Url(_), .. }) {
+        if matches!(&p.kind, Kind::SamlSp { source, .. } if source.url().is_some()) {
             if let Err(e) = p.idp_metadata(http, gap).await {
                 crate::obs::log::log_warn!("SSO {}: IdP metadata: {e}", p.id);
             }
@@ -366,6 +367,8 @@ mod tests {
         assert!(say(Role::SpEncryption, None, "secret", false).contains("SSO_CORP_SP_ENCRYPTION_CERT_FILE and SSO_CORP_ENCRYPTION_PRIVATE_KEY"));
         assert!(say(Role::IdpSigning, None, "url", false).contains("reads it again daily"));
         assert!(say(Role::IdpSigning, None, "file", false).contains("SSO_CORP_IDP_METADATA_FILE"));
+        let mdq = say(Role::IdpSigning, None, "mdq", false);
+        assert!(mdq.contains("federation's metadata") && !mdq.contains("import <"), "{mdq}");
         assert!(say(Role::IdpSigning, None, "botctl", false).contains("botctl sso saml corp import"));
         assert!(say(Role::IdpSigning, None, "url", true).contains("already has a newer certificate (SHA-256 after)"));
         assert!(say(Role::MetadataSigning, None, "file", false).contains("SSO_CORP_METADATA_SIGNING_CERT_FILE"));

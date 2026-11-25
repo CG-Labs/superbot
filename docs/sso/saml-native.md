@@ -174,6 +174,7 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_IDP_ENTITY_ID` | (required) | The IdP's entity ID. Responses from any other issuer are refused, and identities are stored under it. |
 | `SSO_<ID>_IDP_METADATA_URL` | | The IdP's metadata, https, refreshed daily. |
 | `SSO_<ID>_IDP_METADATA_FILE` | | Or a metadata file, read at startup. Without either, import it with `botctl sso saml <id> import`. |
+| `SSO_<ID>_IDP_MDQ_URL` | | Or a federation's MDQ server, its https base URL (InCommon: `https://mdq.incommon.org`): botd asks it for `IDP_ENTITY_ID` alone, daily. Needs `METADATA_SIGNING_CERT_FILE` ([below](#metadata-from-a-federation-mdq)). |
 | `SSO_<ID>_SP_ENTITY_ID` | `<SSO_PUBLIC_URL>/api/auth/sso/<id>/metadata` | Our entity ID (the audience), if the IdP needs another. |
 | `SSO_<ID>_EMAIL_ATTRIBUTE` | `email`, `mail`, or the emailaddress claim URI | The attribute with the email. |
 | `SSO_<ID>_NAME_ATTRIBUTE` | `displayName`, `name`, or the displayname claim URI | The attribute with the display name. |
@@ -190,7 +191,7 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_AES_CBC` | `off` | `signed-response`: also take AES-CBC encrypted assertions (Entra ID, ADFS), only inside a response the IdP signed ([below](#aes-cbc-entra-id-and-adfs)). Needs `ENCRYPTED_ASSERTIONS`. |
 | `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` | | With `SP_ENCRYPTION_CERT_FILE`: its private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_METADATA_SIGNING_CERT_FILE` | | The certificates (PEM, one or more) the IdP signs its metadata with. Metadata is then checked on every load ([below](#signed-idp-metadata)). |
-| `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked. Badly signed metadata is refused either way. |
+| `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked (not with `IDP_MDQ_URL`). Badly signed metadata is refused either way. |
 | `SSO_<ID>_GROUPS_ATTRIBUTE` | | The assertion attribute with the person's groups ([above](#groups)). No default: without it, groups aren't read. |
 | `SSO_<ID>_REQUIRED_GROUPS` | | Only people in one of these groups sign in, comma separated (exact). Needs `GROUPS_ATTRIBUTE`. |
 | `SSO_<ID>_IDP_INITIATED` | `off` | `restart`: an unsolicited response from an IdP's app tile starts an SP-initiated sign-in ([above](#idp-initiated-sign-in-app-tiles)). `off` refuses it. |
@@ -337,7 +338,26 @@ SSO_CORP_METADATA_SIGNING_CERT_FILE=/etc/superbot/corp-idp-metadata.pem
 - The signature must be on the `EntityDescriptor`, or on the `EntitiesDescriptor` of an aggregate. It must verify against a certificate in the file, with strong algorithms only. With `require`, unsigned metadata is refused. With `allow`, it's taken unchecked. A bad signature is refused either way.
 - Signed metadata past its `validUntil` is refused, so an old copy can't be served again.
 - A refused copy never replaces the one in use. From a URL, botd keeps the last good copy and tries again later. An import is refused, and the stored copy stays. A bad file stops botd from starting.
-- Refusals are audited as `sso.saml_metadata_refused` (`botctl audit --action sso.saml_metadata_refused`), with the source, the reason (`unsigned`, `bad_signature`, `wrapped`, `weak_algorithm`, `bad_algorithm`, `expired`), and whether a good copy is still in use (`kept`). `botctl sso saml corp` shows the setting and the trusted certificates.
+- The copy in use is never used past its `validUntil` either, not even as the last good one ([ADR 0281](../adr/0281-saml-metadata-from-mdq.md)). From a URL or MDQ, botd fetches it again; from a file or an import, sign-ins fail as `idp_metadata_expired` until you give botd a fresh signed copy. `botctl sso saml corp` shows `Valid until` under the metadata. Unsigned metadata's `validUntil` vouches for nothing, so it ends nothing.
+- Refusals are audited as `sso.saml_metadata_refused` (`botctl audit --action sso.saml_metadata_refused`), with the source, the reason (`unsigned`, `bad_signature`, `wrapped`, `weak_algorithm`, `bad_algorithm`, `expired`, and for MDQ `not_one_entity`, `no_valid_until` and `valid_too_long`), and whether a good copy is still in use (`kept`). `botctl sso saml corp` shows the setting and the trusted certificates.
+
+### Metadata from a federation (MDQ)
+
+Universities and research institutions often sign in through a federation, such as InCommon or a national federation in eduGAIN. Their aggregates of every member's metadata are far over botd's 1 MB limit, but many run an MDQ server (the Metadata Query Protocol) that answers for one entity at a time, signed by the federation ([ADR 0281](../adr/0281-saml-metadata-from-mdq.md)). Point botd at it instead of a metadata URL:
+
+```bash
+SSO_UNI_TYPE=saml
+SSO_UNI_IDP_ENTITY_ID=https://idp.university.example/idp/shibboleth
+SSO_UNI_IDP_MDQ_URL=https://mdq.incommon.org
+SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
+```
+
+- **The signer is required.** Get the federation's MDQ signing certificate by a channel you trust and check its fingerprint against the one the federation publishes (InCommon: `https://mdq.incommon.org/certs/inc-md-cert-mdq.pem`, not the certificate of its old aggregates). Without `METADATA_SIGNING_CERT_FILE`, or with `SIGNED_METADATA=allow`, botd won't start: anyone can answer for an MDQ server, so only the signature says the answer is the IdP's.
+- **What botd asks.** `GET <base>/entities/<entity ID>`, the entity ID percent-encoded (`https%3A%2F%2Fidp.university.example%2Fidp%2Fshibboleth`), when the metadata is first needed and daily after, as for a metadata URL. A 404 in the log means the server doesn't know that entity ID: check `IDP_ENTITY_ID`.
+- **What it takes.** Only the IdP's own `EntityDescriptor`, signed at its root by a certificate in the file, with a `validUntil` no more than 30 days ahead (InCommon's are 14). An aggregate, an unsigned or badly signed answer, one without a `validUntil` or valid for longer is refused and audited (`source` = `mdq`), and the last good copy stays until its own `validUntil`.
+- **Everything else is as with a metadata URL**: the IdP's certificate rollovers reach botd within a day, [certificate warnings](#certificates-that-are-ending) cover the federation's signer, and `botctl offline check` lists the MDQ URL among the addresses botd reaches. `botctl sso saml uni` shows `IdP metadata from mdq (<the request URL>)`.
+
+Register SuperBot with the IdP's operators as they ask: some take SuperBot's metadata URL directly, others only through the federation's registry.
 
 ## Single logout
 
@@ -451,6 +471,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `replayed` | The same assertion was posted twice. |
 | `transient_subject`, `missing_subject` | Use a persistent NameID. |
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
+| `idp_metadata_expired` | The IdP's signed metadata in use has passed its `validUntil`, and no fresh copy loaded. From a file or an import, give botd a fresh signed copy; from a URL or MDQ, look for `sso.saml_metadata_refused` or an unreachable server in the log ([above](#signed-idp-metadata)). |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
 | `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |
 | `stale_authn` | `FORCE_AUTHN` or `MAX_AUTHN_AGE` is set, and the IdP's answer to SuperBot's `ForceAuthn` request was from an older sign-in. `authnInstant` and `authnSince` say how old. The IdP ignores `ForceAuthn`: fix the app at the IdP ([above](#sign-in-age-and-the-idps-session-limit)). |

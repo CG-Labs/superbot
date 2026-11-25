@@ -45,7 +45,8 @@
 //! HTTP-POST instead (ADR 0235), signed inside the message, when the IdP's metadata offers
 //! only that or the provider asks for it.
 //!
-//! IdP metadata can be held to a signature by a configured certificate (ADR 0151): see
+//! IdP metadata can be held to a signature by a configured certificate (ADR 0151), and
+//! fetched one entity at a time from a federation's MDQ server (ADR 0281): see
 //! `load_idp_metadata`.
 
 use super::jwt::Invalid;
@@ -76,6 +77,9 @@ pub const SKEW_MS: i64 = 120_000;
 /// The largest posted `SAMLResponse` we decode (base64 characters). Real ones are a few KB.
 pub const MAX_RESPONSE: usize = 256 * 1024;
 pub const MAX_METADATA: usize = 1024 * 1024;
+/// The furthest ahead an MDQ answer's `validUntil` may be (ADR 0281): a signed answer stolen or
+/// cached by a proxy can be served again for at most this long. Federations use 7 to 28 days.
+pub const MDQ_MAX_VALIDITY_MS: i64 = 30 * 86_400_000;
 
 /// Attributes IdPs commonly put the email in, tried in order when none is configured: Okta
 /// and Google's `email`, LDAP's `mail`, Entra and ADFS's claim URI, and the X.500 OID.
@@ -313,6 +317,16 @@ pub struct IdpMetadata {
     /// The SOAP ArtifactResolutionServices on https, by their `index`: an artifact names the
     /// one it is resolved at (ADR 0268).
     pub artifact_resolution: Vec<(u16, String)>,
+    /// The earliest `validUntil` over the entity, from signed metadata only: past it this copy
+    /// vouches for nothing, even as the last good one (ADR 0281).
+    pub valid_until: Option<i64>,
+}
+
+impl IdpMetadata {
+    /// Whether this copy may still be trusted at `now_ms`.
+    pub fn valid_at(&self, now_ms: i64) -> bool {
+        self.valid_until.is_none_or(|u| u > now_ms)
+    }
 }
 
 /// Where the IdP takes logout messages: requests at `location`, our responses at `response`,
@@ -351,6 +365,25 @@ pub(super) fn escape(s: &str) -> String {
 pub struct MetadataTrust {
     pub certs: Vec<Cert>,
     pub require: bool,
+    /// From an MDQ server (`SSO_<ID>_IDP_MDQ_URL`, ADR 0281): only the IdP's own
+    /// `EntityDescriptor`, signed as a whole, with a `validUntil` at most
+    /// `MDQ_MAX_VALIDITY_MS` ahead. Always with `require`.
+    pub query: bool,
+}
+
+/// The MDQ request for one entity (draft-young-md-query): `<base>/entities/<entityID>`, the
+/// entity ID percent-encoded but for RFC 3986's unreserved characters, so `/`, `:`, `?` and
+/// `#` in it stay inside the one path segment.
+pub fn mdq_url(base: &str, entity_id: &str) -> String {
+    let mut out = format!("{}/entities/", base.trim_end_matches('/'));
+    for b in entity_id.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// IdP metadata that can't be used: `reason` for the audit log, `message` for the admin.
@@ -393,8 +426,9 @@ fn all_text(n: Node) -> String {
 /// With `trust`, the signatures that cover `entity`: the document's (`root`) and the entity's
 /// own, when it's inside an aggregate. Each one present must verify against the anchor, and
 /// one must be present when it's required. Signed metadata past its `validUntil` is refused,
-/// so an old signed copy can't be served again once it has expired.
-fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Result<(), MetadataRefused> {
+/// so an old signed copy can't be served again once it has expired. Returns the earliest
+/// `validUntil` of signed metadata, for the copy's use later (`IdpMetadata::valid_at`).
+fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Result<Option<i64>, MetadataRefused> {
     let path = if root == entity { vec![root] } else { vec![root, entity] };
     let mut signed = false;
     for n in &path {
@@ -404,19 +438,34 @@ fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Res
         }
     }
     if !signed {
-        return if t.require { Err(MetadataRefused { reason: "unsigned", message: "it isn't signed, and signed metadata is required".into() }) } else { Ok(()) };
+        return match (t.query, t.require) {
+            (true, _) => Err(MetadataRefused { reason: "unsigned", message: "the MDQ answer isn't signed: every one must be".into() }),
+            (false, true) => Err(MetadataRefused { reason: "unsigned", message: "it isn't signed, and signed metadata is required".into() }),
+            (false, false) => Ok(None),
+        };
     }
     // Every descriptor from the entity up to the root: a signed root covers a nested
     // EntitiesDescriptor's validUntil too.
+    let mut earliest: Option<i64> = None;
     for n in entity.ancestors().filter(Node::is_element) {
         if let Some(v) = n.attribute("validUntil") {
             let until = time(v).map_err(|_| MetadataRefused::bad(format!("its validUntil ({v}) isn't a date")))?;
             if until <= now_ms {
                 return Err(MetadataRefused { reason: "expired", message: format!("it expired at {v} (validUntil): the IdP must publish a fresh copy") });
             }
+            earliest = Some(earliest.map_or(until, |e| e.min(until)));
         }
     }
-    Ok(())
+    if t.query {
+        match earliest {
+            None => return Err(MetadataRefused { reason: "no_valid_until", message: "the MDQ answer has no validUntil, so a copy of it would vouch for the IdP forever".into() }),
+            Some(u) if u > now_ms.saturating_add(MDQ_MAX_VALIDITY_MS) => {
+                return Err(MetadataRefused { reason: "valid_too_long", message: format!("the MDQ answer is valid until {}, more than {} days ahead", instant(u), MDQ_MAX_VALIDITY_MS / 86_400_000) });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(earliest)
 }
 
 /// The IdP `entity_id` in `xml` (an `EntityDescriptor`, or one inside `EntitiesDescriptor`).
@@ -424,7 +473,10 @@ fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Res
 /// wants them signed is fine. `binding` picks the SingleSignOnService (ADR 0235); `response`
 /// is how the IdP is asked to answer, and artifacts need its ArtifactResolutionService (ADR
 /// 0268). With `trust` (ADR 0151), only metadata signed by its certificate, and not expired at
-/// `now_ms`, is read (`check_signed`). The message says what to fix, for the admin who set it up.
+/// `now_ms`, is read (`check_signed`). An MDQ answer (`trust.query`, ADR 0281) must be the
+/// entity's own `EntityDescriptor` at the root: a signature over an aggregate, or over only
+/// the entity inside one, isn't what the protocol returns, and is refused. The message says
+/// what to fix, for the admin who set it up.
 pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, binding: RequestBinding, response: ResponseBinding, trust: Option<&MetadataTrust>, now_ms: i64) -> Result<IdpMetadata, MetadataRefused> {
     if xml.len() > MAX_METADATA {
         return Err(MetadataRefused::bad("the metadata is over 1 MB"));
@@ -436,10 +488,16 @@ pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, bindi
         let found: Vec<&str> = doc.descendants().filter(|n| is(*n, METADATA, "EntityDescriptor")).filter_map(|n| n.attribute("entityID")).take(5).collect();
         return Err(MetadataRefused::bad(if found.is_empty() { "no EntityDescriptor in the metadata".into() } else { format!("the metadata is for {}, not {entity_id}", found.join(", ")) }));
     };
-    if let Some(t) = trust {
-        check_signed(doc.root_element(), entity, t, now_ms).map_err(|e| MetadataRefused { message: format!("the metadata can't be trusted: {}", e.message), ..e })?;
+    if trust.is_some_and(|t| t.query) && entity != doc.root_element() {
+        return Err(MetadataRefused { reason: "not_one_entity", message: format!("the MDQ answer must be {entity_id}'s EntityDescriptor alone, not an EntitiesDescriptor: check SSO_<ID>_IDP_MDQ_URL is the MDQ server's base URL") });
     }
-    read_idp(entity, entity_id, signs_requests, binding, response).map_err(MetadataRefused::bad)
+    let valid_until = match trust {
+        Some(t) => check_signed(doc.root_element(), entity, t, now_ms).map_err(|e| MetadataRefused { message: format!("the metadata can't be trusted: {}", e.message), ..e })?,
+        None => None,
+    };
+    let mut m = read_idp(entity, entity_id, signs_requests, binding, response).map_err(MetadataRefused::bad)?;
+    m.valid_until = valid_until;
+    Ok(m)
 }
 
 /// What we need from the IdP's `EntityDescriptor`.
@@ -498,7 +556,7 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: Reques
     if response == ResponseBinding::Artifact && artifact_resolution.is_empty() {
         return Err("the metadata has no SOAP ArtifactResolutionService on https: set SSO_<ID>_RESPONSE_BINDING=post for this provider, or turn on artifact resolution at the IdP".into());
     }
-    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution })
+    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution, valid_until: None })
 }
 
 /// Whether a native provider takes encrypted assertions (`SSO_<ID>_ENCRYPTED_ASSERTIONS`,
@@ -2656,7 +2714,7 @@ pub(crate) mod tests {
     }
 
     fn trust(signers: &[&Signer], require: bool) -> MetadataTrust {
-        MetadataTrust { certs: signers.iter().map(|s| s.cert()).collect(), require }
+        MetadataTrust { certs: signers.iter().map(|s| s.cert()).collect(), require, query: false }
     }
 
     fn load(xml: &str, t: &MetadataTrust) -> Result<IdpMetadata, &'static str> {
@@ -2729,6 +2787,51 @@ pub(crate) mod tests {
         };
         assert!(load(&signed_metadata(&nested(NOW + 1_000), anchor), &t).is_ok());
         assert_eq!(load(&signed_metadata(&nested(NOW - 1_000), anchor), &t).unwrap_err(), "expired", "an expired middle level");
+        let m = load(&signed_metadata(&nested(NOW + 5_000), anchor), &t).unwrap();
+        assert_eq!(m.valid_until, Some(NOW + 5_000), "the earliest validUntil on the way, kept for later");
+        assert!(m.valid_at(NOW + 4_999) && !m.valid_at(NOW + 5_000));
+        assert_eq!(load(&signed_metadata(&aggregate(&entity), anchor), &t).unwrap().valid_until, None, "signed without a validUntil");
+        let unsigned_until = format!(r#"<md:EntitiesDescriptor xmlns:md="{METADATA}" validUntil="{}">{entity}</md:EntitiesDescriptor>"#, instant(NOW + 1_000));
+        assert_eq!(parse_idp_metadata(&unsigned_until, IDP, false).unwrap().valid_until, None, "unsigned metadata's validUntil vouches for nothing, so it ends nothing");
+    }
+
+    #[test]
+    fn mdq_requests_keep_the_entity_id_in_one_path_segment() {
+        assert_eq!(mdq_url("https://mdq.example.org", "https://idp.example.edu/idp/shibboleth"), "https://mdq.example.org/entities/https%3A%2F%2Fidp.example.edu%2Fidp%2Fshibboleth");
+        assert_eq!(mdq_url("https://mdq.example.org/global/", "urn:mace:a b"), "https://mdq.example.org/global/entities/urn%3Amace%3Aa%20b", "one slash before entities");
+        assert_eq!(mdq_url("https://mdq.example.org", "http://x/?a=1&b#c..~_-"), "https://mdq.example.org/entities/http%3A%2F%2Fx%2F%3Fa%3D1%26b%23c..~_-");
+        assert_eq!(mdq_url("https://mdq.example.org", "https://idp.example/é"), "https://mdq.example.org/entities/https%3A%2F%2Fidp.example%2F%C3%A9", "UTF-8, byte by byte");
+    }
+
+    #[test]
+    fn mdq_answers_are_the_entity_alone_signed_and_short_lived() {
+        let anchor = &signers()[1];
+        let t = MetadataTrust { query: true, ..trust(&[anchor], true) };
+        let until = |ms: i64| metadata().replacen("<md:EntityDescriptor ", &format!(r#"<md:EntityDescriptor validUntil="{}" "#, instant(ms)), 1);
+        let week = NOW + 7 * 86_400_000;
+        let m = load(&signed_metadata(&until(week), anchor), &t).unwrap();
+        assert_eq!((m.valid_until, m.certs[0].sha256.as_str()), (Some(week), signers()[0].cert().sha256.as_str()));
+        assert!(load(&signed_metadata(&until(NOW + MDQ_MAX_VALIDITY_MS), anchor), &t).is_ok(), "up to the limit");
+
+        assert_eq!(load(&until(week), &t).unwrap_err(), "unsigned");
+        assert_eq!(load(&until(week), &MetadataTrust { require: false, ..t.clone() }).unwrap_err(), "unsigned", "never taken unsigned, whatever require says");
+        assert_eq!(load(&signed_metadata(&until(week), &signers()[0]), &t).unwrap_err(), "bad_signature");
+        assert_eq!(load(&signed_metadata(&metadata(), anchor), &t).unwrap_err(), "no_valid_until", "a copy that would vouch forever");
+        assert_eq!(load(&signed_metadata(&until(NOW + MDQ_MAX_VALIDITY_MS + 1_000), anchor), &t).unwrap_err(), "valid_too_long");
+        assert_eq!(load(&signed_metadata(&until(NOW - 1), anchor), &t).unwrap_err(), "expired", "an old answer served again");
+        assert!(load(&signed_metadata(&metadata(), anchor), &MetadataTrust { query: false, ..t.clone() }).is_ok(), "other sources need no validUntil, as before");
+
+        // Not one entity, signed as a whole: an aggregate, signed whole or only around our entity.
+        let entity = until(week).replacen(r#"<?xml version="1.0"?>"#, "", 1);
+        let aggregate = |inner: &str| format!(r#"<md:EntitiesDescriptor xmlns:md="{METADATA}" validUntil="{}">{inner}</md:EntitiesDescriptor>"#, instant(week));
+        for xml in [signed_metadata(&aggregate(&entity), anchor), aggregate(&signed_metadata(&entity, anchor))] {
+            let e = load_idp_metadata(&xml, IDP, false, RequestBinding::Auto, ResponseBinding::Post, Some(&t), NOW).unwrap_err();
+            assert!(e.reason == "not_one_entity" && e.untrusted() && e.message.contains("EntityDescriptor alone"), "{e:?}");
+        }
+        let other = signed_metadata(&until(week).replace(IDP, "https://other.example/saml"), anchor);
+        assert!(load_idp_metadata(&other, IDP, false, RequestBinding::Auto, ResponseBinding::Post, Some(&t), NOW).unwrap_err().message.contains("is for https://other.example/saml"), "another entity's answer");
+        let e = load_idp_metadata(&until(week), IDP, false, RequestBinding::Auto, ResponseBinding::Post, Some(&t), NOW).unwrap_err();
+        assert!(e.untrusted(), "audited as a refusal");
     }
 
     #[test]

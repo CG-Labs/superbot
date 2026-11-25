@@ -2009,6 +2009,10 @@ fn saml_summary(v: &Value) -> String {
         return out;
     }
     out += &format!(":\n    Sign-in URL: {}\n", idp["ssoUrl"].as_str().unwrap_or_default());
+    if !idp["validUntil"].is_null() {
+        let state = if idp["expired"].as_bool().unwrap_or(false) { " (expired: no longer used)" } else { "" };
+        out += &format!("    Valid until: {}{state}\n", day(&idp["validUntil"]));
+    }
     if let Some(slo) = idp["sloUrl"].as_str() {
         let post = if idp["sloBinding"] == "post" { " (HTTP-POST)" } else { "" };
         out += &format!("    Logout URL:  {slo}{post}\n");
@@ -4498,6 +4502,18 @@ mod tests {
         let out = saml_summary(&v);
         assert!(out.contains("  Responses over:           HTTP-Artifact, resolved over SOAP (RESPONSE_BINDING=artifact)\n"), "{out}");
         assert!(out.contains("    Artifact resolution URL 1:  https://idp.example/ars\n"), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_mdq_and_how_long_the_metadata_is_valid() {
+        let mut v = json!({ "provider": "corp", "label": "Corp", "source": "mdq", "from": "https://mdq.example.org/entities/x", "idp": { "ssoUrl": "https://idp.example/sso", "certificates": [], "validUntil": null } });
+        let out = saml_summary(&v);
+        assert!(out.contains("  IdP metadata from mdq (https://mdq.example.org/entities/x):\n") && !out.contains("Valid until"), "{out}");
+        v["idp"]["validUntil"] = json!(1_800_000_000_000i64);
+        v["idp"]["expired"] = json!(false);
+        assert!(saml_summary(&v).contains("    Valid until: 2027-01-15\n"));
+        v["idp"]["expired"] = json!(true);
+        assert!(saml_summary(&v).contains("    Valid until: 2027-01-15 (expired: no longer used)\n"));
     }
 
     #[test]
