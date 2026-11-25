@@ -1,5 +1,6 @@
 //! A native SAML 2.0 service provider (ADR 0127): Web Browser SSO, SP-initiated only, an
-//! HTTP-Redirect AuthnRequest out and an HTTP-POST Response back.
+//! HTTP-Redirect AuthnRequest out and an HTTP-POST Response back, or an artifact the response
+//! is fetched by over SOAP (`saml_artifact`, ADR 0268), then held to the same checks.
 //!
 //! What a response must be to sign anyone in, checked here in this order:
 //!
@@ -62,8 +63,10 @@ pub const ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 const METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
 const POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
 const REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
-/// The SOAP binding: back-channel logout, server to server (ADR 0208).
+/// The SOAP binding: back-channel logout, server to server (ADR 0208), and artifact resolution (ADR 0268).
 pub(super) const SOAP: &str = "urn:oasis:names:tc:SAML:2.0:bindings:SOAP";
+/// The HTTP-Artifact binding: the browser carries a reference, not the response (ADR 0268).
+pub const ARTIFACT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact";
 pub(super) const SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
 const BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 const PERSISTENT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent";
@@ -242,6 +245,41 @@ impl RequestBinding {
     }
 }
 
+/// How a native provider asks the IdP to send its response (`SSO_<ID>_RESPONSE_BINDING`, ADR
+/// 0268). Post: the browser posts it to the ACS. Artifact: the browser brings only an artifact,
+/// and botd fetches the response from the IdP's ArtifactResolutionService over SOAP, so the
+/// assertion never passes through the browser; metadata without that service is refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ResponseBinding {
+    #[default]
+    Post,
+    Artifact,
+}
+
+impl ResponseBinding {
+    pub fn parse(s: &str) -> Option<ResponseBinding> {
+        match s.to_ascii_lowercase().as_str() {
+            "post" => Some(ResponseBinding::Post),
+            "artifact" => Some(ResponseBinding::Artifact),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResponseBinding::Post => "post",
+            ResponseBinding::Artifact => "artifact",
+        }
+    }
+
+    fn uri(self) -> &'static str {
+        match self {
+            ResponseBinding::Post => POST,
+            ResponseBinding::Artifact => ARTIFACT,
+        }
+    }
+}
+
 /// The binding AuthnRequests go to the IdP's SingleSignOnService over.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Binding {
@@ -272,6 +310,9 @@ pub struct IdpMetadata {
     /// The SOAP SingleLogoutService on https, if it has one: botd signs out of the IdP over the
     /// back channel when there's no browser to send (ADR 0208).
     pub slo_soap: Option<String>,
+    /// The SOAP ArtifactResolutionServices on https, by their `index`: an artifact names the
+    /// one it is resolved at (ADR 0268).
+    pub artifact_resolution: Vec<(u16, String)>,
 }
 
 /// Where the IdP takes logout messages: requests at `location`, our responses at `response`,
@@ -340,7 +381,7 @@ impl std::fmt::Display for MetadataRefused {
 /// `load_idp_metadata` without a trust anchor, for tests that don't care about one.
 #[cfg(test)]
 pub fn parse_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool) -> Result<IdpMetadata, String> {
-    load_idp_metadata(xml, entity_id, signs_requests, RequestBinding::Auto, None, 0).map_err(|e| e.message)
+    load_idp_metadata(xml, entity_id, signs_requests, RequestBinding::Auto, ResponseBinding::Post, None, 0).map_err(|e| e.message)
 }
 
 /// The text of an element, all of it: a comment inside doesn't cut it short. Exclusive C14N
@@ -380,10 +421,11 @@ fn check_signed(root: Node, entity: Node, t: &MetadataTrust, now_ms: i64) -> Res
 
 /// The IdP `entity_id` in `xml` (an `EntityDescriptor`, or one inside `EntitiesDescriptor`).
 /// `signs_requests`: this provider signs its AuthnRequests (`SIGN_REQUESTS`), so an IdP that
-/// wants them signed is fine. `binding` picks the SingleSignOnService (ADR 0235). With `trust`
-/// (ADR 0151), only metadata signed by its certificate, and not expired at `now_ms`, is read
-/// (`check_signed`). The message says what to fix, for the admin who set it up.
-pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, binding: RequestBinding, trust: Option<&MetadataTrust>, now_ms: i64) -> Result<IdpMetadata, MetadataRefused> {
+/// wants them signed is fine. `binding` picks the SingleSignOnService (ADR 0235); `response`
+/// is how the IdP is asked to answer, and artifacts need its ArtifactResolutionService (ADR
+/// 0268). With `trust` (ADR 0151), only metadata signed by its certificate, and not expired at
+/// `now_ms`, is read (`check_signed`). The message says what to fix, for the admin who set it up.
+pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, binding: RequestBinding, response: ResponseBinding, trust: Option<&MetadataTrust>, now_ms: i64) -> Result<IdpMetadata, MetadataRefused> {
     if xml.len() > MAX_METADATA {
         return Err(MetadataRefused::bad("the metadata is over 1 MB"));
     }
@@ -397,11 +439,11 @@ pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, bindi
     if let Some(t) = trust {
         check_signed(doc.root_element(), entity, t, now_ms).map_err(|e| MetadataRefused { message: format!("the metadata can't be trusted: {}", e.message), ..e })?;
     }
-    read_idp(entity, entity_id, signs_requests, binding).map_err(MetadataRefused::bad)
+    read_idp(entity, entity_id, signs_requests, binding, response).map_err(MetadataRefused::bad)
 }
 
 /// What we need from the IdP's `EntityDescriptor`.
-fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: RequestBinding) -> Result<IdpMetadata, String> {
+fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: RequestBinding, response: ResponseBinding) -> Result<IdpMetadata, String> {
     let idp = elements(entity)
         .into_iter()
         .find(|n| is(*n, METADATA, "IDPSSODescriptor") && n.attribute("protocolSupportEnumeration").is_some_and(|p| p.split_ascii_whitespace().any(|p| p == PROTOCOL)))
@@ -446,7 +488,17 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: Reques
         .filter_map(|n| n.attribute("Location").map(str::trim))
         .find(|l| super::secure_url(l))
         .map(String::from);
-    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap })
+    let mut artifact_resolution: Vec<(u16, String)> = Vec::new();
+    for n in elements(idp).into_iter().filter(|n| is(*n, METADATA, "ArtifactResolutionService") && n.attribute("Binding") == Some(SOAP)) {
+        let (Some(index), Some(location)) = (n.attribute("index").and_then(|i| i.trim().parse::<u16>().ok()), n.attribute("Location").map(str::trim)) else { continue };
+        if super::secure_url(location) && !artifact_resolution.iter().any(|(i, _)| *i == index) {
+            artifact_resolution.push((index, location.to_string()));
+        }
+    }
+    if response == ResponseBinding::Artifact && artifact_resolution.is_empty() {
+        return Err("the metadata has no SOAP ArtifactResolutionService on https: set SSO_<ID>_RESPONSE_BINDING=post for this provider, or turn on artifact resolution at the IdP".into());
+    }
+    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution })
 }
 
 /// Whether a native provider takes encrypted assertions (`SSO_<ID>_ENCRYPTED_ASSERTIONS`,
@@ -554,8 +606,8 @@ fn encryption_methods(aes_cbc: AesCbc) -> String {
 /// be signed; with an SP key, also its certificates and where to send logout messages; with
 /// encryption certificates (`encryption`, base64 DER), the keys to encrypt assertions to and
 /// the ciphers taken (`aes_cbc`). During a rollover each use lists the key in use first, then
-/// the next one (ADR 0181).
-pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc) -> String {
+/// the next one (ADR 0181). The ACS takes responses over `response` only (ADR 0268).
+pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc, response: ResponseBinding) -> String {
     let signed = signing.is_some_and(|s| s.sign_requests);
     let key_info = |cert: &str| format!(r#"<ds:KeyInfo xmlns:ds="{}"><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#, xmldsig::DSIG);
     let mut keys = String::new();
@@ -578,11 +630,12 @@ pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], ae
 <md:EntityDescriptor xmlns:md="{METADATA}" entityID="{}">
   <md:SPSSODescriptor AuthnRequestsSigned="{signed}" WantAssertionsSigned="true" protocolSupportEnumeration="{PROTOCOL}">{keys}
     <md:NameIDFormat>{PERSISTENT}</md:NameIDFormat>
-    <md:AssertionConsumerService Binding="{POST}" Location="{}" index="0" isDefault="true"/>
+    <md:AssertionConsumerService Binding="{}" Location="{}" index="0" isDefault="true"/>
   </md:SPSSODescriptor>
 </md:EntityDescriptor>
 "#,
         escape(sp.entity_id),
+        response.uri(),
         escape(sp.acs)
     )
 }
@@ -861,18 +914,20 @@ pub fn request_id() -> String {
 /// The AuthnRequest XML. The NameID format is left to the IdP's settings for the app. With
 /// `authn` (ADR 0190), it asks for one of those classes, in that order, with `exact`
 /// comparison: the one comparison every IdP takes (Entra ID refuses the others). With `force`
-/// (ADR 0225), it asks the IdP to sign the person in again rather than reuse its session.
-pub fn authn_request(sp: &Sp, id: &str, destination: &str, now_ms: i64, authn: Option<&AuthnContext>, force: bool) -> String {
+/// (ADR 0225), it asks the IdP to sign the person in again rather than reuse its session. The
+/// IdP answers over `response` (ADR 0268).
+pub fn authn_request(sp: &Sp, id: &str, destination: &str, now_ms: i64, authn: Option<&AuthnContext>, force: bool, response: ResponseBinding) -> String {
     let requested = match authn.filter(|a| a.request && !a.accepted.is_empty()) {
         Some(a) => format!(r#"<samlp:RequestedAuthnContext Comparison="exact">{}</samlp:RequestedAuthnContext>"#, a.accepted.iter().map(|c| format!("<saml:AuthnContextClassRef>{}</saml:AuthnContextClassRef>", escape(c))).collect::<String>()),
         None => String::new(),
     };
     let force = if force { r#" ForceAuthn="true""# } else { "" };
     format!(
-        r#"<samlp:AuthnRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{id}" Version="2.0" IssueInstant="{}" Destination="{}"{force} AssertionConsumerServiceURL="{}" ProtocolBinding="{POST}"><saml:Issuer>{}</saml:Issuer><samlp:NameIDPolicy AllowCreate="true"/>{requested}</samlp:AuthnRequest>"#,
+        r#"<samlp:AuthnRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}" ID="{id}" Version="2.0" IssueInstant="{}" Destination="{}"{force} AssertionConsumerServiceURL="{}" ProtocolBinding="{}"><saml:Issuer>{}</saml:Issuer><samlp:NameIDPolicy AllowCreate="true"/>{requested}</samlp:AuthnRequest>"#,
         instant(now_ms),
         escape(destination),
         escape(sp.acs),
+        response.uri(),
         escape(sp.entity_id)
     )
 }
@@ -1147,7 +1202,16 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     }
     let bytes = xmldsig::base64(posted).ok_or_else(bad)?;
     let xml = String::from_utf8(bytes).map_err(|_| bad())?;
-    let doc = xmldsig::parse(&xml)?;
+    check_response_xml(&xml, e)
+}
+
+/// `check_response` for the response XML itself: what an artifact resolves to (ADR 0268).
+pub fn check_response_xml(xml: &str, e: &Expect) -> Result<Checked, Refused> {
+    let bad = || Refused("bad_response", None);
+    if xml.len() > MAX_RESPONSE {
+        return Err(bad());
+    }
+    let doc = xmldsig::parse(xml)?;
     let response = doc.root_element();
     if !is(response, PROTOCOL, "Response") || response.attribute("Version") != Some("2.0") {
         return Err(bad());
@@ -1324,7 +1388,7 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let email = pick(&e.attributes.email, &EMAIL_ATTRIBUTES).filter(|m| m.len() <= 254 && crate::users::valid_email(m)).map(String::from);
     let name = pick(&e.attributes.name, &NAME_ATTRIBUTES).map(|n| crate::audit::clip(n, 100));
     let how = read_authn(assertion, e.attributes.authn_methods.as_deref());
-    let claims = Claims { issuer: e.idp.entity_id.clone(), subject: super::saml::subject(raw), tenant: None, email, name, username: None, authn_context: how.class().map(String::from), encryption };
+    let claims = Claims { issuer: e.idp.entity_id.clone(), subject: super::saml::subject(raw), tenant: None, email, name, username: None, authn_context: how.class().map(String::from), encryption, response_binding: None };
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
@@ -1383,6 +1447,13 @@ pub mod test_idp {
     /// `xml` with a SOAP SingleLogoutService at `location` added (ADR 0208).
     pub fn with_soap_slo(xml: &str, location: &str) -> String {
         xml.replacen("<md:NameIDFormat>", &format!(r#"<md:SingleLogoutService Binding="{SOAP}" Location="{location}"/><md:NameIDFormat>"#), 1)
+    }
+
+    /// `xml` with a SOAP ArtifactResolutionService at `location`, as endpoint `index`, added
+    /// ahead of the rest, where the schema puts it (ADR 0268).
+    pub fn with_artifact_resolution(xml: &str, location: &str, index: u16) -> String {
+        let at = xml.find("<md:SingleLogoutService").or_else(|| xml.find("<md:NameIDFormat>")).unwrap();
+        format!(r#"{}<md:ArtifactResolutionService Binding="{SOAP}" Location="{location}" index="{index}"/>{}"#, &xml[..at], &xml[at..])
     }
 
     /// The parts of a response, each one replaceable before it is signed.
@@ -1636,7 +1707,7 @@ pub(crate) mod tests {
 
     #[test]
     fn logout_goes_over_http_post_when_thats_all_the_idp_offers() {
-        let slo = |xml: &str, b: RequestBinding| load_idp_metadata(xml, IDP, false, b, None, 0).unwrap().slo.map(|s| (s.location, s.binding));
+        let slo = |xml: &str, b: RequestBinding| load_idp_metadata(xml, IDP, false, b, ResponseBinding::Post, None, 0).unwrap().slo.map(|s| (s.location, s.binding));
         let (redirect, post) = ((SLO_URL.to_string(), Binding::Redirect), (format!("{SLO_URL}/post"), Binding::Post));
         let only_post = with_post_slo(&metadata());
         let both = with_post_slo(&with_slo(&metadata()));
@@ -1698,7 +1769,7 @@ pub(crate) mod tests {
             let key = SpKey::from_pem(&key_pem, &cert_pem).unwrap();
             assert_eq!(key.sig_alg(), sig_alg);
             assert!(key.decrypting().is_none(), "IdPs encrypt with RSA-OAEP only");
-            let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, false);
+            let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, false, ResponseBinding::Post);
             let q = redirect_query("SAMLRequest", &xml, Some("s"), Some(&key));
             assert!(q.contains(&format!("SigAlg={}", form(sig_alg))), "{q}");
             let r = from_redirect(&q).unwrap();
@@ -1714,7 +1785,7 @@ pub(crate) mod tests {
     #[test]
     fn redirect_messages_are_signed_over_the_query_as_sent() {
         let (key, _) = SpKey::generate("sp").unwrap();
-        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, false);
+        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, false, ResponseBinding::Post);
         let q = redirect_query("SAMLRequest", &xml, Some("state+/="), Some(&key));
         let names: Vec<&str> = q.split('&').map(|p| p.split('=').next().unwrap()).collect();
         assert_eq!(names, ["SAMLRequest", "RelayState", "SigAlg", "Signature"], "in the order the binding signs them");
@@ -1752,7 +1823,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_request_binding_picks_the_single_sign_on_service() {
-        let load = |xml: &str, b: RequestBinding| load_idp_metadata(xml, IDP, false, b, None, 0).map_err(|e| e.message);
+        let load = |xml: &str, b: RequestBinding| load_idp_metadata(xml, IDP, false, b, ResponseBinding::Post, None, 0).map_err(|e| e.message);
         let post = format!("{SSO_URL}/post");
         let post_only = metadata().replace(&format!(r#"<md:SingleSignOnService Binding="{REDIRECT}" Location="{SSO_URL}"/>"#), "");
         let redirect_only = metadata().replace(&format!(r#"<md:SingleSignOnService Binding="{POST}" Location="{post}"/>"#), "");
@@ -1777,7 +1848,7 @@ pub(crate) mod tests {
     #[test]
     fn post_messages_carry_the_request_signed_inside() {
         let (key, _) = SpKey::generate("sp").unwrap();
-        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, true);
+        let xml = authn_request(&Sp { entity_id: SP, acs: ACS }, REQ, SSO_URL, NOW, None, true, ResponseBinding::Post);
         let signed = key.sign_enveloped(&xml, REQ).unwrap();
         let doc = roxmltree::Document::parse(&signed).unwrap();
         let root = doc.root_element();
@@ -1814,7 +1885,7 @@ pub(crate) mod tests {
         let slo = "https://bot.example.com/api/auth/sso/okta/slo";
         let slo_soap = "https://bot.example.com/api/auth/sso/okta/slo/soap";
         for sign_requests in [false, true] {
-            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off);
+            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off, ResponseBinding::Post);
             let doc = roxmltree::Document::parse(&md).unwrap();
             let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
             assert_eq!(spsso.attribute("AuthnRequestsSigned"), Some(if sign_requests { "true" } else { "false" }));
@@ -1825,13 +1896,13 @@ pub(crate) mod tests {
             let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
             assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         }
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off).contains("SingleLogoutService"), "no key, no logout");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post).contains("SingleLogoutService"), "no key, no logout");
     }
 
     #[test]
     fn writes_sp_metadata_and_a_redirect_authn_request() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, &[], AesCbc::Off);
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let root = doc.root_element();
         assert_eq!(root.attribute("entityID"), Some(SP));
@@ -1841,7 +1912,7 @@ pub(crate) mod tests {
 
         let id = request_id();
         assert!(id.starts_with('_') && id.len() == 41);
-        let xml = authn_request(&sp, &id, SSO_URL, NOW, None, false);
+        let xml = authn_request(&sp, &id, SSO_URL, NOW, None, false, ResponseBinding::Post);
         let encoded = redirect_encode(&xml);
         let inflated = miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(encoded).unwrap()).unwrap();
         assert_eq!(String::from_utf8(inflated).unwrap(), xml, "raw DEFLATE, as the binding says");
@@ -1854,8 +1925,42 @@ pub(crate) mod tests {
         );
         assert_eq!(r.attribute("IssueInstant"), Some("2027-01-15T08:00:00Z"));
         assert_eq!(doc.descendants().find(|n| is(*n, ASSERTION, "Issuer")).and_then(|n| n.text()), Some(SP));
-        let odd = authn_request(&Sp { entity_id: "urn:a&b<c>", acs: ACS }, &id, SSO_URL, NOW, None, false);
+        let odd = authn_request(&Sp { entity_id: "urn:a&b<c>", acs: ACS }, &id, SSO_URL, NOW, None, false, ResponseBinding::Post);
         assert!(roxmltree::Document::parse(&odd).is_ok(), "escaped");
+    }
+
+    #[test]
+    fn artifact_responses_are_asked_for_and_offered_alone() {
+        let sp = Sp { entity_id: SP, acs: ACS };
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Artifact);
+        let doc = roxmltree::Document::parse(&md).unwrap();
+        let acs: Vec<_> = doc.descendants().filter(|n| is(*n, METADATA, "AssertionConsumerService")).map(|n| (n.attribute("Binding"), n.attribute("Location"), n.attribute("index"))).collect();
+        assert_eq!(acs, [(Some(ARTIFACT), Some(ACS), Some("0"))], "one ACS, so the IdP can't fall back to posting");
+        let xml = authn_request(&sp, &request_id(), SSO_URL, NOW, None, false, ResponseBinding::Artifact);
+        assert_eq!(roxmltree::Document::parse(&xml).unwrap().root_element().attribute("ProtocolBinding"), Some(ARTIFACT));
+        assert_eq!((ResponseBinding::parse("ARTIFACT"), ResponseBinding::parse("Post"), ResponseBinding::parse("redirect")), (Some(ResponseBinding::Artifact), Some(ResponseBinding::Post), None));
+    }
+
+    #[test]
+    fn idp_metadata_names_its_artifact_resolution_services() {
+        let load = |xml: &str, response| load_idp_metadata(xml, IDP, false, RequestBinding::Auto, response, None, NOW);
+        let plain = test_idp::metadata();
+        assert_eq!(load(&plain, ResponseBinding::Post).unwrap().artifact_resolution, []);
+        let e = load(&plain, ResponseBinding::Artifact).unwrap_err();
+        assert!(e.message.contains("no SOAP ArtifactResolutionService on https") && e.message.contains("RESPONSE_BINDING=post"), "{e}");
+
+        let ars = "https://idp.example.com/ars";
+        let two = test_idp::with_artifact_resolution(&test_idp::with_artifact_resolution(&plain, ars, 2), "https://idp.example.com/ars2", 1);
+        assert_eq!(load(&two, ResponseBinding::Artifact).unwrap().artifact_resolution, [(2, ars.to_string()), (1, "https://idp.example.com/ars2".to_string())]);
+        for (bad, why) in [
+            (test_idp::with_artifact_resolution(&plain, "http://idp.example.com/ars", 0), "not https"),
+            (test_idp::with_artifact_resolution(&plain, ars, 0).replace(r#"index="0""#, r#"index="x""#), "no usable index"),
+            (test_idp::with_artifact_resolution(&plain, ars, 0).replace(&format!(r#"ArtifactResolutionService Binding="{SOAP}""#), &format!(r#"ArtifactResolutionService Binding="{POST}""#)), "not SOAP"),
+        ] {
+            assert!(load(&bad, ResponseBinding::Artifact).is_err(), "{why}");
+        }
+        let dup = test_idp::with_artifact_resolution(&test_idp::with_artifact_resolution(&plain, ars, 0), "https://idp.example.com/later", 0);
+        assert_eq!(load(&dup, ResponseBinding::Artifact).unwrap().artifact_resolution, [(0, ars.to_string())], "the first one for an index");
     }
 
     #[test]
@@ -2036,21 +2141,21 @@ pub(crate) mod tests {
     fn authn_requests_ask_for_the_classes_only_when_told_to() {
         let sp = Sp { entity_id: SP, acs: ACS };
         let mut c = required(&[MFA, "urn:a&b"]);
-        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, Some(&c), false).contains("RequestedAuthnContext"), "required, but not requested");
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, Some(&c), false, ResponseBinding::Post).contains("RequestedAuthnContext"), "required, but not requested");
         c.request = true;
-        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&c), false);
+        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&c), false, ResponseBinding::Post);
         assert!(xml.contains(&format!(r#"<samlp:NameIDPolicy AllowCreate="true"/><samlp:RequestedAuthnContext Comparison="exact"><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef><saml:AuthnContextClassRef>urn:a&amp;b</saml:AuthnContextClassRef></samlp:RequestedAuthnContext></samlp:AuthnRequest>"#)), "after NameIDPolicy, as the schema orders them, in the admin's order: {xml}");
         let doc = roxmltree::Document::parse(&xml).unwrap();
         let refs: Vec<&str> = doc.descendants().filter(|n| is(*n, ASSERTION, "AuthnContextClassRef")).filter_map(|n| n.text()).collect();
         assert_eq!(refs, [MFA, "urn:a&b"]);
-        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None, false).contains("RequestedAuthnContext"));
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None, false, ResponseBinding::Post).contains("RequestedAuthnContext"));
     }
 
     #[test]
     fn authn_requests_ask_the_idp_to_sign_in_again_only_when_told_to() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None, false).contains("ForceAuthn"));
-        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&AuthnContext { accepted: vec![MFA.into()], request: true }), true);
+        assert!(!authn_request(&sp, REQ, SSO_URL, NOW, None, false, ResponseBinding::Post).contains("ForceAuthn"));
+        let xml = authn_request(&sp, REQ, SSO_URL, NOW, Some(&AuthnContext { accepted: vec![MFA.into()], request: true }), true, ResponseBinding::Post);
         let doc = roxmltree::Document::parse(&xml).unwrap();
         assert_eq!(doc.root_element().attribute("ForceAuthn"), Some("true"));
         assert!(xml.contains("RequestedAuthnContext"), "beside a requested class: {xml}");
@@ -2555,7 +2660,7 @@ pub(crate) mod tests {
     }
 
     fn load(xml: &str, t: &MetadataTrust) -> Result<IdpMetadata, &'static str> {
-        load_idp_metadata(xml, IDP, false, RequestBinding::Auto, Some(t), NOW).map_err(|e| e.reason)
+        load_idp_metadata(xml, IDP, false, RequestBinding::Auto, ResponseBinding::Post, Some(t), NOW).map_err(|e| e.reason)
     }
 
     #[test]
@@ -2582,7 +2687,7 @@ pub(crate) mod tests {
         assert_eq!(load(&commented, &required).unwrap().certs[0].sha256, signers()[0].cert().sha256);
         let sha1 = signed.replace(xmldsig::RSA_SHA256, "http://www.w3.org/2000/09/xmldsig#rsa-sha1");
         assert_eq!(load(&sha1, &required).unwrap_err(), "weak_algorithm");
-        assert_eq!(load_idp_metadata(&metadata(), IDP, false, RequestBinding::Auto, Some(&required), NOW).unwrap_err().message, "the metadata can't be trusted: it isn't signed, and signed metadata is required");
+        assert_eq!(load_idp_metadata(&metadata(), IDP, false, RequestBinding::Auto, ResponseBinding::Post, Some(&required), NOW).unwrap_err().message, "the metadata can't be trusted: it isn't signed, and signed metadata is required");
     }
 
     #[test]
@@ -2631,7 +2736,7 @@ pub(crate) mod tests {
         let sp = Sp { entity_id: SP, acs: ACS };
         let (sign, _) = SpKey::generate("sp").unwrap();
         let enc = &enc_keys()[0];
-        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off);
+        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off, ResponseBinding::Post);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<String> = elements(spsso).iter().map(|n| format!("{}{}", n.tag_name().name(), n.attribute("use").map(|u| format!("/{u}")).unwrap_or_default())).collect();
@@ -2646,10 +2751,10 @@ pub(crate) mod tests {
         let mut r = encrypted();
         r.encrypt = Some(ok);
         assert_eq!(enc_reason(&r.xml()), "ok");
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off).contains("encryption"), "off: nothing to encrypt to");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post).contains("encryption"), "off: nothing to encrypt to");
 
         // With AES-CBC taken (ADR 0218), it's offered after GCM, so an IdP that picks the first keeps GCM.
-        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse);
+        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse, ResponseBinding::Post);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let methods: Vec<&str> = doc.descendants().filter(|n| is(*n, METADATA, "EncryptionMethod")).filter_map(|n| n.attribute("Algorithm")).collect();
         assert_eq!(&methods[..4], [AES256_GCM, AES128_GCM, AES256_CBC, AES128_CBC]);

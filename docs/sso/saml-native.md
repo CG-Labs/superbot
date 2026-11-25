@@ -182,6 +182,7 @@ If the IdP answers SuperBot's request with another unsolicited response, it igno
 | `SSO_<ID>_LABEL` | `Company SSO` | Button text: "Sign in with …". |
 | `SSO_<ID>_SIGN_REQUESTS` | `false` | `true`: sign AuthnRequests with the SP key ([below](#signed-authnrequests)). |
 | `SSO_<ID>_REQUEST_BINDING` | `auto` | How AuthnRequests reach the IdP: `auto` uses HTTP-Redirect when the IdP's metadata offers it, else HTTP-POST; `redirect` or `post` uses only that one ([below](#authnrequests-over-http-post)). `post` also puts logout over HTTP-POST when the IdP offers both ([logout](#logout-over-http-post)). |
+| `SSO_<ID>_RESPONSE_BINDING` | `post` | How the IdP's answer comes back: `post`, posted by the browser; `artifact`, an artifact botd resolves at the IdP over SOAP ([below](#responses-over-http-artifact)). Only that one is taken. |
 | `SSO_<ID>_SP_CERT_FILE` | | Your own SP certificate (PEM), with its key as `SSO_<ID>_PRIVATE_KEY`. Without it, botd makes and keeps one. |
 | `SSO_<ID>_PRIVATE_KEY` | | With `SP_CERT_FILE`: the SP's private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_ENCRYPTED_ASSERTIONS` | `off` | `allow`: take encrypted assertions as well as plain ones; `require`: only encrypted ones ([below](#encrypted-assertions)). `off` refuses them. |
@@ -217,6 +218,17 @@ Most IdPs don't need them. If yours says it wants signed requests (`WantAuthnReq
 botd sends AuthnRequests over HTTP-Redirect (in the URL) when the IdP's metadata lists an HTTP-Redirect `SingleSignOnService`, which nearly every IdP does. For an IdP that lists only HTTP-POST (some Shibboleth, PingFederate and government IdPs), botd uses that with no setting: the browser gets a page that posts the AuthnRequest to the IdP and moves on at once. To use HTTP-POST even when the IdP offers both (say, it wants signed requests in the message itself), set `SSO_CORP_REQUEST_BINDING=post`; `redirect` refuses metadata without an HTTP-Redirect URL, as before. `botctl sso saml corp` shows the binding in use.
 
 Over HTTP-POST, a signed AuthnRequest ([above](#signed-authnrequests)) carries its signature inside the XML (an enveloped XML signature after the Issuer, RSA-SHA256 or your ECDSA key's), with the same SP certificate. The page loads nothing, runs only its own script and sends no Referer; without script, it shows a **Continue** button. The IdP's answer comes back to the ACS as before, held to the same checks.
+
+## Responses over HTTP-Artifact
+
+By default the browser posts the IdP's signed response to the ACS. Some IdPs, mostly government and higher-education Shibboleth ones, can send the browser back with only an artifact, a short reference, instead. botd then fetches the response from the IdP itself over SOAP, so the assertion never passes through the browser ([ADR 0268](../adr/0268-saml-artifact-binding.md)). Set `SSO_CORP_RESPONSE_BINDING=artifact` and restart, then import SuperBot's metadata at the IdP again: its one ACS is now HTTP-Artifact, and AuthnRequests ask for it.
+
+- **The IdP's metadata** must list a SOAP `ArtifactResolutionService` on https (http only on loopback); metadata without one is refused, and the last good metadata stays.
+- **Resolving.** The artifact must be the IdP's own (its SourceID is the SHA-1 of the IdP's entity ID) and name an endpoint index its metadata lists. botd sends an `ArtifactResolve`, signed with the SP signing key, to that URL, once per artifact, over the same HTTP client as metadata (10 seconds, no redirects). The `ArtifactResponse` must answer that request, come from the IdP, be under five minutes old, and carry exactly one `Response`. Its signature is checked when there is one; TLS carries it otherwise. The `Response` inside is then held to every check a posted one is: the assertion signature is still required.
+- **One binding only.** A provider set to `artifact` refuses a posted response, and one set to `post` refuses an artifact, both as `wrong_binding`. The IdP may send the artifact by redirect (`GET` on the ACS) or by a posted form.
+- **Audit.** `auth.login` carries `responseBinding: "artifact"`. Refusals are `auth.login_failed` with `bad_artifact`, `wrong_artifact_source`, `no_artifact_resolution`, `artifact_unknown` (the IdP had nothing for it), `artifact_mismatch`, `soap_fault`, `artifact_unreachable` or `artifact_http_error`. The last two, the IdP being down, don't count against the browser's address.
+
+`botctl sso saml corp` shows `Responses over: HTTP-Artifact` and the IdP's artifact resolution URLs.
 
 ## Encrypted assertions
 

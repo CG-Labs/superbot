@@ -1856,7 +1856,7 @@ mod tests {
 
     #[tokio::test]
     async fn saved_saml_metadata_and_discovery_documents_are_read_on_the_running_server() {
-        use crate::sso::saml_sp::{RequestBinding, load_idp_metadata, test_idp};
+        use crate::sso::saml_sp::{RequestBinding, ResponseBinding, load_idp_metadata, test_idp};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let asked = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(saved.status, Status::Check);
 
         let corp = sso.provider("corp").unwrap();
-        corp.set_idp(load_idp_metadata(&test_idp::metadata(), test_idp::IDP, false, RequestBinding::Auto, None, crate::db::now()).unwrap());
+        corp.set_idp(load_idp_metadata(&test_idp::metadata(), test_idp::IDP, false, RequestBinding::Auto, ResponseBinding::Post, None, crate::db::now()).unwrap());
         let r = live(BTreeMap::new(), &store(&[]), &Started::default(), &sso, &internal(&["idp.example"])).await;
         let f = &r.findings;
         let page = by(f, "botctl sso saml corp import");

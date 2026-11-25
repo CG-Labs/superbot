@@ -16,14 +16,16 @@
 //! the signed response the IdP posts to `/acs` (`saml_sp`, `xmldsig`). Both end in the same
 //! identities, checks, and sessions as the rest. Native SAML also signs AuthnRequests when a
 //! provider asks, and does single logout at `/slo` (ADR 0137, `saml_slo`), can require
-//! IdP groups and map them to custom roles (ADR 0160, `saml_roles`), and rolls its own keys
-//! over without an outage (ADR 0181, `saml_keys`).
+//! IdP groups and map them to custom roles (ADR 0160, `saml_roles`), rolls its own keys
+//! over without an outage (ADR 0181, `saml_keys`), and can take an artifact at `/acs`
+//! instead, resolved at the IdP over SOAP (ADR 0268, `saml_artifact`).
 
 pub mod apple;
 mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_artifact;
 pub(crate) mod saml_expiry;
 pub(crate) mod saml_keys;
 pub(crate) mod saml_roles;
@@ -45,7 +47,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
 pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
-use saml_sp::{AesCbc, Binding, Encryption, IdpInitiated, KeyUse, Refused, RequestBinding, Sp, SpKey, SpSigning};
+use saml_sp::{AesCbc, Binding, Encryption, IdpInitiated, KeyUse, Refused, RequestBinding, ResponseBinding, Sp, SpKey, SpSigning};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -389,13 +391,13 @@ impl Sso {
     /// Loads IdP metadata imported with botctl, at startup.
     pub fn load_saved(&self, db: &db::Db) {
         for p in self.providers.iter().filter(|p| matches!(&p.kind, Kind::SamlSp { source: IdpSource::Saved, .. })) {
-            let Kind::SamlSp { entity_id, sign_requests, request_binding, metadata_trust, .. } = &p.kind else {
+            let Kind::SamlSp { entity_id, sign_requests, request_binding, response_binding, metadata_trust, .. } = &p.kind else {
                 continue;
             };
             let Some(xml) = db.setting(&format!("{SAML_METADATA_SETTING}{}", p.id)) else {
                 continue;
             };
-            match saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, metadata_trust.as_ref(), db::now()) {
+            match saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, *response_binding, metadata_trust.as_ref(), db::now()) {
                 Ok(m) => p.set_idp(m),
                 Err(e) => {
                     crate::obs::log::log_warn!("SSO {}: the imported IdP metadata no longer reads: {e}. Import it again: botctl sso saml {} import", p.id, p.id);
@@ -457,7 +459,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 37] = [
+const ONLY_FOR: [(&str, &[&str]); 38] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -480,6 +482,7 @@ const ONLY_FOR: [(&str, &[&str]); 37] = [
     ("NAME_ATTRIBUTE", &["saml"]),
     ("SIGN_REQUESTS", &["saml"]),
     ("REQUEST_BINDING", &["saml"]),
+    ("RESPONSE_BINDING", &["saml"]),
     ("SP_CERT_FILE", &["saml"]),
     ("ENCRYPTED_ASSERTIONS", &["saml"]),
     ("AES_CBC", &["saml"]),
@@ -499,7 +502,7 @@ const ONLY_FOR: [(&str, &[&str]); 37] = [
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 22] = [
+const SAML_NATIVE_ONLY: [&str; 23] = [
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
     "SP_ENTITY_ID",
@@ -507,6 +510,7 @@ const SAML_NATIVE_ONLY: [&str; 22] = [
     "NAME_ATTRIBUTE",
     "SIGN_REQUESTS",
     "REQUEST_BINDING",
+    "RESPONSE_BINDING",
     "SP_CERT_FILE",
     "ENCRYPTED_ASSERTIONS",
     "AES_CBC",
@@ -666,6 +670,10 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 None => RequestBinding::Auto,
                 Some(v) => RequestBinding::parse(&v).ok_or_else(|| format!("{} must be auto, redirect, or post", key("REQUEST_BINDING")))?,
             };
+            let response_binding = match var(&key("RESPONSE_BINDING")) {
+                None => ResponseBinding::Post,
+                Some(v) => ResponseBinding::parse(&v).ok_or_else(|| format!("{} must be post or artifact", key("RESPONSE_BINDING")))?,
+            };
             // The key itself is a secret, read when used; its certificate is checked now.
             let cert_file = |k: &str| -> Result<Option<String>, String> {
                 let Some(path) = var(&key(k)) else { return Ok(None) };
@@ -709,7 +717,7 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             let authn_context = authn_context(&key, var, list, &attributes)?;
             let freshness = freshness(&key, var)?;
             (
-                Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness },
+                Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness },
                 saml::LABEL,
             )
         }
@@ -790,9 +798,9 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
     };
     let label = var(&key("LABEL")).map(|l| crate::audit::clip(&l, 40)).unwrap_or_else(|| label.to_string());
     let p = Provider::new(id, &label, kind, &client_id, &scopes, jit_role);
-    if let Kind::SamlSp { source: IdpSource::File(path), entity_id, sign_requests, request_binding, metadata_trust, .. } = &p.kind {
+    if let Kind::SamlSp { source: IdpSource::File(path), entity_id, sign_requests, request_binding, response_binding, metadata_trust, .. } = &p.kind {
         let xml = std::fs::read_to_string(path).map_err(|e| format!("{}: {path}: {e}", key("IDP_METADATA_FILE")))?;
-        p.set_idp(saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, metadata_trust.as_ref(), db::now()).map_err(|e| format!("{}: {e}", key("IDP_METADATA_FILE")))?);
+        p.set_idp(saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, *response_binding, metadata_trust.as_ref(), db::now()).map_err(|e| format!("{}: {e}", key("IDP_METADATA_FILE")))?);
     }
     Ok(p)
 }
@@ -884,6 +892,9 @@ fn claim_details(d: &mut Value, c: &Claims) {
     if let Some(e) = c.encryption {
         d["assertionEncryption"] = json!(e);
     }
+    if let Some(b) = c.response_binding {
+        d["responseBinding"] = json!(b);
+    }
 }
 
 /// The IdP's type (entra, google, oidc, apple, github, saml), beside the configured id.
@@ -893,7 +904,7 @@ pub(crate) fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
 
 /// Failures anyone can cause without the IdP's help, by opening a callback URL.
 /// Native SAML's are the ones before the IdP's signature was checked.
-const UNVOUCHED: [&str; 19] = [
+const UNVOUCHED: [&str; 27] = [
     "unknown_state",
     "wrong_provider",
     "binder_mismatch",
@@ -913,6 +924,14 @@ const UNVOUCHED: [&str; 19] = [
     "wrapped",
     "bad_algorithm",
     "weak_algorithm",
+    "wrong_binding",
+    "bad_artifact",
+    "wrong_artifact_source",
+    "no_artifact_resolution",
+    "artifact_unknown",
+    "artifact_unreachable",
+    "artifact_http_error",
+    "soap_fault",
 ];
 
 /// A failed SSO sign-in. The ones in UNVOUCHED are throttled like other failed sign-ins.
@@ -1044,7 +1063,7 @@ pub async fn start(
 /// the caller just read its endpoint.
 #[allow(clippy::too_many_arguments)]
 fn send_authn_request(a: &Auth, p: &Provider, request_id: &str, state: &str, ret: &Return, binder: Option<&str>, force: bool, at: i64) -> Response {
-    let Kind::SamlSp { sp_entity_id, sign_requests, authn_context, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, sign_requests, authn_context, response_binding, .. } = &p.kind else {
         return no_store(ret.fail("sso_failed"));
     };
     // The URL and binding from one copy of the metadata, should a refresh land since.
@@ -1061,7 +1080,7 @@ fn send_authn_request(a: &Auth, p: &Provider, request_id: &str, state: &str, ret
         },
         (true, None) => return no_store(ret.fail("sso_failed")),
     };
-    let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &a.sso.acs_url(&p.id) }, request_id, endpoint, at, authn_context.as_ref(), force);
+    let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &a.sso.acs_url(&p.id) }, request_id, endpoint, at, authn_context.as_ref(), force, *response_binding);
     let mut res = match idp.sso_binding {
         Binding::Redirect => see(&saml_sp::with_redirect_query(endpoint, &saml_sp::redirect_query("SAMLRequest", &request, Some(state), key.as_deref()))),
         Binding::Post => {
@@ -1233,13 +1252,47 @@ pub async fn acs(Extension(a): Extension<Arc<Auth>>, Extension(source): Extensio
     no_store(res)
 }
 
-/// Checks a posted response against the provider's IdP metadata, with our key when it takes
-/// encrypted assertions. `request_id` is the AuthnRequest's ID, or None for an unsolicited
+/// `GET /api/auth/sso/{id}/acs`: the IdP sends the browser here with an artifact (HTTP-Artifact
+/// binding, ADR 0268). Only `SAMLart` and `RelayState` are read from the query.
+pub async fn acs_get(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let f = q.into_iter().filter(|(k, _)| k == "SAMLart" || k == "RelayState").collect();
+    acs(Extension(a), Extension(source), headers, Path(id), Form(f)).await
+}
+
+/// What reached the ACS: a posted `SAMLResponse`, or a `SAMLart` to resolve. Both, or
+/// neither, is no message.
+struct Message<'a> {
+    binding: ResponseBinding,
+    value: &'a str,
+}
+
+fn message(f: &HashMap<String, String>) -> Option<Message<'_>> {
+    match (f.get("SAMLResponse"), f.get("SAMLart")) {
+        (Some(v), None) => Some(Message { binding: ResponseBinding::Post, value: v }),
+        (None, Some(v)) => Some(Message { binding: ResponseBinding::Artifact, value: v }),
+        _ => None,
+    }
+}
+
+/// Checks a response against the provider's IdP metadata, with our key when it takes
+/// encrypted assertions. It must come over the provider's RESPONSE_BINDING; an artifact is
+/// resolved first. `request_id` is the AuthnRequest's ID, or None for an unsolicited
 /// response. A refusal says whether it counts against the client's address.
-async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, request_id: Option<&str>, at: i64) -> Result<saml_sp::Checked, (Refused, bool)> {
-    let idp = idp_metadata(a, p).await.map_err(|e| (Refused(e.0, None), false))?;
-    let Kind::SamlSp { sp_entity_id, attributes, encryption, aes_cbc, .. } = &p.kind else {
+async fn check_saml(a: &Auth, app: &AppState, p: &Provider, msg: &Message<'_>, request_id: Option<&str>, at: i64) -> Result<saml_sp::Checked, (Refused, bool)> {
+    let Kind::SamlSp { sp_entity_id, attributes, encryption, aes_cbc, response_binding, .. } = &p.kind else {
         return Err((Refused("wrong_provider", None), true));
+    };
+    if msg.binding != *response_binding {
+        return Err((Refused("wrong_binding", None), true));
+    }
+    let idp = idp_metadata(a, p).await.map_err(|e| (Refused(e.0, None), false))?;
+    let resolved = match msg.binding {
+        ResponseBinding::Post => None,
+        // The IdP being down, or our key missing, isn't the client's doing.
+        ResponseBinding::Artifact => Some(resolve_artifact(a, app, p, &idp, msg.value, at).await.map_err(|r| {
+            let counts = !matches!(r.0, "idp_error" | "artifact_unreachable" | "artifact_http_error" | "no_sp_key");
+            (r, counts)
+        })?),
     };
     let (decrypt, held) = match encryption {
         Encryption::Off => (vec![], None),
@@ -1263,7 +1316,11 @@ async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, reques
         require_encrypted: *encryption == Encryption::Require,
         aes_cbc: *aes_cbc,
     };
-    let checked = saml_sp::check_response(posted, &expect).map_err(|r| {
+    let checked = match &resolved {
+        Some(xml) => saml_sp::check_response_xml(xml, &expect),
+        None => saml_sp::check_response(msg.value, &expect),
+    };
+    let mut checked = checked.map_err(|r| {
         let counts = r.0 != "idp_error";
         (r, counts)
     })?;
@@ -1272,7 +1329,37 @@ async fn check_saml(a: &Auth, app: &AppState, p: &Provider, posted: &str, reques
             h.used(stage, at);
         }
     }
+    checked.claims.response_binding = Some(msg.binding.as_str());
     Ok(checked)
+}
+
+/// Resolves an artifact at the IdP's SOAP ArtifactResolutionService (ADR 0268): our signed
+/// ArtifactResolve goes out, and the Response inside its checked ArtifactResponse comes back.
+/// It must be the IdP's own artifact, for an endpoint its metadata names, and is sent at
+/// most once. The body is read up to `MAX_RESPONSE`, and redirects aren't followed.
+async fn resolve_artifact(a: &Auth, app: &AppState, p: &Provider, idp: &saml_sp::IdpMetadata, raw: &str, at: i64) -> Result<String, Refused> {
+    let art = saml_artifact::parse(raw, &idp.entity_id)?;
+    let Some((_, url)) = idp.artifact_resolution.iter().find(|(i, _)| *i == art.index) else {
+        return Err(Refused("no_artifact_resolution", Some(art.index.to_string())));
+    };
+    a.sso.first_use(&format!("artifact|{}|{}", p.id, art.value), at + PENDING_TTL_MS, at).map_err(|r| Refused(if r == "replayed" { "replayed" } else { "too_many" }, None))?;
+    let Kind::SamlSp { sp_entity_id, .. } = &p.kind else {
+        return Err(Refused("wrong_provider", None));
+    };
+    let id = saml_sp::request_id();
+    let signed = sp_key(app, p).and_then(|k| k.sign_enveloped(&saml_artifact::resolve_request(sp_entity_id, &id, url, &art, at), &id)).map_err(|e| {
+        crate::obs::log::log_warn!("SSO {}: can't resolve artifacts: {e}", p.id);
+        Refused("no_sp_key", None)
+    })?;
+    let sent = a.sso.http().post(url).header(header::CONTENT_TYPE, "text/xml; charset=utf-8").header("SOAPAction", saml_slo::SOAP_ACTION).body(saml_slo::soap_envelope(&signed)).send().await;
+    match sent {
+        Err(e) => Err(Refused("artifact_unreachable", Some(crate::audit::clip(&e.without_url().to_string(), 128)))),
+        // SOAP 1.1 faults come with a 500, so the body is read either way.
+        Ok(res) => match capped_body(res, saml_sp::MAX_RESPONSE).await {
+            Ok((code, body)) => saml_artifact::receive(&body, idp, &id, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("artifact_http_error", Some(code.as_u16().to_string())) } else { r }),
+            Err(e) => Err(e.refused("artifact_unreachable")),
+        },
+    }
 }
 
 async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f: &HashMap<String, String>) -> Response {
@@ -1300,11 +1387,11 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
     if a.limiter.blocked(&ip, at).is_some() {
         return ret.fail("sso_too_many");
     }
-    let Some(posted) = f.get("SAMLResponse") else {
+    let Some(msg) = message(f) else {
         failed(a, source, id, "missing_response", None, json!({}));
         return ret.fail("sso_failed");
     };
-    let checked = match check_saml(a, app, p, posted, Some(&pending.nonce), at).await {
+    let checked = match check_saml(a, app, p, &msg, Some(&pending.nonce), at).await {
         Ok(c) => c,
         Err((Refused(reason, status), counts)) => {
             if counts {
@@ -1455,11 +1542,11 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     let Some(p) = a.sso.provider(id).filter(|p| matches!(p.kind, Kind::SamlSp { idp_initiated: IdpInitiated::Restart, .. })) else {
         return expired();
     };
-    let Some(posted) = f.get("SAMLResponse") else { return expired() };
+    let Some(msg) = message(f) else { return expired() };
     if a.limiter.blocked(&ip, at).is_some() {
         return see("/login?error=sso_too_many");
     }
-    let checked = match check_saml(a, app, p, posted, None, at).await {
+    let checked = match check_saml(a, app, p, &msg, None, at).await {
         Ok(c) => c,
         // It answers a request: a sign-in that expired, or another browser's.
         Err((Refused("in_response_to_mismatch", _), _)) => return expired(),
@@ -1502,7 +1589,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let Some(p) = a.sso.provider(&id).filter(|p| p.saml_sp()) else {
         return not_found("SAML provider").into_response();
     };
-    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, aes_cbc, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, aes_cbc, response_binding, .. } = &p.kind else {
         return not_found("SAML provider").into_response();
     };
     let keys = a.app.as_ref().and_then(|app| published_keys(app, p, KeyUse::Signing).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
@@ -1514,7 +1601,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let signing_certs: Vec<&str> = keys.iter().flatten().map(|k| k.cert.as_str()).collect();
     let signing = keys.as_ref().map(|_| SpSigning { certs: &signing_certs, slo: &slo, slo_soap: &slo_soap, sign_requests: *sign_requests });
     let enc_certs: Vec<&str> = enc.iter().map(|k| k.cert.as_str()).collect();
-    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc);
+    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc, *response_binding);
     ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
 }
 
@@ -1758,8 +1845,8 @@ async fn back_channel_logout(http: &reqwest::Client, app: &AppState, b: &BackCha
         Err(e) => Err(Refused("unreachable", Some(crate::audit::clip(&e.without_url().to_string(), 128)))),
         // SOAP 1.1 faults come with a 500, so the body is read either way.
         Ok(res) => match capped_body(res, saml_sp::MAX_RESPONSE).await {
-            Some((code, body)) => saml_slo::receive_soap_response(&body, &b.idp, &b.request, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("http_error", Some(code.as_u16().to_string())) } else { r }),
-            None => Err(Refused("bad_message", None)),
+            Ok((code, body)) => saml_slo::receive_soap_response(&body, &b.idp, &b.request, db::now()).map_err(|r| if r.0 == "bad_message" && !code.is_success() { Refused("http_error", Some(code.as_u16().to_string())) } else { r }),
+            Err(e) => Err(e.refused("unreachable")),
         },
     };
     let provider = b.provider.as_str();
@@ -1783,17 +1870,35 @@ async fn back_channel_logout(http: &reqwest::Client, app: &AppState, b: &BackCha
     app.db.record(&Event::new(actor, "auth.slo_response").target("session", &b.session).outcome(outcome).details(details));
 }
 
-/// A response's status and body, or None when it's over `max` bytes or not UTF-8.
-async fn capped_body(mut res: reqwest::Response, max: usize) -> Option<(StatusCode, String)> {
+/// Why a response has no body to read.
+enum NoBody {
+    /// The connection failed or timed out partway: the other end's trouble, not the message's.
+    Cut(String),
+    /// Over the size limit, or not UTF-8.
+    Bad,
+}
+
+impl NoBody {
+    /// As a refusal: `cut` (the caller's unreachable reason) with why, or `bad_message`.
+    fn refused(self, cut: &'static str) -> Refused {
+        match self {
+            NoBody::Cut(e) => Refused(cut, Some(crate::audit::clip(&e, 128))),
+            NoBody::Bad => Refused("bad_message", None),
+        }
+    }
+}
+
+/// A response's status and body, up to `max` bytes of UTF-8.
+async fn capped_body(mut res: reqwest::Response, max: usize) -> Result<(StatusCode, String), NoBody> {
     let code = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut body = Vec::new();
-    while let Some(chunk) = res.chunk().await.ok()? {
+    while let Some(chunk) = res.chunk().await.map_err(|e| NoBody::Cut(e.without_url().to_string()))? {
         if body.len() + chunk.len() > max {
-            return None;
+            return Err(NoBody::Bad);
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body).ok().map(|b| (code, b))
+    String::from_utf8(body).map(|b| (code, b)).map_err(|_| NoBody::Bad)
 }
 
 /// Refused logout messages anyone can send: the ones before the IdP's signature was checked.
@@ -2018,7 +2123,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, request_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, sp_entity_id, source, attributes, required_groups, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, .. } = &p.kind else {
         return json!({});
     };
     let now = db::now();
@@ -2028,7 +2133,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     };
     let idp = p.idp_loaded().map(|m| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
-        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
+        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
     });
     let key = a.app.as_ref().map(|app| sp_key(app, p));
     // botd's own keys show their rollover too (ADR 0181).
@@ -2075,7 +2180,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     json!({
         "provider": p.id, "label": p.label, "ready": p.ready(), "problem": p.not_ready(),
         "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
-        "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "requestBinding": request_binding.as_str(), "spKey": sp_key, "singleLogout": slo,
+        "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "requestBinding": request_binding.as_str(), "responseBinding": response_binding.as_str(), "spKey": sp_key, "singleLogout": slo,
         "sloSoapUrl": a.sso.slo_soap_url(&p.id), "backChannelLogout": back_channel,
         "encryptedAssertions": encryption.as_str(), "aesCbc": aes_cbc.as_str(), "spEncryptionKey": enc_key,
         "signedMetadata": metadata_trust.as_ref().map_or("off", |t| if t.require { "require" } else { "allow" }),
@@ -2106,7 +2211,7 @@ pub async fn saml_status(Extension(a): Extension<Arc<Auth>>, Path(id): Path<Stri
 /// it isn't set in `.env`. Checked before it's kept: it must be for `IDP_ENTITY_ID`.
 pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let p = saml_provider(&a, &id)?;
-    let Kind::SamlSp { entity_id, source, sign_requests, request_binding, metadata_trust, .. } = &p.kind else {
+    let Kind::SamlSp { entity_id, source, sign_requests, request_binding, response_binding, metadata_trust, .. } = &p.kind else {
         return Err(bad("not a native SAML provider"));
     };
     if *source != IdpSource::Saved {
@@ -2114,7 +2219,7 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
         return Err(ApiError(StatusCode::CONFLICT, format!("SSO_{}_{var} sets this provider's IdP metadata. Change it there, or remove it to import here.", id.to_ascii_uppercase())));
     }
     let xml = v["xml"].as_str().unwrap_or("");
-    let m = match saml_sp::load_idp_metadata(xml, entity_id, *sign_requests, *request_binding, metadata_trust.as_ref(), db::now()) {
+    let m = match saml_sp::load_idp_metadata(xml, entity_id, *sign_requests, *request_binding, *response_binding, metadata_trust.as_ref(), db::now()) {
         Ok(m) => m,
         Err(e) => {
             if e.untrusted() {
@@ -2673,7 +2778,7 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_id, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness }
             if *freshness == saml_sp::Freshness::default() && entity_id == ADFS && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
@@ -2749,6 +2854,33 @@ mod tests {
         assert!(saml(&[("SSO_ADFS_REQUEST_BINDING", "post")]).is_err(), "the broker sends the bridge's");
         let e = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "oidc"), ("SSO_CORP_ISSUER", "https://idp.example"), ("SSO_CORP_CLIENT_ID", "x")], &[("SSO_CORP_REQUEST_BINDING", "post")]).err().unwrap();
         assert!(e.contains("SSO_CORP_REQUEST_BINDING is only for SSO_CORP_TYPE=saml"), "{e}");
+    }
+
+    #[test]
+    fn reads_the_response_binding() {
+        let binding = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { response_binding, .. } => *response_binding,
+            _ => unreachable!(),
+        };
+        assert_eq!(binding(&native(&[]).unwrap()), ResponseBinding::Post, "posted by default");
+        assert_eq!(binding(&native(&[("SSO_CORP_RESPONSE_BINDING", "Artifact")]).unwrap()), ResponseBinding::Artifact);
+        assert_eq!(binding(&native(&[("SSO_CORP_RESPONSE_BINDING", "post")]).unwrap()), ResponseBinding::Post);
+        let e = native(&[("SSO_CORP_RESPONSE_BINDING", "redirect")]).err().unwrap();
+        assert!(e.contains("SSO_CORP_RESPONSE_BINDING must be post or artifact"), "{e}");
+        assert!(saml(&[("SSO_ADFS_RESPONSE_BINDING", "artifact")]).is_err(), "the bridge takes the broker's answer");
+        let e = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "oidc"), ("SSO_CORP_ISSUER", "https://idp.example"), ("SSO_CORP_CLIENT_ID", "x")], &[("SSO_CORP_RESPONSE_BINDING", "artifact")]).err().unwrap();
+        assert!(e.contains("SSO_CORP_RESPONSE_BINDING is only for SSO_CORP_TYPE=saml"), "{e}");
+    }
+
+    #[test]
+    fn takes_one_message_at_the_acs() {
+        let f = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+        let posted = f(&[("SAMLResponse", "PHg+"), ("RelayState", "r")]);
+        assert!(matches!(message(&posted), Some(Message { binding: ResponseBinding::Post, value: "PHg+" })));
+        let art = f(&[("SAMLart", "AAQ"), ("RelayState", "r")]);
+        assert!(matches!(message(&art), Some(Message { binding: ResponseBinding::Artifact, value: "AAQ" })));
+        assert!(message(&f(&[("SAMLResponse", "PHg+"), ("SAMLart", "AAQ")])).is_none(), "both is no message");
+        assert!(message(&f(&[("RelayState", "r")])).is_none());
     }
 
     #[test]
