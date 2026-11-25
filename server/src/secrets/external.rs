@@ -29,6 +29,7 @@ use crate::audit::{Actor, Event, Outcome};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -192,6 +193,9 @@ pub struct ExternalStore {
     startup: Mutex<HashMap<(Scope, String), Option<Zeroizing<String>>>>,
     /// Held while a refresh runs, so two can't pile their reads onto the backend.
     refreshing: Mutex<()>,
+    /// Bumped as each refresh starts. A read that began before it doesn't cache its
+    /// answer, so a key read before a rotation can't land over the refresh's (ADR 0291).
+    epoch: AtomicU64,
 }
 
 impl ExternalStore {
@@ -205,6 +209,7 @@ impl ExternalStore {
             run_credentials: None,
             startup: Mutex::default(),
             refreshing: Mutex::new(()),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -272,6 +277,7 @@ impl ExternalStore {
     fn list_from_backend(&self, scope: &Scope) -> Result<Vec<String>, Error> {
         let target = Event::new(actor(), "secret.read").target("secret_folder", &scope.folder('/'));
         let mut details = self.details(scope, "list");
+        let started = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         match self.provider.list(scope.clone()) {
             Ok(names) => {
                 let mut names: Vec<String> = names.into_iter().filter(|n| scope.holds(n)).collect();
@@ -279,7 +285,9 @@ impl ExternalStore {
                 names.dedup();
                 let mut cached = self.names.lock().unwrap_or_else(|e| e.into_inner());
                 self.prune(&mut cached);
-                cached.insert(scope.clone(), (Instant::now(), names.clone()));
+                if self.epoch.load(std::sync::atomic::Ordering::SeqCst) == started {
+                    cached.insert(scope.clone(), (Instant::now(), names.clone()));
+                }
                 drop(cached);
                 details["names"] = json!(names.len());
                 audit(target.details(details));
@@ -295,6 +303,7 @@ impl ExternalStore {
     }
 
     fn fetch(&self, scope: &Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
+        let started = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let got = self.provider.read(scope.clone(), name);
         let key = (scope.clone(), name.to_string());
         let details = |found: Option<bool>, err: Option<&Error>| {
@@ -315,7 +324,9 @@ impl ExternalStore {
                 }
                 let mut cached = self.values.lock().unwrap_or_else(|e| e.into_inner());
                 self.prune(&mut cached);
-                cached.insert(key, (Instant::now(), v.clone()));
+                if self.epoch.load(std::sync::atomic::Ordering::SeqCst) == started {
+                    cached.insert(key, (Instant::now(), v.clone()));
+                }
                 drop(cached);
                 audit(Event::new(actor(), "secret.read").target("secret", name).details(details(Some(v.is_some()), None)));
                 Ok(v)
@@ -386,6 +397,8 @@ impl ExternalStore {
             None => None,
         };
         let _one = self.refreshing.try_lock().map_err(|_| RefreshError::Busy)?;
+        // Before anything is read, so reads still in flight from before can't cache over ours.
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let take = |name: &str| wanted.as_ref().is_none_or(|w| w.contains(name));
         let (mut keys, old, startup) = {
             let values = self.values.lock().unwrap_or_else(|e| e.into_inner());
@@ -926,6 +939,26 @@ pub(crate) mod tests {
         pub down: AtomicBool,
         pub reads: AtomicUsize,
         pub lists: AtomicUsize,
+        /// The next read or list takes its answer, says so on the first, and waits for the second.
+        pub pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl Fake {
+        fn hold(&self) {
+            let paused = self.pause.lock().unwrap().take();
+            if let Some((started, release)) = paused {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
+
+        /// Pauses the next read or list: returns (it has its answer, let it finish).
+        pub(crate) fn pause_next(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *self.pause.lock().unwrap() = Some((started_tx, release_rx));
+            (started_rx, release_tx)
+        }
     }
 
     impl Provider for Arc<Fake> {
@@ -941,14 +974,18 @@ pub(crate) mod tests {
                 return Err(Error::Unavailable("fake is down".into()));
             }
             // Empty is "no value", as the real backends answer for a deleted version or empty field.
-            Ok(self.values.lock().unwrap().get(&(scope, name.to_string())).filter(|v| !v.is_empty()).map(|v| Zeroizing::new(v.clone())))
+            let v = self.values.lock().unwrap().get(&(scope, name.to_string())).filter(|v| !v.is_empty()).map(|v| Zeroizing::new(v.clone()));
+            self.hold();
+            Ok(v)
         }
         fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
             self.lists.fetch_add(1, Ordering::SeqCst);
             if self.down.load(Ordering::SeqCst) {
                 return Err(Error::Unavailable("fake is down".into()));
             }
-            Ok(self.values.lock().unwrap().keys().filter(|(s, _)| *s == scope).map(|(_, n)| n.clone()).collect())
+            let names = self.values.lock().unwrap().keys().filter(|(s, _)| *s == scope).map(|(_, n)| n.clone()).collect();
+            self.hold();
+            Ok(names)
         }
     }
 
@@ -1399,6 +1436,44 @@ pub(crate) mod tests {
         assert_eq!(x.refresh(None).unwrap_err(), RefreshError::Busy);
         assert_eq!(f.reads.load(Ordering::SeqCst), reads, "a refresh that can't run asks nothing");
         for v in ["rn-one-1", "rn-two-1", "rn-linode-1"] {
+            redact::forget(v);
+        }
+    }
+
+    #[test]
+    fn a_read_from_before_a_refresh_never_caches_over_it() {
+        let (f, x) = fake(&[(Scope::Bots, "RO_TOKEN", "ro-old-1")], Duration::from_secs(3600));
+        let (started, release) = f.pause_next();
+        let slow = {
+            let x = Arc::clone(&x);
+            std::thread::spawn(move || x.get("RO_TOKEN").unwrap().unwrap().expose().to_string())
+        };
+        started.recv().unwrap();
+        f.values.lock().unwrap().insert((Scope::Bots, "RO_TOKEN".into()), "ro-new-1".into());
+        let r = x.refresh(Some(&["RO_TOKEN".to_string()])).unwrap();
+        assert_eq!(entry(&r, "bots", "RO_TOKEN").result, Change::Found);
+        release.send(()).unwrap();
+        assert_eq!(slow.join().unwrap(), "ro-old-1", "the read in flight gets what it read");
+        let reads = f.reads.load(Ordering::SeqCst);
+        assert_eq!(x.get("RO_TOKEN").unwrap().unwrap().expose(), "ro-new-1", "but it didn't cache it over the refresh's");
+        assert_eq!(f.reads.load(Ordering::SeqCst), reads, "the refresh's answer is the cached one");
+
+        // Folder lists the same way: a list from before the refresh can't hide a new name.
+        let (f, x) = fake(&[(Scope::Bots, "RO_TOKEN", "ro-new-1")], Duration::from_secs(3600));
+        let (started, release) = f.pause_next();
+        let slow = {
+            let x = Arc::clone(&x);
+            std::thread::spawn(move || x.names().unwrap())
+        };
+        started.recv().unwrap();
+        f.values.lock().unwrap().insert((Scope::Bots, "RO_NEW_TOKEN".into()), "ro-added-1".into());
+        x.refresh(None).unwrap();
+        release.send(()).unwrap();
+        assert!(!slow.join().unwrap().contains(&"RO_NEW_TOKEN".to_string()));
+        let lists = f.lists.load(Ordering::SeqCst);
+        assert!(x.names().unwrap().contains(&"RO_NEW_TOKEN".to_string()), "the refresh's list is the cached one");
+        assert_eq!(f.lists.load(Ordering::SeqCst), lists);
+        for v in ["ro-old-1", "ro-new-1", "ro-added-1"] {
             redact::forget(v);
         }
     }
