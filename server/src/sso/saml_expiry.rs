@@ -13,7 +13,7 @@
 //! IdP's next certificate already in its metadata, or botd's next key. Each notice is audited
 //! once per certificate, claimed in the transaction that records it.
 
-use super::provider::{IdpSource, Kind, Provider};
+use super::provider::{Kind, Provider};
 use super::saml_keys::{self, Stage};
 use super::saml_sp::{Encryption, KeyUse};
 use super::xmldsig::Cert;
@@ -236,7 +236,7 @@ fn details(p: &Provider, f: &Finding) -> Value {
 pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::Client, gap: Duration, now: i64) -> usize {
     let mut n = 0;
     for p in providers.iter().filter(|p| p.saml_sp()) {
-        if matches!(&p.kind, Kind::SamlSp { source: IdpSource::Url(_), .. }) {
+        if matches!(&p.kind, Kind::SamlSp { source, .. } if source.url().is_some()) {
             if let Err(e) = p.idp_metadata(http, gap).await {
                 crate::obs::log::log_warn!("SSO {}: IdP metadata: {e}", p.id);
             }

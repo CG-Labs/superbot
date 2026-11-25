@@ -84,7 +84,11 @@ pub enum IdpSource {
     Url(String),
     /// `SSO_<ID>_IDP_METADATA_FILE`: read at startup.
     File(String),
-    /// Neither: imported with `botctl sso saml <id> import`, kept in the database.
+    /// `SSO_<ID>_IDP_MDQ_URL`: the IdP's entry at a federation's MDQ server, this request URL
+    /// (`saml_sp::mdq_url`), fetched and refreshed as `Url` is, and held to `MetadataTrust::query`
+    /// (ADR 0281).
+    Mdq(String),
+    /// None of them: imported with `botctl sso saml <id> import`, kept in the database.
     Saved,
 }
 
@@ -93,7 +97,26 @@ impl IdpSource {
         match self {
             IdpSource::Url(_) => "url",
             IdpSource::File(_) => "file",
+            IdpSource::Mdq(_) => "mdq",
             IdpSource::Saved => "botctl",
+        }
+    }
+
+    /// The URL botd fetches the metadata from, and refreshes it at.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            IdpSource::Url(u) | IdpSource::Mdq(u) => Some(u),
+            IdpSource::File(_) | IdpSource::Saved => None,
+        }
+    }
+
+    /// The setting that names it, without `SSO_<ID>_`.
+    pub fn setting(&self) -> Option<&'static str> {
+        match self {
+            IdpSource::Url(_) => Some("IDP_METADATA_URL"),
+            IdpSource::File(_) => Some("IDP_METADATA_FILE"),
+            IdpSource::Mdq(_) => Some("IDP_MDQ_URL"),
+            IdpSource::Saved => None,
         }
     }
 }
@@ -276,7 +299,10 @@ async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value, Invalid> {
 /// An IdP's SAML metadata document, at most `MAX_METADATA` bytes.
 async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> {
     let mut res = http.get(url).header("accept", "application/samlmetadata+xml, application/xml, text/xml").send().await.map_err(|_| Invalid("idp_unreachable"))?;
-    if res.status().as_u16() != 200 {
+    let status = res.status().as_u16();
+    if status != 200 {
+        // An MDQ server answers 404 for an entity it doesn't know.
+        crate::obs::log::log_warn!("SAML IdP metadata from {url}: HTTP {status}{}", if status == 404 { " (not found: check the URL, or the IdP's entity ID for MDQ)" } else { "" });
         return Err(Invalid("idp_bad_response"));
     }
     let mut body = Vec::new();
@@ -324,6 +350,7 @@ impl Provider {
             Kind::SamlSp { source, response_binding, .. } => {
                 let (mut out, from) = match source {
                     IdpSource::Url(url) => (vec![(key("IDP_METADATA_URL"), url.clone(), "metadata")], key("IDP_METADATA_URL")),
+                    IdpSource::Mdq(url) => (vec![(key("IDP_MDQ_URL"), url.clone(), "MDQ metadata")], key("IDP_MDQ_URL")),
                     IdpSource::File(_) => (Vec::new(), key("IDP_METADATA_FILE")),
                     IdpSource::Saved => (Vec::new(), format!("botctl sso saml {} import", self.id)),
                 };
@@ -610,18 +637,25 @@ impl Provider {
         self.metadata_refused.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
-    /// Native SAML: the IdP metadata. From a URL it's fetched again after a day, and after a
-    /// failure at most once per `gap`, keeping what we had meanwhile, as for OIDC discovery.
+    /// Native SAML: the IdP metadata. From a URL or MDQ it's fetched again after a day, and
+    /// after a failure at most once per `gap`, keeping what we had meanwhile, as for OIDC
+    /// discovery. Signed metadata past its `validUntil` is never used, not even as the last
+    /// good copy (ADR 0281): it's fetched again, or the sign-in fails `idp_metadata_expired`.
     pub async fn idp_metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<IdpMetadata>, Invalid> {
         let Kind::SamlSp { source, entity_id, sign_requests, request_binding, response_binding, metadata_trust, .. } = &self.kind else {
             return Err(Invalid("not_configured"));
         };
-        let (stale, fresh) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some((m, at)) => (Some(m.clone()), at.elapsed() < META_TTL),
-            None => (None, false),
+        let now = crate::db::now();
+        let (stale, fresh, missing) = match self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some((m, _)) if !m.valid_at(now) => (None, false, Invalid("idp_metadata_expired")),
+            Some((m, at)) => (Some(m.clone()), at.elapsed() < META_TTL, Invalid("not_configured")),
+            None => (None, false, Invalid("not_configured")),
         };
-        let IdpSource::Url(url) = source else {
-            return stale.ok_or(Invalid("not_configured"));
+        let Some(url) = source.url() else {
+            if missing.0 == "idp_metadata_expired" {
+                crate::obs::log::log_warn!("SSO {}: the IdP metadata in use has passed its validUntil: give botd a fresh signed copy", self.id);
+            }
+            return stale.ok_or(missing);
         };
         if let (Some(m), true) = (&stale, fresh) {
             return Ok(m.clone());
@@ -630,13 +664,15 @@ impl Provider {
         // Whoever held the lock may just have fetched it.
         if let Some((m, at)) = self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
             && at.elapsed() < META_TTL
+            && m.valid_at(now)
         {
             return Ok(m.clone());
         }
+        let expired = missing.0 == "idp_metadata_expired";
         if let Some((at, e)) = c.idp_failed
             && at.elapsed() < gap
         {
-            return stale.ok_or(e);
+            return stale.ok_or(if expired { missing } else { e });
         }
         let got = get_text(http, url).await.and_then(|xml| {
             saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, *response_binding, metadata_trust.as_ref(), crate::db::now()).map_err(|e| {
@@ -655,7 +691,10 @@ impl Provider {
             }
             Err(e) => {
                 c.idp_failed = Some((Instant::now(), e));
-                stale.ok_or(e)
+                if expired {
+                    crate::obs::log::log_warn!("SSO {}: the IdP metadata in use has passed its validUntil and no fresh copy loaded from {url}", self.id);
+                }
+                stale.ok_or(if expired { missing } else { e })
             }
         }
     }

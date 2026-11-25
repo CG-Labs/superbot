@@ -1306,6 +1306,61 @@ async fn metadata_from_a_url_is_checked_each_time_it_is_fetched() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+#[tokio::test]
+async fn mdq_answers_are_fetched_for_the_one_entity_and_held_to_mdqs_rules() {
+    let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
+    let valid_until = |days: i64| {
+        let at = crate::sso::saml_sp::test_instant(crate::db::now() + days * 86_400_000);
+        test_idp::metadata().replacen("<md:EntityDescriptor ", &format!(r#"<md:EntityDescriptor validUntil="{at}" "#), 1)
+    };
+    let served = std::sync::Arc::new(std::sync::Mutex::new(test_idp::metadata()));
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mdq_port = listener.local_addr().unwrap().port();
+    let (s, a) = (served.clone(), asked.clone());
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        a.lock().unwrap().push(uri.path().to_string());
+        std::future::ready(s.lock().unwrap().clone())
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (sp, dir, provider) = serve_trusting("require", Some(("IDP_MDQ_URL", format!("http://127.0.0.1:{mdq_port}/mdq/")))).await;
+
+    // Unsigned: no sign-in, audited with the source.
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_failed")));
+    assert_eq!(asked.lock().unwrap()[0], "/mdq/entities/https%3A%2F%2Fidp.example%2Fsaml", "the one entity, its ID in one path segment");
+    let refused = &sp.audit("sso.saml_metadata_refused").await[0];
+    assert_eq!((refused["details"]["reason"].as_str(), refused["details"]["source"].as_str()), (Some("unsigned"), Some("mdq")));
+
+    // Signed by the federation but with no validUntil, or one too far ahead: refused too.
+    for (xml, reason) in [(test_idp::signed_metadata(&test_idp::metadata(), signer(1)), "no_valid_until"), (test_idp::signed_metadata(&valid_until(31), signer(1)), "valid_too_long")] {
+        *served.lock().unwrap() = xml;
+        let (code, _, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start", sp.id), "", "", "").await;
+        assert_eq!(code, 303);
+        assert_eq!(sp.audit("sso.saml_metadata_refused").await[0]["details"]["reason"].as_str(), Some(reason));
+    }
+
+    // A signed answer valid for a week: it loads, signs in, and shows when it ends.
+    *served.lock().unwrap() = test_idp::signed_metadata(&valid_until(7), signer(1));
+    let u = sp.link();
+    let (code, _, head) = sp.sign_in(|_| {}).await;
+    assert_eq!(code, 200);
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id.clone()));
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((v["source"].as_str(), v["idp"]["expired"].as_bool()), (Some("mdq"), Some(false)));
+    assert!(v["from"].as_str().unwrap().ends_with("/mdq/entities/https%3A%2F%2Fidp.example%2Fsaml"), "{}", v["from"]);
+    assert!(v["idp"]["validUntil"].as_i64().unwrap() > crate::db::now() + 6 * 86_400_000);
+
+    // A day later the federation serves an aggregate: refused, and the good copy still signs in.
+    *served.lock().unwrap() = test_idp::signed_metadata(&format!(r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">{}</md:EntitiesDescriptor>"#, valid_until(7).replacen(r#"<?xml version="1.0"?>"#, "", 1)), signer(1));
+    provider.age_idp(std::time::Duration::from_secs(25 * 3600));
+    let (code, _, head) = sp.sign_in(|_| {}).await;
+    assert_eq!(code, 200, "the last good copy, still within its validUntil");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id));
+    std::fs::remove_dir_all(dir).ok();
+}
+
 // Groups: required groups and group-to-role mapping (ADR 0160)
 
 fn in_groups(groups: &[&str]) -> impl FnOnce(&mut Response) + use<> {

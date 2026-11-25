@@ -459,7 +459,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 38] = [
+const ONLY_FOR: [(&str, &[&str]); 39] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -477,6 +477,7 @@ const ONLY_FOR: [(&str, &[&str]); 38] = [
     ("IDP_ENTITY_ID", &["saml"]),
     ("IDP_METADATA_URL", &["saml"]),
     ("IDP_METADATA_FILE", &["saml"]),
+    ("IDP_MDQ_URL", &["saml"]),
     ("SP_ENTITY_ID", &["saml"]),
     ("EMAIL_ATTRIBUTE", &["saml"]),
     ("NAME_ATTRIBUTE", &["saml"]),
@@ -502,9 +503,10 @@ const ONLY_FOR: [(&str, &[&str]); 38] = [
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 23] = [
+const SAML_NATIVE_ONLY: [&str; 24] = [
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
+    "IDP_MDQ_URL",
     "SP_ENTITY_ID",
     "EMAIL_ATTRIBUTE",
     "NAME_ATTRIBUTE",
@@ -628,12 +630,22 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             }
             let entity_id = var(&key("IDP_ENTITY_ID")).ok_or_else(|| format!("{} is required: the SAML IdP's entity ID, as in its metadata", key("IDP_ENTITY_ID")))?;
             let entity_id = saml::entity_id(&entity_id).ok_or_else(|| format!("{}: {entity_id} is not an entity ID (a URI, like http://www.okta.com/exk1abc)", key("IDP_ENTITY_ID")))?;
-            let source = match (var(&key("IDP_METADATA_URL")), var(&key("IDP_METADATA_FILE"))) {
-                (Some(_), Some(_)) => return Err(format!("Set {} or {}, not both", key("IDP_METADATA_URL"), key("IDP_METADATA_FILE"))),
-                (Some(u), None) if secure_url(&u) => IdpSource::Url(u),
-                (Some(_), None) => return Err(format!("{} must be an https URL", key("IDP_METADATA_URL"))),
-                (None, Some(f)) => IdpSource::File(f),
-                (None, None) => IdpSource::Saved,
+            let source = match (var(&key("IDP_METADATA_URL")), var(&key("IDP_METADATA_FILE")), var(&key("IDP_MDQ_URL"))) {
+                (Some(_), Some(_), _) => return Err(format!("Set {} or {}, not both", key("IDP_METADATA_URL"), key("IDP_METADATA_FILE"))),
+                (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
+                    return Err(format!("{} fetches the IdP's metadata: remove {} and {}", key("IDP_MDQ_URL"), key("IDP_METADATA_URL"), key("IDP_METADATA_FILE")));
+                }
+                (Some(u), None, None) if secure_url(&u) => IdpSource::Url(u),
+                (Some(_), None, None) => return Err(format!("{} must be an https URL", key("IDP_METADATA_URL"))),
+                (None, Some(f), None) => IdpSource::File(f),
+                (None, None, Some(base)) => {
+                    let clean = Url::parse(&base).is_ok_and(|u| u.query().is_none() && u.fragment().is_none());
+                    if !secure_url(&base) || !clean {
+                        return Err(format!("{} must be the MDQ server's https base URL, like https://mdq.incommon.org (no query)", key("IDP_MDQ_URL")));
+                    }
+                    IdpSource::Mdq(saml_sp::mdq_url(&base, &entity_id))
+                }
+                (None, None, None) => IdpSource::Saved,
             };
             let sp_entity_id = match var(&key("SP_ENTITY_ID")) {
                 Some(e) => saml::entity_id(&e).ok_or_else(|| format!("{}: {e} is not an entity ID (a URI)", key("SP_ENTITY_ID")))?,
@@ -709,7 +721,16 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             {
                 return Err(format!("{} must be an RSA certificate: IdPs encrypt to it with RSA-OAEP", key("SP_ENCRYPTION_CERT_FILE")));
             }
-            let metadata_trust = metadata_trust(&key, var)?;
+            let mut metadata_trust = metadata_trust(&key, var)?;
+            if matches!(source, IdpSource::Mdq(_)) {
+                // Anyone can run an MDQ server, and any proxy on the way can answer for it:
+                // only the federation's signature says the answer is the IdP's.
+                match metadata_trust.as_mut() {
+                    None => return Err(format!("{} needs {}: the certificate the federation signs its MDQ answers with", key("IDP_MDQ_URL"), key("METADATA_SIGNING_CERT_FILE"))),
+                    Some(t) if !t.require => return Err(format!("{}=allow would take unsigned MDQ answers: remove it, every answer must be signed", key("SIGNED_METADATA"))),
+                    Some(t) => t.query = true,
+                }
+            }
             let idp_initiated = match var(&key("IDP_INITIATED")) {
                 None => IdpInitiated::Off,
                 Some(v) => IdpInitiated::parse(&v).ok_or_else(|| format!("{} must be off or restart", key("IDP_INITIATED")))?,
@@ -818,8 +839,8 @@ fn metadata_trust(key: &dyn Fn(&str) -> String, var: &Var) -> Result<Option<saml
     };
     let mode = var(&key("SIGNED_METADATA")).map(|v| v.to_ascii_lowercase());
     match (mode.as_deref(), certs) {
-        (None | Some("require"), Some(certs)) => Ok(Some(saml_sp::MetadataTrust { certs, require: true })),
-        (Some("allow"), Some(certs)) => Ok(Some(saml_sp::MetadataTrust { certs, require: false })),
+        (None | Some("require"), Some(certs)) => Ok(Some(saml_sp::MetadataTrust { certs, require: true, query: false })),
+        (Some("allow"), Some(certs)) => Ok(Some(saml_sp::MetadataTrust { certs, require: false, query: false })),
         (None | Some("off"), None) => Ok(None),
         (Some("off"), Some(_)) => Err(format!("{}=off would ignore {}: remove one of them", key("SIGNED_METADATA"), key("METADATA_SIGNING_CERT_FILE"))),
         (Some("allow" | "require"), None) => Err(format!("{} needs {}: the certificate the IdP signs its metadata with", key("SIGNED_METADATA"), key("METADATA_SIGNING_CERT_FILE"))),
@@ -2133,7 +2154,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     };
     let idp = p.idp_loaded().map(|m| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
-        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()) })
+        json!({ "entityId": m.entity_id, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age().map(|d| d.as_secs()), "validUntil": m.valid_until, "expired": !m.valid_at(now) })
     });
     let key = a.app.as_ref().map(|app| sp_key(app, p));
     // botd's own keys show their rollover too (ADR 0181).
@@ -2173,7 +2194,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     // Signing out where there's no browser reaches the IdP only over its SOAP URL (ADR 0208).
     let back_channel = p.idp_loaded().is_some_and(|m| m.slo_soap.is_some()) && matches!(key, Some(Ok(_)));
     let from = match source {
-        IdpSource::Url(u) => Some(u.clone()),
+        IdpSource::Url(u) | IdpSource::Mdq(u) => Some(u.clone()),
         IdpSource::File(f) => Some(f.clone()),
         IdpSource::Saved => None,
     };
@@ -2199,7 +2220,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
 /// `GET /api/sso/{id}/saml`: what to enter at the IdP, and the IdP metadata in use.
 pub async fn saml_status(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>) -> Res {
     let p = saml_provider(&a, &id)?;
-    if matches!(&p.kind, Kind::SamlSp { source: IdpSource::Url(_), .. })
+    if matches!(&p.kind, Kind::SamlSp { source, .. } if source.url().is_some())
         && let Err(e) = idp_metadata(&a, p).await
     {
         crate::obs::log::log_warn!("SSO {id}: IdP metadata: {e}");
@@ -2214,8 +2235,7 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
     let Kind::SamlSp { entity_id, source, sign_requests, request_binding, response_binding, metadata_trust, .. } = &p.kind else {
         return Err(bad("not a native SAML provider"));
     };
-    if *source != IdpSource::Saved {
-        let var = if matches!(source, IdpSource::Url(_)) { "IDP_METADATA_URL" } else { "IDP_METADATA_FILE" };
+    if let Some(var) = source.setting() {
         return Err(ApiError(StatusCode::CONFLICT, format!("SSO_{}_{var} sets this provider's IdP metadata. Change it there, or remove it to import here.", id.to_ascii_uppercase())));
     }
     let xml = v["xml"].as_str().unwrap_or("");
@@ -3178,6 +3198,56 @@ mod tests {
         assert!(file(&unsigned, "allow").is_ok());
         assert!(file(&forged, "allow").err().unwrap().contains("bad_signature"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_an_mdq_source_only_with_a_signer_it_requires() {
+        use xmldsig::test_signer::signers;
+        let dir = std::env::temp_dir().join(format!("superbot-mdq-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let anchor = dir.join("federation.pem");
+        std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signers()[1].cert)).unwrap();
+        let anchor: &'static str = Box::leak(anchor.to_string_lossy().into_owned().into_boxed_str());
+
+        let s = native(&[("SSO_CORP_IDP_MDQ_URL", "https://mdq.example.org/"), ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor)]).unwrap();
+        let p = &s.providers[0];
+        let Kind::SamlSp { source, metadata_trust: Some(t), .. } = &p.kind else { panic!("trusted") };
+        assert_eq!(*source, IdpSource::Mdq(saml_sp::mdq_url("https://mdq.example.org", ADFS)));
+        assert_eq!((source.name(), source.setting(), t.require, t.query), ("mdq", Some("IDP_MDQ_URL"), true, true));
+        assert!(source.url().unwrap().starts_with("https://mdq.example.org/entities/http%3A%2F%2F"));
+        assert_eq!(p.reaches()[0], ("SSO_CORP_IDP_MDQ_URL".into(), source.url().unwrap().to_string(), "MDQ metadata"));
+        assert!(p.not_ready().is_none(), "offered: fetched when needed, as a metadata URL");
+        let plain = native(&[("SSO_CORP_IDP_METADATA_URL", "https://idp.example/m"), ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor)]).unwrap();
+        assert!(matches!(&plain.providers[0].kind, Kind::SamlSp { metadata_trust: Some(t), .. } if !t.query), "only MDQ answers are held to MDQ's rules");
+
+        let err = |extra: &[(&'static str, &'static str)]| native(extra).err().unwrap();
+        let mdq = ("SSO_CORP_IDP_MDQ_URL", "https://mdq.example.org");
+        let signer = ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor);
+        assert!(err(&[mdq]).contains("needs SSO_CORP_METADATA_SIGNING_CERT_FILE"), "never unsigned");
+        assert!(err(&[mdq, signer, ("SSO_CORP_SIGNED_METADATA", "allow")]).contains("unsigned MDQ answers"));
+        assert!(native(&[mdq, signer, ("SSO_CORP_SIGNED_METADATA", "require")]).is_ok());
+        assert!(err(&[mdq, signer, ("SSO_CORP_IDP_METADATA_URL", "https://idp.example/m")]).contains("remove SSO_CORP_IDP_METADATA_URL"));
+        assert!(err(&[mdq, signer, ("SSO_CORP_IDP_METADATA_FILE", "/x.xml")]).contains("remove"));
+        for bad in ["http://mdq.example.org", "https://mdq.example.org/?entity=x", "https://mdq.example.org/#x", "mdq.example.org"] {
+            assert!(err(&[("SSO_CORP_IDP_MDQ_URL", bad), signer]).contains("https base URL"), "{bad}");
+        }
+        assert!(saml(&[("SSO_ADFS_IDP_MDQ_URL", "https://mdq.example.org")]).is_err(), "a native setting on the bridge");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_expired_copy_of_signed_metadata_is_never_used() {
+        use saml_sp::test_idp::{IDP, metadata};
+        let s = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "saml"), ("SSO_CORP_IDP_ENTITY_ID", IDP)], &[]).unwrap();
+        let p = &s.providers[0];
+        let http = reqwest::Client::new();
+        let copy = |until: Option<i64>| saml_sp::IdpMetadata { valid_until: until, ..saml_sp::parse_idp_metadata(&metadata(), IDP, false).unwrap() };
+        p.set_idp(copy(Some(db::now() + 60_000)));
+        assert!(p.idp_metadata(&http, Duration::ZERO).await.is_ok());
+        p.set_idp(copy(None));
+        assert!(p.idp_metadata(&http, Duration::ZERO).await.is_ok(), "no validUntil: no end");
+        p.set_idp(copy(Some(db::now() - 1)));
+        assert_eq!(p.idp_metadata(&http, Duration::ZERO).await.unwrap_err(), jwt::Invalid("idp_metadata_expired"), "not even as the last good copy");
     }
 
     fn random_hex() -> String {
