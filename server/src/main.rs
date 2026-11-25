@@ -304,6 +304,8 @@ mod teams;
 #[cfg(test)]
 mod team_roles_http_tests;
 #[cfg(test)]
+mod team_role_requests_http_tests;
+#[cfg(test)]
 mod teams_http_tests;
 #[cfg(test)]
 mod teams_offboard_tests;
@@ -1244,6 +1246,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/team/members/{user}", patch(teams::set_role).delete(teams::remove))
         .route("/team/members/{user}/offboarding", get(teams::offboarding))
         .route("/team/members/{user}/custom-role", put(teams::give_custom_role).delete(teams::take_custom_role))
+        .route("/team/role-requests", get(role_requests::team_list))
+        .route("/team/role-requests/{id}/approve", post(role_requests::team_approve))
+        .route("/team/role-requests/{id}/deny", post(role_requests::team_deny))
         .route("/team/members/{user}/machine", post(teams::give_machine))
         .route("/team/members/{user}/machine/suspend", post(teams::suspend))
         .route("/team/members/{user}/machine/resume", post(teams::resume))

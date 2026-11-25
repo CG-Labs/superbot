@@ -8,6 +8,9 @@
 //! across the server the role's base must be the role they have, and in either scope they
 //! must hold no other custom role there (the same one with an end is renewed). Everything
 //! is checked when it's asked for and again, in one transaction, when it's approved.
+//!
+//! A request within a team can also be decided by that team's own owners and admins (ADR
+//! 0263), for its plain members, never over a role their identity provider gives them.
 
 use crate::audit::Who;
 use crate::db::{CustomRole, RoleRequest, RoleRequestError, TeamMember, User};
@@ -85,6 +88,8 @@ pub fn why(code: &str, r: &CustomRole, u: &User, you: bool) -> String {
         "not_on_team" => format!("{are} not on that team."),
         "holds_it" => format!("{subj} hold {} already, with no end.", r.name),
         "holds_another" => format!("{subj} hold another custom role there, and a request never replaces one. Ask an admin."),
+        "team_manager" => format!("{are} one of the team's owners or admins, so {have} can do all of that in it already. A server admin can still decide it."),
+        "from_idp" => format!("{} role in the team comes from {} identity provider (a SCIM group). A server admin decides this request.", if you { "Your" } else { "Their" }, if you { "your" } else { "their" }),
         _ => "It can't be given.".into(),
     }
 }
@@ -265,14 +270,14 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
     let d = json!({ "request": q.id, "name": r.name, "user": u.id, "scope": scope(&q), "team": q.team_id, "hours": hours, "reason": reason, "lapsesAt": q.expires_at });
     app.db.record(&by.event("role.requested").target("role", &r.id).details(d));
     let who = u.email.clone().unwrap_or_else(|| u.name.clone());
-    let place = match &q.team_id {
-        Some(t) => format!("In the team {}.", app.db.team(t).map(|t| t.name).unwrap_or_default()),
-        None => "Across the server.".into(),
+    let (place, where_) = match &q.team_id {
+        Some(t) => (format!("In the team {}.", app.db.team(t).map(|t| t.name).unwrap_or_default()), "in Roles, or the team's owners and admins in Team"),
+        None => ("Across the server.".into(), "in Roles"),
     };
     let alert = crate::notify::Alert {
         event: "role.requested".into(),
         title: format!("{who} asks for {} for {}", r.name, duration(hours)),
-        lines: vec![format!("Why: {reason}"), place, format!("Approve or deny it in Roles. It lapses in {PENDING_DAYS} days.")],
+        lines: vec![format!("Why: {reason}"), place, format!("Approve or deny it {where_}. It lapses in {PENDING_DAYS} days.")],
         target_type: "role".into(),
         target_id: r.id.clone(),
         link: None,
@@ -286,10 +291,18 @@ pub async fn cancel(State(app): State<AppState>, Extension(c): Extension<Caller>
     lapse_due(&app);
     let u = person(&c)?;
     let q = app.db.role_request(&id).filter(|q| q.user_id == u.id).ok_or_else(|| not_found("Request"))?;
-    let q = app.db.close_role_request(&q.id, "cancelled", Some(&u.id), None, Some(&u.id)).ok_or_else(|| request_error(&app, RoleRequestError::NotPending(app.db.role_request(&q.id).map_or(q.status, |q| q.status)), None, true))?;
+    let q = app.db.close_role_request(&q.id, "cancelled", Some(&u.id), None, Some(&u.id), None).ok_or_else(|| request_error(&app, RoleRequestError::NotPending(app.db.role_request(&q.id).map_or(q.status, |q| q.status)), None, true))?;
     let name = app.db.custom_role(&q.role_id).map(|r| r.name);
     app.db.record(&by.event("role.request_cancelled").target("role", &q.role_id).details(json!({ "request": q.id, "name": name, "user": q.user_id, "scope": scope(&q), "team": q.team_id })));
     Ok(Json(view(&app, &q)))
+}
+
+fn status_filter(params: &HashMap<String, String>) -> Res<Option<&'static str>> {
+    match params.get("status").map(String::as_str) {
+        None | Some("pending") => Ok(Some("pending")),
+        Some("all") => Ok(None),
+        Some(s) => STATUSES.iter().find(|x| **x == s).map(|x| Some(*x)).ok_or_else(|| bad(format!("status must be all or one of: {}", STATUSES.join(", ")))),
+    }
 }
 
 /// `GET /api/role-requests?status=pending|approved|denied|cancelled|lapsed|all` (admins):
@@ -297,42 +310,67 @@ pub async fn cancel(State(app): State<AppState>, Extension(c): Extension<Caller>
 pub async fn list(State(app): State<AppState>, Query(params): Query<HashMap<String, String>>) -> Res {
     lapse_due(&app);
     crate::roles::expire_due(&app);
-    let status = match params.get("status").map(String::as_str) {
-        None | Some("pending") => Some("pending"),
-        Some("all") => None,
-        Some(s) if STATUSES.contains(&s) => Some(s),
-        Some(_) => return Err(bad(format!("status must be all or one of: {}", STATUSES.join(", ")))),
-    };
+    let status = status_filter(&params)?;
     let requests: Vec<Value> = app.db.role_requests(None, status, 200).iter().map(|q| view(&app, q)).collect();
     let pending = if status == Some("pending") { requests.len() } else { app.db.role_requests(None, Some("pending"), 200).len() };
     Ok(Json(json!({ "requests": requests, "pending": pending, "pendingDays": PENDING_DAYS })))
 }
 
-/// `POST /api/role-requests/{id}/approve` `{hours?, note?}` (admins): gives the role for the
-/// hours asked for, or fewer, from now. Not your own request.
-pub async fn approve(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
-    only_fields(&v, &["hours", "note"])?;
-    lapse_due(&app);
-    crate::roles::expire_due(&app);
-    let q = app.db.role_request(&id).ok_or_else(|| not_found("Request"))?;
+/// Who decides a request: a server admin, or one of the owners and admins of the team the
+/// request is within (ADR 0263), audited with `via: "team"`.
+#[derive(Clone, Copy, PartialEq)]
+enum Decider {
+    Admin,
+    Team,
+}
+
+impl Decider {
+    fn mark(self, d: &mut Value) {
+        if self == Decider::Team {
+            d["via"] = json!("team");
+        }
+    }
+
+    fn ask_another(self) -> &'static str {
+        match self {
+            Decider::Admin => "Ask another admin.",
+            Decider::Team => "Ask another of the team's owners or admins, or a server admin.",
+        }
+    }
+}
+
+/// Gives the role `q` asks for, for its hours or fewer from now, and audits it. Not your own
+/// request. A team's owners and admins approve only for its plain members, and never over a
+/// role the person's identity provider gives them in the team; both are read in the
+/// approval's transaction, with everything else `refusal` checks.
+fn approve_as(app: &App, by: &Who, q: &RoleRequest, v: &Value, decider: Decider) -> Res {
     if by.actor.id.as_deref() == Some(q.user_id.as_str()) {
-        return Err(conflict("You can't approve your own request. Ask another admin."));
+        return Err(conflict(format!("You can't approve your own request. {}", decider.ask_another())));
     }
     let hours = if v["hours"].is_null() { None } else { Some(parse_hours(&v["hours"], q.hours, ": an approval can shorten a request, never lengthen it")?) };
     let note = parse_text(&v["note"], "note", false)?;
-    let a = app
-        .db
-        .approve_role_request(&q.id, hours, by.actor.id.as_deref(), note.as_deref(), |s| refusal(s.user, s.role, s.request.team_id.as_deref(), s.member).map_or(Ok(()), Err))
-        .map_err(|e| request_error(&app, e, Some(&q), false))?;
+    let check = |s: &crate::db::RequestState| {
+        if decider == Decider::Team {
+            if s.from_idp {
+                return Err("from_idp");
+            }
+            if s.member.is_some_and(|m| m.role != crate::teams::MEMBER) {
+                return Err("team_manager");
+            }
+        }
+        refusal(s.user, s.role, s.request.team_id.as_deref(), s.member).map_or(Ok(()), Err)
+    };
+    let a = app.db.approve_role_request(&q.id, hours, by.actor.id.as_deref(), note.as_deref(), check).map_err(|e| request_error(app, e, Some(q), false))?;
     let q = a.request;
     let r = app.db.custom_role(&q.role_id).ok_or_else(|| not_found("Role"))?;
     let granted = q.granted_until.unwrap_or_default();
     let hours = hours.unwrap_or(q.hours);
     let applies = if q.team_id.is_some() { r.perms().in_team().names() } else { r.perms().names() };
-    let d = json!({ "request": q.id, "name": r.name, "user": q.user_id, "scope": scope(&q), "team": q.team_id, "hours": hours, "requestedHours": q.hours, "expiresAt": granted, "note": q.note });
+    let mut d = json!({ "request": q.id, "name": r.name, "user": q.user_id, "scope": scope(&q), "team": q.team_id, "hours": hours, "requestedHours": q.hours, "expiresAt": granted, "note": q.note });
+    decider.mark(&mut d);
     app.db.record(&by.event("role.request_approved").target("role", &r.id).details(d));
     let mut d = json!({
-        "name": r.name, "user": q.user_id, "scope": scope(&q), "from": held(&app, a.before.0.as_deref(), a.before.1),
+        "name": r.name, "user": q.user_id, "scope": scope(&q), "from": held(app, a.before.0.as_deref(), a.before.1),
         "expiresAt": granted, "reason": q.reason, "request": q.id, "takenFromScim": a.taken,
     });
     match &q.team_id {
@@ -342,8 +380,35 @@ pub async fn approve(State(app): State<AppState>, Extension(by): Extension<Who>,
         }
         None => d["takenFromSaml"] = json!(a.taken_saml),
     }
+    decider.mark(&mut d);
     app.db.record(&by.event("role.assigned").target("role", &r.id).details(d));
-    Ok(Json(json!({ "request": view(&app, &q), "role": held(&app, Some(&r.id), Some(granted)), "applies": applies })))
+    Ok(Json(json!({ "request": view(app, &q), "role": held(app, Some(&r.id), Some(granted)), "applies": applies })))
+}
+
+/// Denies `q`, with an optional note, and audits it. `team`: only while it's within that team.
+fn deny_as(app: &App, by: &Who, q: &RoleRequest, v: &Value, team: Option<&str>) -> Res {
+    let note = parse_text(&v["note"], "note", false)?;
+    let q = app
+        .db
+        .close_role_request(&q.id, "denied", by.actor.id.as_deref(), note.as_deref(), None, team)
+        .ok_or_else(|| request_error(app, RoleRequestError::NotPending(app.db.role_request(&q.id).map_or(q.status.clone(), |q| q.status)), None, false))?;
+    let name = app.db.custom_role(&q.role_id).map(|r| r.name);
+    let mut d = json!({ "request": q.id, "name": name, "user": q.user_id, "scope": scope(&q), "team": q.team_id, "note": q.note });
+    if team.is_some() {
+        Decider::Team.mark(&mut d);
+    }
+    app.db.record(&by.event("role.request_denied").target("role", &q.role_id).details(d));
+    Ok(Json(view(app, &q)))
+}
+
+/// `POST /api/role-requests/{id}/approve` `{hours?, note?}` (admins): gives the role for the
+/// hours asked for, or fewer, from now. Not your own request.
+pub async fn approve(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    only_fields(&v, &["hours", "note"])?;
+    lapse_due(&app);
+    crate::roles::expire_due(&app);
+    let q = app.db.role_request(&id).ok_or_else(|| not_found("Request"))?;
+    approve_as(&app, &by, &q, &v, Decider::Admin)
 }
 
 /// `POST /api/role-requests/{id}/deny` `{note?}` (admins).
@@ -351,14 +416,55 @@ pub async fn deny(State(app): State<AppState>, Extension(by): Extension<Who>, Pa
     only_fields(&v, &["note"])?;
     lapse_due(&app);
     let q = app.db.role_request(&id).ok_or_else(|| not_found("Request"))?;
-    let note = parse_text(&v["note"], "note", false)?;
-    let q = app
-        .db
-        .close_role_request(&q.id, "denied", by.actor.id.as_deref(), note.as_deref(), None)
-        .ok_or_else(|| request_error(&app, RoleRequestError::NotPending(app.db.role_request(&q.id).map_or(q.status, |q| q.status)), None, false))?;
-    let name = app.db.custom_role(&q.role_id).map(|r| r.name);
-    app.db.record(&by.event("role.request_denied").target("role", &q.role_id).details(json!({ "request": q.id, "name": name, "user": q.user_id, "scope": scope(&q), "team": q.team_id, "note": q.note })));
-    Ok(Json(view(&app, &q)))
+    deny_as(&app, &by, &q, &v, None)
+}
+
+/// A request within the caller's team, for its owners and admins (ADR 0263). Any other is
+/// not found, so they learn nothing of requests elsewhere, nor of people who left the team.
+fn team_request(app: &AppState, t: &crate::db::Team, id: &str) -> Res<RoleRequest> {
+    app.db.role_request(id).filter(|q| q.team_id.as_deref() == Some(t.id.as_str()) && on_team(app, q, &t.id)).ok_or_else(|| not_found("Request"))
+}
+
+fn on_team(app: &App, q: &RoleRequest, team: &str) -> bool {
+    app.db.team_member(&q.user_id).is_some_and(|m| m.team_id == team)
+}
+
+/// How many requests within `team` wait for a decision, from people still on it.
+pub fn pending_in_team(app: &App, team: &str) -> usize {
+    app.db.team_role_requests(team, Some("pending"), 200).iter().filter(|q| on_team(app, q, team)).count()
+}
+
+/// `GET /api/team/role-requests?status=...` (ADR 0263): the requests for roles within your
+/// team, for its owners and admins, pending ones by default, from people still on it.
+pub async fn team_list(State(app): State<AppState>, Extension(c): Extension<Caller>, Query(params): Query<HashMap<String, String>>) -> Res {
+    let (_, _, t) = crate::teams::my_managed_team(&app, &c)?;
+    lapse_due(&app);
+    crate::roles::expire_due(&app);
+    let status = status_filter(&params)?;
+    let mine = |status| app.db.team_role_requests(&t.id, status, 200).into_iter().filter(|q| on_team(&app, q, &t.id)).collect::<Vec<_>>();
+    let requests: Vec<Value> = mine(status).iter().map(|q| view(&app, q)).collect();
+    let pending = if status == Some("pending") { requests.len() } else { pending_in_team(&app, &t.id) };
+    Ok(Json(json!({ "team": { "id": t.id, "name": t.name }, "requests": requests, "pending": pending, "pendingDays": PENDING_DAYS })))
+}
+
+/// `POST /api/team/role-requests/{id}/approve` `{hours?, note?}` (ADR 0263): a team's owner
+/// or admin approves a request within it, as a server admin does.
+pub async fn team_approve(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    only_fields(&v, &["hours", "note"])?;
+    let (_, _, t) = crate::teams::my_managed_team(&app, &c)?;
+    lapse_due(&app);
+    crate::roles::expire_due(&app);
+    let q = team_request(&app, &t, &id)?;
+    approve_as(&app, &by, &q, &v, Decider::Team)
+}
+
+/// `POST /api/team/role-requests/{id}/deny` `{note?}` (ADR 0263).
+pub async fn team_deny(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    only_fields(&v, &["note"])?;
+    let (_, _, t) = crate::teams::my_managed_team(&app, &c)?;
+    lapse_due(&app);
+    let q = team_request(&app, &t, &id)?;
+    deny_as(&app, &by, &q, &v, Some(&t.id))
 }
 
 #[cfg(test)]

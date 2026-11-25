@@ -1,0 +1,198 @@
+//! Team owners and admins deciding requests for roles within their own team (ADR 0263), on
+//! the real router: only requests within their team, from people still on it; approved
+//! only for its plain members, never their own, never over a role from the identity
+//! provider; checked again in the approval's transaction; audited as the team's.
+
+use crate::tests::{audit_list, call, serve_app};
+use crate::users_http_tests::{parse, user_with};
+use crate::*;
+
+async fn json_call(port: u16, method: &str, path: &str, who: &str, body: &str) -> (u16, Value) {
+    let (code, body) = call(port, method, path, who, body).await;
+    (code, parse(&body))
+}
+
+async fn events(port: u16, admin: &str, action: &str) -> Vec<Value> {
+    let (code, body) = call(port, "GET", &format!("/api/audit?action={action}&limit=200"), admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    audit_list(&body)
+}
+
+async fn requestable(port: u16, admin: &str, name: &str, perms: &[&str], days: i64) -> String {
+    let body = json!({ "name": name, "permissions": perms, "maxDays": days, "requestable": true });
+    let (code, v) = json_call(port, "POST", "/api/roles", admin, &body.to_string()).await;
+    assert_eq!(code, 201, "{v}");
+    v["id"].as_str().unwrap().to_string()
+}
+
+async fn team(port: u16, admin: &str, name: &str, owner: &str, members: &[(&str, &str)]) -> String {
+    let (code, t) = json_call(port, "POST", "/api/teams", admin, &json!({ "name": name, "owner": owner }).to_string()).await;
+    assert_eq!(code, 201, "{t}");
+    let id = t["id"].as_str().unwrap().to_string();
+    for (u, r) in members {
+        assert_eq!(call(port, "PUT", &format!("/api/teams/{id}/members/{u}"), admin, &json!({ "role": r }).to_string()).await.0, 200);
+    }
+    id
+}
+
+/// Files a request that must succeed. Returns its id.
+async fn asked(port: u16, who: &str, body: Value) -> String {
+    let (code, v) = json_call(port, "POST", "/api/me/role-requests", who, &body.to_string()).await;
+    assert_eq!(code, 201, "{v}");
+    v["id"].as_str().unwrap().to_string()
+}
+
+fn at(id: &str, verb: &str) -> String {
+    format!("/api/team/role-requests/{id}/{verb}")
+}
+
+#[tokio::test]
+async fn team_owners_and_admins_decide_requests_within_their_team() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (eve, eve_auth) = user_with(port, &admin, "eve@example.com", "member").await;
+    let (cy, cy_auth) = user_with(port, &admin, "cy@example.com", "member").await;
+    let (dee, dee_auth) = user_with(port, &admin, "dee@example.com", "member").await;
+    let (bea, bea_auth) = user_with(port, &admin, "bea@example.com", "member").await;
+    let (bo, bo_auth) = user_with(port, &admin, "bo@example.com", "member").await;
+    let alpha = team(port, &admin, "Alpha", &ada, &[(&eve, "admin"), (&cy, "member"), (&dee, "member")]).await;
+    team(port, &admin, "Beta", &bea, &[(&bo, "member")]).await;
+    let helpdesk = requestable(port, &admin, "Team helpdesk", &["users.manage", "audit.view"], 7).await;
+    requestable(port, &admin, "On-call", &["machines.manage"], 1).await;
+
+    let cy_q = asked(port, &cy_auth, json!({ "role": "Team helpdesk", "scope": "team", "hours": 48, "reason": "Onboarding week" })).await;
+    let org_q = asked(port, &dee_auth, json!({ "role": "On-call", "hours": 8, "reason": "Incident 42" })).await;
+    let bo_q = asked(port, &bo_auth, json!({ "role": "Team helpdesk", "scope": "team", "hours": 8, "reason": "Beta's invites" })).await;
+
+    // Owners and admins see how many wait, and which: only their team's, never one across the server.
+    for who in [&ada_auth, &eve_auth] {
+        let (_, mine) = json_call(port, "GET", "/api/team", who, "").await;
+        assert_eq!(mine["roleRequests"], 1, "{mine}");
+        let (code, v) = json_call(port, "GET", "/api/team/role-requests", who, "").await;
+        assert_eq!((code, v["pending"].as_i64(), v["team"]["name"].as_str()), (200, Some(1), Some("Alpha")), "{v}");
+        let q = &v["requests"][0];
+        assert_eq!((q["id"].as_str(), q["user"]["id"].as_str(), q["reason"].as_str(), q["role"]["applies"].clone()), (Some(cy_q.as_str()), Some(cy.as_str()), Some("Onboarding week"), json!(["users.manage"])), "{v}");
+    }
+    let (_, v) = json_call(port, "GET", "/api/team/role-requests", &bea_auth, "").await;
+    assert_eq!(v["requests"].as_array().unwrap().iter().map(|q| q["id"].as_str().unwrap()).collect::<Vec<_>>(), [bo_q.as_str()], "{v}");
+    let (_, mine) = json_call(port, "GET", "/api/team", &cy_auth, "").await;
+    assert!(mine.get("roleRequests").is_none(), "members aren't told: {mine}");
+    assert_eq!(call(port, "GET", "/api/team/role-requests", &cy_auth, "").await.0, 403);
+    assert_eq!(call(port, "GET", "/api/team/role-requests?status=nope", &ada_auth, "").await.0, 400);
+
+    // Requests elsewhere read as missing, and plain members decide nothing.
+    for (who, id, code, why) in [
+        (&bea_auth, &cy_q, 404, "another team's owner"),
+        (&ada_auth, &bo_q, 404, "another team's request"),
+        (&ada_auth, &org_q, 404, "a request across the server stays with server admins"),
+        (&dee_auth, &cy_q, 403, "a plain member"),
+        (&cy_auth, &cy_q, 403, "the asker, a plain member"),
+    ] {
+        let (c, v) = json_call(port, "POST", &at(id, "approve"), who, "{}").await;
+        assert_eq!(c, code, "{why}: {v}");
+        assert_eq!(call(port, "POST", &at(id, "deny"), who, "{}").await.0, code, "{why}");
+    }
+    assert_eq!(call(port, "POST", &at(&cy_q, "approve"), &eve_auth, r#"{"hours":49}"#).await.0, 400, "never longer than asked");
+    assert_eq!(call(port, "POST", &at(&cy_q, "approve"), &eve_auth, r#"{"until":5}"#).await.0, 400, "unknown field");
+
+    // A team admin approves it for fewer hours; only its team permissions apply, only there.
+    let (code, v) = json_call(port, "POST", &at(&cy_q, "approve"), &eve_auth, r#"{"hours":24,"note":"A day is enough"}"#).await;
+    assert_eq!((code, v["request"]["status"].as_str(), v["applies"].clone()), (200, Some("approved"), json!(["users.manage"])), "{v}");
+    let ends = v["role"]["expiresAt"].as_i64().unwrap();
+    assert!((ends - db::now() - 24 * 3_600_000).abs() < 60_000, "{v}");
+    let (_, mine) = json_call(port, "GET", "/api/team", &cy_auth, "").await;
+    assert_eq!((mine["customRole"]["id"].as_str(), mine["permissions"].clone()), (Some(helpdesk.as_str()), json!(["users.manage"])), "{mine}");
+    assert_eq!(call(port, "POST", "/api/team/invites", &cy_auth, r#"{"email":"new@example.com"}"#).await.0, 201);
+    assert_eq!(call(port, "GET", "/api/audit", &cy_auth, "").await.0, 403, "nothing across the server");
+    assert_eq!(app.db.user(&cy).unwrap().role_id, None);
+    let approved = &events(port, &admin, "role.request_approved").await[0];
+    let d = &approved["details"];
+    assert_eq!((approved["actorId"].as_str(), d["via"].as_str(), d["hours"].as_i64(), d["requestedHours"].as_i64(), d["note"].as_str()), (Some(eve.as_str()), Some("team"), Some(24), Some(48), Some("A day is enough")), "{approved}");
+    let given = &events(port, &admin, "role.assigned").await[0];
+    let d = &given["details"];
+    assert_eq!((d["via"].as_str(), d["request"].as_str(), d["team"].as_str(), d["reason"].as_str(), d["expiresAt"].as_i64()), (Some("team"), Some(cy_q.as_str()), Some(alpha.as_str()), Some("Onboarding week"), Some(ends)), "{given}");
+    assert_eq!(call(port, "POST", &at(&cy_q, "approve"), &ada_auth, "{}").await.0, 409, "decided already");
+    let (_, mine) = json_call(port, "GET", "/api/team", &ada_auth, "").await;
+    assert_eq!(mine["roleRequests"], 0, "{mine}");
+
+    // Holding users.manage in the team, they still don't decide: only owners and admins do.
+    let dee_q = asked(port, &dee_auth, json!({ "role": helpdesk, "scope": "team", "hours": 8, "reason": "Cover for cy" })).await;
+    assert_eq!(call(port, "GET", "/api/team/role-requests", &cy_auth, "").await.0, 403);
+    assert_eq!(call(port, "POST", &at(&dee_q, "approve"), &cy_auth, "{}").await.0, 403);
+
+    // The owner denies one, with a note the asker sees.
+    let (code, v) = json_call(port, "POST", &at(&dee_q, "deny"), &ada_auth, r#"{"note":"cy has it covered"}"#).await;
+    assert_eq!((code, v["status"].as_str(), v["note"].as_str()), (200, Some("denied"), Some("cy has it covered")), "{v}");
+    assert_eq!(call(port, "POST", &at(&dee_q, "deny"), &ada_auth, "{}").await.0, 409, "denied already");
+    let (_, mine) = json_call(port, "GET", "/api/me/role-requests", &dee_auth, "").await;
+    assert_eq!(mine["requests"][0]["note"].as_str(), Some("cy has it covered"), "{mine}");
+    let denied = &events(port, &admin, "role.request_denied").await[0];
+    assert_eq!((denied["actorId"].as_str(), denied["details"]["via"].as_str()), (Some(ada.as_str()), Some("team")), "{denied}");
+    let (_, v) = json_call(port, "GET", "/api/team/role-requests?status=all", &ada_auth, "").await;
+    assert_eq!((v["requests"].as_array().unwrap().len(), v["pending"].as_i64()), (2, Some(0)), "{v}");
+
+    // Server admins still decide team requests, without a via.
+    let (code, _) = json_call(port, "POST", &format!("/api/role-requests/{bo_q}/approve"), &admin, "{}").await;
+    assert_eq!(code, 200);
+    assert!(events(port, &admin, "role.request_approved").await[0]["details"].get("via").is_none());
+    assert_eq!(app.db.team_member(&bo).unwrap().role_id.as_deref(), Some(helpdesk.as_str()));
+}
+
+#[tokio::test]
+async fn not_their_own_nor_a_team_admins_nor_over_the_identity_provider() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (eve, eve_auth) = user_with(port, &admin, "eve@example.com", "member").await;
+    let (fay, fay_auth) = user_with(port, &admin, "fay@example.com", "member").await;
+    let (gus, gus_auth) = user_with(port, &admin, "gus@example.com", "member").await;
+    let alpha = team(port, &admin, "Alpha", &ada, &[(&eve, "admin"), (&fay, "member"), (&gus, "member")]).await;
+    let helpdesk = requestable(port, &admin, "Team helpdesk", &["users.manage"], 7).await;
+    let billing = requestable(port, &admin, "Team billing", &["billing.manage"], 7).await;
+
+    // A team admin's own request: not by themselves, and not by the team's owner either,
+    // since they can do all of it already. A server admin still can.
+    let eve_q = asked(port, &eve_auth, json!({ "role": helpdesk, "scope": "team", "hours": 8, "reason": "x" })).await;
+    let (code, v) = json_call(port, "POST", &at(&eve_q, "approve"), &eve_auth, "{}").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("your own request"), "{v}");
+    let (code, v) = json_call(port, "POST", &at(&eve_q, "approve"), &ada_auth, "{}").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("owners or admins"), "{v}");
+    assert_eq!(app.db.role_request(&eve_q).unwrap().status, "pending", "a refused approval leaves it pending");
+    assert_eq!(call(port, "POST", &format!("/api/role-requests/{eve_q}/approve"), &admin, "{}").await.0, 200);
+
+    // A role the identity provider gives them in the team stays with its mapping, even when
+    // SCIM gives it after they asked.
+    let fay_q = asked(port, &fay_auth, json!({ "role": helpdesk, "scope": "team", "hours": 8, "reason": "x" })).await;
+    app.db.link_scim_group("okta", &alpha, None, "Alpha", None).unwrap();
+    let standing = {
+        let body = json!({ "name": "Team payer", "permissions": ["billing.manage"] });
+        json_call(port, "POST", "/api/roles", &admin, &body.to_string()).await.1["id"].as_str().unwrap().to_string()
+    };
+    let m = app.db.create_scim_role_mapping("okta", &alpha, &standing, "team", None).unwrap();
+    assert!(app.db.grant_scim_role(&m, &fay));
+    let (code, v) = json_call(port, "POST", &at(&fay_q, "approve"), &ada_auth, "{}").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("identity provider"), "{v}");
+    assert_eq!(app.db.team_member(&fay).unwrap().role_id.as_deref(), Some(standing.as_str()), "unchanged");
+    // Read in the approval's own transaction.
+    let saw = std::cell::Cell::new(false);
+    let r = app.db.approve_role_request(&fay_q, None, Some(&ada), None, |s| {
+        saw.set(s.from_idp);
+        Err("from_idp")
+    });
+    assert_eq!((saw.get(), r.unwrap_err()), (true, db::RoleRequestError::Refused("from_idp")));
+    // Denying changes no role, so they may.
+    assert_eq!(call(port, "POST", &at(&fay_q, "deny"), &ada_auth, "{}").await.0, 200);
+
+    // Someone who left the team: their requests are gone from its view, and can't be decided there.
+    let gus_q = asked(port, &gus_auth, json!({ "role": billing, "scope": "team", "hours": 8, "reason": "x" })).await;
+    let (_, v) = json_call(port, "GET", "/api/team/role-requests", &ada_auth, "").await;
+    assert_eq!(v["pending"], 1, "{v}");
+    assert_eq!(call(port, "POST", "/api/team/leave", &gus_auth, "").await.0, 200);
+    let (_, v) = json_call(port, "GET", "/api/team/role-requests?status=all", &ada_auth, "").await;
+    assert!(v["requests"].as_array().unwrap().iter().all(|q| q["id"] != gus_q.as_str()), "{v}");
+    assert_eq!(v["pending"], 0, "{v}");
+    assert_eq!(call(port, "POST", &at(&gus_q, "approve"), &ada_auth, "{}").await.0, 404);
+    assert_eq!(call(port, "POST", &at(&gus_q, "deny"), &ada_auth, "{}").await.0, 404);
+}

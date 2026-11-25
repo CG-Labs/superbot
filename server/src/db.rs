@@ -942,6 +942,9 @@ pub struct RequestState<'a> {
     pub user: &'a User,
     /// Their team membership, when the request is for a team.
     pub member: Option<&'a TeamMember>,
+    /// Whether a SCIM mapping or team role group gave them their role in the request's
+    /// team (ADR 0138, ADR 0206). False for a request across the server.
+    pub from_idp: bool,
 }
 
 /// An approved request, with the role they held in its scope just before (and its end),
@@ -6180,14 +6183,22 @@ impl Db {
             .unwrap_or_default()
     }
 
-    /// Denies or withdraws (`status`) a pending request; with `user`, only theirs. None
-    /// when there's no such pending request.
-    pub fn close_role_request(&self, id: &str, status: &str, by: Option<&str>, note: Option<&str>, user: Option<&str>) -> Option<RoleRequest> {
+    /// Newest first: the requests for roles within `team_id` (ADR 0263); with `status`, only those.
+    pub fn team_role_requests(&self, team_id: &str, status: Option<&str>, limit: usize) -> Vec<RoleRequest> {
+        let c = self.c();
+        c.prepare("SELECT * FROM role_requests WHERE team_id = ?1 AND (?2 IS NULL OR status = ?2) ORDER BY created_at DESC, id DESC LIMIT ?3")
+            .and_then(|mut s| s.query_map(params![team_id, status, limit as i64], role_request_row)?.collect())
+            .unwrap_or_default()
+    }
+
+    /// Denies or withdraws (`status`) a pending request; with `user`, only theirs; with
+    /// `team`, only one within that team. None when there's no such pending request.
+    pub fn close_role_request(&self, id: &str, status: &str, by: Option<&str>, note: Option<&str>, user: Option<&str>, team: Option<&str>) -> Option<RoleRequest> {
         self.c()
             .query_row(
                 "UPDATE role_requests SET status = ?2, decided_at = ?3, decided_by = ?4, note = ?5
-                 WHERE id = ?1 AND status = 'pending' AND (?6 IS NULL OR user_id = ?6) RETURNING *",
-                params![id, status, now(), by, note, user],
+                 WHERE id = ?1 AND status = 'pending' AND (?6 IS NULL OR user_id = ?6) AND (?7 IS NULL OR team_id = ?7) RETURNING *",
+                params![id, status, now(), by, note, user, team],
                 role_request_row,
             )
             .optional()
@@ -6250,7 +6261,8 @@ impl Db {
             Some(t) => tx.query_row("SELECT * FROM team_members WHERE user_id = ?1 AND team_id = ?2", [&q.user_id, t], team_member_row).optional().map_err(err)?,
             None => None,
         };
-        check(&RequestState { request: &q, role: &role, user: &user, member: member.as_ref() }).map_err(RoleRequestError::Refused)?;
+        let from_idp = q.team_id.is_some() && Self::idp_team_role_in(&tx, &q.user_id).map_err(err)?;
+        check(&RequestState { request: &q, role: &role, user: &user, member: member.as_ref(), from_idp }).map_err(RoleRequestError::Refused)?;
         let hours = hours.unwrap_or(q.hours);
         let limit = role.max_days.map(|d| d * 24).ok_or(RoleRequestError::Refused("not_requestable"))?;
         if hours > limit {
