@@ -237,12 +237,13 @@ pub fn dates(d: &Draft, saml: &[health_check::Cert], scim_tenants_expiring: usiz
     }
     for c in saml {
         let detail = format!(
-            "{}'s {} ends{}.",
+            "{}'s {} {}{}.",
             code(&c.provider),
             role_words(&c.role),
+            if c.ends_at <= now_ms { "has ended" } else { "ends" },
             if c.covered { ", with a newer one already in use" } else { ": nothing replaces it yet; record who rotates it (botctl sso saml <provider>)" }
         );
-        out.push(due("saml_certificate", Some(now_ms + c.days_left.max(0) * DAY_MS), &today, detail));
+        out.push(due("saml_certificate", Some(c.ends_at), &today, detail));
     }
     let check = d.last_health_check.as_ref().map_or(now_ms, |c| c.at + health_check::MONTH_DAYS * DAY_MS);
     let detail = match &d.last_health_check {
@@ -295,7 +296,7 @@ pub fn build(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> rusqlite::
     let report = crate::health_score::build(app, now_ms, health_check::SCORE_DAYS);
     let history = crate::health_history::history(app, now_ms, health_check::MONTH_DAYS)?;
     let since = now_ms - REVIEW_DAYS * DAY_MS;
-    let listed = app.db.status_incidents(since, 1000, 0)?;
+    let listed = app.db.status_incidents_between(since, i64::MAX)?;
     let inputs = health_check::gather_with(app, a, setup, now_ms, &report, Some(&history));
     let checked = health_check::check(&inputs);
 
@@ -717,8 +718,8 @@ mod tests {
 
     fn with_dates(mut d: Draft) -> Draft {
         let certs = [
-            health_check::Cert { provider: "okta".into(), role: "idp_signing".into(), days_left: 20, covered: false },
-            health_check::Cert { provider: "okta".into(), role: "sp_signing".into(), days_left: 45, covered: true },
+            health_check::Cert { provider: "okta".into(), role: "idp_signing".into(), days_left: 20, ends_at: NOW + 20 * DAY_MS, covered: false },
+            health_check::Cert { provider: "okta".into(), role: "sp_signing".into(), days_left: 45, ends_at: NOW + 45 * DAY_MS, covered: true },
         ];
         d.dates = dates(&d, &certs, 1, Some(ms("2026-07-01")), NOW);
         d
@@ -756,6 +757,16 @@ mod tests {
         assert_eq!(detail("business_review"), "The next quarterly business review, for 2026-10 to 2026-12; the last draft covered 2026-07 to 2026-09.");
         assert!(d.dates[2].detail.contains("nothing replaces it yet") && d.dates[4].detail.contains("a newer one already in use"), "{:#?}", d.dates);
         assert_eq!(detail("scim_tokens"), "Every SCIM token of 1 tenant ends within 14 days: botctl scim token rotate.");
+    }
+
+    #[test]
+    fn a_certificate_that_has_ended_is_overdue() {
+        let d = draft();
+        let ended = health_check::Cert { provider: "okta".into(), role: "idp_signing".into(), days_left: 0, ends_at: NOW - 30 * 3_600_000, covered: false };
+        let due = dates(&d, &[ended], 0, None, NOW).into_iter().find(|x| x.what == "saml_certificate").unwrap();
+        assert_eq!((due.on.as_deref(), due.overdue), (Some("2026-11-23"), true), "{due:?}");
+        assert!(due.detail.starts_with("okta's the IdP's signing certificate has ended"), "{due:?}");
+        assert_eq!(with_dates(d).audit_details(Format::Json)["overdue"], json!(["access_review"]));
     }
 
     #[test]

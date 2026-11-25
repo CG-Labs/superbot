@@ -165,6 +165,8 @@ pub struct Cert {
     /// `saml_expiry::Role::as_str`.
     pub role: String,
     pub days_left: i64,
+    /// When it ends, unix ms.
+    pub ends_at: i64,
     /// Another certificate of the same role outlives `CERT_DAYS`.
     pub covered: bool,
 }
@@ -721,7 +723,7 @@ pub fn gather_with(app: &AppState, a: &Auth, setup: &Value, now_ms: i64, report:
             let ends_soon = |c: &crate::sso::saml_expiry::InUse| c.cert.not_after.saturating_mul(1000) <= end;
             for c in certs.iter().filter(|c| ends_soon(c)) {
                 let covered = certs.iter().any(|o| o.role == c.role && o.cert.sha256 != c.cert.sha256 && !ends_soon(o));
-                m.ending.push(Cert { provider: p.id.clone(), role: c.role.as_str().into(), days_left: crate::sso::saml_expiry::days_left(c.cert.not_after, now_ms), covered });
+                m.ending.push(Cert { provider: p.id.clone(), role: c.role.as_str().into(), days_left: crate::sso::saml_expiry::days_left(c.cert.not_after, now_ms), ends_at: c.cert.not_after.saturating_mul(1000), covered });
             }
         }
         m
@@ -977,7 +979,7 @@ mod tests {
     #[test]
     fn saml_certificates_ending_without_a_replacement_are_open() {
         let mut i = healthy();
-        let cert = |role: &str, days: i64, covered: bool| Cert { provider: "okta".into(), role: role.into(), days_left: days, covered };
+        let cert = |role: &str, days: i64, covered: bool| Cert { provider: "okta".into(), role: role.into(), days_left: days, ends_at: days * DAY_MS, covered };
         i.saml.as_mut().unwrap().ending = vec![cert("idp_signing", 21, true)];
         assert_eq!(
             status(&check(&i), "saml"),
