@@ -170,6 +170,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0243-onboarding-check-in-the-console-and-the-bundle.md"));
     files.push(repo().join("docs/adr/0252-monthly-health-check.md"));
     files.push(repo().join("docs/adr/0262-business-review-draft.md"));
+    files.push(repo().join("docs/adr/0271-health-check-in-the-support-bundle.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -518,6 +519,17 @@ fn the_health_check_page_documents_every_item_status_and_option() {
     }
     for (name, needle) in [("README.md", "botctl health-check"), ("tam.md", "botctl health-check")] {
         assert!(read(name).contains(needle), "{name} doesn't point at botctl health-check");
+    }
+    // ADR 0271: the bundle carries the check, and triage reads it.
+    assert!(anchors(&page).contains("in-the-support-bundle"), "health-check.md has no \"In the support bundle\" section");
+    let bundle = page.split("## In the support bundle").nth(1).unwrap().split("\n## ").next().unwrap();
+    for needle in ["health-check.json", "support.health_checked", "health_check.open", "health_check.saml"] {
+        assert!(bundle.contains(needle), "health-check.md's bundle section doesn't mention {needle}");
+    }
+    let triage = fs::read_to_string(repo().join("server/src/support_triage.rs")).unwrap();
+    let shown = triage.split("HEALTH_CHECK_SHOWN_ELSEWHERE: [&str; ").nth(1).unwrap().split(';').next().unwrap();
+    for id in shown.split('"').skip(1).step_by(2) {
+        assert!(bundle.contains(&format!("`{id}`")), "health-check.md's bundle section doesn't say triage leaves out {id}");
     }
 }
 

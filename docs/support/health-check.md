@@ -1,6 +1,6 @@
 # Monthly health check
 
-What the technical account manager (TAM) checks each month for an Enterprise customer, in about an hour ([TAM programme](tam.md#cadence)). On a managed or dedicated deployment the Provider runs the commands; on a self-hosted one, the customer's admin runs them and shares the output, or a [support bundle](support-bundle.md) (which has the health score in it). Record the score, and anything not ticked, in the customer's record, not here.
+What the technical account manager (TAM) checks each month for an Enterprise customer, in about an hour ([TAM programme](tam.md#cadence)). On a managed or dedicated deployment the Provider runs the commands; on a self-hosted one, the customer's admin runs them and shares the output, or a [support bundle](support-bundle.md), which has the health score and this check in it ([below](#in-the-support-bundle)). Record the score, and anything not ticked, in the customer's record, not here.
 
 Start with `botctl health-check` ([below](#run-it-first)): it judges every item of this checklist from botd's own records, so the hour goes on what's open and what only a person can confirm.
 
@@ -78,6 +78,12 @@ Details are codes, counts, provider ids and incident ids: never a person's name 
 ## Afterwards
 
 Send the customer's owner a short note: the score and band, what changed, and what's being done, with owners and dates. Keep the full checklist for the [quarterly review](qbr-template.md).
+
+## In the support bundle
+
+Every [support bundle](support-bundle.md) has this check in it as `health-check.json`: the same report as `botctl health-check json`, judged when the bundle is made. A bundle's check isn't recorded as `support.health_checked`, because a bundle made for a ticket isn't the TAM's monthly check, and the cadence above and the [business review](qbr-template.md#draft-it-first) count only those. So a customer's admin can send a bundle instead of running the check and sending its output.
+
+When support triages the bundle ([bundle triage](triage.md)), open items show as `health_check.open` for the TAM, with no severity and each item's guide. The score's items (`score`, `sign_in`, `runs`) and `setup` are left out there, since triage already reports the score's signals and the setup checklist. A native SAML certificate ending with nothing to replace it shows as its own warning, `health_check.saml`, since sign-in through that provider stops the day it ends. Design: [ADR 0271](../adr/0271-health-check-in-the-support-bundle.md).
 
 ## What botd reads
 

@@ -28,6 +28,22 @@ fn it_knows_both_bundles_formats_and_files() {
     assert_eq!(support_triage::OFFLINE_FORMAT, u64::from(support_check::FORMAT), "the offline bundle changed: teach support_triage the new format");
 }
 
+/// botctl builds support_triage without botd's health check, so it keeps its own table of
+/// the items' guides; this holds the two together.
+#[test]
+fn it_knows_each_health_check_items_guide() {
+    let ids: Vec<&str> = crate::health_check::ITEMS.iter().map(|i| i.id).collect();
+    for id in support_triage::HEALTH_CHECK_SHOWN_ELSEWHERE {
+        assert!(ids.contains(&id), "{id} isn't a health check item");
+    }
+    for it in crate::health_check::ITEMS.iter().filter(|i| !support_triage::HEALTH_CHECK_SHOWN_ELSEWHERE.contains(&i.id)) {
+        let ours = support_triage::HEALTH_CHECK_GUIDES.iter().find(|(id, _)| *id == it.id).map(|(_, g)| format!("docs/{g}"));
+        let playbook = ["docs/support/", "docs/sso/", "docs/ops/"].iter().any(|p| it.guide.starts_with(p));
+        assert_eq!(ours.as_deref(), playbook.then_some(it.guide), "{}'s guide", it.id);
+    }
+    assert!(support_triage::HEALTH_CHECK_GUIDES.iter().all(|(id, _)| ids.contains(id)), "every guide is an item's");
+}
+
 #[test]
 fn it_reads_the_online_bundle_botd_makes() {
     let app = crate::runner::test_app();
@@ -41,8 +57,8 @@ fn it_reads_the_online_bundle_botd_makes() {
     app.db.add_approval(&bot.id, "claude", "Bash", "shell", "rm -rf build", &json!({}), "shell_destructive", "asks", db::now() + 600_000);
     let setup = json!({ "checklist": [{ "id": "backups", "label": "Server backups copied off this host", "done": false }], "done": 0, "total": 1 });
     let auth = crate::Auth::new(Some(app.clone()));
-    let onboarding = crate::onboarding::check(&crate::onboarding::gather(&app, &auth, &setup, db::now()), &[]).view("2026-11-24T05:00:00Z");
-    let built = crate::support::build(&app, &[], setup, onboarding, db::now());
+    let checks = crate::support::Checks::judge(&app, &auth, &setup, db::now());
+    let built = crate::support::build(&app, &[], setup, checks, db::now());
     for n in names(&built.tar) {
         assert!(support_triage::FILES.contains(&n.as_str()), "support_triage doesn't read {n}");
     }
@@ -69,6 +85,14 @@ fn it_reads_the_online_bundle_botd_makes() {
         assert!(onboarding.summary.contains(open), "{open}: {}", onboarding.summary);
     }
     assert!(!onboarding.summary.contains("first_bundle"), "the bundle is one");
+    let check = find(&t, "health_check.open");
+    assert_eq!((check.level, check.severity), (Level::Info, None), "the health check sets no severity");
+    for open in ["Incidents closed and reviewed (incidents)", "Server backups within their RPO (backups)"] {
+        assert!(check.summary.contains(open), "{open}: {}", check.summary);
+    }
+    assert!(!check.summary.contains("(setup)") && !check.summary.contains("(score)"), "shown above: {}", check.summary);
+    assert!(check.runbooks.contains(&"support/incident-review.md#the-review-draft") && check.runbooks.contains(&"ops/backup-restore.md"), "{:?}", check.runbooks);
+    assert!(!ids(&t).contains(&"health_check.saml"), "no native SAML provider");
 
     assert!(t.testing, "tests run in testing mode");
     let v: Value = t.json();
