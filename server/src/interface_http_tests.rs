@@ -189,6 +189,18 @@ fn the_console_runs_the_health_check_only_when_asked() {
     }
 }
 
+/// ADR 0278: the TAM handover draft is a plain download link, never fetched when the
+/// Support tab loads, since each draft is audited.
+#[test]
+fn the_console_drafts_the_tam_handover_only_when_clicked() {
+    let start = CONSOLE_JS.find("async function loadSupport(").expect("loadSupport");
+    let load = &CONSOLE_JS[start..start + CONSOLE_JS[start..].find("\n}\n").expect("function end")];
+    assert!(!load.contains("tam-handover"), "opening the Support tab would record a draft");
+    assert!(!CONSOLE_JS.contains("tam-handover"), "the link needs no script");
+    let link = CONSOLE_HTML.lines().find(|l| l.contains(r#"id="sup-handover""#)).expect("the download link");
+    assert!(link.contains(r#"href="/api/support/tam-handover?format=markdown" download"#) && link.contains("Draft TAM handover"), "{link}");
+}
+
 /// ADR 0262: the business review draft is a download the admin clicks, never fetched when
 /// the Support tab loads, since each draft is audited; the month picked only changes its link.
 #[test]

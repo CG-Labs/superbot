@@ -165,6 +165,8 @@ pub struct Cert {
     /// `saml_expiry::Role::as_str`.
     pub role: String,
     pub days_left: i64,
+    /// When it ends, unix ms.
+    pub ends_at: i64,
     /// Another certificate of the same role outlives `CERT_DAYS`.
     pub covered: bool,
 }
@@ -686,8 +688,14 @@ fn days_since(ms: i64, now_ms: i64) -> i64 {
 /// The inputs, from the health score, its history, the database, botd's settings and the setup wizard's checklist.
 pub fn gather(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
     let report = crate::health_score::build(app, now_ms, SCORE_DAYS);
-    let score = score_of(&report);
     let history = crate::health_history::history(app, now_ms, MONTH_DAYS).ok();
+    gather_with(app, a, setup, now_ms, &report, history.as_ref())
+}
+
+/// `gather`, given the 30-day health score report and the last month's history (None
+/// when botd couldn't read it).
+pub fn gather_with(app: &AppState, a: &Auth, setup: &Value, now_ms: i64, report: &Value, history: Option<&Value>) -> Inputs {
+    let score = score_of(report);
     let month = now_ms - MONTH_DAYS * DAY_MS;
     let window = now_ms - SCORE_DAYS * DAY_MS;
 
@@ -715,7 +723,7 @@ pub fn gather(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
             let ends_soon = |c: &crate::sso::saml_expiry::InUse| c.cert.not_after.saturating_mul(1000) <= end;
             for c in certs.iter().filter(|c| ends_soon(c)) {
                 let covered = certs.iter().any(|o| o.role == c.role && o.cert.sha256 != c.cert.sha256 && !ends_soon(o));
-                m.ending.push(Cert { provider: p.id.clone(), role: c.role.as_str().into(), days_left: crate::sso::saml_expiry::days_left(c.cert.not_after, now_ms), covered });
+                m.ending.push(Cert { provider: p.id.clone(), role: c.role.as_str().into(), days_left: crate::sso::saml_expiry::days_left(c.cert.not_after, now_ms), ends_at: c.cert.not_after.saturating_mul(1000), covered });
             }
         }
         m
@@ -786,7 +794,7 @@ pub fn gather(app: &AppState, a: &Auth, setup: &Value, now_ms: i64) -> Inputs {
 
     Inputs {
         score,
-        trend: trend_of(history.as_ref()),
+        trend: trend_of(history),
         version: env!("CARGO_PKG_VERSION").into(),
         setup_open: setup["checklist"].as_array().into_iter().flatten().filter(|c| c["done"] != true).filter_map(|c| c["id"].as_str().map(String::from)).collect(),
         incidents,
@@ -971,7 +979,7 @@ mod tests {
     #[test]
     fn saml_certificates_ending_without_a_replacement_are_open() {
         let mut i = healthy();
-        let cert = |role: &str, days: i64, covered: bool| Cert { provider: "okta".into(), role: role.into(), days_left: days, covered };
+        let cert = |role: &str, days: i64, covered: bool| Cert { provider: "okta".into(), role: role.into(), days_left: days, ends_at: days * DAY_MS, covered };
         i.saml.as_mut().unwrap().ending = vec![cert("idp_signing", 21, true)];
         assert_eq!(
             status(&check(&i), "saml"),

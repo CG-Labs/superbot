@@ -71,6 +71,8 @@ qrcode = { version = "0.15", default-features = false, features = ["svg"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+p12-keystore = "0.4"
+pkcs8 = { version = "0.11", features = ["encryption", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["test-util"] }
