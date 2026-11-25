@@ -92,6 +92,15 @@ HARNESS_LINKED=()
 # (docs/adr/0294-offline-upgrades-checked-against-machines-settings.md).
 MACHINE_HERMES_BUNDLE_VALUE=""
 MACHINE_HARNESS_BUNDLE_VALUE=""
+# An offline upgrade to a newer release first backs up DATA_DIR and .env with the release that
+# is running, into ROLLBACK_DIR (root only); --rollback puts that release back from them
+# (docs/adr/0300-offline-upgrades-keep-a-way-back.md). --no-upgrade-backup skips the backup.
+ROLLBACK=false
+NO_UPGRADE_BACKUP=false
+ROLLBACK_DIR=${ROLLBACK_DIR:-}
+# Set by prepare_offline: the release this host runs, and whether this run restores ROLLBACK_DIR.
+OFFLINE_INSTALLED=""
+ROLLBACK_RESTORE=false
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
@@ -193,6 +202,11 @@ Usage: install.sh [options]
                       in .env (as there: FILE or FILE=SHA-256, comma-separated, one per arch), the
                       bundles users' machines take from botd. Before anything changes, the bundle's
                       botd checks machines' settings with them (botd machines check)
+  --rollback          With --offline <older bundle> --upgrade: go back to the release this host
+                      ran before its last offline upgrade, putting back the database and .env
+                      that upgrade backed up. Everything since that upgrade is lost
+  --no-upgrade-backup With --offline --upgrade: don't back up DATA_DIR and .env first, so
+                      --rollback can't go back to the release running now
   --tls-cert PATH, --tls-key PATH
                       Serve --domain with this certificate (PEM, full chain) and key instead of
                       getting one from Let's Encrypt
@@ -240,6 +254,8 @@ parse_args() {
       --machine-hermes-bundle) MACHINE_HERMES_BUNDLE_VALUE=$2; shift 2 ;;
       --machine-harness-bundle) MACHINE_HARNESS_BUNDLE_VALUE=$2; shift 2 ;;
       --harness-bundle-sha256) HARNESS_BUNDLE_SHA256=$2; shift 2 ;;
+      --rollback) ROLLBACK=true; shift ;;
+      --no-upgrade-backup) NO_UPGRADE_BACKUP=true; shift ;;
       --tls-cert) TLS_CERT=$2; shift 2 ;;
       --tls-key) TLS_KEY=$2; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
@@ -1773,7 +1789,20 @@ machine_settings_check() {
   fi
   [[ -z "$MACHINE_HERMES_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HERMES_BUNDLE=$MACHINE_HERMES_BUNDLE_VALUE")
   [[ -z "$MACHINE_HARNESS_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HARNESS_BUNDLE=$MACHINE_HARNESS_BUNDLE_VALUE")
-  out=$(cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --home "$home" "${args[@]}" 2>&1) || rc=$?
+  if [[ "$ROLLBACK_RESTORE" == true ]]; then
+    # A rollback puts back the .env from before the upgrade, which root alone reads. botd's user
+    # gets a copy of its own, as it owns the live .env: a pipe root made can't be reopened as
+    # /dev/stdin by another user. botd runs in the folder the unit runs it in.
+    env_file="$(rollback_dir)/$(manifest_value "$(rollback_dir)/record" env)"
+    doc="docs/ops/air-gapped.md#going-back"
+    local copy
+    copy=$(cat -- "$env_file" | (cd / && sudo -u "$SUPERBOT_USER" sh -c 'f=$(mktemp) && cat >"$f" && echo "$f"')) \
+      || die "Couldn't hand $SUPERBOT_USER the .env from before the upgrade to check. Nothing has changed."
+    out=$(cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --env-file "$copy" 2>&1) || rc=$?
+    rm -f -- "$copy"
+  else
+    out=$(cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --home "$home" "${args[@]}" 2>&1) || rc=$?
+  fi
   case $rc in
     0)
       log "Machines' settings: the bundle's botd would start with them (botd machines check)"
@@ -1788,6 +1817,8 @@ machine_settings_check() {
         return 0
       fi
       warn "$why"
+      [[ "$ROLLBACK_RESTORE" != true ]] \
+        || die "Nothing has changed. The .env from before the upgrade names something $OFFLINE_VERSION's botd can't use now, such as machines' bundles since removed: put back what it names, then run the rollback again ($doc)"
       die "Nothing has changed. If it names MACHINE_HERMES_BUNDLE or MACHINE_HARNESS_BUNDLE, carry in this release's Hermes or harness bundles for your machines' arches, put them on this server where $SUPERBOT_USER can read them, and re-run with --machine-hermes-bundle or --machine-harness-bundle naming them; else change $env_file ($doc)"
       ;;
     *) warn "botd machines check didn't run (status $rc), so machines' settings weren't checked before the upgrade: $(head -n 1 <<<"$out")" ;;
@@ -1804,10 +1835,18 @@ check_offline_flags() {
     [[ -z "$HARNESS_BUNDLE$HARNESS_BUNDLE_SHA256" ]] || die "--harness-bundle is for --offline installs: online, install the harness CLIs with npm"
     [[ -z "$MACHINE_HERMES_BUNDLE_VALUE$MACHINE_HARNESS_BUNDLE_VALUE" ]] \
       || die "--machine-hermes-bundle and --machine-harness-bundle are for --offline --upgrade: online, set MACHINE_HERMES_BUNDLE and MACHINE_HARNESS_BUNDLE in .env"
+    [[ "$ROLLBACK" != true && "$NO_UPGRADE_BACKUP" != true ]] \
+      || die "--rollback and --no-upgrade-backup are for --offline upgrades: online, go back by restoring a backup (docs/ops/backup-restore.md)"
     return 0
   fi
   [[ -z "$MACHINE_HERMES_BUNDLE_VALUE$MACHINE_HARNESS_BUNDLE_VALUE" || "$UPGRADE" == true ]] \
     || die "--machine-hermes-bundle and --machine-harness-bundle change an installed server's .env: use them with --upgrade"
+  if [[ "$ROLLBACK" == true ]]; then
+    [[ "$UPGRADE" == true ]] || die "--rollback changes an installed server: use it with --upgrade"
+    [[ "$NO_UPGRADE_BACKUP" != true ]] || die "--rollback restores the backup an upgrade took: --no-upgrade-backup doesn't go with it"
+    [[ -z "$MACHINE_HERMES_BUNDLE_VALUE$MACHINE_HARNESS_BUNDLE_VALUE" ]] \
+      || die "--rollback puts back the .env from before the upgrade, with its MACHINE_HERMES_BUNDLE and MACHINE_HARNESS_BUNDLE: change them after the rollback"
+  fi
   local flag item path items
   for flag in "--machine-hermes-bundle=$MACHINE_HERMES_BUNDLE_VALUE" "--machine-harness-bundle=$MACHINE_HARNESS_BUNDLE_VALUE"; do
     IFS=, read -ra items <<<"${flag#*=}"
@@ -2439,10 +2478,11 @@ semver_gt() {
 
 # Unpacks into a root-owned folder (Caddy's files are copied from it as the service user, who
 # can read but not change it) and refuses an older version than the one installed: a newer
-# database may not open with older binaries. Restore a backup to go back.
+# database may not open with older binaries. --rollback goes back with the backup the last
+# upgrade took, when that backup is of the bundle's release (rollback_problem).
 prepare_offline() {
   [[ -n "$OFFLINE_BUNDLE" ]] || return 0
-  local installed release
+  local installed release why
   if [[ "$DRY_RUN" == true ]]; then
     OFFLINE_TMP=$(mktemp -d)
   else
@@ -2455,10 +2495,28 @@ prepare_offline() {
   release=$(offline_release_file)
   if [[ -f "$release" ]]; then
     installed=$(manifest_value "$release" version)
+    OFFLINE_INSTALLED=$installed
     if [[ -n "$installed" ]] && semver_gt "$installed" "$OFFLINE_VERSION"; then
-      die "This host runs $installed, newer than the bundle's $OFFLINE_VERSION. To go back, restore a backup made on $OFFLINE_VERSION (docs/ops/air-gapped.md#upgrading)."
+      if [[ "$ROLLBACK" == true ]]; then
+        why=$(rollback_problem "$installed")
+        [[ -z "$why" ]] || die "Can't roll back to $OFFLINE_VERSION: $why. Nothing has changed. To go back, restore a backup made on $OFFLINE_VERSION (docs/ops/air-gapped.md#going-back)."
+        ROLLBACK_RESTORE=true
+        log "Offline rollback: $installed -> $OFFLINE_VERSION, with the backup taken before the upgrade to $installed ($(manifest_value "$(rollback_dir)/record" created))"
+        return 0
+      fi
+      if [[ -z "$(rollback_problem "$installed")" ]]; then
+        die "This host runs $installed, newer than the bundle's $OFFLINE_VERSION. To go back to the backup taken before the upgrade to $installed, losing everything since, add --rollback (docs/ops/air-gapped.md#going-back)."
+      fi
+      die "This host runs $installed, newer than the bundle's $OFFLINE_VERSION. To go back, restore a backup made on $OFFLINE_VERSION (docs/ops/air-gapped.md#going-back)."
+    fi
+    if [[ "$ROLLBACK" == true ]]; then
+      [[ "$installed" == "$OFFLINE_VERSION" ]] \
+        || die "--rollback goes back to an older release, but this host runs ${installed:-an unknown release} and the bundle is $OFFLINE_VERSION"
+      log "This host already runs $OFFLINE_VERSION: nothing to roll back, so the bundle is installed again as is"
     fi
     log "Offline upgrade: ${installed:-unknown} -> $OFFLINE_VERSION"
+  else
+    [[ "$ROLLBACK" != true ]] || die "--rollback: this host has no offline release recorded in $release, so there's nothing to go back from"
   fi
 }
 
@@ -2502,6 +2560,195 @@ record_offline_release() {
   install -m 0644 -o root -g root "$OFFLINE_DIR/MANIFEST" "$release"
 }
 
+# --- Going back after an offline upgrade (docs/adr/0300-offline-upgrades-keep-a-way-back.md) ---
+
+rollback_dir() { printf '%s\n' "${ROLLBACK_DIR:-$SHARE_DIR/rollback}"; }
+
+# DATA_DIR as superbot-restore reads it from an .env: the last value, unquoted, or the default.
+env_data_dir() {
+  local value
+  value=$(sed -n 's/^DATA_DIR=//p' "$1" | tail -n 1)
+  case $value in
+    \"*\" | \'*\') value=${value:1:-1} ;;
+  esac
+  printf '%s\n' "${value:-$2/superbot/data}"
+}
+
+# The .pre-restore-* folders in a DATA_DIR: superbot-restore makes one as it starts swapping.
+pre_restore_dirs() {
+  (cd / && find "$1" -mindepth 1 -maxdepth 1 -name '.pre-restore-*' 2>/dev/null | sort) || true
+}
+
+# Why the backup in rollback_dir can't take this host, running INSTALLED, back to the bundle's
+# release; nothing when it can. It must be that release's, from just before the upgrade to the
+# one running now, so no later release has opened the database since.
+rollback_problem() {
+  local installed=$1 dir record from commit want to archive env
+  dir=$(rollback_dir)
+  record="$dir/record"
+  [[ -f "$record" ]] || { echo "no backup was taken before an offline upgrade on this host ($record)"; return; }
+  from=$(manifest_value "$record" from_version)
+  commit=$(manifest_value "$record" from_commit)
+  to=$(manifest_value "$record" to_version)
+  archive=$(manifest_value "$record" archive)
+  env=$(manifest_value "$record" env)
+  want=$(manifest_value "$OFFLINE_DIR/MANIFEST" commit)
+  if [[ "$from" != "$OFFLINE_VERSION" ]]; then
+    echo "the backup in $dir is of $from, not $OFFLINE_VERSION: roll back with the $from bundle"
+  elif [[ -n "$commit" && "$commit" != unknown && -n "$want" && "$want" != unknown && "$commit" != "$want" ]]; then
+    echo "the backup in $dir is of $from built from $commit, but this bundle is built from $want"
+  elif [[ "$to" != "$installed" ]]; then
+    echo "the backup in $dir was taken before the upgrade to $to, but this host runs $installed, which may have changed the database since"
+  elif ! [[ "$archive" =~ ^superbot-pre-upgrade-[0-9A-Za-z._+-]+\.tar\.gz(\.age)?$ && "$env" =~ ^env-[0-9A-Z]+$ && -f "$dir/$archive" && -f "$dir/$env" ]]; then
+    echo "the backup's files aren't all in $dir"
+  elif [[ "$(sha256sum "$dir/$archive" | awk '{ print $1 }')" != "$(manifest_value "$record" archive_sha256)" ]]; then
+    echo "$dir/$archive has changed since it was backed up (its SHA-256 differs)"
+  fi
+}
+
+# The backup ARCHIVE, decrypted by root when it is encrypted, into the bundle's superbot-restore
+# as botd's user, who owns DATA_DIR but can't read rollback_dir or the backup key. ARGS go to
+# superbot-restore (--check only reads it).
+rollback_feed_restore() {
+  local home=$1 archive=$2
+  shift 2
+  local restore=(sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" SUPERBOT_BOTD="$OFFLINE_DIR/bin/botd"
+    bash "$OFFLINE_DIR/deploy/superbot-restore.sh" --home "$home" "$@" -)
+  if [[ "$archive" == *.age ]]; then
+    age -d -i "$BACKUP_IDENTITY_FILE" -- "$archive" | (cd / && "${restore[@]}")
+  else
+    (cd / && "${restore[@]}") <"$archive"
+  fi
+}
+
+# Before anything changes on a rollback: the backup unpacks, opens and passes its checks.
+prepare_rollback() {
+  [[ "$ROLLBACK_RESTORE" == true ]] || return 0
+  local dir archive out data_dir
+  dir=$(rollback_dir)
+  archive="$dir/$(manifest_value "$dir/record" archive)"
+  # The restore puts DATA_DIR where the old .env points, and configure_env then points botd at
+  # the installer's own, as on every install.
+  data_dir=$(env_data_dir "$dir/$(manifest_value "$dir/record" env)" "$(user_home)")
+  [[ "$data_dir" == "$(user_home)/superbot/data" ]] \
+    || die "The .env from before the upgrade sets DATA_DIR=$data_dir, but the installer runs botd with $(user_home)/superbot/data, so the backup would go where botd won't read it. Nothing has changed. Restore it by hand instead (docs/ops/backup-restore.md)."
+  if [[ "$archive" == *.age ]]; then
+    command -v age >/dev/null 2>&1 || die "The backup taken before the upgrade, $archive, is encrypted, and age isn't installed. Nothing has changed."
+    [[ -r "$BACKUP_IDENTITY_FILE" ]] \
+      || die "The backup taken before the upgrade, $archive, is encrypted: put the age identity that opens it at $BACKUP_IDENTITY_FILE, or name it with BACKUP_IDENTITY_FILE=<file>. Nothing has changed."
+  fi
+  if ! out=$(rollback_feed_restore "$(user_home)" "$archive" --check 2>&1); then
+    printf '%s\n' "$out" >&2
+    die "The backup taken before the upgrade, $archive, doesn't restore: $(tail -n 1 <<<"$out"). Nothing has changed."
+  fi
+  log "Rollback: the backup taken before the upgrade to $OFFLINE_INSTALLED unpacks and checks out"
+  grep -E '^(created|users|bots|messages|needs master key): ' <<<"$out" | sed 's/^/    /' || true
+}
+
+# An offline upgrade to a newer release: DATA_DIR, backed up by the running release's own
+# superbot-backup as botd's user (encrypted as its backups are), and .env, kept root-only in
+# rollback_dir for --rollback. One backup is kept: this one replaces the last once it is
+# complete. A backup that fails stops the upgrade before anything changes. A rollback instead
+# puts them back (rollback_restore).
+offline_rollback_point() {
+  [[ -n "$OFFLINE_BUNDLE" ]] || return 0
+  if [[ "$ROLLBACK_RESTORE" == true ]]; then
+    rollback_restore
+    return
+  fi
+  if [[ -z "$OFFLINE_INSTALLED" ]] || ! semver_gt "$OFFLINE_VERSION" "$OFFLINE_INSTALLED"; then
+    return 0
+  fi
+  local dir home env_file stamp partial name out commit
+  local -a backup
+  dir=$(rollback_dir)
+  home=$(user_home)
+  env_file="$home/superbot/.env"
+  [[ -f "$env_file" ]] || return 0
+  if [[ "$NO_UPGRADE_BACKUP" == true ]]; then
+    warn "No backup before the upgrade (--no-upgrade-backup): --rollback can't take this host back to $OFFLINE_INSTALLED"
+    return 0
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would back up DATA_DIR and $env_file with $OFFLINE_INSTALLED's superbot-backup into $dir (root only), for --rollback"
+    return 0
+  fi
+  backup=("$BIN_DIR/superbot-backup")
+  [[ -x "$BIN_DIR/superbot-backup" ]] || backup=(bash "$OFFLINE_DIR/deploy/superbot-backup.sh")
+  install -d -m 0700 -o root -g root "$dir"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  partial="$dir/.partial-$stamp"
+  install -m 0600 -o root -g root /dev/null "$partial"
+  log "Backing up DATA_DIR and .env before the upgrade, so --rollback can go back to $OFFLINE_INSTALLED"
+  if ! out=$( (cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" SUPERBOT_BOTD="$BIN_DIR/botd" "${backup[@]}" --home "$home" -) 2>&1 >"$partial"); then
+    rm -f -- "$partial"
+    printf '%s\n' "$out" >&2
+    die "Couldn't back up before the upgrade: $(tail -n 1 <<<"$out"). Nothing has changed. Fix it (free space under $dir, say) and run the upgrade again, or upgrade with no way back with --no-upgrade-backup."
+  fi
+  name="superbot-pre-upgrade-$OFFLINE_INSTALLED-$stamp.tar.gz"
+  [[ "$(head -c 21 "$partial")" != age-encryption.org/v1 ]] || name+=.age
+  mv -- "$partial" "$dir/$name"
+  install -m 0600 -o root -g root "$env_file" "$dir/env-$stamp"
+  commit=$(manifest_value "$(offline_release_file)" commit)
+  printf 'format=1\nfrom_version=%s\nfrom_commit=%s\nto_version=%s\ncreated=%s\narchive=%s\narchive_sha256=%s\nenv=%s\n' \
+    "$OFFLINE_INSTALLED" "$commit" "$OFFLINE_VERSION" "$(date -u +%FT%TZ)" "$name" \
+    "$(sha256sum "$dir/$name" | awk '{ print $1 }')" "env-$stamp" >"$dir/record.new"
+  chmod 0600 "$dir/record.new"
+  mv -f -- "$dir/record.new" "$dir/record"
+  find "$dir" -mindepth 1 -maxdepth 1 ! -name record ! -name "$name" ! -name "env-$stamp" -exec rm -rf -- {} +
+  log "Rollback point: $dir/$name ($(du -h "$dir/$name" | cut -f1)). To go back to $OFFLINE_INSTALLED, losing everything since: install.sh --offline <its bundle> --upgrade --rollback (docs/ops/air-gapped.md#going-back)"
+}
+
+# --rollback, once every check has passed: botd stops, and the .env and DATA_DIR from before
+# the upgrade go back, keeping what they replace beside them. If the restore fails before it
+# touches DATA_DIR, the .env goes back too and botd starts again as it was; if it fails while
+# swapping DATA_DIR, botd stays stopped. Then the install goes on with the bundle's release,
+# and botd stays stopped until its binaries are in place. The folder .env is in belongs to
+# botd's user, so root only replaces files there with install, which doesn't follow symlinks;
+# the copies are made as that user.
+rollback_restore() {
+  local dir record archive env home env_file stamp out kept was_active=false data_dir before_swap
+  dir=$(rollback_dir)
+  record="$dir/record"
+  archive="$dir/$(manifest_value "$record" archive)"
+  env="$dir/$(manifest_value "$record" env)"
+  home=$(user_home)
+  env_file="$home/superbot/.env"
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would stop superbot and put back $env_file and DATA_DIR from before the upgrade to $OFFLINE_INSTALLED ($archive), keeping what they replace"
+    return 0
+  fi
+  [[ ! -L "$env_file" ]] || die "Refusing symlinked $env_file. Nothing has changed."
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  kept="$env_file.before-rollback-$stamp"
+  (cd / && sudo -u "$SUPERBOT_USER" cp -p -- "$env_file" "$kept") \
+    || die "Couldn't keep $env_file as $kept. Nothing has changed."
+  data_dir=$(env_data_dir "$env" "$home")
+  before_swap=$(pre_restore_dirs "$data_dir")
+  if systemctl is-active --quiet superbot.service 2>/dev/null; then
+    log "Stopping superbot to put back the backup"
+    systemctl stop superbot.service
+    was_active=true
+  fi
+  if ! out=$(install -m 0600 -o "$SUPERBOT_USER" -g "$(id -gn "$SUPERBOT_USER")" -- "$env" "$env_file" 2>&1) \
+    || ! out=$(rollback_feed_restore "$home" "$archive" 2>&1); then
+    printf '%s\n' "$out" >&2
+    if [[ "$(pre_restore_dirs "$data_dir")" != "$before_swap" ]]; then
+      die "Putting back the backup taken before the upgrade stopped while swapping $data_dir: $(tail -n 1 <<<"$out"). superbot is left stopped. What $data_dir held is in its newest .pre-restore-* folder: as $SUPERBOT_USER, move everything else in $data_dir aside and that folder's contents back, then run the rollback again, or put back $kept as $env_file and start superbot on $OFFLINE_INSTALLED (docs/ops/air-gapped.md#going-back)"
+    fi
+    (cd / && sudo -u "$SUPERBOT_USER" cp -- "$kept" "$env_file") && rm -f -- "$kept"
+    [[ "$was_active" != true ]] || systemctl start superbot.service || true
+    die "Couldn't put back the backup taken before the upgrade: $(tail -n 1 <<<"$out"). DATA_DIR wasn't touched, and superbot is back as it was on $OFFLINE_INSTALLED, with its .env."
+  fi
+  # The data is the bundle's release's again: a run that stops after this is repeated as an
+  # install of that release, with nothing left to restore.
+  record_offline_release
+  rm -f -- "$record" "$archive" "$env"
+  log "Put back DATA_DIR and .env from before the upgrade to $OFFLINE_INSTALLED"
+  grep -F 'Previous data kept' <<<"$out" | sed 's/^superbot-restore: /    /' || true
+  log "The .env $OFFLINE_INSTALLED ran with is kept as $kept"
+}
+
 finish() {
   [[ -n "$CLIENT_NOT_INSTALLED" ]] || return 0
   warn "$CLIENT_NOT_INSTALLED. Everything else is installed, but /app/ still serves the previous web client, if any."
@@ -2521,6 +2768,7 @@ main() {
     prepare_offline
     prepare_hermes_bundle
     prepare_harness_bundle
+    prepare_rollback
     machine_settings_check
   else
     detect_source_dir
@@ -2543,6 +2791,9 @@ main() {
   elif [[ "$UPGRADE" == true ]]; then
     log "Upgrade mode: updating source and rebuilding"
   fi
+  # Last of the offline checks, first of the changes: the backup an upgrade can go back to, or
+  # a rollback putting one back.
+  offline_rollback_point
   sync_repo
   stage_trusted_deploy
   # Before the new binaries are in place: once they may have opened the database, the older
