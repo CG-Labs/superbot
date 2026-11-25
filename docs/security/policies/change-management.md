@@ -47,8 +47,10 @@ An engineering lead dates the version's section of `CHANGELOG.md` and tags `v<ve
 - Each production change is recorded before it is made: what, why, the risk, how to roll back, who approved it. A pull request, an issue or a change ticket all work.
 - Planned changes that may interrupt the service are announced on the status page at least 48 hours ahead as maintenance, within the [SLO's](../../slo.md) limits.
 - Managed servers run a released, signed image or binary, upgraded by changing `SUPERBOT_VERSION` or the installer's version, never a build from someone's machine. Before an upgrade the operator takes a backup and checks that it was copied off the host (`botctl backups`).
-- After a change, the operator checks the service (health, `/status`, alerts) and checks the server against the [configuration baseline](information-security.md#configuration-baseline).
+- After a change, the operator checks the service (health, `/status`, alerts) and checks the server against the [configuration baseline](information-security.md#configuration-baseline), the same or the next business day.
+- Whoever makes a change has production access to that system on record ([access control policy](access-control.md#granting-access)).
+- The engineering lead or operator enters each production change in the [policy register](../policy-register.md#production-changes), by id, with the change record's SHA-256, when it was recorded, approved, made and checked, and by whom; the monthly register bundle checks them against this policy ([ADR 0270](../../adr/0270-production-changes-in-the-register.md)).
 
 ## Emergency changes
 
-When an incident needs a change faster than review allows, the incident commander may approve it ([incident response plan](incident-response.md)). The change is recorded in the incident, reviewed by a second person within 2 business days, and, if it was code, goes through a normal pull request afterwards. Emergency changes are listed in the quarterly management review.
+When an incident needs a change faster than review allows, the incident commander may approve it ([incident response plan](incident-response.md)). The change is recorded in the incident, reviewed by a second person within 2 business days (someone who neither made nor approved it), and, if it was code, goes through a normal pull request within 5 business days. Emergency changes are listed in the next quarterly management review. They are entered in the policy register like any other production change, with the incident, the review and the pull request.

@@ -109,7 +109,11 @@ exercise each year (ADR 0223), and production access granted on the security own
 removed by a leaver's last day, and reviewed each quarter with MFA recorded and findings
 fixed in time (ADR 0231), and vulnerabilities found outside the scans acknowledged,
 assessed and fixed or accepted within SECURITY.md's targets, and a penetration test each
-year with its critical and high findings retested (ADR 0241); with each --baseline (botctl
+year with its critical and high findings retested (ADR 0241), and production changes
+recorded and approved by someone else before they were made, announced 48 hours ahead
+when they could interrupt the service and checked the next business day, and emergency
+changes approved by the incident commander, reviewed by a second person within 2
+business days and listed at the next management review (ADR 0270); with each --baseline (botctl
 evidence baseline json, or the month's evidence bundle's baseline.json, checked in the
 period or the 7 days after it), every setting the server excepted held to an exception in
 force; with each --access-review <system>=<file> (a managed server's register id and its

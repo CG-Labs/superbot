@@ -73,5 +73,8 @@
     { "system": "code-host", "at": "2026-12-01", "by": "person-2", "listSha256": "0000000000000000000000000000000000000000000000000000000000000000", "mfa": true, "findings": [{ "id": "AF-01", "fixed": "2026-12-02" }] }
   ],
   "vulnerabilities": [],
-  "penTests": []
+  "penTests": [],
+  "changes": [
+    { "id": "CHG-0001", "system": "hosting", "recorded": "2026-12-01", "recordSha256": "0000000000000000000000000000000000000000000000000000000000000000", "approved": "2026-12-01", "approvedBy": "person-2", "made": "2026-12-02", "madeBy": "person-3", "verified": "2026-12-02", "notes": "<the change record: a pull request, issue or ticket saying what, why, the risk and how to roll back>" }
+  ]
 }
