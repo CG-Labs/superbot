@@ -363,7 +363,7 @@ mod tests {
             let mut a = Answer::new(RESOLVE, Some(r.xml()), NOW);
             a.hoist_namespaces = true;
             let body = a.soap();
-            assert!(!body.contains(&format!(r#"<samlp:Response xmlns:samlp="{PROTOCOL}""#)), "{body}");
+            assert!(!body.contains(&format!(r#"<samlp:Response xmlns:samlp="{PROTOCOL}""#)), "declared on the response, not the envelope");
             let xml = got(&a).unwrap();
             let start = xml.split('>').next().unwrap();
             assert!(start.contains(&format!(r#"xmlns:samlp="{PROTOCOL}""#)) && start.contains(&format!(r#"xmlns:saml="{ASSERTION}""#)), "{start}");
@@ -371,7 +371,7 @@ mod tests {
         }
         // Declared on it already: not declared twice.
         let xml = got(&answer()).unwrap();
-        assert_eq!(xml.matches(&format!(r#"xmlns:samlp="{PROTOCOL}""#)).count(), 1, "{xml}");
+        assert_eq!(xml.matches(&format!(r#"xmlns:samlp="{PROTOCOL}""#)).count(), 1);
     }
 
     #[test]
