@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md), and Hermes Agent with Docker Compose from the Hermes bundle in [ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md).
 
 ## What a bundle holds
 
@@ -12,7 +12,7 @@ SuperBot runs on a server with no internet access. You make (or download) an **o
 | `client/` | The Expo web client, built for `/app/` |
 | `site/` | The landing page |
 | `deploy/` | `install.sh`, `offline-bundle.sh`, the systemd units and the backup, restore and per-user account scripts |
-| `docker/` | The Compose file, its Caddyfile, `.env.example` and `init.sh` |
+| `docker/` | The Compose file, its Caddyfile, `.env.example`, `init.sh`, and `docker-compose.hermes.yml` for [Hermes Agent with Compose](#hermes-agent-with-docker-compose) |
 | `env.example` | botd's `.env` template |
 | `images/` | Optional: each image for the bundle's arch as an OCI archive (`<name>.tar`, which `docker load` also reads), with the digest it has in its registry, its reference and that digest, what `cosign verify` printed when it was bundled (`<name>.cosign.json`: certificate and transparency log entry), its SBOM (`<name>.sbom.spdx.json`), and for a signed image the digest of the multi-arch index that was signed (`<name>.index`) |
 | `signatures/` | With signed images: each one's signatures and attestations as an OCI layout (`<name>.tar`): the cosign signatures on the multi-arch index, this arch's image and its attestation manifest (BuildKit's SBOM and provenance), and the build provenance on the index |
@@ -33,7 +33,7 @@ The bundle carries SuperBot, not the operating system. Install these on the serv
 
 The installer lists anything missing and stops before it changes anything.
 
-**Harness CLIs** (Claude Code, Codex, Pi) for the bash install come from their own [harness bundle](#harness-clis-on-this-server) (`--harness-bundle`), at the versions the release pins, with their own Node.js. **Hermes Agent** comes from its own [Hermes bundle](#hermes-agent): `--with-hermes` with `--offline` needs `--hermes-bundle`. Users' own machines install their harness CLIs from botd's copy of those bundles, or from your mirrors ([below](#harness-clis-on-users-machines)). With [Docker Compose](#docker-compose), the published image already has Claude Code, Codex and Pi and the screens. It doesn't have Hermes Agent: for Hermes with Compose, build your own image on the connected side (`docker build --build-arg HARNESSES="claude codex pi hermes" -t superbot-hermes:<version> .`) and bundle it with `--image superbot=superbot-hermes:<version> --allow-unsigned` (it is your image, so there is no release signature to check). After loading it, set `SUPERBOT_IMAGE=superbot-hermes:<version>` in `.env` as well as `SUPERBOT_VERSION`, so Compose runs your image instead of the published one.
+**Harness CLIs** (Claude Code, Codex, Pi) for the bash install come from their own [harness bundle](#harness-clis-on-this-server) (`--harness-bundle`), at the versions the release pins, with their own Node.js. **Hermes Agent** comes from its own [Hermes bundle](#hermes-agent): `--with-hermes` with `--offline` needs `--hermes-bundle`. Users' own machines install their harness CLIs from botd's copy of those bundles, or from your mirrors ([below](#harness-clis-on-users-machines)). With [Docker Compose](#docker-compose), the published image already has Claude Code, Codex and Pi and the screens. Hermes Agent comes from the same signed Hermes bundle, loaded into a Docker volume the image mounts ([below](#hermes-agent-with-docker-compose)), so you don't build an image of your own.
 
 ## Getting a bundle
 
@@ -208,6 +208,31 @@ services:
       - ./tls:/etc/caddy/tls:ro
 ```
 
+### Hermes Agent with Docker Compose
+
+The published image has no Hermes Agent, which the shipped plans use by default. It gets it from the release's [Hermes bundle](#hermes-agent), loaded into a Docker volume that botd mounts read-only at `/opt/hermes` ([ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md)). Load the images first, then, from the bundle's `docker/` folder:
+
+```sh
+../deploy/offline-bundle.sh load-hermes superbot-hermes-v0.23.3-x86_64.tar.gz --sha256 <its recorded sha-256>
+```
+
+It finds the image Compose runs botd from, as Compose does (`SUPERBOT_IMAGE`, else the published image at `SUPERBOT_VERSION`, from the environment, then `.env`; or give `--image`, or `--env-file`). Before it changes anything, it checks:
+
+- the Hermes bundle as `install.sh` does: its SHA-256 or signature, its files, its `MANIFEST` (this arch, `/opt/hermes`) and every entry of its tree;
+- that the image is there and for this arch;
+- that the bundle holds the exact Hermes commit that image's botd pins (`botd harness pins`, run in the image with no network).
+
+Then it copies the tree into a new volume, `superbot-hermes-<commit>` (the first 12 characters), root-owned and not writable by botd. It shares it as `install.sh` does, and runs `hermes --version` from it in the image, with no network, as the image's user and as another account. It marks the volume last, so one left by a failed load is made again. Run again for the same commit, it says the volume already has it. It refuses a volume it didn't make (a `--volume` naming a stack's data is left alone), and runs one load at a time per volume. If `.env` gives the image through a variable, such as `${MIRROR}/superbot:0.1.0`, give it with `--image`. It needs about 2.7 GB free under `$TMPDIR` while it runs, and 2.7 GB for the volume. It prints two settings for `.env`:
+
+```sh
+COMPOSE_FILE=docker-compose.yml:docker-compose.hermes.yml
+SUPERBOT_HERMES_VOLUME=superbot-hermes-<commit>
+```
+
+Then `docker compose up -d`. botd's log lists `hermes` in "Harnesses on PATH". `docker-compose.hermes.yml` only adds the volume. Compose reads `docker-compose.override.yml` only when `COMPOSE_FILE` isn't set, so with one, add it: `COMPOSE_FILE=docker-compose.yml:docker-compose.hermes.yml:docker-compose.override.yml`.
+
+**Upgrades.** A release that moves the Hermes pin needs that release's Hermes bundle: `load` says whether the volume for its pin is there, or which bundle to load. `load-hermes` makes a new volume beside the old one. Set the new `SUPERBOT_HERMES_VOLUME` and recreate botd, then remove the old volume with `docker volume rm`. Bots' Hermes data is in their own folders, not the volume, so nothing is lost. An image from before this release has no `hermes` link for the volume, and `load-hermes` refuses it.
+
 ## Registry mirrors
 
 If your network has its own container registry (Harbor, Artifactory, Nexus, Zot, `registry:2`, ...), push a bundle's images into it, from any machine that can reach it. Give both arches' bundles of a release to put up the multi-arch images:
@@ -354,6 +379,7 @@ Logins that go through a vendor's website (`claude login`, `codex login`) don't 
 | Sign-in | Password, TOTP, and SSO against an identity provider inside your network (ADFS, Keycloak or another OIDC/SAML IdP); cloud IdPs (Entra, Google, GitHub, Apple) only if the server can reach them |
 | Harness CLIs on this server | Claude Code, Codex and Pi from the release's harness bundle (`--harness-bundle`, [above](#harness-clis-on-this-server)), or the published image |
 | `--with-hermes` | Downloads Hermes Agent: with `--offline`, give `--hermes-bundle` ([Hermes Agent](#hermes-agent)) |
+| Hermes Agent with Compose | The published image has none: load the Hermes bundle into a volume with `load-hermes` ([above](#hermes-agent-with-docker-compose)) |
 | Harness CLIs on users' machines | Claude Code, Codex and Pi from botd's harness bundle (`MACHINE_HARNESS_BUNDLE`, [above](#claude-code-codex-and-pi-from-botds-harness-bundle)), or from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent from botd's Hermes bundle (`MACHINE_HERMES_BUNDLE`, [above](#hermes-agent-on-users-machines)) |
 | Billing (Stripe), push notifications (`PUSH_PROVIDER=expo`), Turnstile on the sign-up form | Need the internet: leave them off (the default) |
 | Managed machines on Linode | Need the internet: use Incus hosts inside your network, or none. Incus fetches images from `images.linuxcontainers.org` unless you import them and set `INCUS_IMAGE_SERVER=local` ([guide](incus-containers.md)) |

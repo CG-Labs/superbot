@@ -79,7 +79,7 @@ ARG SUPERBOT_UID=10001
 RUN apt-get update \
     && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
-        acl age ca-certificates curl git procps sqlite3 sudo tini tzdata \
+        acl age ca-certificates curl git libatomic1 procps sqlite3 sudo tini tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # The Bots' computer (docs/computer.md, docs/adr/0084-published-image-with-computer-use.md): the
@@ -152,7 +152,7 @@ RUN groupadd --system --gid "$SUPERBOT_UID" superbot \
 # leaves the hermes they run (docs/adr/0072-one-hermes-environment-per-computer.md).
 COPY deploy/hermes-share.sh /tmp/hermes-share.sh
 RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) rm -f /tmp/hermes-share.sh; exit 0 ;; esac; \
-    apt-get update; apt-get install -y --no-install-recommends libatomic1 xz-utils; rm -rf /var/lib/apt/lists/*; \
+    apt-get update; apt-get install -y --no-install-recommends xz-utils; rm -rf /var/lib/apt/lists/*; \
     install -d -o superbot -g superbot /opt/hermes; \
     curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" -o /tmp/hermes-install.sh; \
     runuser -u superbot -- env HOME=/opt/hermes bash /tmp/hermes-install.sh --non-interactive --skip-browser \
@@ -165,6 +165,10 @@ RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) rm -f /tmp/hermes-share.
     runuser -u nobody -- env HOME="$probe" HERMES_HOME="$probe/hermes" hermes --version; \
     rm -rf "$probe"; \
     if find /opt/hermes \! -user superbot | grep -q .; then echo "root-owned files in /opt/hermes" >&2; exit 1; fi
+# Hermes Agent from a Hermes bundle, which deploy/offline-bundle.sh load-hermes puts in a volume that
+# docker-compose.hermes.yml mounts at /opt/hermes (docs/adr/0275-hermes-agent-bundle-for-docker-compose.md).
+# Without it the link leads nowhere, so botd doesn't count Hermes as installed.
+RUN ln -sfn /opt/hermes/.hermes/superbot/hermes /usr/local/bin/hermes
 
 # botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
 COPY --from=build /out/botd /out/botctl /out/superbot-machine /out/superbot-run /opt/superbot/bin/

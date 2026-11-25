@@ -50,7 +50,7 @@ echo font >"$T/client/assets/node_modules/@expo/icons.ttf"
 B="$T/out/superbot-offline-$VERSION-$ARCH.tar.gz"
 [[ -f "$B" && -f "$B.sha256" ]] || fail "no bundle and .sha256 in $T/out"
 names=$(tar -tf "$B")
-for f in MANIFEST SHA256SUMS bin/botd bin/botctl deploy/install.sh deploy/offline-bundle.sh deploy/superbot.service env.example site/index.html client/index.html docker/docker-compose.yml docker/.env.example; do
+for f in MANIFEST SHA256SUMS bin/botd bin/botctl deploy/install.sh deploy/offline-bundle.sh deploy/superbot.service env.example site/index.html client/index.html docker/docker-compose.yml docker/docker-compose.hermes.yml docker/.env.example; do
   grep -qx "superbot-offline-$VERSION-$ARCH/$f" <<<"$names" || fail "the bundle has no $f"
 done
 owners=$(tar -tvf "$B" | awk '{ print $2 }' | sort -u)
@@ -322,6 +322,81 @@ grep -Fq "Hermes Agent dddddddddddd is installed in $T/hpinned/hermes, but this 
   || { printf '%s\n' "$note" >&2; fail "no notice for an installed Hermes Agent that isn't pinned"; }
 [[ -z "$( (HERMES_SHARED_DIR=$T/htree/hermes SUPERBOT_USER=nobody-here DRY_RUN=true; hermes_pin_notice) 2>&1)" ]] || fail "a notice for the pinned Hermes Agent"
 ok "an upgrade that keeps another Hermes Agent than the one pinned says how to replace it"
+
+# Hermes Agent for Compose (docs/adr/0275-hermes-agent-bundle-for-docker-compose.md): before it
+# makes a volume, load-hermes refuses a Hermes bundle the installer would, and an image that isn't
+# here, is for another arch, or pins another Hermes Agent. A stand-in docker answers for the image;
+# the real runs are in docker.yml's smoke test (the real image) and offline.yml (the real bundle).
+mkdir -p "$T/fakedocker"
+cat >"$T/fakedocker/docker" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$FAKE_DOCKER_LOG"
+for a; do last=$a; done
+case "$1 $2" in
+  "image inspect")
+    [ "$last" = "$FAKE_DOCKER_IMAGE" ] || exit 1
+    case "$*" in *--format*) echo "$FAKE_DOCKER_ARCH" ;; esac
+    exit 0 ;;
+  "volume inspect")
+    [ -n "${FAKE_DOCKER_VOLUME+x}" ] && [ "$last" = "$FAKE_DOCKER_VOLUME" ] || exit 1
+    echo "${FAKE_DOCKER_VOLUME_LABEL:-}"
+    exit 0 ;;
+  "run --rm")
+    case "$*" in *"--entrypoint botd $FAKE_DOCKER_IMAGE harness pins") printf '%s\n' "$FAKE_DOCKER_PINS"; exit 0 ;; esac ;;
+esac
+exit 1
+EOF
+chmod 0755 "$T/fakedocker/docker"
+docker_arch() { case $1 in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac; }
+DOCKER_ARCH=$(docker_arch "$ARCH")
+GOOD_PINS="node $NODE_PIN $ARCH $(printf 'a%.0s' {1..64})
+hermes hermes $HERMES_COMMIT $HTAG $(printf 'f%.0s' {1..64})"
+lhrefused() {
+  local why=$1 want=$2 out
+  shift 2
+  : >"$T/fakedocker.log"
+  if out=$(PATH="$T/fakedocker:$PATH" FAKE_DOCKER_LOG="$T/fakedocker.log" FAKE_DOCKER_IMAGE=${LH_IMAGE-superbot:here} \
+    FAKE_DOCKER_ARCH=${LH_ARCH-$DOCKER_ARCH} FAKE_DOCKER_PINS=${LH_PINS-$GOOD_PINS} \
+    "$DIR/offline-bundle.sh" load-hermes "$@" 2>&1); then
+    fail "$why: loaded"
+  fi
+  grep -Fq -- "$want" <<<"$out" || { printf '%s\n' "$out" >&2; fail "$why: refused for another reason"; }
+  ! grep -Eq '^(volume (create|rm)|run .* -v )' "$T/fakedocker.log" || fail "$why: a Docker volume was changed or used before the refusal"
+}
+lhrefused "no bundle" "Give the Hermes bundle"
+lhrefused "an offline bundle" "not a Hermes bundle" "$B" --image superbot:here
+lhrefused "a wrong SHA-256" "not the one published" "$HB" --image superbot:here --sha256 "$(printf '0%.0s' {1..64})"
+lhrefused "a changed hermes.tar" "files don't match SHA256SUMS" "$T/hchanged.tar.gz" --image superbot:here
+lhrefused "another arch's Hermes bundle" "This Hermes bundle is for $other" "$(HMANIFEST=1 hremake harch sed -i "s/^arch=.*/arch=$other/" MANIFEST)" --image superbot:here
+lhrefused "a bad volume name" "isn't a Docker volume name" "$HB" --image superbot:here --volume '../x'
+lhrefused "an image that isn't here" "No image superbot:gone here" "$HB" --image superbot:gone
+printf "AUTH_PASSWORD=x\nSUPERBOT_VERSION='1.2.3'\n" >"$T/compose.env"
+lhrefused "Compose's image at .env's version" "No image ghcr.io/cg-labs/superbot:1.2.3 here" "$HB" --env-file "$T/compose.env"
+printf 'SUPERBOT_VERSION=1.2.3\nSUPERBOT_IMAGE="registry.corp.example/superbot/superbot@sha256:%s"\n' "$(printf 'c%.0s' {1..64})" >>"$T/compose.env"
+lhrefused "Compose's image named in .env" "No image registry.corp.example/superbot/superbot@sha256:cccc" "$HB" --env-file "$T/compose.env"
+SUPERBOT_IMAGE=superbot:from-env lhrefused "Compose's image from the environment, over .env" "No image superbot:from-env here" "$HB" --env-file "$T/compose.env"
+(cd "$T" && cp compose.env .env && lhrefused "Compose's image from ./.env" "No image registry.corp.example/superbot/superbot@sha256:cccc" "$HB")
+LH_ARCH=$(docker_arch "$other") lhrefused "an image for another arch" "superbot:here is for linux/$(docker_arch "$other"), but the Hermes bundle is for $ARCH" "$HB" --image superbot:here
+LH_PINS="node $NODE_PIN $ARCH x" lhrefused "an image whose botd pins no Hermes Agent" "doesn't say which Hermes Agent it pins" "$HB" --image superbot:here
+LH_PINS="hermes hermes $(printf 'b%.0s' {1..40}) v9.9.9 x" lhrefused "an image that pins another Hermes Agent" \
+  "The Hermes bundle holds Hermes Agent ${HERMES_COMMIT:0:12}, but superbot:here pins bbbbbbbbbbbb" "$HB" --image superbot:here
+printf 'export SUPERBOT_VERSION = 4.5.6   # the release\nSUPERBOT_IMAGE=\n' >"$T/compose.env"
+lhrefused "Compose's version with a comment after it" "No image ghcr.io/cg-labs/superbot:4.5.6 here" "$HB" --env-file "$T/compose.env"
+# shellcheck disable=SC2016 # for Compose to fill in
+printf 'SUPERBOT_IMAGE="${MIRROR}/superbot:1.2.3" # mirror\n' >"$T/compose.env"
+lhrefused "an image Compose fills in from a variable" "with a variable Compose fills in: give it with --image" "$HB" --env-file "$T/compose.env"
+FAKE_DOCKER_VOLUME=superbot_data lhrefused "a volume load-hermes didn't make" \
+  "The Docker volume superbot_data wasn't made by load-hermes for Hermes Agent ${HERMES_COMMIT:0:12}: give another --volume" "$HB" --image superbot:here --volume superbot_data
+FAKE_DOCKER_VOLUME=$(printf 'superbot-hermes-%.12s' "$HERMES_COMMIT") FAKE_DOCKER_VOLUME_LABEL=$(printf 'b%.0s' {1..40}) \
+  lhrefused "a volume load-hermes made for another Hermes Agent" "(it is for bbbbbbbbbbbb)" "$HB" --image superbot:here
+if command -v flock >/dev/null; then
+  lock="/tmp/superbot-load-hermes-lh-locked-$$.lock"
+  : >"$lock"
+  (flock -n 8 && lhrefused "a volume another load-hermes is filling" "Another load-hermes is filling the Docker volume lh-locked-$$" \
+    "$HB" --image superbot:here --volume "lh-locked-$$") 8<"$lock"
+  rm -f "$lock"
+fi
+ok "load-hermes checks the Hermes bundle as the installer does, and takes it only for the pin of Compose's image, on this arch, into a volume of its own that no other load is filling"
 
 # Harness bundles (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md), from a tree laid
 # out as Node.js's tarball and npm install -g --prefix leave one: bin/node, each CLI linked from
@@ -626,6 +701,11 @@ case "$1 $2" in
     ref=$(tar -xOf "$4" manifest.json 2>/dev/null | jq -r '.[0].RepoTags[0]') || { echo "stub docker: $4 isn't an image archive" >&2; exit 1; }
     echo loaded >"$STUB_REG/local/$(key "$ref")" ;;
   "buildx imagetools") echo '{"spdxVersion":"SPDX-2.3"}' ;;
+  "run --rm")
+    echo "$*" >>"$STUB_REG/run.log"
+    [[ -n "${STUB_PINS:-}" && "$*" == *"--network none --entrypoint botd "*" harness pins" ]] || exit 1
+    printf '%s\n' "$STUB_PINS" ;;
+  "volume inspect") exit 1 ;;
   *) echo "stub docker: $*" >&2; exit 2 ;;
 esac
 EOF
@@ -734,6 +814,13 @@ stubbed "$DIR/offline-bundle.sh" load "$IB" >"$T/load.log" 2>&1 || { cat "$T/loa
 grep -Fq "Loaded reg.test/cg/superbot:1.0.0 ($MINE, signature checked when bundled)" "$T/load.log" || fail "load didn't load the image alone"
 rm -f "$REG/local/$(regkey reg.test/cg/superbot:1.0.0)"
 ok "load loads a bundle's images, with its signatures beside them"
+
+STUB_PINS="hermes hermes $(printf 'd%.0s' {1..40}) v7.7.7 x" stubbed "$DIR/offline-bundle.sh" load "$IB" >"$T/load.log" 2>&1 \
+  || { cat "$T/load.log" >&2; fail "load with the Hermes notice failed"; }
+grep -Fq "load this release's Hermes bundle (v7.7.7): " "$T/load.log" || { cat "$T/load.log" >&2; fail "load didn't name the Hermes bundle its image pins"; }
+grep -Fqx "run --rm --network none --entrypoint botd reg.test/cg/superbot:1.0.0 harness pins" "$REG/run.log" || fail "load didn't ask the loaded image for its pins"
+rm -f "$REG/local/$(regkey reg.test/cg/superbot:1.0.0)" "$REG/run.log"
+ok "load names the Hermes bundle for Compose from the loaded image's pins, asked in a container with no network, not the bundle's botd on the host"
 
 ibuild "$T/iown" --image own=own-image:2 --allow-unsigned >"$T/iown.log" 2>&1 || { cat "$T/iown.log" >&2; fail "a local image didn't bundle"; }
 [[ "$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest")" == "$OWN" ]] || fail "the local image wasn't bundled from docker save"

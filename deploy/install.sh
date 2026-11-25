@@ -102,6 +102,10 @@ ISOLATION_MODE=""
 ISOLATION_DIR=${ISOLATION_DIR:-}
 ISOLATION_GROUP=superbot-users
 HERMES_SHARED_DIR=/opt/hermes
+# Hermes writes some files every run reads as 0600 (its install's facts.json, its checkout's
+# stamps), so other accounts must be given them. Only the parts runs use: not the install's
+# own data root (its .env, sessions and memories).
+HERMES_SHARED_READABLE=(.hermes/hermes-agent .hermes/installs .hermes/tools .local/share/uv)
 ISOLATION_CONF=/etc/superbot/isolation.conf
 USERCTL_BIN=/usr/local/sbin/superbot-userctl
 SUDOERS_FILE=/etc/sudoers.d/superbot-isolation
@@ -1208,10 +1212,7 @@ install_hermes_shared() {
   fi
   env HOME="$HERMES_SHARED_DIR" sh "$share" >/dev/null || hermes_failed "Couldn't share Hermes Agent's environment"
   chmod -R go-w "$HERMES_SHARED_DIR" || hermes_failed "Couldn't make Hermes Agent writable by root only"
-  # Hermes writes some files every run reads as 0600 (its install's facts.json, its checkout's
-  # stamps), so other accounts must be given them. Only the parts runs use: not the install's
-  # own data root (its .env, sessions and memories).
-  for d in .hermes/hermes-agent .hermes/installs .hermes/tools .local/share/uv; do
+  for d in "${HERMES_SHARED_READABLE[@]}"; do
     [[ ! -d "$HERMES_SHARED_DIR/$d" ]] || chmod -R a+rX "$HERMES_SHARED_DIR/$d" || hermes_failed "Couldn't make Hermes Agent readable by other accounts"
   done
   chmod go+rx "$HERMES_SHARED_DIR/.hermes" "$HERMES_SHARED_DIR/.hermes/superbot" || hermes_failed "Couldn't make Hermes Agent readable by other accounts"

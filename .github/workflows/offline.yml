@@ -338,6 +338,43 @@ jobs:
           grep -Fq "Hermes Agent ${commit:0:12} is already installed in /opt/hermes" /tmp/offline-hermes-again.log
           sudo test -e /opt/hermes/.ci-marker
           sudo systemctl is-active --quiet superbot
+      # Compose's image is built in docker.yml (whose smoke test runs load-hermes with a stand-in
+      # tree); here the real Hermes bundle goes into a volume and runs from it, read-only and with
+      # no network, in the image's Node.js base with the hermes link and libatomic1 the Dockerfile
+      # adds, and botd's pins (ADR 0275).
+      - name: Hermes Agent from its bundle in a Docker volume, as Compose runs it
+        run: |
+          set -euo pipefail
+          commit=$(sed -n 's/^HERMES_COMMIT=.*:-\([0-9a-f]\{40\}\)}.*/\1/p' deploy/install.sh)
+          base=$(sed -n 's/^ARG NODE_IMAGE=//p' Dockerfile)
+          release=$(sed -n 's/^ARG DEBIAN_RELEASE=//p' Dockerfile)
+          base=${base//'${DEBIAN_RELEASE}'/$release}
+          [[ $base =~ ^node:[0-9]+-[a-z]+-slim$ ]]
+          ctx=$(mktemp -d)
+          { echo '#!/bin/sh'; echo '[ "$*" = "harness pins" ] || exit 1'; echo "cat <<'EOF'"; target/release/botd harness pins; echo EOF; } >"$ctx/botd"
+          chmod 0755 "$ctx/botd"
+          grep -q "^hermes hermes $commit " "$ctx/botd"
+          cat >"$ctx/Dockerfile" <<EOF
+          FROM $base
+          RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends libatomic1 && rm -rf /var/lib/apt/lists/* \\
+              && groupadd --system --gid 10001 superbot && useradd --system --uid 10001 --gid superbot -m superbot
+          COPY botd /opt/superbot/bin/botd
+          RUN ln -sfn /opt/hermes/.hermes/superbot/hermes /usr/local/bin/hermes
+          ENV PATH=/opt/superbot/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          USER superbot
+          EOF
+          docker buildx build --load -q -t superbot-hermes-volume:ci "$ctx" >/dev/null
+          deploy/offline-bundle.sh load-hermes "$HB" --image superbot-hermes-volume:ci | tee /tmp/offline-hermes-volume.log
+          volume=superbot-hermes-${commit:0:12}
+          grep -Fq "is in the Docker volume $volume, and runs in superbot-hermes-volume:ci with no network: Hermes Agent v" /tmp/offline-hermes-volume.log
+          grep -qx "    SUPERBOT_HERMES_VOLUME=$volume" /tmp/offline-hermes-volume.log
+          [[ $(docker run --rm --network none -v "$volume:/opt/hermes:ro" --entrypoint stat superbot-hermes-volume:ci -c '%U %a' /opt/hermes) == 'root 755' ]]
+          deploy/offline-bundle.sh load-hermes "$HB" --image superbot-hermes-volume:ci | tee /tmp/offline-hermes-volume-again.log
+          grep -Fq "Hermes Agent ${commit:0:12} is already in the Docker volume $volume" /tmp/offline-hermes-volume-again.log
+          docker volume rm "$volume" >/dev/null
+          docker image rm superbot-hermes-volume:ci >/dev/null
+          rm -rf "$ctx"
+          df -h / | tail -n 1
       # Connected, as an operator makes it once per release, at the pins of that release's botd
       # (ADR 0232); then nothing below has a network.
       - name: A harness bundle, built with the network

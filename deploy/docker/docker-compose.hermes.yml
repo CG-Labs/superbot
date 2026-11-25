@@ -1,0 +1,18 @@
+# Hermes Agent from the release's signed Hermes bundle, for Compose with no internet
+# (docs/ops/air-gapped.md#hermes-agent-with-docker-compose,
+# docs/adr/0275-hermes-agent-bundle-for-docker-compose.md). deploy/offline-bundle.sh load-hermes
+# checks the bundle against the pin of the image Compose runs, puts its tree in a Docker volume of
+# its own, and prints the two .env settings that use this file:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.hermes.yml
+#   SUPERBOT_HERMES_VOLUME=superbot-hermes-<commit>
+# The image links /usr/local/bin/hermes into the volume. Bots run it; nothing in the container may change it.
+
+services:
+  botd:
+    volumes:
+      - hermes:/opt/hermes:ro
+
+volumes:
+  hermes:
+    external: true
+    name: ${SUPERBOT_HERMES_VOLUME:?Set SUPERBOT_HERMES_VOLUME in .env (deploy/offline-bundle.sh load-hermes prints it)}
