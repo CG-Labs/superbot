@@ -622,6 +622,8 @@ rule_files: ["/etc/prometheus/superbot-slo.rules.yml", "/etc/prometheus/superbot
 
 Route `severity: page` to on-call and `severity: ticket` to a queue in Alertmanager.
 
+Each month, `superbot-evidence alerts --prometheus <prometheus-url>` turns what the rules fired into the month's alert history, as a bundle for a SOC 2 evidence store: every SuperBot alert and page, the stretches Prometheus had nothing from the `superbot` job, the rules loaded against those in `deploy/prometheus/` (`--rules <file>` for each file you load, if not all of them), and Alertmanager's notifications if Prometheus scrapes it ([evidence plan](../docs/security/soc2-evidence-plan.md#the-alerts-bundle)). Keep Prometheus' data longer than a month (`--storage.tsdb.retention.time=45d`; the default is 15 days).
+
 ## Approval notifications
 
 A pending approval can reach people by email and a webhook when no app is open ([ADR 0061](../docs/adr/0061-approval-notifications.md)). Both are off until an admin turns them on; neither needs a paid service.
