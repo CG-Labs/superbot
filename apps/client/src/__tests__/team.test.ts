@@ -13,6 +13,7 @@ import {
   managesTeam,
   offboardingMessage,
   seatsLine,
+  teamApproveBlocked,
   TEAM_LINK_EVERY_MS,
   teamLinkWanted,
   teamPlanLine,
@@ -167,6 +168,16 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
     expect(customRoleActions(team, member("me", "member"), "me")).toEqual({ give: false, take: false });
     expect(customRoleActions({ role: "admin", roleChoices: [] }, member("cy", "member"), "me")).toEqual({ give: false, take: false });
     expect(customRoleActions({ role: "member", roleChoices: choices }, member("cy", "member"), "me")).toEqual({ give: false, take: false });
+  });
+
+  it("lets owners and admins approve only their plain members' requests, never over the identity provider (ADR 0263)", () => {
+    const team = { members: [member("cy", "member"), member("ev", "admin"), member("ow", "owner"), { ...member("fay", "member"), customRole: { id: "r1", name: "Billing", fromIdp: true } }] };
+    expect(teamApproveBlocked(team, { user: { id: "cy", name: "cy", email: null } })).toBeNull();
+    expect(teamApproveBlocked(team, { user: { id: "ev", name: "ev", email: null } })).toMatch(/owners or admins/);
+    expect(teamApproveBlocked(team, { user: { id: "ow", name: "ow", email: null } })).toMatch(/owners or admins/);
+    expect(teamApproveBlocked(team, { user: { id: "fay", name: "fay", email: null } })).toMatch(/identity provider/);
+    expect(teamApproveBlocked(team, { user: { id: "gone", name: "gone", email: null } })).toMatch(/no longer on the team/);
+    expect(teamApproveBlocked(team, { user: null })).toMatch(/no longer on the team/);
   });
 
   it("puts a teammate's custom role in a few words", () => {

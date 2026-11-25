@@ -2,7 +2,7 @@ import React from "react";
 import { act, render, screen, userEvent, within } from "@testing-library/react-native";
 import { TEAM_CONFIRM_EVERY_MS, TeamView } from "../TeamView";
 import { ApiError, type SuperBotApi } from "../../src/api";
-import type { MyTeamInvite, OffboardingPreview, Team, TeamBilling, TeamMember } from "../../src/types";
+import type { MyTeamInvite, OffboardingPreview, RoleRequest, Team, TeamBilling, TeamMember } from "../../src/types";
 
 const mockConfirm = jest.fn(async (..._a: unknown[]) => true);
 jest.mock("../../src/dialogs", () => ({ confirmAsync: (...a: unknown[]) => mockConfirm(...a) }));
@@ -46,8 +46,11 @@ const preview: OffboardingPreview = {
   work: { machines: { files: "archive", graceDays: 7 }, accounts: null },
 };
 
-function fakeApi(team: Team | null, invites: MyTeamInvite[] = []) {
+function fakeApi(team: Team | null, invites: MyTeamInvite[] = [], requests: RoleRequest[] = []) {
   return {
+    teamRoleRequests: jest.fn(async (_status?: string) => ({ team: { id: "t1", name: "Alpha" }, requests, pending: requests.length, pendingDays: 7 })),
+    approveTeamRoleRequest: jest.fn(async (..._a: unknown[]) => ({})),
+    denyTeamRoleRequest: jest.fn(async (..._a: unknown[]) => ({})),
     team: jest.fn(async () => team),
     myTeamInvites: jest.fn(async () => invites),
     inviteToTeam: jest.fn(async () => ({})),
@@ -65,8 +68,8 @@ function fakeApi(team: Team | null, invites: MyTeamInvite[] = []) {
   };
 }
 
-async function open(team: Team | null, { meId = "ada", canWrite = true, invites = [] as MyTeamInvite[], checkout = undefined as string | undefined } = {}) {
-  const api = fakeApi(team, invites);
+async function open(team: Team | null, { meId = "ada", canWrite = true, invites = [] as MyTeamInvite[], checkout = undefined as string | undefined, requests = [] as RoleRequest[] } = {}) {
+  const api = fakeApi(team, invites, requests);
   const user = userEvent.setup();
   const openPage = jest.fn(async (_url: string) => {});
   await render(<TeamView api={api as unknown as SuperBotApi} meId={meId} canWrite={canWrite} onBack={jest.fn()} checkout={checkout} open={openPage} />);
@@ -316,6 +319,78 @@ describe("TeamView", () => {
       await open({ ...teamAs("member"), members: [ada, fromIdp] }, { meId: "al" });
       expect(screen.getByText("Team role: Billing · from your identity provider")).toBeOnTheScreen();
       expect(screen.queryByLabelText(/team role for/)).toBeNull();
+    });
+  });
+
+  describe("requests for team roles (ADR 0263)", () => {
+    const request = (id: string, user: TeamMember, hours = 48): RoleRequest => ({
+      id,
+      role: { id: "r-people", name: "Team people", maxDays: 7, permissions: ["users.manage", "audit.view"], applies: ["users.manage"] },
+      scope: "team",
+      team: { id: "t1", name: "Alpha" },
+      user: { id: user.id, name: user.name ?? user.id, email: user.email ?? null },
+      hours,
+      reason: "Onboarding week",
+      status: "pending",
+      createdAt: 1,
+      expiresAt: Date.now() + 7 * 86_400_000,
+      decidedAt: null,
+      decidedBy: null,
+      note: null,
+      grantedUntil: null,
+      current: null,
+    });
+
+    it("lets an owner approve a teammate's request for fewer hours, through the team's routes", async () => {
+      const { api, user } = await open({ ...teamAs("owner"), roleRequests: 1 }, { requests: [request("rq1", al)] });
+      expect(api.teamRoleRequests).toHaveBeenCalledWith("pending");
+      const section = within(screen.getByTestId("team-role-requests"));
+      expect(section.getByText("Requests for team roles (1)")).toBeOnTheScreen();
+      expect(section.getByText("“Onboarding week”")).toBeOnTheScreen();
+      await user.press(section.getByRole("radio", { name: "1 day" }));
+      await user.type(section.getByLabelText("Note for Al"), "A day is enough");
+      await user.press(section.getByLabelText("Approve Al's request"));
+      expect(mockConfirm).toHaveBeenCalledWith("Give Team people to Al?", expect.any(String), "Approve");
+      expect(api.approveTeamRoleRequest).toHaveBeenCalledWith("rq1", { hours: 24, note: "A day is enough" });
+      expect(api.team).toHaveBeenCalledTimes(2);
+    });
+
+    it("denies one with a note", async () => {
+      const { api, user } = await open({ ...teamAs("admin"), roleRequests: 1 }, { requests: [request("rq1", al)] });
+      await user.press(screen.getByLabelText("Deny Al's request"));
+      expect(api.denyTeamRoleRequest).toHaveBeenCalledWith("rq1", undefined);
+    });
+
+    it("offers only Deny on a request from the team's owners and admins, and nothing on your own", async () => {
+      const ev: TeamMember = { ...al, id: "ev", name: "Ev", email: "ev@example.com", role: "admin" };
+      const team = { ...teamAs("owner"), roleRequests: 2, members: [ada, al, ev] };
+      await open(team, { requests: [request("rq1", ev), request("rq2", ada)] });
+      const section = within(screen.getByTestId("team-role-requests"));
+      expect(section.getByText(/one of the team's owners or admins/)).toBeOnTheScreen();
+      expect(section.queryByLabelText("Approve Ev's request")).toBeNull();
+      expect(section.getByLabelText("Deny Ev's request")).toBeOnTheScreen();
+      expect(section.getByText("Your own request: another of the team's owners or admins, or a server admin, decides it.")).toBeOnTheScreen();
+      expect(section.queryByLabelText("Deny Ada's request")).toBeNull();
+    });
+
+    it("says when the requests couldn't be loaded, and loads them again", async () => {
+      const api = fakeApi({ ...teamAs("owner"), roleRequests: 1 }, [], [request("rq1", al)]);
+      api.teamRoleRequests.mockRejectedValueOnce(new Error("Server busy"));
+      const user = userEvent.setup();
+      await render(<TeamView api={api as unknown as SuperBotApi} meId="ada" canWrite onBack={jest.fn()} />);
+      expect(await screen.findByText("Couldn't load requests for team roles: Server busy")).toBeOnTheScreen();
+      expect(screen.getByText("People")).toBeOnTheScreen();
+      await user.press(screen.getByLabelText("Load requests again"));
+      expect(await screen.findByTestId("team-role-requests")).toBeOnTheScreen();
+      expect(screen.queryByText(/Couldn't load requests/)).toBeNull();
+    });
+
+    it("asks for none when the team has none waiting, and shows them to nobody who can't decide", async () => {
+      const { api } = await open(teamAs("owner"));
+      expect(api.teamRoleRequests).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("team-role-requests")).toBeNull();
+      await open({ ...teamAs("owner"), roleRequests: 1 }, { canWrite: false, requests: [request("rq1", al)] });
+      expect(screen.queryByTestId("team-role-requests")).toBeNull();
     });
   });
 

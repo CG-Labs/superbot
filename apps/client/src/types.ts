@@ -769,6 +769,11 @@ export interface RoleRequestsView {
   pendingDays: number;
 }
 
+/** `GET /api/team/role-requests` (the team's owners and admins, ADR 0263). */
+export interface TeamRoleRequestsView extends RoleRequestsView {
+  team: { id: string; name: string };
+}
+
 /** How a role is given by hand (ADR 0197): until when, and why, for the audit log. */
 export interface RoleGiving {
   expiresAt?: number | null;
@@ -1396,6 +1401,8 @@ export interface Team {
   region?: string | null;
   /** Owners and admins only: the custom roles they may give in the team (ADR 0254). */
   roleChoices?: TeamRoleChoice[];
+  /** Owners and admins only: how many requests for roles within the team wait for a decision (ADR 0263). */
+  roleRequests?: number;
 }
 
 /** A custom role a team's owners and admins may give in it, and what it adds there (ADR 0254). */

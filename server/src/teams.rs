@@ -619,7 +619,7 @@ fn my_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
     Ok((u, m, t))
 }
 
-fn my_managed_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
+pub(crate) fn my_managed_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
     let (u, m, t) = my_team(app, c)?;
     if !manages(&m.role) {
         return Err(forbidden("Only the team's owners and admins can do this."));
@@ -748,6 +748,8 @@ pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) 
     if manages(&m.role) && c.can(Perm::Write) {
         crate::roles::expire_due(&app);
         v["roleChoices"] = role_choices(&app);
+        crate::role_requests::lapse_due(&app);
+        v["roleRequests"] = json!(crate::role_requests::pending_in_team(&app, &t.id));
     }
     Ok(Json(v))
 }

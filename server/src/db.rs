@@ -942,6 +942,9 @@ pub struct RequestState<'a> {
     pub user: &'a User,
     /// Their team membership, when the request is for a team.
     pub member: Option<&'a TeamMember>,
+    /// Whether a SCIM mapping or team role group gave them their role in the request's
+    /// team (ADR 0138, ADR 0206). False for a request across the server.
+    pub from_idp: bool,
 }
 
 /// An approved request, with the role they held in its scope just before (and its end),
@@ -6200,14 +6203,37 @@ impl Db {
             .unwrap_or_default()
     }
 
-    /// Denies or withdraws (`status`) a pending request; with `user`, only theirs. None
-    /// when there's no such pending request.
-    pub fn close_role_request(&self, id: &str, status: &str, by: Option<&str>, note: Option<&str>, user: Option<&str>) -> Option<RoleRequest> {
+    /// Newest first: the requests for roles within `team_id` from people still on it (ADR
+    /// 0263); with `status`, only those.
+    pub fn team_role_requests(&self, team_id: &str, status: Option<&str>, limit: usize) -> Vec<RoleRequest> {
+        let c = self.c();
+        c.prepare(
+            "SELECT q.* FROM role_requests q JOIN team_members m ON m.user_id = q.user_id AND m.team_id = q.team_id
+             WHERE q.team_id = ?1 AND (?2 IS NULL OR q.status = ?2) ORDER BY q.created_at DESC, q.id DESC LIMIT ?3",
+        )
+        .and_then(|mut s| s.query_map(params![team_id, status, limit as i64], role_request_row)?.collect())
+        .unwrap_or_default()
+    }
+
+    /// How many requests within `team_id`, from people still on it, are pending (ADR 0263).
+    pub fn team_role_requests_pending(&self, team_id: &str) -> usize {
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM role_requests q JOIN team_members m ON m.user_id = q.user_id AND m.team_id = q.team_id WHERE q.team_id = ?1 AND q.status = 'pending'",
+                [team_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_or(0, |n| n as usize)
+    }
+
+    /// Denies or withdraws (`status`) a pending request; with `user`, only theirs; with
+    /// `team`, only one within that team. None when there's no such pending request.
+    pub fn close_role_request(&self, id: &str, status: &str, by: Option<&str>, note: Option<&str>, user: Option<&str>, team: Option<&str>) -> Option<RoleRequest> {
         self.c()
             .query_row(
                 "UPDATE role_requests SET status = ?2, decided_at = ?3, decided_by = ?4, note = ?5
-                 WHERE id = ?1 AND status = 'pending' AND (?6 IS NULL OR user_id = ?6) RETURNING *",
-                params![id, status, now(), by, note, user],
+                 WHERE id = ?1 AND status = 'pending' AND (?6 IS NULL OR user_id = ?6) AND (?7 IS NULL OR team_id = ?7) RETURNING *",
+                params![id, status, now(), by, note, user, team],
                 role_request_row,
             )
             .optional()
@@ -6270,7 +6296,8 @@ impl Db {
             Some(t) => tx.query_row("SELECT * FROM team_members WHERE user_id = ?1 AND team_id = ?2", [&q.user_id, t], team_member_row).optional().map_err(err)?,
             None => None,
         };
-        check(&RequestState { request: &q, role: &role, user: &user, member: member.as_ref() }).map_err(RoleRequestError::Refused)?;
+        let from_idp = q.team_id.is_some() && Self::idp_team_role_in(&tx, &q.user_id).map_err(err)?;
+        check(&RequestState { request: &q, role: &role, user: &user, member: member.as_ref(), from_idp }).map_err(RoleRequestError::Refused)?;
         let hours = hours.unwrap_or(q.hours);
         let limit = role.max_days.map(|d| d * 24).ok_or(RoleRequestError::Refused("not_requestable"))?;
         if hours > limit {
@@ -11821,6 +11848,25 @@ mod tests {
 
     fn all_events(db: &Db) -> Vec<AuditEvent> {
         db.audit_events(&audit::Filter::default(), 1000, false)
+    }
+
+    #[test]
+    fn a_teams_requests_are_its_current_members_before_any_limit() {
+        let db = Db::open(&temp_path("team-requests").join("app.sqlite")).unwrap();
+        let t = db.create_team("Alpha", None);
+        let r = db.create_custom_role("Helpdesk", "", Role::Member, &["users.manage"], Some(7), None).unwrap();
+        assert!(db.set_role_requestable(&r.id, true));
+        let cy = db.create_user(None, Some("cy@example.com"), "Cy", Role::Member).unwrap();
+        assert!(db.add_team_member(&t.id, &cy.id, "member", None));
+        let mine = db.create_role_request(&cy.id, &r.id, Some(&t.id), 8, "x", now() + 86_400_000, 5, 10).unwrap();
+        // Newer requests within the team from people no longer on it.
+        for i in 0..3 {
+            let gone = db.create_user(None, Some(&format!("gone{i}@example.com")), "Gone", Role::Member).unwrap();
+            db.create_role_request(&gone.id, &r.id, Some(&t.id), 8, "x", now() + 86_400_000, 5, 10).unwrap();
+        }
+        let listed = db.team_role_requests(&t.id, Some("pending"), 2);
+        assert_eq!(listed.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), [mine.id.as_str()]);
+        assert_eq!(db.team_role_requests_pending(&t.id), 1);
     }
 
     #[test]
