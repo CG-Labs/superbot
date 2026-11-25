@@ -1778,8 +1778,8 @@ mod tests {
         assert_eq!(j["settings"], json!({ "running": true, "from": { "ANTHROPIC_BASE_URL": "sealed", "ERROR_REPORT_DSN": "file", "NOTIFY_WEBHOOK_URL_BOT_AB12CD34": "sealed" } }));
         assert!(j["findings"].as_array().unwrap().iter().any(|x| x["setting"] == "ERROR_REPORT_DSN" && x["from"] == "file"));
         let all = format!("{text}{j}{f:?}");
-        for secret in [dsn_key.as_str(), &hook_path, "shadowed"] {
-            assert!(!all.contains(secret), "{secret} reached the report");
+        for (what, secret) in [("the DSN's key", dsn_key.as_str()), ("the webhook's path", &hook_path), ("the shadowed webhook", "shadowed")] {
+            assert!(!all.contains(secret), "{what} reached the report");
         }
         for v in [format!("https://hooks.slack.com/services/T0/B0/{hook_path}"), "https://hooks.slack.com/services/T0/B0/shadowed".into(), "https://llm.corp.example".into()] {
             crate::secrets::redact::forget(&v);
