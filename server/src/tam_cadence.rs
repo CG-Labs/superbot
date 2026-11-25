@@ -405,7 +405,7 @@ pub fn check(csv: &str, o: &Options) -> Result<Cadence, String> {
         let done = |f: Field| dates.get(&f).copied().filter(|d| *d <= today);
         let stage = if !has(Field::GoLive) || done(Field::GoLive).is_some() {
             Stage::Live
-        } else if done(Field::Kickoff).is_some() {
+        } else if done(Field::Kickoff).is_some() || done(Field::CheckIn).is_some() {
             Stage::Onboarding
         } else {
             Stage::Signed
@@ -497,7 +497,7 @@ pub fn check(csv: &str, o: &Options) -> Result<Cadence, String> {
     let first = |a: &Account| (a.findings[0].status, a.findings[0].due);
     listed.sort_by(|a, b| first(a).cmp(&first(b)).then(normalize(&a.customer).cmp(&normalize(&b.customer))));
     let mut tams: Vec<_> = tams.into_values().collect();
-    tams.sort_by(|a, b| b.2.cmp(&a.2).then(b.3.cmp(&a.3)).then(a.0.is_none().cmp(&b.0.is_none())).then(a.0.cmp(&b.0)));
+    tams.sort_by(|a, b| a.0.is_none().cmp(&b.0.is_none()).then(b.2.cmp(&a.2)).then(b.3.cmp(&a.3)).then(a.0.cmp(&b.0)));
 
     let mut notes = Vec::new();
     if !has(Field::GoLive) {
@@ -685,6 +685,7 @@ impl Cadence {
 
 #[cfg(test)]
 mod tests {
+    // Asserts here compare, never print the output on failure: CodeQL reads that as logging.
     use super::*;
     use chrono::FixedOffset;
 
@@ -847,17 +848,17 @@ Tyrell,Cy Diaz,,2026-13-01,,,,,,,,,,,
             assert!(!all.contains(never), "the check leaks {never}");
         }
         let text = c.text();
-        assert!(text.starts_with("TAM cadence as of 2026-11-25 (UTC+00:00)\nBusiness days mon,tue,wed,thu,fri; due soon within 7 days, renewals within 90 days\n\n9 accounts: 10 overdue, 2 due soon, across 8 of them.\n"), "{text}");
-        assert!(text.contains("\nAcme  TAM Ana Lima  live since 2026-02-02\n  OVERDUE  restore_drill: 77 days overdue (due 2026-09-09); twice a year; last 2026-03-10. Book the restore drill"), "{text}");
-        assert!(text.contains("  DUE      kickoff: due 2026-11-30, in 5 days; signed 2026-11-23, kickoff within 5 business days."), "{text}");
-        assert!(text.contains("incident_review: 2 days overdue (due 2026-11-23); Severity 1 on 2026-11-16, its review walked through within 5 business days; the last review walked through was 2026-06-01."), "{text}");
-        assert!(text.contains("\nTAM       Accounts  Overdue  Due soon\nAna Lima         3        4         2\n"), "{text}");
-        assert!(text.contains("\n(no TAM)         1        2         0\n"), "{text}");
+        assert!(text.starts_with("TAM cadence as of 2026-11-25 (UTC+00:00)\nBusiness days mon,tue,wed,thu,fri; due soon within 7 days, renewals within 90 days\n\n9 accounts: 10 overdue, 2 due soon, across 8 of them.\n"));
+        assert!(text.contains("\nAcme  TAM Ana Lima  live since 2026-02-02\n  OVERDUE  restore_drill: 77 days overdue (due 2026-09-09); twice a year; last 2026-03-10. Book the restore drill"));
+        assert!(text.contains("  DUE      kickoff: due 2026-11-30, in 5 days; signed 2026-11-23, kickoff within 5 business days."));
+        assert!(text.contains("incident_review: 2 days overdue (due 2026-11-23); Severity 1 on 2026-11-16, its review walked through within 5 business days; the last review walked through was 2026-06-01."));
+        assert!(text.contains("\nTAM       Accounts  Overdue  Due soon\nAna Lima         3        4         2\n"));
+        assert!(text.contains("\n(no TAM)         1        2         0\n"));
         assert!(text.ends_with("Cadence: docs/support/tam.md#cadence. This lists what's due; it tells nobody.\n"));
         let md = c.markdown();
-        assert!(md.starts_with("## TAM cadence as of 2026-11-25 (UTC+00:00)\n"), "{md}");
-        assert!(md.contains("| `Globex` | `Ana Lima` | signed 2026-11-16, not kicked off | `kickoff` | **Overdue** | 2 days overdue (due 2026-11-23) |"), "{md}");
-        assert!(md.contains("| (no TAM) | 1 | 2 | 0 |"), "{md}");
+        assert!(md.starts_with("## TAM cadence as of 2026-11-25 (UTC+00:00)\n"));
+        assert!(md.contains("| `Globex` | `Ana Lima` | signed 2026-11-16, not kicked off | `kickoff` | **Overdue** | 2 days overdue (due 2026-11-23) |"));
+        assert!(md.contains("| (no TAM) | 1 | 2 | 0 |"));
     }
 
     #[test]
@@ -873,13 +874,29 @@ Tyrell,Cy Diaz,,2026-13-01,,,,,,,,,,,
     }
 
     #[test]
+    fn a_check_in_without_a_kickoff_column_is_onboarding() {
+        let csv = "customer,tam,go-live,check-in\nA,Ana,,2026-11-01\nB,,,\nC,,2026-11-20,2026-11-21\nD,,,\nE,,,\nF,Bo,,2026-11-20\n";
+        let v = check(csv, &opts(&[])).unwrap().json();
+        assert_eq!(items(&v, "A"), vec![one("check_in", "overdue", Some("2026-11-08"))], "a check-in on 1 November means onboarding, and the next was due a week later");
+        assert_eq!(v["listed"][0]["stage"], "onboarding");
+        assert_eq!(items(&v, "B"), vec![], "nothing to count from: the kickoff isn't judged without its columns");
+        assert_eq!(items(&v, "F"), vec![one("check_in", "due_soon", Some("2026-11-27"))]);
+        assert!(v["notJudged"].as_array().unwrap().contains(&json!("kickoff")));
+        // No TAM has the most overdue, and is still last.
+        let csv = "customer,tam,health check\nA,Ana,2026-11-20\nB,,\nC,,\nD,Bo,\n";
+        let v = check(csv, &opts(&[])).unwrap().json();
+        let tams: Vec<(Value, Value)> = v["tams"].as_array().unwrap().iter().map(|t| (t["tam"].clone(), t["overdue"].clone())).collect();
+        assert_eq!(tams, vec![(json!("Bo"), json!(1)), (json!("Ana"), json!(0)), (json!(null), json!(2))]);
+    }
+
+    #[test]
     fn without_a_go_live_column_every_account_is_live() {
         let csv = "Company,Health check,QBR,Drill\nA,,,\nB,2026-11-20,2026-10-01,2026-11-01\n";
         let mut o = opts(&["--column", "restore-drill=Drill"]);
         let v = check(csv, &o).unwrap().json();
         assert_eq!(items(&v, "A"), vec![one("health_check", "overdue", None), one("business_review", "overdue", None), one("restore_drill", "overdue", None)]);
         assert_eq!(items(&v, "B"), vec![]);
-        assert!(v["notes"][0].as_str().unwrap().contains("no go-live column, so every account is taken as live"), "{v}");
+        assert!(v["notes"][0].as_str().unwrap().contains("no go-live column, so every account is taken as live"));
         let a = v["listed"][0]["items"].as_array().unwrap().iter().map(|i| i["detail"].as_str().unwrap()).collect::<Vec<_>>();
         assert_eq!(a, vec!["monthly; none recorded", "each quarter; none recorded", "twice a year; none recorded"]);
         o.columns = vec![(Field::RestoreDrill, "Nothing".into())];
@@ -898,7 +915,7 @@ Tyrell,Cy Diaz,,2026-13-01,,,,,,,,,,,
         assert_eq!((v["accounts"].clone(), v["tams"].as_array().unwrap().len()), (json!(3), 1), "the same TAM by name, in any case");
         let c = check(ACCOUNTS, &opts(&["--customer", "hooli"])).unwrap();
         assert!(!c.overdue());
-        assert!(c.text().contains("TAM cadence for hooli as of") && c.text().contains("1 account: nothing due."), "{}", c.text());
+        assert!(c.text().contains("TAM cadence for hooli as of") && c.text().contains("1 account: nothing due."));
     }
 
     #[test]
@@ -906,12 +923,12 @@ Tyrell,Cy Diaz,,2026-13-01,,,,,,,,,,,
         let csv = "customer,tam,signed,kickoff,go-live\n\"Evil|Co [x](https://example.net)\",\"`Ma`\nlory\",2026-11-01,,\nhttps://example.net,*Bo*,2026-11-01,,\n";
         let c = check(csv, &opts(&["--tam", "`Ma`\nlory"])).unwrap();
         let md = c.markdown();
-        assert!(md.contains("## TAM cadence for TAM `` `Ma` lory `` as of"), "{md}");
-        assert!(md.contains("| `Evil\\|Co [x](https://example.net)` | `` `Ma` lory `` |"), "{md}");
+        assert!(md.contains("## TAM cadence for TAM `` `Ma` lory `` as of"));
+        assert!(md.contains("| `Evil\\|Co [x](https://example.net)` | `` `Ma` lory `` |"));
         let text = c.text();
-        assert!(text.contains("\nEvil|Co [x](https://example.net)  TAM `Ma` lory  signed 2026-11-01"), "{text}");
+        assert!(text.contains("\nEvil|Co [x](https://example.net)  TAM `Ma` lory  signed 2026-11-01"));
         let md = check(csv, &opts(&["--customer", "https://example.net"])).unwrap().markdown();
-        assert!(md.contains("| `https://example.net` | `*Bo*` |"), "{md}");
+        assert!(md.contains("| `https://example.net` | `*Bo*` |"));
     }
 
     #[test]

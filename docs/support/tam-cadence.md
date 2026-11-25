@@ -56,7 +56,7 @@ Every other column (contacts, emails, phone numbers, revenue, notes) is never re
 
 ## What it flags
 
-Each account is at one stage: **signed** (no kickoff yet), **onboarding** (kicked off, not live) or **live**. Each promise for its stage that is overdue, or due within `--warn-days`, is listed with when it was due, why, and what to do, the account with the oldest overdue promise first:
+Each account is at one stage: **signed** (no kickoff or check-in yet), **onboarding** (kicked off, or with a check-in, and not live) or **live**. Each promise for its stage that is overdue, or due within `--warn-days`, is listed with when it was due, why, and what to do, the account with the oldest overdue promise first:
 
 | Item | Stage | Due |
 |---|---|---|
@@ -69,7 +69,7 @@ Each account is at one stage: **signed** (no kickoff yet), **onboarding** (kicke
 | `restore_drill` | Live | 183 days after the last drill, or go-live; with neither, now |
 | `renewal` | Any | Due soon from `--renewal-days` before; overdue once the date in the record has passed, until it's renewed or corrected |
 
-A month is 31 days, as the [TAM handover](tam.md#draft-it-first) counts the next health check, and the quarterly review is due by the end of the quarter after the last one, as it counts the next review. The output ends with each TAM's accounts, overdue and due-soon promises, the busiest first, and accounts with no TAM last (`botctl support-readiness --tams` checks that every account has one, [support readiness](readiness.md#the-tam-list)).
+A month is 31 days, as the [TAM handover](tam.md#draft-it-first) counts the next health check, and the quarterly review is due by the end of the quarter after the last one, as it counts the next review. The output ends with each TAM's accounts, overdue and due-soon promises, the busiest first, and accounts with no TAM always last (`botctl support-readiness --tams` checks that every account has one, [support readiness](readiness.md#the-tam-list)).
 
 ## What it doesn't know
 
