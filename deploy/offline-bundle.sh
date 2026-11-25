@@ -13,6 +13,9 @@
 #                                  # for install.sh --offline --harness-bundle
 #   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]   # an offline, Hermes or harness bundle
 #   deploy/offline-bundle.sh load BUNDLE [--sha256 HEX]      # docker load its images, no network
+#   deploy/offline-bundle.sh load-hermes HERMES_BUNDLE [--sha256 HEX] [--image REF] [--env-file FILE] [--volume NAME]
+#                                  # Hermes Agent for Compose: the checked tree in a Docker volume,
+#                                  # for the pin of the image Compose runs, mounted by docker-compose.hermes.yml
 #   deploy/offline-bundle.sh push BUNDLE... --registry HOST[:PORT][/PATH] [--sha256 HEX]...
 #                                  # copy its images, signatures and attestations to a registry mirror,
 #                                  # digests unchanged; one bundle per arch puts up the signed multi-arch index
@@ -24,11 +27,15 @@ export SUPERBOT_INSTALL_NO_MAIN=1
 source "$DIR/install.sh"
 
 # Files deploy/docker needs for Compose with loaded images (no build).
-DOCKER_FILES=(docker-compose.yml Caddyfile .env.example init.sh seccomp-chromium.json)
+DOCKER_FILES=(docker-compose.yml docker-compose.hermes.yml Caddyfile .env.example init.sh seccomp-chromium.json)
 IMAGE_ISSUER=https://token.actions.githubusercontent.com
+# load-hermes's volume, once the tree in it has run: Compose mounts only a volume that has it.
+HERMES_VOLUME_MARK=.superbot-hermes
+# Set while load-hermes fills a volume it made, so a failure removes it.
+HERMES_VOLUME_NEW=""
 
 usage() {
-  sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The first of SUPERBOT_OCI and CANDIDATES (then superbot-oci on PATH) that runs here: one
@@ -618,6 +625,172 @@ cmd_load() {
   done
   [[ "$found" == true ]] || die "This bundle has no images: it is for install.sh --offline only"
   log "Run Compose from the bundle's docker/ folder with SUPERBOT_VERSION=$OFFLINE_VERSION in .env (docs/ops/air-gapped.md#docker-compose)"
+  local pins commit tag volume
+  pins=$(harness_pins "$OFFLINE_DIR/bin/botd" 2>/dev/null) || return 0
+  read -r commit tag < <(awk '$1 == "hermes" { print $3, $4; exit }' <<<"$pins") || true
+  [[ "${commit:-}" =~ ^[0-9a-f]{40}$ ]] || return 0
+  volume=$(hermes_volume_name "$commit")
+  if docker volume inspect "$volume" >/dev/null 2>&1; then
+    log "This release's Hermes Agent ($tag) is already in the Docker volume $volume, for Compose with Hermes (SUPERBOT_HERMES_VOLUME=$volume)"
+  else
+    log "With Hermes Agent in Compose, load this release's Hermes bundle ($tag): $0 load-hermes superbot-hermes-$tag-$(uname -m).tar.gz (docs/ops/air-gapped.md#hermes-agent-with-docker-compose)"
+  fi
+}
+
+# --- Hermes Agent for Compose (docs/adr/0275-hermes-agent-bundle-for-docker-compose.md) -------
+
+hermes_volume_name() { printf 'superbot-hermes-%s\n' "${1:0:12}"; }
+
+# The last NAME=value in a Compose env FILE, without the quotes around it.
+compose_env_value() {
+  local v
+  v=$(sed -n "s/^$2=//p" "$1" | tail -n 1)
+  v=${v%$'\r'}
+  if [[ "$v" =~ ^\'(.*)\'$ || "$v" =~ ^\"(.*)\"$ ]]; then v=${BASH_REMATCH[1]}; fi
+  printf '%s\n' "$v"
+}
+
+# The image docker-compose.yml runs botd from: SUPERBOT_IMAGE, else the published image at
+# SUPERBOT_VERSION (main when unset), from this environment first, then ENV_FILE, as Compose
+# reads them.
+compose_botd_image() {
+  local env=$1 image=${SUPERBOT_IMAGE:-} version=${SUPERBOT_VERSION:-}
+  if [[ -f "$env" ]]; then
+    [[ -n "$image" ]] || image=$(compose_env_value "$env" SUPERBOT_IMAGE)
+    [[ -n "$version" ]] || version=$(compose_env_value "$env" SUPERBOT_VERSION)
+  fi
+  printf '%s\n' "${image:-ghcr.io/cg-labs/superbot:${version:-main}}"
+}
+
+# Runs IMAGE with VOLUME at $HERMES_SHARED_DIR and no network: docker run's own options, then
+# --, then the entrypoint and its arguments.
+hermes_volume_run() {
+  local image=$1 volume=$2 opts=()
+  shift 2
+  while [[ $# -gt 0 && "$1" != -- ]]; do opts+=("$1"); shift; done
+  shift
+  docker run --rm --network none "${opts[@]}" -v "$volume:$HERMES_SHARED_DIR${HERMES_VOLUME_MODE:-}" --entrypoint "$1" "$image" "${@:2}"
+}
+
+# Hermes Agent from VOLUME, run in IMAGE as Compose runs it: read-only, with no network, from
+# PATH, with a HERMES_HOME of its own, as the image's user and as another account (per-user
+# accounts run it as theirs). Prints the version it says.
+hermes_volume_probe() {
+  local image=$1 volume=$2 user out rc
+  for user in "" 65534:65534; do
+    rc=0
+    # shellcheck disable=SC2016 # expanded in the container
+    out=$(HERMES_VOLUME_MODE=:ro hermes_volume_run "$image" "$volume" ${user:+--user "$user"} -- sh -c \
+      'command -v hermes >/dev/null || exit 3; p=$(mktemp -d) && HOME=$p HERMES_HOME=$p/hermes hermes --version' 2>&1) || rc=$?
+    [[ $rc -ne 3 ]] \
+      || die "$image has no hermes on PATH for the volume: it is older than load-hermes (ADR 0275). Use the image of the release the Hermes bundle is for"
+    [[ $rc -eq 0 ]] || die "Hermes Agent in the Docker volume $volume didn't run in $image (as ${user:-its user}): $(tail -n 5 <<<"$out")"
+  done
+  head -n 1 <<<"$out"
+}
+
+load_hermes_cleanup() {
+  [[ -z "$HERMES_VOLUME_NEW" ]] || docker volume rm "$HERMES_VOLUME_NEW" >/dev/null 2>&1 || true
+  cleanup_offline
+}
+
+# Hermes Agent for Compose with no internet: the Hermes bundle checked as install.sh checks it,
+# for the Hermes Agent the image Compose runs pins, its tree checked again as files, then copied
+# into a Docker volume of its own, root's, shared as install.sh shares it, and run from there as
+# Compose will. The volume is marked last, so one left by a failed load is made again.
+cmd_load_hermes() {
+  local bundle="" sha="" image="" env_file=.env volume="" arch commit tag pinned img_arch tree version
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sha256) sha=$2; shift 2 ;;
+      --image) image=$2; shift 2 ;;
+      --env-file) env_file=$2; shift 2 ;;
+      --volume) volume=$2; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown option: $1" ;;
+      *) [[ -z "$bundle" ]] || die "Give one Hermes bundle"; bundle=$1; shift ;;
+    esac
+  done
+  [[ -n "$bundle" ]] || die "Give the Hermes bundle (superbot-hermes-<tag>-<arch>.tar.gz)"
+  [[ -f "$bundle" ]] || die "No Hermes bundle at $bundle"
+  [[ -z "$sha" || "$sha" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 must be 64 lowercase hex digits"
+  [[ -z "$volume" || "$volume" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "--volume \"$volume\" isn't a Docker volume name"
+  OFFLINE_TMP=$(mktemp -d)
+  trap load_hermes_cleanup EXIT
+  hermes_unpack_bundle "$bundle" "$OFFLINE_TMP" "$sha"
+  arch=$(manifest_value "$HERMES_BUNDLE_DIR/MANIFEST" arch)
+  commit=$(manifest_value "$HERMES_BUNDLE_DIR/MANIFEST" hermes_commit)
+  tag=$(manifest_value "$HERMES_BUNDLE_DIR/MANIFEST" hermes_tag)
+
+  command -v docker >/dev/null 2>&1 || die "load-hermes needs docker"
+  [[ -n "$image" ]] || image=$(compose_botd_image "$env_file")
+  docker image inspect "$image" >/dev/null 2>&1 \
+    || die "No image $image here: load the release's images first ($0 load), or give --image"
+  img_arch=$(docker image inspect --format '{{.Architecture}}' "$image" 2>/dev/null) || true
+  [[ "$img_arch" == "$(docker_arch "$arch")" ]] || die "$image is for linux/$img_arch, but the Hermes bundle is for $arch"
+  pinned=$(docker run --rm --network none --entrypoint botd "$image" harness pins 2>/dev/null \
+    | awk '$1 == "hermes" { print $3; exit }') || true
+  [[ "$pinned" =~ ^[0-9a-f]{40}$ ]] || die "$image's botd doesn't say which Hermes Agent it pins (botd harness pins): use a SuperBot image of the Hermes bundle's release"
+  [[ "$pinned" == "$commit" ]] \
+    || die "The Hermes bundle holds Hermes Agent ${commit:0:12}, but $image pins ${pinned:0:12}: use the Hermes bundle made for the image's release (docs/ops/air-gapped.md#hermes-agent-with-docker-compose)"
+  volume=${volume:-$(hermes_volume_name "$commit")}
+
+  if docker volume inspect "$volume" >/dev/null 2>&1; then
+    if [[ "$(HERMES_VOLUME_MODE=:ro hermes_volume_run "$image" "$volume" -- cat "$HERMES_SHARED_DIR/$HERMES_VOLUME_MARK" 2>/dev/null)" == "$commit" ]]; then
+      version=$(hermes_volume_probe "$image" "$volume")
+      log "Hermes Agent ${commit:0:12} is already in the Docker volume $volume, and runs in $image: $version"
+      load_hermes_settings "$volume"
+      return
+    fi
+    warn "The Docker volume $volume holds no finished load of Hermes Agent ${commit:0:12}: making it again"
+    docker volume rm "$volume" >/dev/null || die "Couldn't remove the Docker volume $volume: stop what uses it (docker compose down), then run this again"
+  fi
+
+  tree="$OFFLINE_TMP/tree"
+  mkdir -m 0700 "$tree"
+  log "Unpacking Hermes Agent ${commit:0:12} from $bundle"
+  tar -xf "$HERMES_BUNDLE_DIR/hermes.tar" -C "$tree" --no-same-owner || die "Couldn't unpack Hermes Agent from $bundle"
+  rm -f -- "$HERMES_BUNDLE_DIR/hermes.tar"
+  bundle_tree_ok "$tree/hermes" "$HERMES_SHARED_DIR" || die "Refusing $bundle: $BUNDLE_TREE_PROBLEM"
+  [[ "$(hermes_installed "$tree/hermes")" == "$commit" ]] || die "Refusing $bundle: its checkout isn't Hermes Agent $commit"
+
+  log "Copying Hermes Agent ${commit:0:12} into the Docker volume $volume"
+  docker volume create --label "org.superbot.hermes-commit=$commit" "$volume" >/dev/null || die "Couldn't make the Docker volume $volume"
+  HERMES_VOLUME_NEW=$volume
+  tar -C "$tree" --owner=0 --group=0 --numeric-owner -cf - hermes \
+    | hermes_volume_run "$image" "$volume" -i --user 0:0 -- tar -xf - -C "$(dirname "$HERMES_SHARED_DIR")" --no-same-owner \
+    || die "Couldn't copy Hermes Agent into the Docker volume $volume"
+  rm -rf -- "$tree"
+  # As install.sh: hermes-share.sh with the install's HOME, then root's alone to change and
+  # every account's to run. The script is copied in, as it writes itself out as the wrapper.
+  local readable
+  readable=$(printf ' %q' "${HERMES_SHARED_READABLE[@]}")
+  # shellcheck disable=SC2016 # expanded in the container
+  hermes_volume_run "$image" "$volume" -i --user 0:0 -e HOME="$HERMES_SHARED_DIR" -- sh -euc '
+    cat >/tmp/hermes-share.sh
+    sh /tmp/hermes-share.sh >/dev/null
+    cd "$HOME"
+    chown root:root .
+    chmod 0755 .
+    chmod -R go-w .
+    for d in '"$readable"'; do
+      [ ! -d "$d" ] || chmod -R a+rX "$d"
+    done
+    chmod go+rx .hermes .hermes/superbot
+  ' <"$DIR/hermes-share.sh" || die "Couldn't share Hermes Agent's environment in the Docker volume $volume"
+  version=$(hermes_volume_probe "$image" "$volume")
+  # shellcheck disable=SC2016 # expanded in the container
+  hermes_volume_run "$image" "$volume" --user 0:0 -- sh -c 'printf "%s\n" "$1" >"$2"' _ "$commit" "$HERMES_SHARED_DIR/$HERMES_VOLUME_MARK" \
+    || die "Couldn't mark the Docker volume $volume as loaded"
+  HERMES_VOLUME_NEW=""
+  log "Hermes Agent $tag (${commit:0:12}) is in the Docker volume $volume, and runs in $image with no network: $version"
+  load_hermes_settings "$volume"
+}
+
+load_hermes_settings() {
+  log "For Compose, set these in .env, then docker compose up -d (docs/ops/air-gapped.md#hermes-agent-with-docker-compose):"
+  printf '    %s\n' "COMPOSE_FILE=docker-compose.yml:docker-compose.hermes.yml" "SUPERBOT_HERMES_VOLUME=$1"
+  log "With a docker-compose.override.yml, name it in COMPOSE_FILE too: Compose reads it only when COMPOSE_FILE isn't set"
 }
 
 # A registry and optional path to push under: a host (with a dot or a port, or localhost), then
@@ -778,7 +951,8 @@ case "${1:-}" in
   harnesses) shift; cmd_harnesses "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   load) shift; cmd_load "$@" ;;
+  load-hermes) shift; cmd_load_hermes "$@" ;;
   push) shift; cmd_push "$@" ;;
   -h|--help|"") usage ;;
-  *) die "Unknown command: $1 (build, hermes, harnesses, verify, load or push)" ;;
+  *) die "Unknown command: $1 (build, hermes, harnesses, verify, load, load-hermes or push)" ;;
 esac

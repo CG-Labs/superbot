@@ -15,6 +15,8 @@ HTTPS_PORT=${SMOKE_HTTPS_PORT:-18443}
 BASE="http://127.0.0.1:$HTTP_PORT"
 WORK=$(mktemp -d)
 export SUPERBOT_ENV_FILE="$WORK/.env"
+# Made by load-hermes below; external, so compose down -v leaves it.
+HERMES_VOLUME=""
 
 log() { printf '==> %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -30,6 +32,7 @@ cleanup() {
     printf 'Kept project %s; env file %s\n' "$PROJECT" "$SUPERBOT_ENV_FILE" >&2
   else
     dc down -v --remove-orphans >/dev/null 2>&1 || true
+    [[ -z "$HERMES_VOLUME" ]] || docker volume rm "$HERMES_VOLUME" >/dev/null 2>&1 || true
     rm -rf "$WORK"
   fi
   exit "$status"
@@ -341,5 +344,46 @@ if refused=$(docker run --rm --cap-drop ALL --entrypoint chromium "$image" --hea
 fi
 grep -q 'No usable sandbox' <<<"$refused" || fail "Chromium failed for another reason under Docker's default profile: $refused"
 dc exec -T botd agent-desktop --version >/dev/null || fail "agent-desktop is not runnable in the image"
+
+log "Hermes Agent from a Hermes bundle (ADR 0275): load-hermes fills a volume, docker-compose.hermes.yml mounts it read-only"
+# A stand-in for Hermes Agent's tree as its installer leaves it with HOME=/opt/hermes, which
+# hermes-share.sh takes. offline.yml runs the real bundle from a volume.
+hermes_tree() {
+  local h=$1/hermes key commit
+  commit=$(sed -n 's/^HERMES_COMMIT=.*:-\([0-9a-f]\{40\}\)}.*/\1/p' "$DIR/../install.sh")
+  key=$(printf '%s' /opt/hermes/.hermes/hermes-agent | sha256sum | cut -c1-16)
+  mkdir -p "$h/.hermes/hermes-agent/.git" "$h/.hermes/hermes-agent/.hermes/bin" "$h/.hermes/installs/$key/environments/g1/venv" "$h/.hermes/superbot"
+  echo "$commit" >"$h/.hermes/hermes-agent/.git/HEAD"
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\ncase "$1" in pm) ;; --version) echo "Hermes Agent v0.0.0 (smoke stand-in)" ;; *) exit 1 ;; esac\n' >"$h/.hermes/hermes-agent/.hermes/bin/hermes"
+  printf '{"environment": "/opt/hermes/.hermes/installs/%s/environments/g1/venv"}\n' "$key" >"$h/.hermes/installs/$key/facts.json"
+  chmod 0600 "$h/.hermes/installs/$key/facts.json"
+  cp "$DIR/../hermes-share.sh" "$h/.hermes/superbot/hermes"
+  chmod 0755 "$h/.hermes/hermes-agent/.hermes/bin/hermes" "$h/.hermes/superbot/hermes"
+}
+if [[ " ${SMOKE_HARNESSES-claude codex pi} " != *" hermes "* ]]; then
+  dc exec -T botd sh -c '! command -v hermes' >/dev/null || fail "hermes counts as installed without its volume"
+fi
+mkdir "$WORK/hermes-tree"
+hermes_tree "$WORK/hermes-tree"
+"$DIR/../offline-bundle.sh" hermes --out "$WORK/hermes-out" --tree "$WORK/hermes-tree/hermes" >"$WORK/hermes-bundle.log" 2>&1 \
+  || { cat "$WORK/hermes-bundle.log" >&2; fail "the stand-in Hermes bundle didn't build"; }
+hb=$(ls "$WORK"/hermes-out/superbot-hermes-*.tar.gz)
+image=$(docker inspect --format '{{.Config.Image}}' "$(dc ps -q botd)")
+HERMES_VOLUME="$PROJECT-hermes"
+"$DIR/../offline-bundle.sh" load-hermes "$hb" --image "$image" --volume "$HERMES_VOLUME" >"$WORK/load-hermes.log" 2>&1 \
+  || { cat "$WORK/load-hermes.log" >&2; fail "load-hermes failed"; }
+grep -Fq "runs in $image with no network: Hermes Agent v0.0.0 (smoke stand-in)" "$WORK/load-hermes.log" \
+  || { cat "$WORK/load-hermes.log" >&2; fail "load-hermes didn't run Hermes Agent from the volume"; }
+grep -qx "    SUPERBOT_HERMES_VOLUME=$HERMES_VOLUME" "$WORK/load-hermes.log" || fail "load-hermes didn't print the .env settings"
+COMPOSE_FILES+=(-f "$DIR/docker-compose.hermes.yml")
+export SUPERBOT_HERMES_VOLUME=$HERMES_VOLUME
+dc up -d --no-build --force-recreate --wait --wait-timeout 120 botd
+[[ $(dc exec -T botd hermes --version) == "Hermes Agent v0.0.0 (smoke stand-in)" ]] || fail "botd's container doesn't run Hermes Agent from the volume"
+grep -Eq 'Harnesses on PATH: .*\bhermes\b' <<<"$(dc logs --no-color botd)" || fail "botd doesn't count Hermes Agent from the volume as installed"
+if dc exec -T -u 0 botd touch /opt/hermes/.hermes/superbot/x 2>/dev/null; then fail "the Hermes volume is writable in botd's container"; fi
+"$DIR/../offline-bundle.sh" load-hermes "$hb" --image "$image" --volume "$HERMES_VOLUME" >"$WORK/load-hermes-again.log" 2>&1 \
+  || { cat "$WORK/load-hermes-again.log" >&2; fail "load-hermes again failed"; }
+grep -Fq "is already in the Docker volume $HERMES_VOLUME" "$WORK/load-hermes-again.log" || fail "load-hermes again didn't see the volume was loaded"
 
 log "Smoke test passed"
