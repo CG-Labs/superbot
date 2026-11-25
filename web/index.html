@@ -279,6 +279,12 @@
         <thead><tr><th>Item</th><th>Status</th><th>What botd saw</th><th>Guide</th></tr></thead>
         <tbody id="sup-health-check-items"></tbody>
       </table>
+      <h2>Quarterly business review</h2>
+      <div class="bar">
+        <span class="hint">A draft of the quarterly business review from the score's history, the health checks and botd's records, as Markdown. Each draft is audited.</span>
+        <input id="sup-qbr-to" class="push" type="month" title="The quarter's last month. Empty: the last whole month." />
+        <a class="btn" id="sup-qbr" href="/api/support/business-review?format=markdown" download title="Three months of the health score, health checks, runs, incidents, access reviews and changes, with goals, tickets and actions left to fill in. Names nobody. Audited.">Draft business review</a>
+      </div>
     </section>
 
     <section id="tab-settings" hidden>

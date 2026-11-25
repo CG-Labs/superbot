@@ -196,7 +196,7 @@ const ACTIONS: [&str; 10] = [
 ];
 
 impl Inputs {
-    fn add(&mut self, c: &AuditCount) {
+    pub(crate) fn add(&mut self, c: &AuditCount) {
         let code = c.code.as_deref().map_or("none", reason_code).to_string();
         let bump = |t: &mut Tally, k: String| *t.entry(k).or_default() += c.n;
         let sso = c.method.as_deref() == Some("sso");

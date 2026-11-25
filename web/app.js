@@ -2528,6 +2528,13 @@ $("sup-health-check-form").addEventListener("submit", async (e) => {
   }
 });
 
+// The quarterly business review draft (ADR 0262): a download, made only when clicked, since each draft is audited.
+$("sup-qbr-to").max = new Date().toISOString().slice(0, 7);
+$("sup-qbr-to").addEventListener("change", () => {
+  const to = $("sup-qbr-to").value;
+  $("sup-qbr").href = `/api/support/business-review?${/^\d{4}-\d{2}$/.test(to) ? `to=${encodeURIComponent(to)}&` : ""}format=markdown`;
+});
+
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
 const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, roles: loadRoles, "service-accounts": () => loadServiceAccounts({ keepForm: true }), audit: () => loadAudit(), status: loadStatus, support: loadSupport, settings: loadSettings, setup: loadSetup };

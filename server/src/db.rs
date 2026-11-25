@@ -9386,8 +9386,13 @@ impl Db {
     /// throttled failure's `unloggedSinceLast` is summed apart as `skipped`: the failures
     /// it stands for were of any reason, not necessarily its own.
     pub fn audit_counts(&self, from: i64, actions: &[&str]) -> Vec<AuditCount> {
+        self.audit_counts_between(from, i64::MAX, actions)
+    }
+
+    /// `audit_counts` for events from `from` up to, not including, `to` (unix ms).
+    pub fn audit_counts_between(&self, from: i64, to: i64, actions: &[&str]) -> Vec<AuditCount> {
         use rusqlite::types::Value as V;
-        let mut args = vec![V::Integer(from)];
+        let mut args = vec![V::Integer(from), V::Integer(to)];
         let mut parts = Vec::new();
         for a in actions {
             match a.strip_suffix('*') {
@@ -9409,7 +9414,7 @@ impl Db {
                CASE WHEN json_valid(details) THEN CAST(COALESCE(json_extract(details, '$.result'), json_extract(details, '$.reason')) AS TEXT) END AS code,
                COUNT(*),
                SUM(CASE WHEN json_valid(details) THEN max(0, CAST(COALESCE(json_extract(details, '$.unloggedSinceLast'), 0) AS INTEGER)) ELSE 0 END)
-             FROM audit_events WHERE at >= ? AND ({})
+             FROM audit_events WHERE at >= ? AND at < ? AND ({})
              GROUP BY action, outcome, auth_method, code ORDER BY action, outcome, code",
             parts.join(" OR ")
         );
@@ -9421,6 +9426,23 @@ impl Db {
         .unwrap()
         .filter_map(Result::ok)
         .collect()
+    }
+
+    /// Finished runs from `from` up to `to` (unix ms), counted by Bot, the harness that ran
+    /// each (its `token_usage` rows, None when it has none) and result (ADR 0262).
+    pub fn run_results_by_harness(&self, from: i64, to: i64) -> Vec<(Option<String>, Option<String>, Option<String>, u64)> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT e.bot_id, (SELECT t.harness FROM token_usage t WHERE t.run_id = e.run_id LIMIT 1) AS harness, e.result, COUNT(*)
+                 FROM (SELECT bot_id,
+                         CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.runId') AS TEXT) END AS run_id,
+                         CASE WHEN json_valid(details) THEN CAST(json_extract(details, '$.result') AS TEXT) END AS result
+                       FROM audit_events WHERE action = 'bot.run_finished' AND at >= ? AND at < ?) e
+                 GROUP BY e.bot_id, harness, e.result ORDER BY e.bot_id, harness, e.result",
+            )
+            .unwrap();
+        s.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)?.max(0) as u64))).unwrap().filter_map(Result::ok).collect()
     }
 
     /// Active people, the owner aside as seats count them, and how many of them signed in
@@ -10688,6 +10710,30 @@ impl Db {
             .collect()
     }
 
+    /// Every incident posted before `to` and open at some time from `from` (unix ms), without
+    /// its updates, however many there are (ADR 0262).
+    pub fn status_incidents_between(&self, from: i64, to: i64) -> rusqlite::Result<Vec<StatusIncident>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM status_incidents WHERE created_at < ? AND (resolved_at IS NULL OR resolved_at >= ?) ORDER BY created_at, id")?;
+        let rows = s.query_map(params![to, from], status_incident_row)?;
+        rows.collect()
+    }
+
+    /// Direct changes to people's built-in roles from `from` up to `to` (unix ms): those
+    /// with no custom role, which go with `role.assigned`, `role.unassigned` or
+    /// `role.updated` and are counted there (ADR 0262).
+    pub fn built_in_role_changes(&self, from: i64, to: i64) -> u64 {
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action = 'user.role_changed' AND outcome = 'success' AND at >= ? AND at < ?
+                   AND (NOT json_valid(details) OR json_type(details, '$.role') IS NULL)",
+                params![from, to],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as u64
+    }
+
     /// Every open incident's impact and components, however many there are.
     pub fn status_incidents_open(&self) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
         let c = self.c();
@@ -10898,6 +10944,13 @@ impl Db {
     }
 
     /// The newest restores of every machine, newest first.
+    /// Restores asked for from `from` up to `to` (unix ms), however many (ADR 0262).
+    pub fn machine_restores_between(&self, from: i64, to: i64) -> Vec<MachineRestore> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_restores WHERE created_at >= ? AND created_at < ? ORDER BY created_at, id").unwrap();
+        s.query_map([from, to], machine_restore_row).unwrap().filter_map(Result::ok).collect()
+    }
+
     pub fn machine_restores_recent(&self, limit: u32) -> Vec<MachineRestore> {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machine_restores ORDER BY created_at DESC, id DESC LIMIT ?").unwrap();
@@ -11643,6 +11696,11 @@ impl Db {
         Db::on(crate::database_encryption::open_with(path, Some(key)).unwrap()).unwrap()
     }
 
+    /// Drops `table`, so reading it fails as a damaged database's would (ADR 0262).
+    pub fn drop_table(&self, table: &str) {
+        self.c().execute_batch(&format!("DROP TABLE {table}")).unwrap();
+    }
+
     /// Moves when a pending request for a role lapses to `at`, as the clock passing it would (ADR 0209).
     pub fn move_role_request_lapse(&self, id: &str, at: i64) {
         self.c().execute("UPDATE role_requests SET expires_at = ?1 WHERE id = ?2", params![at, id]).unwrap();
@@ -12134,6 +12192,45 @@ mod tests {
         // No team pin: nothing to keep.
         db.unpin_residency(PinOn::Team, &t.id).unwrap();
         assert!(matches!(db.remove_team_member_keeping_pin(&t.id, &ada.id, true, true), Ok((true, None))));
+    }
+
+    #[test]
+    fn restores_between_two_times_are_all_of_them_however_many_came_after() {
+        let db = Db::open(&temp_path("restores-between").join("app.sqlite")).unwrap();
+        let ada = db.create_user(None, Some("ada@example.com"), "ada", Role::Member).unwrap();
+        let new = NewMachine { user_id: &ada.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let m = db.add_machine(&new).unwrap();
+        let b = NewMachineBackup { id: "b1", machine: &m, object_key: "t/b1.incus", store_region: None, encrypted: false, created_by: None };
+        db.machine_backup_start(&b).unwrap();
+        let ids: Vec<String> = (0..1003).map(|i| format!("r{i:04}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            db.machine_restore_start(&NewMachineRestore { id, machine: &m, backup_id: "b1", by: None, rto_ms: None, from_host: None, to_host: None, reason: None }).unwrap();
+            assert!(db.machine_restore_move(id, &["importing"], "failed", None));
+            db.c().execute("UPDATE machine_restores SET created_at = ? WHERE id = ?", params![1_000 + i as i64, id]).unwrap();
+        }
+        let got: Vec<String> = db.machine_restores_between(1_000, 1_003).into_iter().map(|r| r.id).collect();
+        assert_eq!(got, ["r0000", "r0001", "r0002"], "the oldest, behind 1000 newer");
+        assert!(db.machine_restores_recent(1000).iter().all(|r| r.created_at >= 1_003));
+    }
+
+    #[test]
+    fn incidents_between_two_times_are_all_of_them_however_many_came_after() {
+        let db = Db::open(&temp_path("incidents-between").join("app.sqlite")).unwrap();
+        // Posted at 10 and resolved at `resolved`, or open.
+        let made = [("before", Some(5)), ("ended_in", Some(100)), ("open", None), ("posted_in", Some(300)), ("after", None)];
+        for (i, (id, resolved)) in made.iter().enumerate() {
+            let n = NewStatusIncident { id, title: "t", impact: "major", components: &[], state: "investigating", body: "b", by: None };
+            db.status_incident_create(&n).unwrap();
+            let posted = if *id == "posted_in" { 150 } else if *id == "after" { 200 } else { 10 + i as i64 };
+            db.c().execute("UPDATE status_incidents SET created_at = ?, resolved_at = ? WHERE id = ?", params![posted, resolved, id]).unwrap();
+        }
+        for i in 0..1001 {
+            let id = format!("newer{i}");
+            db.status_incident_create(&NewStatusIncident { id: &id, title: "t", impact: "minor", components: &[], state: "investigating", body: "b", by: None }).unwrap();
+            db.c().execute("UPDATE status_incidents SET created_at = 500 WHERE id = ?", [&id]).unwrap();
+        }
+        let got: Vec<String> = db.status_incidents_between(50, 200).unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(got, ["ended_in", "open", "posted_in"]);
     }
 
     #[test]
