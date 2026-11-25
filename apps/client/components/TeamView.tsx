@@ -241,7 +241,7 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
       setTeam(t);
       setInvites(i);
       // Only owners and admins get a count, so nobody else asks (nor an older server, without one).
-      setRequests(t?.roleRequests ? (await api.teamRoleRequests("pending")).requests : []);
+      setRequests(t?.roleRequests ? await api.teamRoleRequests("pending").then((v) => v.requests, () => []) : []);
     } catch (e) {
       setError(message(e, "Couldn't load your team"));
       setTeam((t) => t ?? null);
