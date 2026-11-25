@@ -302,6 +302,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    item of the TAM's checklist done, open, to confirm or n/a,
                                                    from the health score and botd's records. Exits 1 while any
                                                    item is open
+  botctl offline check [--internal <suffix or range>,...] [--json]
+                                                   What the running botd reaches outside an air-gapped network
+                                                   (ADR 0266): botd offline check's settings, with secrets saved
+                                                   in botd or a secrets manager, IdP metadata saved with botctl
+                                                   and each OIDC provider's discovery document. Exits 1 while
+                                                   anything is on the internet
   botctl business-review [--to <YYYY-MM>] [--json] [-o <file>]
                                                    Draft the quarterly business review (ADR 0262) as Markdown:
                                                    the three months to --to (the last whole month by default),
@@ -2367,6 +2373,27 @@ fn run(args: &[String]) -> Result<String, String> {
             }
             Ok(out)
         }
+        ["offline", rest @ ..] => {
+            let (path, json) = offline_check_request(rest)?;
+            let res = api(Cred::Operator, "GET", &path, None)?;
+            let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
+            let out = if json {
+                let mut v = v.clone();
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("text");
+                }
+                serde_json::to_string_pretty(&v).unwrap_or_default()
+            } else {
+                v["text"].as_str().unwrap_or_default().trim_end().to_string()
+            };
+            // Anything on the internet exits 1, so a script can stop before going offline.
+            if v["offline"] != true {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(format!("{out}\n").as_bytes()).and_then(|_| stdout.flush());
+                std::process::exit(1);
+            }
+            Ok(out)
+        }
         ["business-review", rest @ ..] => {
             let (path, json, out) = business_review_request(rest)?;
             let res = api(Cred::Operator, "GET", &path, None)?;
@@ -3131,6 +3158,23 @@ fn onboarding_markdown(v: &Value) -> String {
     out
 }
 
+/// `botctl offline check [--internal <list>]... [--json]`: the path to ask, and whether to print JSON.
+fn offline_check_request(rest: &[&str]) -> Result<(String, bool), String> {
+    const USAGE: &str = "Usage: botctl offline check [--internal <suffix or range>,...] [--json]";
+    let Some((&"check", rest)) = rest.split_first() else { return Err(USAGE.into()) };
+    let (mut internal, mut json) = (Vec::new(), false);
+    let mut it = rest.iter();
+    while let Some(&flag) = it.next() {
+        match flag {
+            "--json" | "json" => json = true,
+            "--internal" => internal.extend(it.next().ok_or(USAGE)?.split(',').map(str::trim).filter(|v| !v.is_empty())),
+            _ => return Err(format!("Unknown option {flag}\n{USAGE}")),
+        }
+    }
+    let path = if internal.is_empty() { "/api/offline-check".to_string() } else { format!("/api/offline-check?internal={}", encode(&internal.join(","))) };
+    Ok((path, json))
+}
+
 /// `botctl health-check [markdown | json]`: how to print it.
 fn health_check_request(rest: &[&str]) -> Result<Shape, String> {
     match rest {
@@ -3600,6 +3644,18 @@ mod tests {
         let served = "superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z.tar";
         assert_eq!(evidence_check("evidence.tar", Some(served)), "tar -xf 'evidence.tar' && cd 'superbot-evidence-2026-10-01_2026-11-01-20261101T000000Z' && sha256sum -c SHA256SUMS");
         assert_eq!(evidence_check("my dir/it's.tar", None), "tar -xf 'my dir/it'\\''s.tar' && cd 'it'\\''s' && sha256sum -c SHA256SUMS");
+    }
+
+    #[test]
+    fn the_offline_check_takes_internal_ranges_and_json() {
+        assert_eq!(offline_check_request(&["check"]), Ok(("/api/offline-check".into(), false)));
+        assert_eq!(
+            offline_check_request(&["check", "--internal", "corp.example, 10.0.0.0/8", "--json", "--internal", "[fd00::]/8"]),
+            Ok(("/api/offline-check?internal=corp.example,10.0.0.0%2F8,%5Bfd00::%5D%2F8".into(), true))
+        );
+        for bad in [&[][..], &["verify"], &["check", "--internal"], &["check", "--home", "/h"]] {
+            assert!(offline_check_request(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -326,6 +326,11 @@ impl Sso {
         self.providers.iter().find(|p| p.id == id)
     }
 
+    /// `p`'s discovery document's endpoints, fetched as sign-in fetches it (ADR 0266).
+    pub async fn discovered(&self, p: &Provider) -> Option<Result<Vec<(&'static str, String)>, String>> {
+        Some(p.discovered(self.http(), self.refresh_gap).await?.map_err(|e| e.0.to_string()))
+    }
+
     fn http(&self) -> &reqwest::Client {
         self.http.get_or_init(|| {
             reqwest::Client::builder()

@@ -173,6 +173,8 @@ mod obs;
 mod obs_http_tests;
 mod offline_check;
 #[cfg(test)]
+mod offline_check_http_tests;
+#[cfg(test)]
 mod push_http_tests;
 mod paths;
 mod policy;
@@ -1111,6 +1113,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/support/health-score", get(health_score::get))
         .route("/support/health-score/history", get(health_history::get))
         .route("/support/onboarding", get(onboarding::get))
+        .route("/offline-check", get(offline_check::get))
         .route("/evidence", get(evidence::get))
         .route("/evidence/bundle", get(evidence::bundle))
         .route("/evidence/baseline", get(baseline::get))

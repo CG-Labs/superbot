@@ -413,6 +413,11 @@ impl Secrets {
         Ok(self.find(name)?.map(|(v, _)| v))
     }
 
+    /// The value and the kind of store it came from, for `botctl offline check` (ADR 0266).
+    pub fn found(&self, name: &str) -> Result<Option<(Secret, &'static str)>, Error> {
+        Ok(self.find(name)?.map(|(v, s)| (v, s.kind())))
+    }
+
     /// The store whose value wins for `name` (`env` or `sealed`), and whether it can be written.
     pub fn source(&self, name: &str) -> Result<Option<(&'static str, bool)>, Error> {
         Ok(self.find(name)?.map(|(_, s)| (s.kind(), s.writable())))
