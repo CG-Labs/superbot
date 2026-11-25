@@ -374,3 +374,154 @@ async fn a_scim_delete_takes_mapped_roles_away_with_group_roles_turned_off() {
     let gone = &events(port, &admin, "action=role.unassigned").await[0];
     assert_eq!((gone["details"]["user"].as_str(), gone["details"]["reason"].as_str()), (Some(eve.as_str()), Some("user_deleted")));
 }
+
+async fn remap(port: u16, admin: &str, mapping: &str, body: Value) -> (u16, Value) {
+    json_call(port, "PATCH", &format!("{MAPPINGS}/{mapping}"), admin, &body.to_string()).await
+}
+
+/// ADR 0265: an admin changes a mapping's role in place. Its holders get the new role
+/// instead, in one go; nobody it skipped, or whose role an admin took away, is given it.
+#[tokio::test]
+async fn changing_a_mappings_role_swaps_it_for_its_holders_and_gives_nobody_else() {
+    let (port, app, admin) = serve(true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let ro = person(port, &t, "ro@example.com").await;
+    let mem = person(port, &t, "mem@example.com").await;
+    let adm = person(port, &t, "adm@example.com").await;
+    let hand = person(port, &t, "hand@example.com").await;
+    let bo = person(port, &t, "bo@example.com").await;
+    for (u, r) in [(&ro, "readonly"), (&adm, "admin")] {
+        assert_eq!(call(port, "PATCH", &format!("/api/users/{u}"), &admin, &json!({ "role": r }).to_string()).await.0, 200);
+    }
+    let auditor = role(port, &admin, "Auditor", "member", &["audit.view", "users.manage"]).await;
+    let viewer = role(port, &admin, "Viewer", "readonly", &["audit.view"]).await;
+    let bots = role(port, &admin, "Bot keeper", "member", &["bots.manage"]).await;
+    let (code, v) = json_call(port, "POST", "/api/roles", &admin, &json!({ "name": "Brief", "base": "member", "permissions": ["audit.view"], "maxDays": 7 }).to_string()).await;
+    assert_eq!(code, 201, "{v}");
+    let brief = v["id"].as_str().unwrap().to_string();
+    let other = role(port, &admin, "Other", "member", &["billing.manage"]).await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{other}/users/{hand}"), &admin, "").await.0, 200);
+    let team = group(port, &t, "Ops", &[&ro, &mem, &adm, &hand, &bo]).await;
+    let (code, m) = map(port, &admin, json!({ "team": team, "role": auditor, "scope": "org" })).await;
+    assert_eq!((code, ids(&m["granted"])), (201, sorted(vec![ro.clone(), mem.clone(), bo.clone()])), "{m}");
+    let mid = m["id"].as_str().unwrap().to_string();
+    // An admin takes Bo's role away: the mapping doesn't give it back, old role or new.
+    assert_eq!(call(port, "DELETE", &format!("/api/roles/{auditor}/users/{bo}"), &admin, "").await.0, 200);
+
+    for (body, code, why) in [
+        (json!({ "role": "admin" }), 400, "never admin"),
+        (json!({ "role": "member" }), 400, "custom roles only"),
+        (json!({ "role": bots }), 400, "bots.manage acts on admins' Bots across the server"),
+        (json!({ "role": brief }), 409, "never a time-bound role"),
+        (json!({ "role": "nope" }), 404, "unknown role"),
+        (json!({ "role": viewer, "scope": "team" }), 400, "the scope stays as it is"),
+        (json!({}), 400, "a role is needed"),
+    ] {
+        let (got, v) = remap(port, &admin, &mid, body).await;
+        assert_eq!(got, code, "{why}: {v}");
+    }
+    assert_eq!(remap(port, &admin, "sm-nope", json!({ "role": viewer })).await.0, 404);
+    let refused = events(port, &admin, "action=scim.role_map_refused").await;
+    let got: Vec<(&str, &str)> = refused.iter().map(|e| (e["details"]["reason"].as_str().unwrap(), e["details"]["mapping"].as_str().unwrap())).collect();
+    assert_eq!(got, [("reaches_admins", mid.as_str()), ("built_in", mid.as_str()), ("admin", mid.as_str())], "newest first, naming the mapping");
+    assert_eq!(app.db.user(&ro).unwrap().role_id.as_deref(), Some(auditor.as_str()), "a refusal changes nobody");
+
+    let (code, v) = remap(port, &admin, &mid, json!({ "role": "Viewer" })).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["role"]["id"].as_str(), v["from"]["id"].as_str(), v["applies"].clone()), (Some(viewer.as_str()), Some(auditor.as_str()), json!(["audit.view"])), "{v}");
+    assert_eq!((ids(&v["swapped"]), v["dropped"].clone(), v["grants"].clone()), (sorted(vec![ro.clone(), mem.clone()]), json!([]), json!(2)));
+    for u in [&ro, &mem] {
+        let x = app.db.user(u).unwrap();
+        assert_eq!((x.role, x.role_id.as_deref()), (Role::Readonly, Some(viewer.as_str())), "the new role and its base");
+    }
+    assert_eq!(app.db.user(&bo).unwrap().role_id, None, "an admin's removal holds");
+    assert_eq!(app.db.user(&adm).unwrap().role, Role::Admin);
+    assert_eq!(app.db.user(&hand).unwrap().role_id.as_deref(), Some(other.as_str()), "a role given by hand stays");
+    let swaps: Vec<Value> = events(port, &admin, "action=role.assigned").await.into_iter().filter(|e| e["details"]["reason"] == "mapping_changed").collect();
+    assert_eq!(swaps.len(), 2);
+    assert_eq!((swaps[0]["targetId"].as_str(), swaps[0]["details"]["from"]["id"].as_str(), swaps[0]["details"]["mapping"].as_str()), (Some(viewer.as_str()), Some(auditor.as_str()), Some(mid.as_str())));
+    let changed = events(port, &admin, &format!("action=user.role_changed&target=user:{mem}")).await;
+    assert_eq!((changed[0]["details"]["from"].as_str(), changed[0]["details"]["to"].as_str()), (Some("member"), Some("readonly")), "a base change is audited");
+    let remapped = events(port, &admin, "action=scim.role_remapped").await;
+    assert_eq!(remapped.len(), 1);
+    let d = &remapped[0]["details"];
+    assert_eq!((d["from"]["name"].as_str(), d["role"]["name"].as_str(), d["group"].as_str(), d["scope"].as_str()), (Some("Auditor"), Some("Viewer"), Some("Ops"), Some("org")));
+    assert_eq!(ids(&d["swapped"]), sorted(vec![ro.clone(), mem.clone()]));
+    let unassigned = events(port, &admin, "action=role.unassigned").await;
+    assert!(unassigned.iter().all(|e| e["details"]["user"] != ro.as_str() && e["details"]["user"] != mem.as_str()), "nothing was taken away between the two: {unassigned:?}");
+
+    // Ro still reads the audit log, as the new role says, but no longer manages people.
+    let ro_auth = crate::scim_http_tests::session_for(port, &admin, &ro).await;
+    assert_eq!(call(port, "GET", "/api/audit", &ro_auth, "").await.0, 200);
+    let (_, v) = json_call(port, "GET", &format!("/api/roles/{auditor}"), &admin, "").await;
+    assert_eq!(v["scimMappings"], 0, "the old role is no longer mapped");
+    assert_eq!(call(port, "DELETE", &format!("/api/roles/{auditor}"), &admin, "").await.0, 200, "so it can be deleted");
+    let (code, v) = json_call(port, "PATCH", &format!("/api/roles/{viewer}"), &admin, &json!({ "permissions": ["audit.view", "bots.manage"] }).to_string()).await;
+    assert_eq!(code, 409, "the new one can't grow to reach admins: {v}");
+
+    // The same role again changes nothing and audits nothing.
+    let (code, v) = remap(port, &admin, &mid, json!({ "role": viewer })).await;
+    assert_eq!((code, v["swapped"].clone()), (200, json!([])), "{v}");
+    assert_eq!(events(port, &admin, "action=scim.role_remapped").await.len(), 1);
+
+    // Leaving the group takes the new role, and gives back the role from before the mapping.
+    members(port, &t, &team, "Remove", &[&mem]).await;
+    let x = app.db.user(&mem).unwrap();
+    assert_eq!((x.role, x.role_id), (Role::Member, None));
+    let gone = &events(port, &admin, "action=role.unassigned").await[0];
+    assert_eq!((gone["targetId"].as_str(), gone["details"]["reason"].as_str()), (Some(viewer.as_str()), Some("left_group")));
+    // Joining now gives the new role.
+    members(port, &t, &team, "Add", &[&mem]).await;
+    assert_eq!(app.db.user(&mem).unwrap().role_id.as_deref(), Some(viewer.as_str()));
+    let (code, v) = json_call(port, "DELETE", &format!("{MAPPINGS}/{mid}"), &admin, "").await;
+    assert_eq!((code, ids(&v["revoked"])), (200, sorted(vec![ro.clone(), mem.clone()])), "{v}");
+    assert_eq!(app.db.user(&ro).unwrap().role, Role::Readonly);
+}
+
+#[tokio::test]
+async fn a_team_mappings_role_changes_within_the_team_and_only_while_group_roles_are_on() {
+    let (port, app, admin) = serve(true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let ada = person(port, &t, "ada@contoso.example").await;
+    let cy = person(port, &t, "cy@contoso.example").await;
+    let team = group(port, &t, "Support", &[&ada, &cy]).await;
+    let lead = role(port, &admin, "Support Lead", "member", &["users.manage"]).await;
+    let biller = role(port, &admin, "Biller", "member", &["billing.manage", "bots.manage"]).await;
+    let keeper = role(port, &admin, "Machine keeper", "member", &["machines.manage"]).await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{biller}/teams/{team}/users/{cy}"), &admin, "").await.0, 200);
+    let (code, m) = map(port, &admin, json!({ "team": team, "role": lead })).await;
+    assert_eq!((code, m["granted"].clone()), (201, json!([ada])), "{m}");
+    let mid = m["id"].as_str().unwrap().to_string();
+
+    let (code, v) = remap(port, &admin, &mid, json!({ "role": keeper })).await;
+    assert_eq!(code, 400, "machines.manage reaches admins' machines in a team: {v}");
+    let (code, v) = remap(port, &admin, &mid, json!({ "role": biller })).await;
+    assert_eq!(code, 200, "bots.manage means nothing in a team: {v}");
+    assert_eq!((v["swapped"].clone(), v["applies"].clone(), v["scope"].clone()), (json!([ada]), json!(["billing.manage"]), json!("team")), "{v}");
+    assert_eq!(team_role(&app, &ada), Some(biller.clone()));
+    assert_eq!(app.db.user(&ada).unwrap().role_id, None, "nothing across the server");
+    let swap = &events(port, &admin, "action=role.assigned").await[0];
+    assert_eq!((swap["details"]["team"].as_str(), swap["details"]["applies"].clone()), (Some(team.as_str()), json!(["billing.manage"])));
+    assert!(events(port, &admin, "action=user.role_changed").await.iter().all(|e| e["targetId"] != ada.as_str()), "a team role leaves the built-in role alone");
+
+    // Cy's role was given by hand: it stays when the mapping goes, Ada's goes.
+    let (code, v) = json_call(port, "DELETE", &format!("{MAPPINGS}/{mid}"), &admin, "").await;
+    assert_eq!((code, v["revoked"].clone()), (200, json!([ada])), "{v}");
+    assert_eq!((team_role(&app, &ada), team_role(&app, &cy)), (None, Some(biller.clone())));
+
+    // Off, nothing changes, though mappings made before stay listed.
+    let (port, app, admin, _) = serve_app_with(|a| {
+        a.scim.enabled = true;
+        a.scim.groups = true;
+    })
+    .await;
+    let team = app.db.create_team("Eng", None);
+    app.db.link_scim_group("okta", &team.id, None, "Eng", None).unwrap();
+    let a1 = role(port, &admin, "A1", "member", &["audit.view"]).await;
+    let a2 = role(port, &admin, "A2", "member", &["audit.view"]).await;
+    let m = app.db.create_scim_role_mapping("okta", &team.id, &a1, "org", None).unwrap();
+    let (code, v) = remap(port, &admin, &m.id, json!({ "role": a2 })).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("SCIM_GROUP_ROLES=on"), "{v}");
+    assert_eq!(app.db.scim_role_mapping(&m.id).unwrap().role_id, a1);
+}

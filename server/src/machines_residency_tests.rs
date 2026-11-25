@@ -617,7 +617,8 @@ async fn reports_and_the_app_say_whether_botds_own_data_is_in_a_pins_region() {
     let s = &regions["residency"]["serverData"];
     assert_eq!((s["region"].as_str(), s["policy"].as_str(), s["earlierCopies"].as_i64()), (Some("gb-lon"), Some("report"), Some(1)), "{regions}");
     let w = regions["residency"]["warnings"].to_string();
-    assert!(!w.contains("botd's own"), "report mode adds no warnings about botd's region: {regions}");
+    assert!(!w.contains("botd's own database"), "report mode adds no warnings about botd's data region: {regions}");
+    assert!(w.contains("fra's Bots run on botd's own server, and botd's own server is in gb-lon"), "runs are still held to the pin's region (ADR 0267): {regions}");
     assert!(w.contains("1 server backup copies were made to a store botd no longer copies to") && !w.contains("old-s3"), "{regions}");
 }
 

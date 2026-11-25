@@ -1842,10 +1842,10 @@ async function loadScim() {
 }
 
 // SCIM groups mapped to custom roles (ADR 0138), and role groups (ADR 0180, within a
-// team ADR 0206): mapped, declared, changed and removed here (ADR 0253). The pickers hold
+// team ADR 0206): mapped, declared, changed (ADR 0265 for mappings) and removed here (ADR 0253). The pickers hold
 // only what the server's `choices` say it would take; it checks everything again.
 const NO_SCIM_CHOICES = { roles: { org: [], team: [] }, groups: [], tenants: [], undeclared: [] };
-let scimChoices = NO_SCIM_CHOICES, scimRoleGroups = [];
+let scimChoices = NO_SCIM_CHOICES, scimRoleGroups = [], scimMappings = [];
 const SCOPE_NAMES = { org: "Across the server", team: "In its team" };
 const SKIPS = {
   admin: "admins", owner: "the owner account", has_role: "people holding a custom role already", readonly: "read-only people",
@@ -1902,11 +1902,12 @@ function scimGiven(r) {
 }
 
 async function loadScimRoles() {
-  let maps = [], enabled = false;
+  let enabled = false;
   scimRoleGroups = [];
+  scimMappings = [];
   try {
     const [r, g] = await Promise.all([api("GET", "/api/scim/role-mappings"), api("GET", "/api/scim/role-groups")]);
-    maps = r.mappings || [];
+    scimMappings = r.mappings || [];
     scimRoleGroups = g.roleGroups || [];
     enabled = r.enabled;
     scimChoices = { ...NO_SCIM_CHOICES, ...g.choices, groups: r.choices?.groups || [] };
@@ -1920,16 +1921,16 @@ async function loadScimRoles() {
     $("scim-roles-empty").textContent = err.message;
   }
   renderScimForms(enabled);
-  $("scim-roles-empty").hidden = maps.length + scimRoleGroups.length > 0;
-  const roleCell = (g) => enabled
-    ? `<select data-act="rg-role" title="The role this group gives">${scimRoleOptions(g.scope, g.role)}</select>`
+  $("scim-roles-empty").hidden = scimMappings.length + scimRoleGroups.length > 0;
+  const roleCell = (g, act) => enabled
+    ? `<select data-act="${act}" title="The role this group gives">${scimRoleOptions(g.scope, g.role)}</select>`
     : esc(g.role ? g.role.name : "");
-  $("scim-roles-rows").innerHTML = maps.map((m) => `<tr data-mapping="${esc(m.id)}">
-      <td>${esc(m.group || m.team.name || m.team.id)}</td><td>${esc(m.tenant)}</td><td>${esc(m.role ? m.role.name : "")}</td>
+  $("scim-roles-rows").innerHTML = scimMappings.map((m) => `<tr data-mapping="${esc(m.id)}">
+      <td>${esc(m.group || m.team.name || m.team.id)}</td><td>${esc(m.tenant)}</td><td>${roleCell(m, "map-role")}</td>
       <td>${SCOPE_NAMES[m.scope] || esc(m.scope)}</td><td>${esc(String(m.grants))}</td>
       <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
     </tr>`).join("") + scimRoleGroups.map((g) => `<tr data-role-group="${esc(g.id)}">
-      <td>${esc(g.displayName)}</td><td>${esc(g.tenant)}</td><td>${roleCell(g)}</td>
+      <td>${esc(g.displayName)}</td><td>${esc(g.tenant)}</td><td>${roleCell(g, "rg-role")}</td>
       <td>Role group, ${g.scope === "team" ? "in each member's team" : "across the server"}${g.state === "waiting" ? " (waiting for the IdP)" : ""}</td><td>${esc(String(g.grants))}</td>
       <td class="actions"><button type="button" class="btn" data-act="unmap">Remove</button></td>
     </tr>`).join("");
@@ -1977,7 +1978,25 @@ $("scim-rg-undeclared").addEventListener("click", (e) => {
   $("scim-rg-role").focus();
 });
 
+// A mapping's holders swap to the new role in one step; nobody else is given it (ADR 0265).
+async function changeScimMapping(select) {
+  const m = scimMappings.find((x) => x.id === select.closest("tr").dataset.mapping);
+  const to = (scimChoices.roles[m?.scope] || []).find((r) => r.id === select.value);
+  if (!m || !to) return loadScimRoles();
+  const group = m.group || m.team.name || m.team.id;
+  if (!confirm(`Make ${group} give ${to.name} instead of ${m.role?.name || "its role"} ${m.scope === "org" ? "across the server" : "in its team"}? The ${m.grants} ${m.grants === 1 ? "person" : "people"} it gave the old role to get ${to.name} instead. Nobody else is given it, and roles given by hand stay.`)) return loadScimRoles();
+  try {
+    const r = await api("PATCH", `/api/scim/role-mappings/${key(m.id)}`, { role: to.id });
+    const n = (r.swapped || []).length;
+    notice(`Changed. ${to.name} now held by ${n} ${n === 1 ? "person" : "people"} through ${group}.`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadScimRoles();
+}
+
 $("scim-roles-rows").addEventListener("change", async (e) => {
+  if (e.target.dataset.act === "map-role") return changeScimMapping(e.target);
   if (e.target.dataset.act !== "rg-role") return;
   const g = scimRoleGroups.find((x) => x.id === e.target.closest("tr").dataset.roleGroup);
   const to = (scimChoices.roles[g?.scope] || []).find((r) => r.id === e.target.value);
