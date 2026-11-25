@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md), Hermes Agent with Docker Compose from the Hermes bundle in [ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md), Ubuntu's packages on users' machines from your apt mirror in [ADR 0284](../adr/0284-ubuntu-packages-on-machines-from-an-apt-mirror.md), and upgrades checked against machines' settings first in [ADR 0294](../adr/0294-offline-upgrades-checked-against-machines-settings.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md), Hermes Agent with Docker Compose from the Hermes bundle in [ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md), Ubuntu's packages on users' machines from your apt mirror in [ADR 0284](../adr/0284-ubuntu-packages-on-machines-from-an-apt-mirror.md), upgrades checked against machines' settings first in [ADR 0294](../adr/0294-offline-upgrades-checked-against-machines-settings.md), and the backup each upgrade takes for `--rollback` in [ADR 0300](../adr/0300-offline-upgrades-keep-a-way-back.md).
 
 ## What a bundle holds
 
@@ -123,7 +123,7 @@ sudo bash install.sh --offline superbot-offline-0.2.0-x86_64.tar.gz --upgrade \
   --bundle-sha256 <recorded sha-256> --domain bots.corp.example --tls-cert /root/bots.pem --tls-key /root/bots.key
 ```
 
-The same checks run, then the binaries, client, site and templates are replaced and botd restarts; `.env`, the database, the master key, the license and per-user accounts stay. Back up first (`botctl backups`, [backup-restore.md](backup-restore.md)) and read the release's notes in the [changelog](../../CHANGELOG.md). The installed version is recorded in `/usr/local/share/superbot/offline-release`; a bundle **older** than it is refused, because a database a newer botd changed may not open with an older one. To go back, restore a backup made on the older version.
+The same checks run, then the binaries, client, site and templates are replaced and botd restarts; `.env`, the database, the master key, the license and per-user accounts stay. Read the release's notes in the [changelog](../../CHANGELOG.md) first. Before anything changes, the installer backs up the database and `.env` so you can [go back](#going-back). Your usual backups ([backup-restore.md](backup-restore.md)) still matter: that one is on this host, and only until the next upgrade. The installed version is recorded in `/usr/local/share/superbot/offline-release`; a bundle **older** than it is refused, because a database a newer botd changed may not open with an older one, unless you [roll back](#going-back).
 
 **Machines' settings are checked first** ([ADR 0294](../adr/0294-offline-upgrades-checked-against-machines-settings.md)). A release can move the Hermes and harness pins, and botd won't start while `.env` names [machines' bundles](#claude-code-codex-and-pi-from-botds-harness-bundle) that don't hold them. So before anything changes, the bundle's botd runs `botd machines check` as botd's user, over the server's `.env` and its secrets manager, as the unit would start it. If botd wouldn't start, the upgrade stops, says why, and changes nothing. Carry in this release's Hermes or harness bundles for your machines' arches, put them where botd's user can read them (not under `/tmp` or `/var/tmp`, which botd's service has its own of), and name them:
 
@@ -140,6 +140,34 @@ sudo -u superbot /usr/local/bin/botd machines check --home ~superbot --set MACHI
 ```
 
 It prints what machines get (the control plane, their upkeep, each bundle and what it holds) and exits 0, or names the setting botd would refuse and exits 1. It starts and serves nothing. A bundle's botd from before this check is skipped with a warning.
+
+### Going back
+
+An upgrade to a newer release backs up first ([ADR 0300](../adr/0300-offline-upgrades-keep-a-way-back.md)). Once every check has passed, and before anything changes, the release that is running backs up DATA_DIR with its own `superbot-backup`, as botd's user. The backup is encrypted to your backup key, as the daily ones are. The installer keeps it, with a copy of `.env`, in `/usr/local/share/superbot/rollback/`, which only root can read, and prints:
+
+```text
+==> Rollback point: /usr/local/share/superbot/rollback/superbot-pre-upgrade-0.1.0-<stamp>.tar.gz.age (12M). To go back to 0.1.0, losing everything since: ...
+```
+
+It needs room for that backup under `/usr/local/share/superbot`. If the backup fails, the upgrade stops and nothing changes. `--no-upgrade-backup` upgrades without one, with a warning, and then there's no way back with `--rollback`. Each upgrade's backup replaces the last, so you can go back one upgrade.
+
+If the new release isn't working, go back with the previous release's bundle (keep it until the new one has run well), using an installer that has `--rollback` (this release's, or the bundle's own):
+
+```sh
+sudo bash install.sh --offline superbot-offline-0.1.0-x86_64.tar.gz --upgrade --rollback \
+  --bundle-sha256 <its recorded sha-256> --domain bots.corp.example --tls-cert /root/bots.pem --tls-key /root/bots.key
+```
+
+**Everything since the upgrade is lost**: chats, Bots, settings and secrets saved since then. Before anything changes, the installer checks:
+
+- the bundle as for any install;
+- that the backup is of exactly that release (and build), taken before the upgrade to the release running now, so no later release has opened the database, and unchanged since;
+- that the backup unpacks and passes `superbot-restore --check`. An encrypted backup needs its age key at `/root/superbot-backup-identity.txt`, or wherever `BACKUP_IDENTITY_FILE=<file>` points; bring it back if you moved it off the host;
+- machines' settings in the `.env` it puts back, as for an upgrade. That `.env` names the bundles your machines had then, so keep those until you're sure you won't roll back.
+
+If any of these fails, it says which and changes nothing. Otherwise it stops botd and puts back `.env` and DATA_DIR from before the upgrade. It keeps what they replace in `.env.before-rollback-<stamp>` and `DATA_DIR/.pre-restore-<stamp>/`, then installs the older bundle as usual. Delete those copies once SuperBot looks right. If the restore fails, the `.env` goes back too and botd starts again as it was. If the rollback stops after that, run the same command again before starting botd: it reinstalls the older release with nothing left to restore. Without `--rollback`, a downgrade is still refused, and says to add it when a backup that fits is there.
+
+A rollback doesn't touch per-user accounts and their folders, Hermes Agent in `/opt/hermes`, or the harness CLIs in `/opt/superbot-harnesses`: the installer says when their pins differ from the older release's. Users' machines keep what they had. To go back further than one upgrade, or with Docker Compose, restore a backup made on that release ([backup-restore.md](backup-restore.md)).
 
 ## Hermes Agent
 
@@ -490,4 +518,4 @@ botd's clock decides when a license starts and ends: keep it right with an inter
 - Security fixes ship as new releases ([SECURITY.md](../../SECURITY.md)); each release's notes in the [changelog](../../CHANGELOG.md) say what changed. Watch the releases from a connected machine (or ask your CG-Labs contact for notice), then make or download the bundle, verify it, and upgrade as above.
 - Images are rebuilt weekly with Debian's security fixes and scanned on every build ([ADR 0101](../adr/0101-image-scanning-and-signing.md)); a release bundle carries that release's images, and every release has its bundles. Each image's SBOM is in the bundle, so your own scanner can match new CVEs against it offline.
 - Rust and npm dependencies are scanned in CI ([ADR 0092](../adr/0092-dependency-vulnerability-scanning.md)). The host's own packages (Caddy, OpenSSL, the kernel) are yours to update from your mirror.
-- For an urgent fix, upgrade to the release that carries it; there are no in-place patches. Keep the previous bundle until the new one has run well, and a backup to restore if it doesn't.
+- For an urgent fix, upgrade to the release that carries it; there are no in-place patches. Keep the previous bundle until the new one has run well, so you can [roll back](#going-back) if it doesn't.
