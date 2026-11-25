@@ -255,6 +255,32 @@ impl Google {
         Ok(name.to_string())
     }
 
+    /// An identity token for `audience` from the metadata server, with the instance's
+    /// details (`format=full`): what Vault's `gcp` method takes for its `gce` type (ADR 0298).
+    /// Google signs it as the VM's service account, so botd needs no IAM permission. Checked
+    /// to be a compact JWT; errors never quote the answer.
+    pub async fn instance_identity(&self, audience: &str) -> Result<Zeroizing<String>, String> {
+        let Auth::Metadata { host } = &self.auth else {
+            return Err(format!("{}: an instance identity token comes only from the metadata server", self.label));
+        };
+        let what = format!("{}: the metadata server's identity token", self.label);
+        let mut url = url::Url::parse(&format!("http://{host}/computeMetadata/v1/instance/service-accounts/default/identity")).map_err(|e| format!("{what}: {e}"))?;
+        url.query_pairs_mut().append_pair("audience", audience).append_pair("format", "full");
+        let res = self.local.get(url).header("Metadata-Flavor", "Google").send().await.map_err(|e| format!("{what}: {e}"))?;
+        let status = res.status();
+        let text = Zeroizing::new(res.text().await.map_err(|e| format!("{what}: {e}"))?);
+        if !status.is_success() {
+            let hint = if status == reqwest::StatusCode::NOT_FOUND { "; does this VM have a service account?" } else { "" };
+            return Err(format!("{what} answered {status}{hint}"));
+        }
+        let jwt = text.trim();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        if parts.len() != 3 || !parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+            return Err(format!("{what} isn't a JWT"));
+        }
+        Ok(Zeroizing::new(jwt.to_string()))
+    }
+
     /// Signs in at `base` instead: a stand-in for the metadata server.
     #[cfg(test)]
     pub fn point_at(&mut self, base: &str) {
