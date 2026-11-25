@@ -27,9 +27,9 @@ Once botd's database has attached the stores at startup, the users' secrets atta
 
 - Reads (`get`, `names`, the redactor's load) go through the view, unchanged.
 - A new secret is written to the store of its owner's pin.
-- Changing or deleting one reaches every place that holds it.
+- Changing or deleting one reaches every place that holds it, in one write transaction, so a move's copy can't put it back in a place already cleared.
 
-The redactor learned secret values at startup before the stores were attached, so it learns the stores' values once they are.
+The redactor learned secret values at startup before the stores were attached, and both startup scrubs of saved chats and approvals ran without the stores' values. So once the stores are attached it learns their values, and when they hold any, saved rows in botd's database and every store are scrubbed again.
 
 ### Moving them
 
@@ -41,7 +41,7 @@ At startup, before botd serves anything, each store's secrets are sealed again, 
 
 ### Restore
 
-A backup holds secrets as they were when it was made. Restored as they were, a secret deleted since would come back, and one changed since would turn back to its old value. So a restore puts the store's secrets now, for the people kept in it, in place of the backup's. Unlike sessions, a secret can't be made again by signing in. So with the store missing or unreadable, the backup's are kept: they are the only copy left. The restore says which it did.
+A backup holds secrets as they were when it was made. Restored as they were, a secret deleted since would come back, and one changed since would turn back to its old value. So a restore puts the store's secrets now, for the people kept in it, in place of the backup's. Unlike sessions, a secret can't be made again by signing in. So with the store missing or unreadable, the backup's are kept: they are the only copy left. Kept secrets that neither master key opens (a backup from before a rotation) would stop botd at start, so the restore refuses them, as it does approvals' inputs, unless `SUPERBOT_FORGET_SEALED=1` says botd drops them and their owners save them again. The restore says which it did.
 
 Erasure deletes them in the store and, when a backup is restored, in the backup too.
 
@@ -66,7 +66,8 @@ Erasure deletes them in the store and, when a backup is restored, in the backup 
 ## Tests
 
 - `db::chats`: a pinned person's secrets move to the store and back with the pin; new ones, changes and deletes reach the store and someone unpinned stays in botd's own; the redactor's load sees them; a move cut off after its copy keeps changes and deletes made meanwhile; secrets in a store are sealed at startup; an erasure deletes them in a copy of a store.
-- `machines::chat_store_restore`: a restore takes secrets from the store it replaces, so one deleted or changed since stays so; with the store gone, the backup's are kept.
+- `db::chats`: saved rows are scrubbed again of values only a store holds.
+- `machines::chat_store_restore`: a restore takes secrets from the store it replaces, so one deleted or changed since stays so; with the store gone, the backup's are kept; kept ones under a lost key are refused unless botd drops them.
 - `main`: the rotation lines count secrets in stores.
 - HTTP (`machines_residency_tests.rs`): a pin moves a secret into London's store, audited; the report counts it; one left outside makes the pin unkept until reconcile; unpinned, it comes back.
 - Client (`residency.test.ts`): Settings names own secrets with the rest, and not on a server from before this.
