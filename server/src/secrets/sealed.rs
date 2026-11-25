@@ -493,6 +493,53 @@ pub fn approvals_in(c: &Connection, table: &str, current: &Cipher, previous: Opt
     Ok(done)
 }
 
+/// Brings the push tokens in `table` (a regional store's `<schema>.push_devices`, ADR 0283)
+/// under `current`, as `approvals_in` does approvals' inputs: plaintext sealed, values
+/// `previous` opens sealed again, and, with `forget`, devices whose token neither opens
+/// deleted, so their phones register again. A token neither key opens, outside a rotation
+/// and without `forget`, refuses (nothing changed).
+pub fn push_tokens_in(c: &Connection, table: &str, current: &Cipher, previous: Option<&Cipher>, forget: bool) -> Result<StoreApprovals, String> {
+    let db = |e: rusqlite::Error| e.to_string();
+    let context = crate::db::PUSH_TOKEN_CONTEXT;
+    let tx = c.unchecked_transaction().map_err(db)?;
+    let rows: Vec<(String, String)> = {
+        let mut s = tx.prepare(&format!("SELECT id, token FROM {table}")).map_err(db)?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
+    };
+    let mut done = StoreApprovals::default();
+    let mut refused = 0;
+    for (id, token) in &rows {
+        let value = if !is_sealed(token) {
+            done.sealed += 1;
+            current.seal(context, token.as_bytes())
+        } else if current.open(context, token).is_ok() {
+            continue;
+        } else if let Some(plain) = previous.and_then(|p| p.open(context, token).ok()) {
+            done.resealed += 1;
+            current.seal(context, &plain)
+        } else if forget {
+            done.discarded += 1;
+            tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [id]).map_err(db)?;
+            continue;
+        } else if previous.is_some() {
+            done.unreadable += 1;
+            continue;
+        } else {
+            refused += 1;
+            continue;
+        };
+        tx.execute(&format!("UPDATE {table} SET token = ?1 WHERE id = ?2"), params![value, id]).map_err(db)?;
+    }
+    if refused > 0 {
+        return Err(format!(
+            "{refused} push tokens of phones in it don't open with the master key. If the key was rotated, set SUPERBOT_MASTER_KEY_PREVIOUS back to the key before \
+             (docs/ops/master-key-rotation.md); if that key is lost for good, start once with SUPERBOT_FORGET_SEALED=1 to drop those phones, which register again (ADR 0283)."
+        ));
+    }
+    tx.commit().map_err(db)?;
+    Ok(done)
+}
+
 /// Whether `cipher` opens what this database has sealed. True when nothing is sealed yet.
 fn opens(c: &Connection, cipher: &Cipher) -> rusqlite::Result<bool> {
     if let Some(v) = key_check(c)? {

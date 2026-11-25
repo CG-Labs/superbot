@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod chats;
-pub use chats::{ChatMove, ChatStore, Doc, Held, MovesOut, Whose, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy, kept_in_region, upgrade_copy};
+pub use chats::{ChatMove, ChatStore, Doc, Held, MovesOut, Whose, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy, kept_in_region, sign_ins_from, upgrade_copy};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 
@@ -174,6 +174,12 @@ const ERASE_ROUTINES: &str = "DELETE FROM {routines} WHERE author_id = ?1";
 const ERASE_APPROVALS: &str = "UPDATE {approvals} SET decided_by = ?2, note = NULL WHERE decided_by = ?1";
 /// `?1` the erased user (ADR 0277).
 const ERASE_FACTS: &str = "DELETE FROM {facts} WHERE user_id = ?1";
+/// `?1` the erased user: their sign-ins (ADR 0283), each session's rows before it, by table.
+const ERASE_SIGN_INS: [(&str, &str); 3] = [
+    ("push_devices", "DELETE FROM {push_devices} WHERE user_id = ?1"),
+    ("saml_sessions", "DELETE FROM {saml_sessions} WHERE user_id = ?1"),
+    ("sessions", "DELETE FROM {sessions} WHERE user_id = ?1"),
+];
 
 /// `?1` the erased user, `?2` their Bots as a JSON array.
 fn erase_messages() -> String {
@@ -190,19 +196,27 @@ fn erase_requested_by() -> String {
 }
 
 /// Runs an erasure of `user_id` (pseudonym `pseudonym`, whose Bots were `bots`) on a copy
-/// of a regional chat store opened on `c` (ADR 0256): their routines and facts deleted,
-/// what they and their Bots wrote replaced, their approval decisions pseudonymised. What it
-/// changed.
+/// of a regional chat store opened on `c` (ADR 0256): their routines, facts and sign-ins
+/// deleted, what they and their Bots wrote replaced, their approval decisions
+/// pseudonymised. What it changed.
 pub(crate) fn erase_in_copy(c: &Connection, user_id: &str, pseudonym: &str, bots: &[String]) -> rusqlite::Result<Held> {
     let bots = serde_json::to_string(bots).unwrap_or_else(|_| "[]".into());
-    let main = |sql: &str| ["messages", "routines", "approvals", "facts"].iter().fold(sql.to_string(), |q, t| q.replace(&format!("{{{t}}}"), &format!("main.{t}")));
+    let tables = ["messages", "routines", "approvals", "facts", "sessions", "saml_sessions", "push_devices"];
+    let main = |sql: &str| tables.iter().fold(sql.to_string(), |q, t| q.replace(&format!("{{{t}}}"), &format!("main.{t}")));
+    let has = |t: &str| c.query_row("SELECT COUNT(*) > 0 FROM main.sqlite_master WHERE type = 'table' AND name = ?1", [t], |r| r.get::<_, bool>(0));
     let routines = c.execute(&main(ERASE_ROUTINES), [user_id])? as i64;
     let messages = c.execute(&main(&erase_messages()), params![user_id, bots])? as i64;
     c.execute(&main(&erase_requested_by()), [user_id])?;
     let approvals = c.execute(&main(ERASE_APPROVALS), params![user_id, pseudonym])? as i64;
-    let has_facts: bool = c.query_row("SELECT COUNT(*) > 0 FROM main.sqlite_master WHERE type = 'table' AND name = 'facts'", [], |r| r.get(0))?;
-    let facts = if has_facts { c.execute(&main(ERASE_FACTS), [user_id])? as i64 } else { 0 };
-    Ok(Held { messages, routines, approvals, memories: 0, facts })
+    let facts = if has("facts")? { c.execute(&main(ERASE_FACTS), [user_id])? as i64 } else { 0 };
+    let mut signed = [0; 3];
+    for (n, (table, sql)) in signed.iter_mut().zip(ERASE_SIGN_INS) {
+        if has(table)? {
+            *n = c.execute(&main(sql), [user_id])? as i64;
+        }
+    }
+    let [push_devices, saml_sessions, sessions] = signed;
+    Ok(Held { messages, routines, approvals, facts, sessions, saml_sessions, push_devices, ..Held::default() })
 }
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
@@ -2409,7 +2423,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 70] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 71] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2480,7 +2494,21 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 70] = [
     migrate_service_account_bots,
     migrate_scim_token_scopes,
     migrate_deleted_teams,
+    migrate_saml_session_users,
 ];
+
+/// Native SAML sign-ins name their person (ADR 0283), so a regional chat store keeps them
+/// with the session they belong to.
+fn migrate_saml_session_users(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('saml_sessions', 'main') WHERE name = 'user_id'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE main.saml_sessions ADD COLUMN user_id TEXT;
+        UPDATE main.saml_sessions SET user_id = (SELECT s.user_id FROM main.sessions s WHERE s.id = saml_sessions.session_id);",
+    )
+}
 
 /// Teams this server deleted (ADR 0251), kept outside the audit log so audit retention
 /// never makes a gone team's network look like another server's. A trigger writes one
@@ -7410,8 +7438,12 @@ impl Db {
         let mut out = Erased::default();
         run("DELETE FROM settings WHERE key = ?", &[&format!("{ERASING_BOTS}{user_id}")])?;
         run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", &[&format!("{ERASED_BOTS}{user_id}"), &bots_json])?;
-        run("DELETE FROM push_devices WHERE user_id = ?", &[&user_id])?;
-        out.sessions = run("DELETE FROM sessions WHERE user_id = ?", &[&user_id])?;
+        for (table, sql) in ERASE_SIGN_INS {
+            let n = self.on_places(&tx, sql, &[&user_id]).map_err(db_err)?;
+            if table == "sessions" {
+                out.sessions = n;
+            }
+        }
         out.login_codes = run("DELETE FROM login_codes WHERE user_id = ?", &[&user_id])?;
         out.identities = run("DELETE FROM user_identities WHERE user_id = ?", &[&user_id])?;
         out.mfa = run("DELETE FROM user_mfa WHERE user_id = ?", &[&user_id])? > 0;
@@ -8452,7 +8484,9 @@ impl Db {
         let _ = self.c().execute("UPDATE user_identities SET last_login_at = ?, email = coalesce(?, email) WHERE id = ?", params![at, email, id]);
     }
 
-    // Sessions and sign-in codes. Callers hash tokens; nothing here sees one.
+    // Sessions and sign-in codes. Callers hash tokens; nothing here sees one. A pinned
+    // person's sessions, with their SAML sign-ins and push devices, are kept in their
+    // region's chat store (ADR 0283): reads see every place, and writes name the place.
 
     pub fn create_session(&self, s: &NewSession) -> Session {
         self.create_session_at(s, now())
@@ -8464,9 +8498,12 @@ impl Db {
         let id = format!("s{}", crate::random_hex(8));
         {
             let c = self.c();
+            let place = self.place_for_user(&c, s.user_id).unwrap();
             c.execute(
-                "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, idp_provider, label, ip, user_agent, created_at, last_seen_at, expires_at, mfa)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &format!(
+                    "INSERT INTO {place}.sessions (id, token_hash, user_id, kind, method, idp_subject, idp_provider, label, ip, user_agent, created_at, last_seen_at, expires_at, mfa)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ),
                 params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.idp_provider, s.label, s.ip, s.user_agent, at, at, s.expires_at, s.mfa],
             )
             .unwrap();
@@ -8526,7 +8563,7 @@ impl Db {
     /// `last_seen_at` follows, for the health score's adoption (ADR 0144).
     pub fn touch_session(&self, id: &str, at: i64) {
         let c = self.c();
-        if c.execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]).unwrap_or(0) > 0 {
+        if self.on_places(&c, "UPDATE {sessions} SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]).unwrap_or(0) > 0 {
             let _ = c.execute(
                 "UPDATE users SET last_seen_at = ?1 WHERE id = (SELECT user_id FROM sessions WHERE id = ?2) AND coalesce(last_seen_at, 0) < ?1",
                 params![at, id],
@@ -8554,17 +8591,24 @@ impl Db {
     /// Its push device goes with it (ADR 0080), whatever ended it.
     pub fn revoke_session(&self, id: &str, by: &str, reason: &str) -> bool {
         let c = self.c();
-        let _ = c.execute("DELETE FROM push_devices WHERE session_id = ?", [id]);
-        c.execute("UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ? AND revoked_at IS NULL", params![now(), by, reason, id])
+        let _ = self.on_places(&c, "DELETE FROM {push_devices} WHERE session_id = ?", &[&id]);
+        self.on_places(&c, "UPDATE {sessions} SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ? AND revoked_at IS NULL", params![now(), by, reason, id])
             .unwrap_or(0)
-            == 1
+            > 0
     }
 
+    /// Kept where its session is (every copy of it), so the two move together (ADR 0283).
     pub fn add_saml_session(&self, session_id: &str, l: &SamlLogin) {
-        let _ = self.c().execute(
-            "INSERT OR REPLACE INTO saml_sessions (session_id, name_id, name_id_format, name_qualifier, sp_name_qualifier, session_index) VALUES (?, ?, ?, ?, ?, ?)",
-            params![session_id, l.name_id, l.format, l.name_qualifier, l.sp_name_qualifier, l.session_index],
-        );
+        let c = self.c();
+        for place in self.places_holding(&c, "sessions", session_id).unwrap_or_default() {
+            let _ = c.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {place}.saml_sessions (session_id, user_id, name_id, name_id_format, name_qualifier, sp_name_qualifier, session_index)
+                     SELECT ?1, user_id, ?2, ?3, ?4, ?5, ?6 FROM {place}.sessions WHERE id = ?1"
+                ),
+                params![session_id, l.name_id, l.format, l.name_qualifier, l.sp_name_qualifier, l.session_index],
+            );
+        }
     }
 
     pub fn saml_session(&self, session_id: &str) -> Option<SamlLogin> {
@@ -8603,11 +8647,18 @@ impl Db {
     /// devices. Returns the sessions it revoked, so native SAML IdPs can be told (ADR 0258).
     pub fn revoke_user_sessions(&self, user_id: &str, by: &str, reason: &str) -> Vec<Session> {
         let c = self.c();
-        let _ = c.execute("DELETE FROM push_devices WHERE user_id = ?", [user_id]);
-        let revoked = c
-            .prepare("UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL RETURNING *")
-            .and_then(|mut s| s.query_map(params![now(), by, reason, user_id], session_row)?.collect::<rusqlite::Result<Vec<_>>>())
+        let _ = self.on_places(&c, "DELETE FROM {push_devices} WHERE user_id = ?", &[&user_id]);
+        let revoked = self
+            .returning_on_places(
+                &c,
+                "UPDATE {sessions} SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL RETURNING *",
+                params![now(), by, reason, user_id],
+                session_row,
+            )
             .unwrap_or_default();
+        // A move cut off between its copy and its delete leaves a session in two places.
+        let mut seen = std::collections::HashSet::new();
+        let revoked: Vec<Session> = revoked.into_iter().filter(|s| seen.insert(s.id.clone())).collect();
         let _ = c.execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]);
         revoked
     }
@@ -9262,20 +9313,32 @@ impl Db {
             _ if theirs.is_some() => PushPut::Moved,
             _ => PushPut::Added,
         };
-        tx.execute("DELETE FROM push_devices WHERE token_hash = ? AND session_id <> ?", params![token_hash, session_id]).unwrap();
+        self.on_places(&tx, "DELETE FROM {push_devices} WHERE token_hash = ? AND session_id <> ?", params![token_hash, session_id]).unwrap();
         // Read raw, so a row whose token no longer opens still keeps its id (ON CONFLICT does).
         let stored: Option<(String, i64)> =
             tx.query_row("SELECT id, created_at FROM push_devices WHERE session_id = ?", [session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap();
         let (id, created) = stored.unwrap_or_else(|| (format!("pd{}", crate::random_hex(8)), at));
-        tx.execute(
-            "INSERT INTO push_devices (id, user_id, session_id, provider, token_hash, token, platform, approvals, routines, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(session_id) DO UPDATE SET provider = ?4, token_hash = ?5, token = ?6, platform = ?7, approvals = ?8, routines = ?9, updated_at = ?11",
-            params![id, user_id, session_id, provider, token_hash, sealed::seal_field(PUSH_TOKEN_CONTEXT, token), platform, approvals, routines, created, at],
-        )
-        .unwrap();
-        tx.execute(
-            "DELETE FROM push_devices WHERE user_id = ?1 AND id NOT IN (SELECT id FROM push_devices WHERE user_id = ?1 ORDER BY updated_at DESC, id LIMIT ?2)",
+        // Kept where its session is, every copy of it, so the two move together and a move's
+        // next pass keeps this whichever copy it keeps (ADR 0283).
+        let mut places = self.places_holding(&tx, "sessions", session_id).unwrap();
+        if places.is_empty() {
+            places.push("main");
+        }
+        let sealed_token = sealed::seal_field(PUSH_TOKEN_CONTEXT, token);
+        for place in places {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {place}.push_devices (id, user_id, session_id, provider, token_hash, token, platform, approvals, routines, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(session_id) DO UPDATE SET provider = ?4, token_hash = ?5, token = ?6, platform = ?7, approvals = ?8, routines = ?9, updated_at = ?11"
+                ),
+                params![id, user_id, session_id, provider, token_hash, sealed_token, platform, approvals, routines, created, at],
+            )
+            .unwrap();
+        }
+        self.on_places(
+            &tx,
+            "DELETE FROM {push_devices} WHERE user_id = ?1 AND id NOT IN (SELECT id FROM push_devices WHERE user_id = ?1 ORDER BY updated_at DESC, id LIMIT ?2)",
             params![user_id, MAX_PUSH_DEVICES as i64],
         )
         .unwrap();
@@ -9291,13 +9354,13 @@ impl Db {
     /// The device this session registered, removed. None: it had none.
     pub fn delete_session_push_device(&self, session_id: &str) -> Option<PushDevice> {
         let d = self.session_push_device(session_id)?;
-        (self.c().execute("DELETE FROM push_devices WHERE id = ?", [&d.id]).unwrap_or(0) == 1).then_some(d)
+        (self.on_places(&self.c(), "DELETE FROM {push_devices} WHERE id = ?", &[&d.id]).unwrap_or(0) > 0).then_some(d)
     }
 
     /// Removes a device the provider says is gone, if it still has the token it said
     /// that about. Returns whether it did.
     pub fn delete_push_device_with(&self, id: &str, token_hash: &str) -> bool {
-        self.c().execute("DELETE FROM push_devices WHERE id = ? AND token_hash = ?", params![id, token_hash]).unwrap_or(0) == 1
+        self.on_places(&self.c(), "DELETE FROM {push_devices} WHERE id = ? AND token_hash = ?", params![id, token_hash]).unwrap_or(0) > 0
     }
 
     /// `user_id`'s devices that want `kind`, while the session that registered each is
@@ -9320,12 +9383,10 @@ impl Db {
     /// Deletes sessions and codes that stopped working before `before` (unix ms).
     pub fn prune_sessions(&self, before: i64, idle_ms: i64, max_ms: i64) -> usize {
         let c = self.c();
-        let n = c
-            .execute(
-                "DELETE FROM sessions WHERE coalesce(revoked_at, min(expires_at, created_at + ?2, last_seen_at + ?3)) < ?1",
-                params![before, max_ms, idle_ms],
-            )
+        let n = self
+            .on_places(&c, "DELETE FROM {sessions} WHERE coalesce(revoked_at, min(expires_at, created_at + ?2, last_seen_at + ?3)) < ?1", params![before, max_ms, idle_ms])
             .unwrap_or(0);
+        let _ = self.drop_orphans(&c);
         let _ = c.execute("DELETE FROM login_codes WHERE coalesce(used_at, expires_at) < ?", [before]);
         n
     }
