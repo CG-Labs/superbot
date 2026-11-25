@@ -242,6 +242,14 @@ pub struct Population {
     pub missing: Vec<Value>,
     pub failed: Vec<String>,
     pub without_file: Vec<String>,
+    /// Sources a bundle couldn't read (a scanner GitHub refused), as `<path>: <source>`.
+    pub unread: Vec<String>,
+}
+
+impl Population {
+    pub fn complete(&self) -> bool {
+        self.missing.is_empty() && self.failed.is_empty() && self.without_file.is_empty() && self.unread.is_empty()
+    }
 }
 
 /// Whether a bundle of a kind can hold items dated in the period. A register bundle of a
@@ -280,6 +288,13 @@ pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population 
         let days = bp.from.iter_days().take_while(|d| *d < bp.to).filter(|d| *d >= p.from && *d < p.to);
         covered.extend(days.clone());
         pop.bundles.insert(f.name.clone());
+        for (source, s) in v["sources"].as_object().into_iter().flatten() {
+            if s["available"] == false {
+                pop.unread.push(format!("{}: {source}", f.path));
+            }
+        }
+        // Ids are unique within one repository, so a store of several keeps each apart.
+        let scope = v["repository"].as_str().filter(|r| !r.is_empty()).map(|r| format!("{r}#"));
         let created = f.created.clone().unwrap_or_default();
         let mut add = |id: String, fields: Value| {
             let newer = pop.items.get(&id).is_none_or(|old| (created.as_str(), f.name.as_str()) > (old.created.as_str(), old.bundle.as_str()));
@@ -288,10 +303,14 @@ pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population 
             }
         };
         if t.list.is_empty() {
+            // Two servers' bundles can share a name; their manifests never match, and a
+            // copy of one bundle (its tar and its folder) is still one.
+            let manifest = f.manifest_sha256.as_deref().unwrap_or_default();
+            let bundle = format!("{}@{}", f.name, &manifest[..manifest.len().min(16)]);
             for d in days {
                 let day = d.to_string();
                 let counts = v["period"]["daily"].get(&day).cloned().unwrap_or_else(|| json!({}));
-                add(format!("{}/{day}", f.name), json!({ "day": day, "counts": counts }));
+                add(format!("{bundle}/{day}"), json!({ "day": day, "counts": counts }));
             }
             continue;
         }
@@ -301,7 +320,7 @@ pub fn population(t: &Test, store: &[(Found, Files)], p: &Period) -> Population 
             }
             let parts: Option<Vec<String>> = t.key.iter().map(|k| text(&x[*k])).collect();
             if let Some(parts) = parts {
-                add(parts.join("/"), pick(x, t.fields));
+                add(format!("{}{}", scope.as_deref().unwrap_or_default(), parts.join("/")), pick(x, t.fields));
             }
         }
     }
@@ -362,7 +381,7 @@ pub fn draw(store: &[(Found, Files)], d: &Draw) -> Samples {
             let cells = [t.id, i.id.as_str(), i.bundle.as_str(), rows_text.as_str(), t.check, "", "", "", "", ""];
             rows.push(cells.iter().map(|c| worksheet_cell(c)).collect::<Vec<_>>().join(","));
         }
-        let complete = pop.missing.is_empty() && pop.failed.is_empty() && pop.without_file.is_empty();
+        let complete = pop.complete();
         if n == 0 {
             empty.push(json!(t.id));
         }
@@ -383,6 +402,7 @@ pub fn draw(store: &[(Found, Files)], d: &Draw) -> Samples {
                 "missingDays": pop.missing,
                 "bundlesFailed": pop.failed,
                 "bundlesWithoutFile": pop.without_file,
+                "sourcesUnread": pop.unread,
                 "bundles": pop.bundles,
                 "items": ids,
             },
@@ -392,7 +412,7 @@ pub fn draw(store: &[(Found, Files)], d: &Draw) -> Samples {
         }));
     }
     let samples = json!({
-        "basis": "each test's population is every item dated in the period in the bundles of its kind that check against their digests, register bundles of later periods included since they carry an item's later state, an item in more than one bundle taken from the newest; a population is complete only when those bundles cover every day of the period and none that could hold its items failed (a damaged bundle whose kind can't be told counts for every test) or lacked the file. Each item's rank is the SHA-256 of the seed, the test's id and the item's id, each followed by a newline, and the sample is the items with the lowest ranks, so anyone with the store and the seed can draw it again. Sizes follow the table unless --size was given; the auditor decides the sizes they rely on. Exceptions the bundles list are reviewed in full, not sampled",
+        "basis": "each test's population is every item dated in the period in the bundles of its kind that check against their digests, register bundles of later periods included since they carry an item's later state, an item in more than one bundle taken from the newest (ids are prefixed with their repository where the file names one, and a day of backups is named by its bundle's manifest digest, so several repositories or servers are kept apart); a population is complete only when those bundles cover every day of the period and none that could hold its items failed (a damaged bundle whose kind can't be told counts for every test), lacked the file, or couldn't read one of its sources (a scanner GitHub refused). Each item's rank is the SHA-256 of the seed, the test's id and the item's id, each followed by a newline, and the sample is the items with the lowest ranks, so anyone with the store and the seed can draw it again. Sizes follow the table unless --size was given; the auditor decides the sizes they rely on. Exceptions the bundles list are reviewed in full, not sampled",
         "periodCovered": { "from": p.from.to_string(), "to": p.to.to_string(), "days": p.days() },
         "seed": seed,
         "seedFrom": seed_from,
@@ -833,7 +853,7 @@ pub fn run_sample(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result
         .flatten()
         .map(|t| {
             let pop = &t["population"];
-            let note = if pop["complete"] == true { String::new() } else { " (incomplete: see missingDays, bundlesFailed and bundlesWithoutFile)".into() };
+            let note = if pop["complete"] == true { String::new() } else { " (incomplete: see missingDays, bundlesFailed, bundlesWithoutFile and sourcesUnread)".into() };
             format!("  {}: {} of {}{note}", t["id"].as_str().unwrap_or_default(), t["sampleSize"], pop["size"])
         })
         .collect();
@@ -1003,9 +1023,24 @@ mod tests {
 
         let days = population(&TESTS[8], &st, &p("2027-01-01", "2027-02-01"));
         assert_eq!(days.items.len(), 31);
-        let name = st[5].0.name.clone();
+        let name = format!("{}@{}", st[5].0.name, &st[5].0.manifest_sha256.as_deref().unwrap()[..16]);
         assert_eq!(days.items[&format!("{name}/2027-01-03")].fields["counts"], json!({ "server.backup_copied ok": 24 }));
         assert_eq!(days.items[&format!("{name}/2027-01-04")].fields["counts"], json!({}));
+
+        let mut two = st.clone();
+        two.push(bundle("evidence", p("2027-01-01", "2027-02-01"), "2027-02-01T00:05:00Z", "backups.json", &json!({ "period": { "daily": { "2027-01-03": { "server.backup_copied ok": 12 } } } })));
+        assert_eq!(two[5].0.name, two[6].0.name, "two servers' scheduled bundles, made the same second");
+        assert_eq!(population(&TESTS[8], &two, &p("2027-01-01", "2027-02-01")).items.len(), 62, "each server's days kept apart");
+        two.push(two[5].clone());
+        assert_eq!(population(&TESTS[8], &two, &p("2027-01-01", "2027-02-01")).items.len(), 62, "a copy of one bundle is still one");
+
+        let mut repos = st.clone();
+        let mut other = prs(1..=3, "2027-01");
+        other["repository"] = json!("o/other");
+        repos.push(bundle("change-management", p("2027-01-01", "2027-02-01"), "2027-02-01T03:00:00Z", "pull-requests.json", &other));
+        let both = population(&TESTS[0], &repos, &p("2027-01-01", "2027-02-01"));
+        assert_eq!(both.items.len(), 43, "another repository's #1 to #3 are other pull requests");
+        assert!(both.items.contains_key("o/other#1") && both.items.contains_key("1"));
 
         let prs = population(&TESTS[0], &st, &p("2027-01-15", "2027-02-15"));
         assert!(prs.items.values().all(|i| i.fields["mergedAt"].as_str().unwrap() >= "2027-01-15" && i.fields["mergedAt"].as_str().unwrap() < "2027-02-15"));
@@ -1027,6 +1062,13 @@ mod tests {
 
         let january = population(&TESTS[0], &st, &p("2027-01-01", "2027-02-01"));
         assert!(january.failed.is_empty() && january.missing.is_empty(), "February's failed pull requests can't be January's");
+
+        let unread = json!({ "repository": "o/r", "sources": { "dependabot": { "available": false, "status": 403 }, "codeScanning": { "available": true } }, "alerts": [] });
+        st.push(bundle("vulnerability-management", p("2027-01-01", "2027-02-01"), "2027-02-01T03:00:00Z", "vulnerability-alerts.json", &unread));
+        let alerts = population(&TESTS[6], &st, &p("2027-01-01", "2027-02-01"));
+        assert!(alerts.missing.is_empty() && alerts.items.is_empty());
+        assert!(!alerts.complete(), "no alerts because GitHub refused Dependabot's isn't none");
+        assert_eq!(alerts.unread, vec![format!("{}: dependabot", st.last().unwrap().0.path)]);
 
         st.push((Found { path: "renamed.tar".into(), name: "renamed".into(), problems: vec!["it can't be read as a tar".into()], ..Found::default() }, Files::new()));
         for t in &TESTS {

@@ -230,7 +230,7 @@ pub fn untar(b: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 // Checking one bundle
 
 /// A bundle found in the store, and what checking it showed.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Found {
     /// Where it is, relative to the store.
     pub path: String,
