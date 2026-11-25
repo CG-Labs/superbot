@@ -151,6 +151,9 @@ impl Default for ClaimMap {
     }
 }
 
+/// Held while one IdP's metadata is fetched, with its last failed fetch.
+type IdpFetch = tokio::sync::Mutex<Option<(Instant, Invalid)>>;
+
 pub struct Provider {
     pub id: String,
     pub label: String,
@@ -162,6 +165,9 @@ pub struct Provider {
     cache: tokio::sync::Mutex<Cache>,
     /// Native SAML: each IdP's metadata, by entity ID, and when it was loaded.
     idp: Mutex<HashMap<String, (Arc<IdpMetadata>, Instant)>>,
+    /// Native SAML: held while an IdP's metadata is fetched, by entity ID, with that IdP's
+    /// last failed fetch. One per IdP, so a slow answer for one doesn't hold up another.
+    idp_fetch: Mutex<HashMap<String, Arc<IdpFetch>>>,
     /// Native SAML: our signing key, once loaded or made (ADR 0137).
     pub(super) sp_key: Mutex<Option<Arc<SpKey>>>,
     /// Native SAML: our encryption key, likewise (ADR 0150).
@@ -181,7 +187,6 @@ struct Cache {
     /// The last failed fetch, so a down IdP costs one timeout per gap, not one per sign-in.
     meta_failed: Option<(Instant, Invalid)>,
     jwks_failed: Option<(Instant, Invalid)>,
-    idp_failed: HashMap<String, (Instant, Invalid)>,
 }
 
 pub struct Metadata {
@@ -327,7 +332,7 @@ async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> 
 
 impl Provider {
     pub fn new(id: &str, label: &str, kind: Kind, client_id: &str, scopes: &str, jit_role: Option<Role>) -> Provider {
-        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), sp_key: Mutex::default(), enc_key: Mutex::default(), held: Default::default(), metadata_refused: Mutex::default() }
+        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), idp_fetch: Mutex::default(), sp_key: Mutex::default(), enc_key: Mutex::default(), held: Default::default(), metadata_refused: Mutex::default() }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -641,10 +646,10 @@ impl Provider {
     }
 
     /// Native SAML: which of the provider's IdPs an identity key (`issuer|subject`, as
-    /// sessions record it) is from. Entity IDs may hold `|`, so it's matched whole, the
-    /// longest that fits.
+    /// sessions record it) is from. With several IdPs, none has a `|` in its entity ID.
     pub fn idp_of(&self, key: &str) -> Option<&str> {
-        self.idps().iter().filter(|e| key.strip_prefix(e.as_str()).is_some_and(|rest| rest.starts_with('|'))).max_by_key(|e| e.len()).map(String::as_str)
+        let (issuer, _) = key.split_once('|')?;
+        self.idps().iter().find(|e| *e == issuer).map(String::as_str)
     }
 
     /// The subject as tokens carry it: Entra object ids are lowercase GUIDs, GitHub's are numbers.
@@ -728,7 +733,8 @@ impl Provider {
         if let (Some(m), true) = (&stale, fresh) {
             return Ok(m.clone());
         }
-        let mut c = self.cache.lock().await;
+        let fetch = self.idp_fetch.lock().unwrap_or_else(|e| e.into_inner()).entry(entity_id.to_string()).or_default().clone();
+        let mut failed = fetch.lock().await;
         // Whoever held the lock may just have fetched it.
         if let Some((m, at)) = self.idp.lock().unwrap_or_else(|e| e.into_inner()).get(entity_id)
             && at.elapsed() < META_TTL
@@ -743,10 +749,10 @@ impl Provider {
             None if expired => Err(missing),
             None => Err(e),
         };
-        if let Some((at, e)) = c.idp_failed.get(entity_id)
+        if let Some((at, e)) = *failed
             && at.elapsed() < gap
         {
-            return unexpired(stale, *e);
+            return unexpired(stale, e);
         }
         let got = get_text(http, &url).await.and_then(|xml| {
             saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, *response_binding, metadata_trust.as_ref(), crate::db::now()).map_err(|e| {
@@ -761,12 +767,12 @@ impl Provider {
         });
         match got {
             Ok(m) => {
-                c.idp_failed.remove(entity_id);
+                *failed = None;
                 self.set_idp(m);
                 self.idp_loaded_for(entity_id).ok_or(Invalid("idp_bad_response"))
             }
             Err(e) => {
-                c.idp_failed.insert(entity_id.to_string(), (Instant::now(), e));
+                *failed = Some((Instant::now(), e));
                 if expired {
                     crate::obs::log::log_warn!("SSO {}: the IdP metadata in use has passed its validUntil and no fresh copy loaded from {url}", self.id);
                 }

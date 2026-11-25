@@ -25,7 +25,7 @@ These are refused with several IdPs, at startup:
 - `GROUPS_ATTRIBUTE` (and so `REQUIRED_GROUPS` and group role mappings, ADR 0160). Group names are each IdP's: one university's `admins` is not another's, and a role mapping would grant it to both.
 - `IDP_INITIATED=restart` (ADR 0175). The restarted sign-in would need to know which IdP to go to, and the unsolicited response says so only before its signature is checked. Each sign-in starts at the chooser instead.
 
-`Kind::SamlSp` holds `entity_ids`, one or more. `IdpSource::Mdq` holds the base URL, and the request URL is made per IdP (`url_for`). The provider caches each IdP's metadata by entity ID, with its own refresh time, failure gap, and refusals to audit. A single IdP works exactly as before.
+`Kind::SamlSp` holds `entity_ids`, one or more. `IdpSource::Mdq` holds the base URL, and the request URL is made per IdP (`url_for`). The provider caches each IdP's metadata by entity ID, with its own refresh time, failure gap, refusals to audit, and fetch lock, so a slow MDQ answer for one IdP doesn't hold up sign-ins at another. A single IdP works exactly as before.
 
 ### Choosing the IdP
 
@@ -35,7 +35,7 @@ An `idp` that isn't listed fails the sign-in as `unknown_idp` (audited, throttle
 
 ### Identities
 
-The claims' issuer is the IdP that signed the response, as before, so identities are stored as `(entity ID, NameID)` and sessions as `entity ID|NameID`. Entity IDs may hold `|`, so a session's IdP is found by matching its identity key against the listed entity IDs whole, the longest that fits, never by splitting.
+The claims' issuer is the IdP that signed the response, as before, so identities are stored as `(entity ID, NameID)` and sessions as `entity ID|NameID`. A listed entity ID may not hold `|`: with IdPs `urn:example:idp` and `urn:example:idp|staff`, the first's NameID `staff|alice` and the second's `alice` would both be `urn:example:idp|staff|alice`, and a logout from one could end the other's sessions. Without it, a session's IdP is everything before the first `|`. Real entity IDs are URLs or URNs, which hardly ever hold one; such an IdP can still be its own provider with `IDP_ENTITY_ID`.
 
 Linking by hand must say which IdP: `POST /api/users/{key}/identities` takes `idp`, and `botctl user link … --idp <entity ID>`. Without it, a provider with several IdPs is refused ("say which with --idp"), as is an entity ID it doesn't list. A SCIM token can't link such a provider, since SCIM's `externalId` doesn't say which IdP.
 
@@ -52,7 +52,7 @@ A single IdP isn't checked: its admin chose it, and many IdPs outside federation
 
 ### Status and checks
 
-`GET /api/sso/{id}/saml` adds `idpEntityIds` and `idps` (each IdP with its name, scopes and loaded metadata), and `botctl sso saml` lists them. Refresh, metadata refusals (with `entityId`), certificate expiry warnings (each IdP's certificate is replaced only by a newer one of the same IdP's) and `botctl offline check` (every MDQ request URL) cover every IdP.
+`GET /api/sso/{id}/saml` adds `idpEntityIds` and `idps` (each IdP with its name, scopes and loaded metadata), and `botctl sso saml` lists them. Refresh, metadata refusals (with `entityId`), certificate expiry warnings (each IdP's certificate is replaced only by a newer one of the same IdP's, and each IdP's notice is claimed on its own, so IdPs sharing a certificate are each warned) and `botctl offline check` (every MDQ request URL) cover every IdP.
 
 ## Alternatives considered
 

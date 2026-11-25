@@ -550,6 +550,11 @@ fn entity_ids(key: &dyn Fn(&str) -> String, var: &Var, list: &List) -> Result<Ve
             let mut out: Vec<String> = Vec::new();
             for e in several {
                 let e = check("IDP_ENTITY_IDS", &e)?;
+                // Sessions keep `issuer|subject`: an issuer with `|` would make one IdP's
+                // person look like another's at logout.
+                if e.contains('|') {
+                    return Err(format!("{}: {e} has a |, which can't tell one IdP's people from another's: list it alone in {}", key("IDP_ENTITY_IDS"), key("IDP_ENTITY_ID")));
+                }
                 if !out.contains(&e) {
                     out.push(e);
                 }
@@ -3375,11 +3380,11 @@ mod tests {
         std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signers()[1].cert)).unwrap();
         let anchor: &'static str = Box::leak(anchor.to_string_lossy().into_owned().into_boxed_str());
         const A: &str = "https://idp.uni-a.example/idp/shibboleth";
-        const B: &str = "https://login.uni-b.example/saml|2";
+        const B: &str = "https://login.uni-b.example/saml?v=2";
         let fed = [("SSO_CORP_IDP_ENTITY_ID", ""), ("SSO_CORP_IDP_MDQ_URL", "https://mdq.example.org"), ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor)];
         let several = |extra: &[(&'static str, &'static str)]| native(&[&fed[..], extra].concat());
 
-        let s = several(&[("SSO_CORP_IDP_ENTITY_IDS", "https://idp.uni-a.example/idp/shibboleth, https://login.uni-b.example/saml|2,https://idp.uni-a.example/idp/shibboleth")]).unwrap();
+        let s = several(&[("SSO_CORP_IDP_ENTITY_IDS", "https://idp.uni-a.example/idp/shibboleth, https://login.uni-b.example/saml?v=2,https://idp.uni-a.example/idp/shibboleth")]).unwrap();
         let p = &s.providers[0];
         assert_eq!(p.idps(), [A, B], "listed once each, in order");
         assert!(p.several_idps() && p.not_ready().is_none());
@@ -3390,8 +3395,8 @@ mod tests {
         assert!(p.issuer_for(None).unwrap_err().contains("--idp"));
         assert_eq!(p.issuer_at(B).unwrap(), B);
         assert!(p.issuer_at("https://idp.other.example").is_err());
-        assert_eq!(p.idp_of(&format!("{B}|alice")), Some(B), "entity IDs may hold |");
-        assert_eq!(p.idp_of(&format!("{A}|bob|x")), Some(A));
+        assert_eq!(p.idp_of(&format!("{B}|alice")), Some(B));
+        assert_eq!(p.idp_of(&format!("{A}|staff|alice")), Some(A), "the NameID may hold |");
         assert_eq!(p.idp_of("https://idp.other.example|bob"), None);
         let one = native(&[]).unwrap();
         assert_eq!((one.providers[0].idps(), one.providers[0].several_idps()), (&[ADFS.to_string()][..], false));
@@ -3401,6 +3406,7 @@ mod tests {
         assert!(err(&[two, ("SSO_CORP_IDP_ENTITY_ID", ADFS)]).contains("not both"));
         assert!(err(&[("SSO_CORP_IDP_ENTITY_IDS", "https://a.example/idp")]).contains("set SSO_CORP_IDP_ENTITY_ID instead"));
         assert!(err(&[("SSO_CORP_IDP_ENTITY_IDS", "https://a.example/idp,not an entity id")]).contains("not an entity ID"));
+        assert!(err(&[("SSO_CORP_IDP_ENTITY_IDS", "urn:example:idp,urn:example:idp|staff")]).contains("has a |"), "A's staff|alice would be B's alice");
         let many: &'static str = Box::leak((0..=saml_sp::MAX_IDPS).map(|i| format!("https://idp{i}.example")).collect::<Vec<_>>().join(",").into_boxed_str());
         assert!(err(&[("SSO_CORP_IDP_ENTITY_IDS", many)]).contains("at most"));
         assert!(err(&[two, ("SSO_CORP_IDP_MDQ_URL", ""), ("SSO_CORP_IDP_METADATA_URL", "https://idp.example/m")]).contains("needs SSO_CORP_IDP_MDQ_URL"));
@@ -3443,6 +3449,40 @@ mod tests {
         p.set_idp(copy(Some(db::now() + 60_000)));
         p.age_idp(Duration::from_secs(25 * 3600));
         assert!(p.idp_metadata(&http, Duration::ZERO).await.is_ok(), "still valid after the failed refresh: kept");
+    }
+
+    #[tokio::test]
+    async fn a_slow_idp_of_a_federation_doesnt_hold_up_another() {
+        const A: &str = "https://idp.uni-a.example/idp";
+        const B: &str = "https://login.uni-b.example/saml";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mdq = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+            if uri.path() == saml_sp::mdq_url("/mdq", A) {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        });
+        tokio::spawn(async move { axum::serve(listener, mdq).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("superbot-slow-idp-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let anchor = dir.join("federation.pem");
+        std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", xmldsig::test_signer::signers()[1].cert)).unwrap();
+        let anchor: &'static str = Box::leak(anchor.to_string_lossy().into_owned().into_boxed_str());
+        let url: &'static str = Box::leak(format!("http://127.0.0.1:{port}/mdq").into_boxed_str());
+        let s = native(&[("SSO_CORP_IDP_ENTITY_ID", ""), ("SSO_CORP_IDP_ENTITY_IDS", "https://idp.uni-a.example/idp,https://login.uni-b.example/saml"), ("SSO_CORP_IDP_MDQ_URL", url), ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor)]).unwrap();
+        let p = s.providers[0].clone();
+        let http = reqwest::Client::new();
+        let slow = tokio::spawn({
+            let (p, http) = (p.clone(), http.clone());
+            async move { p.idp_metadata_for(&http, Duration::ZERO, A).await.err() }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        assert_eq!(p.idp_metadata_for(&http, Duration::ZERO, B).await.err(), Some(jwt::Invalid("idp_bad_response")));
+        assert!(started.elapsed() < Duration::from_millis(1_500), "B's answer waited {:?} for A's", started.elapsed());
+        assert_eq!(slow.await.unwrap(), Some(jwt::Invalid("idp_bad_response")));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn random_hex() -> String {

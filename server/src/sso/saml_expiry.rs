@@ -11,7 +11,7 @@
 //! Each certificate in use is judged on its own: `expiring` within [`WARN_DAYS`] of its end,
 //! then `expired`. A certificate is *covered* when another of the same kind isn't ending: an
 //! IdP's next certificate already in its metadata, or botd's next key. Each notice is audited
-//! once per certificate, claimed in the transaction that records it.
+//! once per certificate (and IdP, with several), claimed in the transaction that records it.
 
 use super::provider::{Kind, Provider};
 use super::saml_keys::{self, Stage};
@@ -259,8 +259,14 @@ pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::
             let outcome = if f.state == State::Expired && f.replacement.is_none() { Outcome::Failure } else { Outcome::Success };
             let e = Event::new(Actor::system("sso"), name).target("sso_provider", &p.id).outcome(outcome);
             let c = f.cert;
+            // IdPs of a federation can share a certificate, yet one may have its replacement
+            // and another not: each IdP's is a notice of its own.
+            let role = match &c.idp {
+                Some(idp) if p.several_idps() => format!("{}|{idp}", c.role.as_str()),
+                _ => c.role.as_str().to_string(),
+            };
             let recorded = app.db.record_with(&e, |db, _, _| {
-                if !crate::db::claim_saml_cert_notice(db, &p.id, c.role.as_str(), &c.cert.sha256, notice, now)? {
+                if !crate::db::claim_saml_cert_notice(db, &p.id, &role, &c.cert.sha256, notice, now)? {
                     return Err(rusqlite::Error::QueryReturnedNoRows);
                 }
                 Ok(details(p, &f))

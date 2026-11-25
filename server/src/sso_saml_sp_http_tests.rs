@@ -2958,15 +2958,15 @@ async fn only_our_idps_artifacts_for_its_endpoints_are_sent_and_posts_are_refuse
 const IDP_B: &str = "https://login.uni-b.example/saml";
 
 /// A federation's MDQ server for IdP `IDP` (University A, scope example.com, signer 0) and
-/// `IDP_B` (Beta Institute, scope uni-b.example, signer 2), both with SLO URLs, each answer
-/// signed by test signer 1; and botd with one provider for both, plus `extra` settings.
-async fn serve_federation(extra: &[(&str, &str)]) -> (Sp, std::path::PathBuf) {
+/// `IDP_B` (Beta Institute, scope uni-b.example, signer `b_signer`), both with SLO URLs, each
+/// answer signed by test signer 1; and botd with one provider for both, plus `extra` settings.
+async fn serve_federation(extra: &[(&str, &str)], b_signer: usize) -> (Sp, std::path::PathBuf, Vec<Arc<crate::sso::Provider>>) {
     use crate::sso::saml_sp::{mdq_url, test_instant};
     let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
     let until = test_instant(db::now() + 7 * 86_400_000);
     let entry = |xml: String| test_idp::signed_metadata(&xml.replacen("<md:EntityDescriptor ", &format!(r#"<md:EntityDescriptor validUntil="{until}" "#), 1), signer(1));
     let a = entry(test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata(), "University A", &["example.com"])));
-    let b = entry(test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata_with(IDP_B, &[signer(2)], ""), "Beta Institute", &["uni-b.example"])).replace("https://idp.example/", "https://login.uni-b.example/"));
+    let b = entry(test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata_with(IDP_B, &[signer(b_signer)], ""), "Beta Institute", &["uni-b.example"])).replace("https://idp.example/", "https://login.uni-b.example/"));
     let answers: HashMap<String, String> = HashMap::from([(mdq_url("/mdq", IDP), a), (mdq_url("/mdq", IDP_B), b)]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mdq_port = listener.local_addr().unwrap().port();
@@ -2991,11 +2991,12 @@ async fn serve_federation(extra: &[(&str, &str)]) -> (Sp, std::path::PathBuf) {
         (format!("SSO_{up}_METADATA_SIGNING_CERT_FILE"), anchor.to_string_lossy().into_owned()),
     ]);
     vars.extend(extra.iter().map(|(k, v)| (format!("SSO_{up}_{k}"), v.to_string())));
-    let (port, app, admin) = serve_vars_with(vars, |_| {}).await;
+    let mut providers = Vec::new();
+    let (port, app, admin) = serve_vars_with(vars, |a| providers = a.sso.providers.clone()).await;
     let sp = Sp { port, app, admin, id, sp_entity: None };
     // Loads every IdP's metadata, as the startup expiry check does.
     assert_eq!(call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await.0, 200);
-    (sp, dir)
+    (sp, dir, providers)
 }
 
 impl Sp {
@@ -3030,7 +3031,7 @@ fn from_b(r: &mut Response) {
 
 #[tokio::test]
 async fn one_provider_signs_people_in_at_each_idp_of_a_federation() {
-    let (sp, dir) = serve_federation(&[]).await;
+    let (sp, dir, _) = serve_federation(&[], 2).await;
 
     // The chooser: both IdPs by name, sorted, each a start at that IdP; no script.
     let (code, head, page) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start?session=cookie", sp.id), "", "", "").await;
@@ -3132,7 +3133,7 @@ async fn one_provider_signs_people_in_at_each_idp_of_a_federation() {
 
 #[tokio::test]
 async fn with_allowed_domains_an_email_out_of_the_idps_scope_is_refused() {
-    let (sp, dir) = serve_federation(&[("ALLOWED_DOMAINS", "example.com,uni-b.example"), ("JIT_ROLE", "member")]).await;
+    let (sp, dir, _) = serve_federation(&[("ALLOWED_DOMAINS", "example.com,uni-b.example"), ("JIT_ROLE", "member")], 2).await;
     let (code, to, _) = sp.sign_in_at(IDP_B, from_b).await;
     assert_eq!((code, to.as_str()), (303, "/login?error=sso_wrong_account"), "B can't vouch for example.com");
     assert_eq!(sp.last_failure().await["reason"], "email_out_of_scope");
@@ -3146,5 +3147,17 @@ async fn with_allowed_domains_an_email_out_of_the_idps_scope_is_refused() {
     assert_eq!(sp.app.db.identity(IDP_B, STORED).unwrap().1.email.as_deref(), Some("bob@uni-b.example"));
     let (code, _, _) = sp.sign_in_at(IDP, |_| {}).await;
     assert_eq!(code, 200, "A vouches for example.com");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn idps_sharing_a_certificate_are_each_warned_about_it() {
+    use crate::sso::saml_expiry;
+    let (sp, dir, providers) = serve_federation(&[], 0).await;
+    let late = (crate::sso::xmldsig::test_signer::signer(0).cert().not_after - 10 * 86_400) * 1000;
+    saml_expiry::check(&sp.app, &providers, &reqwest::Client::new(), std::time::Duration::ZERO, late).await;
+    let mut warned: Vec<String> = sp.audit("sso.saml_certificate_expiring").await.iter().filter(|e| e["details"]["role"] == "idp_signing").map(|e| e["details"]["entityId"].as_str().unwrap().to_string()).collect();
+    warned.sort();
+    assert_eq!(warned, [IDP, IDP_B], "one notice each, not one for both");
     std::fs::remove_dir_all(dir).ok();
 }
