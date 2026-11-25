@@ -566,7 +566,7 @@ async fn main() {
     }
     let current_cipher = secrets::sealed::cipher();
     let store_keys = machines::chat_stores::Keys { current: &current_cipher, previous: previous_cipher.as_ref(), forget: secrets::forget_sealed() };
-    let opened = machines::chat_stores::open(&db, &control_plane.chat_stores, previous_db_key.as_ref(), store_keys)
+    let opened = machines::chat_stores::open(&db, &control_plane.chat_stores, &data_dir, previous_db_key.as_ref(), store_keys)
         .unwrap_or_else(|e| exit(format!("Regional chat stores: {e}")));
     for line in &opened.lines {
         log_info!("{line}");

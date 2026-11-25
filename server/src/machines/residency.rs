@@ -713,7 +713,7 @@ pub async fn pin_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     app.db.pin_residency(PinOn::User, &u.id, &region, &reference, by.actor.id.as_deref()).map_err(not_saved)?;
     let d = json!({ "region": region, "reference": reference, "regionFrom": from, "renewed": own.is_some(), "userEmail": u.email });
     app.db.record(&by.event("user.residency_pinned").target("user", &u.id).details(d));
-    super::chat_stores::place(&app.db);
+    super::chat_stores::place(&app.db, &app.cfg.data_dir);
     let u = app.db.user(&u.id).ok_or_else(|| not_found("User"))?;
     Ok(Json(region::user_view(&app, cp, &u)))
 }
@@ -732,7 +732,7 @@ pub async fn unpin_user(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<A
     }
     let d = json!({ "region": p.region, "reference": p.reference, "pinnedAt": p.pinned_at, "pinnedBy": p.pinned_by, "reason": reason, "userEmail": u.email });
     app.db.record(&by.event("user.residency_unpinned").target("user", &u.id).details(d));
-    super::chat_stores::place(&app.db);
+    super::chat_stores::place(&app.db, &app.cfg.data_dir);
     Ok(Json(region::user_view(&app, cp, &u)))
 }
 
@@ -793,7 +793,7 @@ pub async fn pin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     app.db.pin_residency(PinOn::Team, &t.id, &region, &reference, by.actor.id.as_deref()).map_err(not_saved)?;
     let d = json!({ "region": region, "reference": reference, "regionFrom": from, "renewed": own.is_some(), "members": app.db.team_members(&t.id).len() });
     app.db.record(&crate::teams::team_event(&by, "team.residency_pinned", &t.id, d));
-    super::chat_stores::place(&app.db);
+    super::chat_stores::place(&app.db, &app.cfg.data_dir);
     let t = app.db.team(&t.id).ok_or_else(|| not_found("Team"))?;
     Ok(Json(region::team_region_view(&app, cp, &t)))
 }
@@ -812,7 +812,7 @@ pub async fn unpin_team(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<A
     }
     let d = json!({ "region": p.region, "reference": p.reference, "pinnedAt": p.pinned_at, "pinnedBy": p.pinned_by, "reason": reason });
     app.db.record(&crate::teams::team_event(&by, "team.residency_unpinned", &t.id, d));
-    super::chat_stores::place(&app.db);
+    super::chat_stores::place(&app.db, &app.cfg.data_dir);
     Ok(Json(region::team_region_view(&app, cp, &t)))
 }
 

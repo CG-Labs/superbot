@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod chats;
-pub use chats::{ChatMove, ChatStore, Held, bots_kept_in, compare_copy, drop_from_copy, held_in_copy, keep_only_in_copy, upgrade_copy};
+pub use chats::{ChatMove, ChatStore, Held, bots_kept_in, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy, upgrade_copy};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 
@@ -197,7 +197,7 @@ pub(crate) fn erase_in_copy(c: &Connection, user_id: &str, pseudonym: &str, bots
     let messages = c.execute(&main(&erase_messages()), params![user_id, bots])? as i64;
     c.execute(&main(&erase_requested_by()), [user_id])?;
     let approvals = c.execute(&main(ERASE_APPROVALS), params![user_id, pseudonym])? as i64;
-    Ok(Held { messages, routines, approvals })
+    Ok(Held { messages, routines, approvals, memories: 0 })
 }
 
 /// How an erasure rewrites a string about the erased person: their id becomes the
@@ -4828,6 +4828,7 @@ impl Db {
         // Added after the first release; fails harmlessly if it already exists.
         let _ = c.execute("ALTER TABLE messages ADD COLUMN from_bot TEXT", []);
         let _ = c.execute("ALTER TABLE bots ADD COLUMN effort TEXT", []);
+        c.execute_batch(chats::MEMORIES)?;
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         for (i, migrate) in MIGRATIONS.iter().enumerate().skip(version.max(0) as usize) {
             let tx = c.unchecked_transaction()?;
@@ -5343,7 +5344,7 @@ impl Db {
         let c = self.c();
         let gone = c.execute(&format!("DELETE FROM bots WHERE id = ?1 AND NOT {HELD_CHAT}"), [id]).unwrap() > 0;
         if gone {
-            for table in ["{messages}", "{routines}", "{approvals}"] {
+            for table in ["{messages}", "{routines}", "{approvals}", "{memories}"] {
                 self.on_places(&c, &format!("DELETE FROM {table} WHERE bot_id = ?1"), &[&id]).unwrap();
             }
         }
