@@ -19,18 +19,22 @@
 //!   user's own secrets, which reach only Bots that user owns, over the server-wide ones
 //!   and over the ones they saved in botd (ADR 0174). Cached, failing closed and audited
 //!   like the others; values are redacted from that user's Bots.
+//! - `refresh` reads every cached answer again at once, for an admin who rotated a value
+//!   and can't wait out the cache, and says which names botd read at startup have
+//!   changed since, which only a restart picks up (ADR 0291).
 
 use super::leases::{self, RunCredentials};
 use super::{check_name, check_user_name, env_shaped, redact, server_secret, Error, Secret, SecretStore};
 use crate::audit::{Actor, Event, Outcome};
+use serde::Serialize;
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// Which folder of the backend a name lives in.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
     /// Server-wide secrets that reach Bots.
     Bots,
@@ -183,11 +187,25 @@ pub struct ExternalStore {
     user_folders: bool,
     /// `VAULT_RUN_CREDENTIALS`: short-lived credentials made for each run (ADR 0185).
     run_credentials: Option<Arc<RunCredentials>>,
+    /// What botd's startup settings read through `Startup`, kept as they read it: those
+    /// settings hold the value until a restart, whatever the cache does (ADR 0291).
+    startup: Mutex<HashMap<(Scope, String), Option<Zeroizing<String>>>>,
+    /// Held while a refresh runs, so two can't pile their reads onto the backend.
+    refreshing: Mutex<()>,
 }
 
 impl ExternalStore {
     pub fn new(provider: Box<dyn Provider>, ttl: Duration) -> ExternalStore {
-        ExternalStore { provider, ttl, values: Mutex::default(), names: Mutex::default(), user_folders: false, run_credentials: None }
+        ExternalStore {
+            provider,
+            ttl,
+            values: Mutex::default(),
+            names: Mutex::default(),
+            user_folders: false,
+            run_credentials: None,
+            startup: Mutex::default(),
+            refreshing: Mutex::new(()),
+        }
     }
 
     pub fn with_user_folders(mut self, on: bool) -> ExternalStore {
@@ -346,6 +364,299 @@ impl ExternalStore {
     pub fn user_get(&self, user_id: &str, name: &str) -> Result<Option<Secret>, Error> {
         self.user_scope(user_id).map_or(Ok(None), |s| self.get_in(&s, name))
     }
+
+    /// Keeps the first answer a startup setting got for `name`.
+    fn note_startup(&self, name: &str, value: Option<&Secret>) {
+        let Some(scope) = scope_of(name) else { return };
+        let mut startup = self.startup.lock().unwrap_or_else(|e| e.into_inner());
+        startup.entry((scope, name.to_string())).or_insert_with(|| value.map(|v| Zeroizing::new(v.expose().to_string())));
+    }
+
+    /// Reads again, now, every answer in the cache and every name botd's startup settings
+    /// read, and lists each folder again (ADR 0291). With `only`, just those names, in
+    /// every folder that has one cached, or in their own shared folder when none does.
+    ///
+    /// Each read goes through `fetch`, so it is audited, its value redacted from then on,
+    /// and a backend that can't answer leaves nothing cached for that name: the next use
+    /// fails closed as it would once the cache ran out. Values before and after are only
+    /// compared here, in memory; the report says what changed, never a value or a digest.
+    pub fn refresh(&self, only: Option<&[String]>) -> Result<Refresh, RefreshError> {
+        let wanted = match only {
+            Some(names) => Some(refresh_names(names)?),
+            None => None,
+        };
+        let _one = self.refreshing.try_lock().map_err(|_| RefreshError::Busy)?;
+        let take = |name: &str| wanted.as_ref().is_none_or(|w| w.contains(name));
+        let (mut keys, old, startup) = {
+            let values = self.values.lock().unwrap_or_else(|e| e.into_inner());
+            let startup = self.startup.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: BTreeSet<(Scope, String)> = values.keys().chain(startup.keys()).filter(|(_, n)| take(n)).cloned().collect();
+            let old: HashMap<_, _> = keys.iter().filter_map(|k| values.get(k).map(|(_, v)| (k.clone(), v.clone()))).collect();
+            let startup: HashMap<_, _> = keys.iter().filter_map(|k| startup.get(k).map(|v| (k.clone(), v.clone()))).collect();
+            (keys, old, startup)
+        };
+        for name in wanted.iter().flatten() {
+            if !keys.iter().any(|(_, n)| n == name) {
+                keys.insert((scope_of(name).expect("checked by refresh_names"), name.clone()));
+            }
+        }
+        let folders: BTreeSet<Scope> = {
+            let names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+            Scope::ALL.iter().cloned().chain(names.keys().cloned()).collect()
+        };
+        let listed_before: HashMap<Scope, Vec<String>> = self.names.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(s, (_, n))| (s.clone(), n.clone())).collect();
+
+        let jobs: Vec<Job> = keys.into_iter().map(Job::Read).chain(folders.into_iter().map(Job::List)).collect();
+        let done = parallel(&jobs, |job| match job {
+            Job::Read((scope, name)) => Done::Read(self.fetch(scope, name)),
+            Job::List(scope) => Done::List(self.list_from_backend(scope)),
+        });
+
+        let mut entries = Vec::new();
+        let mut folders = Vec::new();
+        for (job, done) in jobs.into_iter().zip(done) {
+            match (job, done) {
+                (Job::Read(key), Done::Read(now)) => {
+                    let result = match (old.get(&key), &now) {
+                        (_, Err(_)) => Change::Unavailable,
+                        (Some(Some(a)), Ok(Some(b))) if a.as_str() == b.as_str() => Change::Unchanged,
+                        (Some(Some(_)), Ok(Some(_))) => Change::Changed,
+                        (Some(None), Ok(Some(_))) => Change::Added,
+                        (Some(Some(_)), Ok(None)) => Change::Removed,
+                        (None, Ok(Some(_))) => Change::Found,
+                        (Some(None) | None, Ok(None)) => Change::NotFound,
+                    };
+                    let at_startup = startup.get(&key);
+                    let restart = match (at_startup, &now) {
+                        (Some(then), Ok(now)) => then.as_ref().map(|v| v.as_str()) != now.as_ref().map(|v| v.as_str()),
+                        _ => false,
+                    };
+                    let read_at_startup = at_startup.is_some();
+                    let (scope, name) = key;
+                    entries.push(Refreshed { name, scope: scope.as_str(), user_id: scope.user_id().map(str::to_string), result, startup: read_at_startup, restart });
+                }
+                (Job::List(scope), Done::List(now)) => {
+                    let before = listed_before.get(&scope);
+                    let (added, removed) = match (before, &now) {
+                        (Some(b), Ok(n)) => (n.iter().filter(|x| !b.contains(x)).cloned().collect(), b.iter().filter(|x| !n.contains(x)).cloned().collect()),
+                        _ => (Vec::new(), Vec::new()),
+                    };
+                    folders.push(FolderRefreshed { folder: scope.folder('/'), names: now.as_ref().ok().map(Vec::len), ok: now.is_ok(), added, removed });
+                }
+                _ => unreachable!("each job is done in its own kind"),
+            }
+        }
+        Ok(Refresh { store: self.provider.kind(), names: wanted.map(|w| w.into_iter().collect()), entries, folders })
+    }
+}
+
+/// Most names one refresh may ask for.
+pub const MAX_REFRESH_NAMES: usize = 100;
+/// Reads a refresh runs at once; the clients run up to `http::MAX_REQUESTS` anyway.
+const REFRESH_READERS: usize = 8;
+
+/// The names a refresh was asked for, checked: each one an external store may answer.
+fn refresh_names(names: &[String]) -> Result<BTreeSet<String>, RefreshError> {
+    if names.is_empty() {
+        return Err(RefreshError::Invalid("Name at least one secret, or none to refresh them all.".into()));
+    }
+    if names.len() > MAX_REFRESH_NAMES {
+        return Err(RefreshError::Invalid(format!("Refresh at most {MAX_REFRESH_NAMES} names at once, or none to refresh them all.")));
+    }
+    let mut out = BTreeSet::new();
+    for n in names {
+        let n = n.trim();
+        if scope_of(n).is_none() {
+            let shown: String = n.chars().take(128).collect();
+            return Err(RefreshError::Invalid(format!("{shown:?} isn't a name an external store answers for botd: use A-Z, 0-9 and _, and not a reserved name.")));
+        }
+        out.insert(n.to_string());
+    }
+    Ok(out)
+}
+
+enum Job {
+    Read((Scope, String)),
+    List(Scope),
+}
+
+enum Done {
+    Read(Result<Option<Zeroizing<String>>, Error>),
+    List(Result<Vec<String>, Error>),
+}
+
+/// `f` over `jobs` on up to `REFRESH_READERS` threads, answers in the jobs' order. Plain
+/// threads, not botd's runtime: each read blocks until the backend answers or times out.
+fn parallel<J: Sync, D: Send>(jobs: &[J], f: impl Fn(&J) -> D + Sync) -> Vec<D> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Mutex<Vec<Option<D>>> = Mutex::new((0..jobs.len()).map(|_| None).collect());
+    std::thread::scope(|s| {
+        for _ in 0..REFRESH_READERS.min(jobs.len()) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(job) = jobs.get(i) else { break };
+                    let d = f(job);
+                    out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(d);
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().map(|d| d.expect("every job is done")).collect()
+}
+
+/// Why a refresh didn't run.
+#[derive(Debug, PartialEq)]
+pub enum RefreshError {
+    /// Another is running.
+    Busy,
+    /// A name it can't refresh, or too many.
+    Invalid(String),
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            RefreshError::Busy => f.write_str("A refresh is already running; try again when it ends."),
+            RefreshError::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
+/// What a refresh found for one name, against the answer cached before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Change {
+    /// Another value than the one cached.
+    Changed,
+    Unchanged,
+    /// A value where the cache had "not there".
+    Added,
+    /// "Not there" where the cache had a value.
+    Removed,
+    /// A value, with nothing cached before to compare.
+    Found,
+    NotFound,
+    /// The backend couldn't answer; nothing is cached for it now (fail closed).
+    Unavailable,
+}
+
+/// One name a refresh read again. Never its value.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Refreshed {
+    pub name: String,
+    pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    pub result: Change,
+    /// botd's startup settings read it.
+    pub startup: bool,
+    /// They read another answer than the backend's now, and hold it until botd restarts.
+    pub restart: bool,
+}
+
+/// One folder a refresh listed again: how many names it has, and which came or went
+/// since the list cached before.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRefreshed {
+    pub folder: String,
+    pub ok: bool,
+    pub names: Option<usize>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// What `ExternalStore::refresh` did.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Refresh {
+    pub store: &'static str,
+    /// The names asked for; None for everything.
+    pub names: Option<Vec<String>>,
+    pub entries: Vec<Refreshed>,
+    pub folders: Vec<FolderRefreshed>,
+}
+
+/// Most entries an audit event lists by name; the counts cover the rest.
+const MAX_AUDITED: usize = 100;
+
+impl Refresh {
+    /// Every read and list answered.
+    pub fn ok(&self) -> bool {
+        self.entries.iter().all(|e| e.result != Change::Unavailable) && self.folders.iter().all(|f| f.ok)
+    }
+
+    pub fn count(&self, c: Change) -> usize {
+        self.entries.iter().filter(|e| e.result == c).count()
+    }
+
+    /// Names botd read at startup whose value is no longer the backend's.
+    pub fn restart(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self.entries.iter().filter(|e| e.restart).map(|e| e.name.as_str()).collect();
+        out.dedup();
+        out
+    }
+
+    fn counts(&self) -> serde_json::Value {
+        let mut c = serde_json::Map::new();
+        for k in [Change::Changed, Change::Unchanged, Change::Added, Change::Removed, Change::Found, Change::NotFound, Change::Unavailable] {
+            c.insert(serde_json::to_value(k).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default(), json!(self.count(k)));
+        }
+        serde_json::Value::Object(c)
+    }
+
+    /// The API's answer: the report, with counts, whether it all answered, and a line to show.
+    pub fn view(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        v["ok"] = json!(self.ok());
+        v["counts"] = self.counts();
+        v["restart"] = json!(self.restart());
+        v["detail"] = json!(self.detail());
+        v
+    }
+
+    pub fn detail(&self) -> String {
+        let moved = self.count(Change::Changed) + self.count(Change::Added) + self.count(Change::Removed);
+        let n = self.entries.len();
+        let mut out = format!("{} read again: {n} name{}, {moved} changed.", self.store, if n == 1 { "" } else { "s" });
+        let down = self.count(Change::Unavailable) + self.folders.iter().filter(|f| !f.ok).count();
+        if down > 0 {
+            out += &format!(" {down} couldn't be read; nothing is cached for them, so runs that need them are refused until the backend answers (fail closed).");
+        }
+        let restart = self.restart();
+        if !restart.is_empty() {
+            out += &format!(" botd read {} at startup and still holds the old value: restart botd for it to take the new one.", restart.join(", "));
+        }
+        out
+    }
+
+    /// For `secret.cache_refreshed`: counts, and the names whose answer moved or failed,
+    /// never values or digests of them.
+    pub fn audit_details(&self) -> serde_json::Value {
+        let moved: Vec<&Refreshed> = self.entries.iter().filter(|e| !matches!(e.result, Change::Unchanged | Change::NotFound | Change::Found) || e.restart).collect();
+        let listed: Vec<serde_json::Value> = moved
+            .iter()
+            .take(MAX_AUDITED)
+            .map(|e| {
+                let mut d = json!({ "name": e.name, "scope": e.scope, "result": e.result, "restart": e.restart });
+                if let Some(id) = &e.user_id {
+                    d["userId"] = json!(id);
+                }
+                d
+            })
+            .collect();
+        json!({
+            "store": self.store,
+            "names": self.names,
+            "counts": self.counts(),
+            "entries": listed,
+            "entriesOmitted": moved.len().saturating_sub(MAX_AUDITED),
+            "restart": self.restart(),
+            "folders": { "listed": self.folders.iter().filter(|f| f.ok).count(), "unavailable": self.folders.iter().filter(|f| !f.ok).count() },
+        })
+    }
 }
 
 impl SecretStore for ExternalStore {
@@ -366,6 +677,24 @@ impl SecretStore for ExternalStore {
             out.extend(self.names_in(&scope)?);
         }
         Ok(out)
+    }
+}
+
+/// The `ExternalStore` as botd's startup settings read it: each answer is kept, so a
+/// refresh can say which of them a rotation left behind (ADR 0291).
+pub struct Startup(pub Arc<ExternalStore>);
+
+impl SecretStore for Startup {
+    fn kind(&self) -> &'static str {
+        self.0.kind()
+    }
+    fn get(&self, name: &str) -> Result<Option<Secret>, Error> {
+        let v = self.0.get(name)?;
+        self.0.note_startup(name, v.as_ref());
+        Ok(v)
+    }
+    fn names(&self) -> Result<Vec<String>, Error> {
+        self.0.names()
     }
 }
 
@@ -526,6 +855,20 @@ static ACTIVE: std::sync::OnceLock<Arc<ExternalStore>> = std::sync::OnceLock::ne
 
 pub(crate) fn set_active(x: &Arc<ExternalStore>) {
     let _ = ACTIVE.set(Arc::clone(x));
+}
+
+/// What `active` answers in tests that need a store: `ACTIVE` is set once per process,
+/// and other tests expect it unset.
+#[cfg(test)]
+pub(crate) static TEST_ACTIVE: Mutex<Option<Arc<ExternalStore>>> = Mutex::new(None);
+
+/// The external store botd runs with, if any.
+pub fn active() -> Option<Arc<ExternalStore>> {
+    #[cfg(test)]
+    if let Some(x) = TEST_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Some(x);
+    }
+    ACTIVE.get().cloned()
 }
 
 /// The secrets backend and whether it answers, for the setup report and `botctl secrets
@@ -957,6 +1300,169 @@ pub(crate) mod tests {
         assert_eq!(d["ok"], false);
         assert!(d["detail"].as_str().unwrap().contains("fake is down"), "{d}");
         assert!(!d.to_string().contains("diag-value-1"));
+    }
+
+    fn entry<'a>(r: &'a Refresh, scope: &str, name: &str) -> &'a Refreshed {
+        r.entries.iter().find(|e| e.scope == scope && e.name == name).unwrap_or_else(|| panic!("{scope}/{name} in {r:?}"))
+    }
+
+    #[test]
+    fn a_refresh_reads_every_cached_answer_again_and_says_what_moved() {
+        let (f, x) = fake(
+            &[(Scope::Bots, "RF_ROTATED_TOKEN", "rf-old-value-1"), (Scope::Bots, "RF_SAME_TOKEN", "rf-same-value-1"), (Scope::Bots, "RF_GONE_TOKEN", "rf-gone-value-1"), (Scope::Server, "SSO_RF_CLIENT_SECRET", "rf-sso-value-1")],
+            Duration::from_secs(3600),
+        );
+        let x = Arc::new(users_on(x));
+        f.values.lock().unwrap().insert((user("urf"), "RF_USER_TOKEN".into()), "rf-user-old-1".into());
+        for n in ["RF_ROTATED_TOKEN", "RF_SAME_TOKEN", "RF_GONE_TOKEN", "RF_LATER_TOKEN", "SSO_RF_CLIENT_SECRET"] {
+            x.get(n).unwrap();
+        }
+        x.names().unwrap();
+        x.user_get("urf", "RF_USER_TOKEN").unwrap();
+        x.user_names("urf").unwrap();
+
+        {
+            let mut v = f.values.lock().unwrap();
+            v.insert((Scope::Bots, "RF_ROTATED_TOKEN".into()), "rf-new-value-1".into());
+            v.remove(&(Scope::Bots, "RF_GONE_TOKEN".into()));
+            v.insert((Scope::Bots, "RF_LATER_TOKEN".into()), "rf-later-value-1".into());
+            v.insert((user("urf"), "RF_USER_TOKEN".into()), "rf-user-new-1".into());
+        }
+        assert_eq!(x.get("RF_ROTATED_TOKEN").unwrap().unwrap().expose(), "rf-old-value-1", "cached until a refresh");
+        let reads = f.reads.load(Ordering::SeqCst);
+        let r = x.refresh(None).unwrap();
+        assert_eq!(f.reads.load(Ordering::SeqCst) - reads, 6, "each cached answer once: {r:?}");
+        assert_eq!(entry(&r, "bots", "RF_ROTATED_TOKEN").result, Change::Changed);
+        assert_eq!(entry(&r, "bots", "RF_SAME_TOKEN").result, Change::Unchanged);
+        assert_eq!(entry(&r, "bots", "RF_GONE_TOKEN").result, Change::Removed);
+        assert_eq!(entry(&r, "bots", "RF_LATER_TOKEN").result, Change::Added);
+        assert_eq!(entry(&r, "server", "SSO_RF_CLIENT_SECRET").result, Change::Unchanged);
+        let u = entry(&r, "users", "RF_USER_TOKEN");
+        assert_eq!((u.result, u.user_id.as_deref(), u.startup, u.restart), (Change::Changed, Some("urf"), false, false));
+        assert!(r.ok() && r.restart().is_empty());
+        let bots = r.folders.iter().find(|f| f.folder == "bots").unwrap();
+        assert_eq!((bots.ok, bots.names, bots.added.clone(), bots.removed.clone()), (true, Some(3), vec!["RF_LATER_TOKEN".to_string()], vec!["RF_GONE_TOKEN".to_string()]));
+        assert!(r.folders.iter().any(|f| f.folder == "users/urf" && f.ok), "cached users' folders are listed again too");
+
+        let reads = f.reads.load(Ordering::SeqCst);
+        assert_eq!(x.get("RF_ROTATED_TOKEN").unwrap().unwrap().expose(), "rf-new-value-1", "the new value, from the cache");
+        assert!(x.get("RF_GONE_TOKEN").unwrap().is_none());
+        assert_eq!(x.user_get("urf", "RF_USER_TOKEN").unwrap().unwrap().expose(), "rf-user-new-1");
+        assert_eq!(f.reads.load(Ordering::SeqCst), reads, "no read past the refresh's");
+        assert!(x.names().unwrap().contains(&"RF_LATER_TOKEN".to_string()), "a new name reaches Bots at once");
+        assert_eq!(redact::text("rf-new-value-1"), redact::MARK, "the new value is redacted");
+        assert_eq!(redact::text("rf-old-value-1"), redact::MARK, "and the old one still is, wherever it turns up");
+
+        let v = r.view();
+        assert_eq!((v["ok"].as_bool(), v["counts"]["changed"].as_u64(), v["counts"]["removed"].as_u64(), v["counts"]["added"].as_u64()), (Some(true), Some(2), Some(1), Some(1)));
+        assert!(v["detail"].as_str().unwrap().starts_with("fake read again: 6 names, 4 changed."), "{v}");
+        let a = r.audit_details();
+        assert_eq!(a["entries"].as_array().unwrap().len(), 4, "only what moved: {a}");
+        assert_eq!(a["names"], serde_json::Value::Null);
+        let text = format!("{v}{a}");
+        for value in ["rf-old-value-1", "rf-new-value-1", "rf-same-value-1", "rf-user-new-1", "rf-later-value-1"] {
+            assert!(!text.contains(value), "{value} in {text}");
+        }
+        for v in ["rf-old-value-1", "rf-new-value-1", "rf-same-value-1", "rf-gone-value-1", "rf-later-value-1", "rf-sso-value-1"] {
+            redact::forget(v);
+        }
+        redact::forget_for("urf", "rf-user-old-1");
+        redact::forget_for("urf", "rf-user-new-1");
+    }
+
+    #[test]
+    fn a_refresh_of_named_secrets_reads_only_those() {
+        let (f, x) = fake(&[(Scope::Bots, "RN_ONE_TOKEN", "rn-one-1"), (Scope::Bots, "RN_TWO_TOKEN", "rn-two-1"), (Scope::Server, "LINODE_TOKEN", "rn-linode-1")], Duration::from_secs(3600));
+        x.get("RN_ONE_TOKEN").unwrap();
+        x.get("RN_TWO_TOKEN").unwrap();
+        f.values.lock().unwrap().insert((Scope::Bots, "RN_TWO_TOKEN".into()), "rn-two-2".into());
+        let reads = f.reads.load(Ordering::SeqCst);
+        let names = ["RN_ONE_TOKEN", "LINODE_TOKEN", "RN_NEVER_TOKEN", " RN_ONE_TOKEN "].map(String::from);
+        let r = x.refresh(Some(&names)).unwrap();
+        assert_eq!(f.reads.load(Ordering::SeqCst) - reads, 3, "each named once, nothing else: {r:?}");
+        assert_eq!(r.names.as_deref(), Some(&["LINODE_TOKEN".to_string(), "RN_NEVER_TOKEN".into(), "RN_ONE_TOKEN".into()][..]));
+        assert_eq!(entry(&r, "bots", "RN_ONE_TOKEN").result, Change::Unchanged);
+        assert_eq!(entry(&r, "server", "LINODE_TOKEN").result, Change::Found, "not cached: read in its own folder");
+        assert_eq!(entry(&r, "bots", "RN_NEVER_TOKEN").result, Change::NotFound);
+        assert!(r.entries.iter().all(|e| e.name != "RN_TWO_TOKEN"));
+        assert_eq!(x.get("RN_TWO_TOKEN").unwrap().unwrap().expose(), "rn-two-1", "not named: still the cached answer");
+        assert_eq!(r.audit_details()["names"], json!(["LINODE_TOKEN", "RN_NEVER_TOKEN", "RN_ONE_TOKEN"]));
+
+        for bad in [vec![], vec!["PATH".to_string()], vec!["lower_case".into()], vec!["AUTH_PASSWORD".into()], vec!["VAULT_TOKEN".into()], (0..=MAX_REFRESH_NAMES).map(|i| format!("RN_{i}_TOKEN")).collect()] {
+            assert!(matches!(x.refresh(Some(&bad)), Err(RefreshError::Invalid(_))), "{bad:?}");
+        }
+        let long = format!("{}x", "A".repeat(500));
+        let RefreshError::Invalid(m) = x.refresh(Some(&[long])).unwrap_err() else { panic!() };
+        assert!(m.len() < 300, "a long name isn't echoed whole: {m}");
+        let reads = f.reads.load(Ordering::SeqCst);
+        let _held = x.refreshing.lock().unwrap();
+        assert_eq!(x.refresh(None).unwrap_err(), RefreshError::Busy);
+        assert_eq!(f.reads.load(Ordering::SeqCst), reads, "a refresh that can't run asks nothing");
+        for v in ["rn-one-1", "rn-two-1", "rn-linode-1"] {
+            redact::forget(v);
+        }
+    }
+
+    #[test]
+    fn a_refresh_while_the_backend_is_down_fails_closed() {
+        let (f, x) = fake(&[(Scope::Bots, "RD_TOKEN", "rd-value-1")], Duration::from_secs(3600));
+        assert!(x.get("RD_TOKEN").unwrap().is_some());
+        x.names().unwrap();
+        f.down.store(true, Ordering::SeqCst);
+        assert!(x.get("RD_TOKEN").unwrap().is_some(), "within the cache time the answer stands");
+        let r = x.refresh(None).unwrap();
+        assert_eq!(entry(&r, "bots", "RD_TOKEN").result, Change::Unavailable);
+        assert!(!r.ok() && r.folders.iter().all(|f| !f.ok));
+        assert!(r.detail().contains("fail closed"), "{}", r.detail());
+        assert!(matches!(x.get("RD_TOKEN"), Err(Error::Unavailable(_))), "nothing cached any more: never the old value");
+        assert!(matches!(x.names(), Err(Error::Unavailable(_))));
+        let ev: Vec<_> = audited("RD_TOKEN").into_iter().filter(|e| e.outcome == Outcome::Failure).collect();
+        assert!(!ev.is_empty(), "the failed read is audited like any other");
+        f.down.store(false, Ordering::SeqCst);
+        let r = x.refresh(None).unwrap();
+        assert!(r.ok());
+        assert_eq!(x.get("RD_TOKEN").unwrap().unwrap().expose(), "rd-value-1");
+        redact::forget("rd-value-1");
+    }
+
+    #[test]
+    fn a_refresh_names_what_startup_settings_still_hold() {
+        let (f, x) = fake(&[(Scope::Server, "INCUS_CLIENT_KEY", "rs-incus-1"), (Scope::Server, "METRICS_TOKEN", "rs-metrics-1"), (Scope::Bots, "RS_BOT_TOKEN", "rs-bot-1")], Duration::ZERO);
+        let at_start = Startup(Arc::clone(&x));
+        assert_eq!(at_start.get("INCUS_CLIENT_KEY").unwrap().unwrap().expose(), "rs-incus-1");
+        at_start.get("METRICS_TOKEN").unwrap();
+        assert!(at_start.get("SMTP_PASSWORD").unwrap().is_none());
+        assert!(at_start.get("PATH").unwrap().is_none(), "never kept: no external store answers it");
+        x.get("RS_BOT_TOKEN").unwrap();
+        {
+            let mut v = f.values.lock().unwrap();
+            v.insert((Scope::Server, "INCUS_CLIENT_KEY".into()), "rs-incus-2".into());
+            v.insert((Scope::Server, "SMTP_PASSWORD".into()), "rs-smtp-1".into());
+            v.insert((Scope::Bots, "RS_BOT_TOKEN".into()), "rs-bot-2".into());
+        }
+        // A cache of 0 s keeps nothing, so only startup's own copy can tell what changed.
+        let r = x.refresh(None).unwrap();
+        let incus = entry(&r, "server", "INCUS_CLIENT_KEY");
+        assert_eq!((incus.result, incus.startup, incus.restart), (Change::Found, true, true));
+        let metrics = entry(&r, "server", "METRICS_TOKEN");
+        assert_eq!((metrics.startup, metrics.restart), (true, false));
+        let smtp = entry(&r, "server", "SMTP_PASSWORD");
+        assert_eq!((smtp.result, smtp.restart), (Change::Found, true), "a name startup found missing, now set, needs a restart too");
+        assert!(r.entries.iter().all(|e| e.name != "PATH"));
+        assert_eq!(r.restart(), ["INCUS_CLIENT_KEY", "SMTP_PASSWORD"]);
+        assert!(r.ok(), "a restart isn't a failed read");
+        assert!(r.detail().contains("INCUS_CLIENT_KEY, SMTP_PASSWORD at startup") && r.detail().contains("restart botd"), "{}", r.detail());
+        let a = r.audit_details();
+        assert_eq!(a["restart"], json!(["INCUS_CLIENT_KEY", "SMTP_PASSWORD"]));
+        assert!(a["entries"].as_array().unwrap().iter().any(|e| e["name"] == "INCUS_CLIENT_KEY" && e["restart"] == true), "{a}");
+        assert!(!format!("{a}{}", r.view()).contains("rs-"), "no values");
+
+        let r = x.refresh(Some(&["RS_BOT_TOKEN".to_string()])).unwrap();
+        assert!(r.restart().is_empty(), "only what was asked for");
+        assert_eq!(r.entries.len(), 1);
+        for v in ["rs-incus-1", "rs-incus-2", "rs-metrics-1", "rs-smtp-1", "rs-bot-1", "rs-bot-2"] {
+            redact::forget(v);
+        }
     }
 
     #[test]
