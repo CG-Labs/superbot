@@ -1731,6 +1731,6 @@ mod tests {
         }
         let run = [("SECRETS_BACKEND", "azure-keyvault"), ("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c"), path, ("AZURE_RUN_CREDENTIALS", APP)];
         let e = external::from_env(&settings(&run), &EnvStore::fixed(&run)).err().unwrap_or_default();
-        assert!(e.contains("doesn't take a client secret or certificate"), "{e}");
+        assert!(e.contains("doesn't take a client secret or certificate"), "AZURE_RUN_CREDENTIALS refuses a certificate sign-in");
     }
 }
