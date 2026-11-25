@@ -52,7 +52,7 @@ pub enum Kind {
     /// the IdP metadata's signature is checked against its certificates (ADR 0151). With
     /// `attributes.groups`, only people in one of `required_groups` (if any) sign in, and
     /// group-to-role mappings apply (ADR 0160). `idp_initiated` says what an unsolicited
-    /// response does (ADR 0175). With `authn_context`, only people the IdP says signed in one
+    /// response does (ADR 0175), at whichever listed IdP signed it (ADR 0290). With `authn_context`, only people the IdP says signed in one
     /// of those ways get in, read from the assertion and `attributes.authn_methods` (ADR 0190).
     /// `freshness` says how recently they must have signed in at the IdP, and whether its
     /// session limit ends ours (ADR 0225). Responses come over `response_binding` only: posted,

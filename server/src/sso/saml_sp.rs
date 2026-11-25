@@ -1350,6 +1350,24 @@ fn decrypted_name_id(encrypted: Node, keys: &[&SpKey]) -> Result<(NameId, usize)
     }
 }
 
+/// The `Issuer` a posted `SAMLResponse` names, before anything about it is checked: which of
+/// a provider's several IdPs to check an unsolicited one against (ADR 0290). The response's
+/// own, else its one plain assertion's. `check_response` then checks it as a response from
+/// that IdP, so nothing read here is trusted.
+pub fn claimed_issuer(posted: &str) -> Option<String> {
+    if posted.len() > MAX_RESPONSE {
+        return None;
+    }
+    let xml = String::from_utf8(xmldsig::base64(posted)?).ok()?;
+    let doc = xmldsig::parse(&xml).ok()?;
+    let response = doc.root_element();
+    if !is(response, PROTOCOL, "Response") {
+        return None;
+    }
+    let named = |n: Node| only(n, ASSERTION, "Issuer").and_then(text_of).map(|i| i.trim().to_string());
+    named(response).or_else(|| only(response, ASSERTION, "Assertion").and_then(named))
+}
+
 /// Checks the base64 `SAMLResponse` an IdP posted, as the module docs list.
 pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
     let bad = || Refused("bad_response", None);
@@ -2498,6 +2516,32 @@ pub(crate) mod tests {
         assert_eq!(check(&comment).unwrap_err().0, "bad_response");
         let dtd = format!(r#"<!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>{signed}"#);
         assert_eq!(check(&dtd).unwrap_err().0, "bad_response");
+    }
+
+    #[test]
+    fn a_responses_claimed_issuer_is_its_own_else_its_plain_assertions() {
+        let posted = |xml: &str| STANDARD.encode(xml);
+        let mut r = base();
+        r.issuer = "https://login.uni-b.example/saml".into();
+        assert_eq!(claimed_issuer(&r.posted()).as_deref(), Some("https://login.uni-b.example/saml"));
+        // Read without any check: a forged one is still what it says, for the caller to check.
+        r.sign_assertion = false;
+        assert_eq!(claimed_issuer(&r.posted()).as_deref(), Some("https://login.uni-b.example/saml"));
+        let xml = base().xml();
+        let own = format!("<saml:Issuer>{IDP}</saml:Issuer><samlp:Status>");
+        let only_the_assertions = xml.replacen(&own, "<samlp:Status>", 1);
+        assert_eq!(claimed_issuer(&posted(&only_the_assertions)).as_deref(), Some(IDP), "the Response's Issuer is optional");
+        let padded = xml.replacen(&own, "<saml:Issuer>\n  https://login.uni-b.example/saml </saml:Issuer><samlp:Status>", 1);
+        assert_eq!(claimed_issuer(&posted(&padded)).as_deref(), Some("https://login.uni-b.example/saml"), "the Response's first");
+        let hidden = encrypted().xml().replacen(&own, "<samlp:Status>", 1);
+        assert_eq!(claimed_issuer(&posted(&hidden)), None, "nothing to read in an encrypted assertion");
+        assert_eq!(claimed_issuer(&encrypted().posted()).as_deref(), Some(IDP), "but the Response's own is");
+        let twice = xml.replacen(&own, &format!("<saml:Issuer>x</saml:Issuer>{own}"), 1);
+        assert_eq!(claimed_issuer(&posted(&twice)).as_deref(), Some(IDP), "two Issuers on the response: the assertion's");
+        let request = format!(r#"<samlp:LogoutRequest xmlns:samlp="{PROTOCOL}" xmlns:saml="{ASSERTION}"><saml:Issuer>{IDP}</saml:Issuer></samlp:LogoutRequest>"#);
+        for bad in [posted(&request), "not base64 <xml>".into(), posted("<r"), "A".repeat(MAX_RESPONSE + 4)] {
+            assert_eq!(claimed_issuer(&bad), None, "{bad:.40}");
+        }
     }
 
     #[test]
