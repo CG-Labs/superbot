@@ -172,6 +172,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0262-business-review-draft.md"));
     files.push(repo().join("docs/adr/0271-health-check-in-the-support-bundle.md"));
     files.push(repo().join("docs/adr/0278-tam-handover-draft.md"));
+    files.push(repo().join("docs/adr/0286-update-targets-from-a-replies-export.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -321,6 +322,25 @@ fn the_support_report_page_documents_every_option_and_field() {
     }
     for page in ["severity.md", "qbr-template.md", "health-check.md"] {
         assert!(read(page).contains("(support-report.md"), "{page} doesn't point at the support report");
+    }
+}
+
+#[test]
+fn the_support_report_page_documents_update_targets() {
+    let code = fs::read_to_string(repo().join("server/src/support_updates.rs")).unwrap();
+    let page = read("support-report.md");
+    let section = page.split("\n## Update targets\n").nth(1).expect("support-report.md has an Update targets section").split("\n## ").next().unwrap();
+    let fields = code.split("fn name(self) -> &'static str {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let fields: Vec<&str> = fields.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(fields.len(), 5, "{fields:?}");
+    for f in fields {
+        assert!(section.contains(&format!("| `{f}` |")), "the update targets section has no row for the {f} field");
+    }
+    for needle in ["Severity 1", "Severity 2", "Severity 3", "Severity 4", "first answer", "overdue", "--update-target 2=4h", "ADR 0286"] {
+        assert!(page.contains(needle), "support-report.md's update targets don't mention {needle}");
+    }
+    for page in ["severity.md", "qbr-template.md", "escalation.md", "README.md"] {
+        assert!(read(page).contains("(support-report.md#update-targets)"), "{page} doesn't point at the update targets");
     }
 }
 

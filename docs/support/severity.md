@@ -35,7 +35,7 @@ The time from a ticket arriving to a person (not an auto-reply) answering with a
 | 3 | Every business day while there's news, at least every 3 business days | The ticket |
 | 4 | When there's news | The ticket |
 
-Each update says what's known, what's being done, and when the next update comes. A ticket closes when the customer confirms the fix, or 5 business days after a proposed fix with no reply.
+Each update says what's known, what's being done, and when the next update comes. Late updates on tickets are counted in the [support report](support-report.md#update-targets) from the ticket system's export of replies (`botctl support-report --updates`); the status page's are in each [incident review](incident-review.md#the-review-draft). A ticket closes when the customer confirms the fix, or 5 business days after a proposed fix with no reply.
 
 ## Targets, not resolution times
 
