@@ -283,6 +283,20 @@ impl Secrets {
         self.users.as_ref().ok_or(Error::ReadOnly)
     }
 
+    /// Keeps pinned people's own secrets in their region's chat store (ADR 0293): attaches
+    /// the stores botd's database has attached (`key`: its database key) to the users'
+    /// secrets' connection, and teaches the redactor what the stores hold, which startup
+    /// read before they were attached. How many values that was.
+    pub fn attach_chat_stores(&self, stores: &[crate::db::ChatStore], key: Option<&str>) -> Result<usize, String> {
+        let Some(users) = self.users.as_ref().filter(|_| !stores.is_empty()) else { return Ok(0) };
+        users.attach_stores(stores, key)?;
+        let values = users.all_values();
+        for (user, v) in &values {
+            redact::register_for(user, v.expose());
+        }
+        Ok(values.len())
+    }
+
     fn server_names_for_bots(&self) -> Vec<String> {
         self.list().unwrap_or_default().into_iter().filter(|l| l.for_bots).map(|l| l.name).collect()
     }

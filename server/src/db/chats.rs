@@ -1,12 +1,14 @@
-//! Pinned people's chats, routines, approvals, Bots' memory, owners' facts and sign-in
-//! sessions in a database in their region (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR
-//! 0283), the first part of splitting botd's database by region. Each region in
-//! REGION_DATA_DIRS has a SQLite file of its own (`chats.sqlite`, keyed like botd's
-//! database), attached to botd's connection. A Bot's messages, routines, approvals and
-//! memory are kept in the store of its owner's residency pin (their team's, else their own,
-//! as `residency::of_user`), and a person's facts and sessions (with each session's SAML
-//! sign-in and push device) in the store of their own pin by the same rule, or in botd's own
-//! database when that region has no store or the person isn't pinned. botd's own copy of a
+//! Pinned people's chats, routines, approvals, Bots' memory, owners' facts, sign-in
+//! sessions and own secrets in a database in their region (ADR 0215, ADR 0228, ADR 0276,
+//! ADR 0277, ADR 0283, ADR 0293), the first part of splitting botd's database by region.
+//! Each region in REGION_DATA_DIRS has a SQLite file of its own (`chats.sqlite`, keyed like
+//! botd's database), attached to botd's connection. A Bot's messages, routines, approvals
+//! and memory are kept in the store of its owner's residency pin (their team's, else their
+//! own, as `residency::of_user`), and a person's facts, sessions (with each session's SAML
+//! sign-in and push device) and own secrets in the store of their own pin by the same rule,
+//! or in botd's own database when that region has no store or the person isn't pinned.
+//! Their secrets are read and written on the users' secrets' own connection, which attaches
+//! the stores too (`attach_to`, `secrets::sealed::UserSecrets`). botd's own copy of a
 //! Bot's memory is a file in DATA_DIR (`DATA_DIR/bots/<id>/MEMORY.md`), and of a person's
 //! facts too (`DATA_DIR/users/<id>/USER.md`); its `memories` and `facts` tables only hold
 //! one on its way between that file and a store (`machines::chat_stores::place`).
@@ -57,7 +59,7 @@ impl Key {
 struct Kept {
     name: &'static str,
     key: Key,
-    /// Its primary key, unique across places.
+    /// Its primary key, unique across places: a column, or several (`"a, b"`).
     pk: &'static str,
     /// The indexes a store's copy gets, as `(name, columns)`.
     indexes: &'static [(&'static str, &'static str)],
@@ -72,7 +74,7 @@ struct Kept {
 
 /// A parent comes before the tables that point at it, so a move into botd's own database
 /// copies it first, and deletes run in reverse.
-const KEPT: [Kept; 8] = [
+const KEPT: [Kept; 9] = [
     Kept { name: "messages", key: Key::Bot, pk: "id", indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], unique: &[], parent: None, rowid: false },
     Kept { name: "routines", key: Key::Bot, pk: "id", indexes: &[("routines_bot", "bot_id")], unique: &[], parent: None, rowid: false },
     Kept { name: "approvals", key: Key::Bot, pk: "id", indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], unique: &[], parent: None, rowid: true },
@@ -97,18 +99,33 @@ const KEPT: [Kept; 8] = [
         parent: Some(("session_id", "sessions")),
         rowid: false,
     },
+    Kept { name: "user_secrets", key: Key::User, pk: "user_id, name", indexes: &[], unique: &[], parent: None, rowid: false },
 ];
 const N: usize = KEPT.len();
 const MESSAGES: usize = 0;
 const APPROVALS: usize = 2;
 const PUSH_DEVICES: usize = 7;
+const USER_SECRETS: usize = 8;
 
 /// The tables of a person's sign-ins (ADR 0283): their sessions, and each one's SAML
 /// sign-in and push device.
 const SIGN_INS: [&str; 3] = ["sessions", "saml_sessions", "push_devices"];
 
+/// The table of each person's own secrets (ADR 0029, ADR 0293).
+pub const SECRETS: &str = "user_secrets";
+
 fn kept(table: &str) -> Option<&'static Kept> {
     KEPT.iter().find(|k| k.name == table)
+}
+
+/// The columns of a primary key `pk` (`"a, b"`).
+fn pk_cols(pk: &str) -> impl Iterator<Item = &str> {
+    pk.split(',').map(str::trim)
+}
+
+/// `pk` of the row in `a` equals `pk` of the row in `b`: `a.x = b.x AND ...`.
+fn same_key(pk: &str, a: &str, b: &str) -> String {
+    pk_cols(pk).map(|c| format!("{a}.{c} = {b}.{c}")).collect::<Vec<_>>().join(" AND ")
 }
 
 /// botd's table for Bots' memory on its way between a store and the Bot's file in DATA_DIR
@@ -234,15 +251,29 @@ pub struct Held {
     pub sessions: i64,
     pub saml_sessions: i64,
     pub push_devices: i64,
+    /// Secrets a person saved for their own Bots (ADR 0029, ADR 0293). Named so in JSON
+    /// because the audit log hides the values of keys naming secrets.
+    #[serde(rename = "personalKeys")]
+    pub user_secrets: i64,
 }
 
 impl Held {
     fn of(n: [i64; N]) -> Held {
-        Held { messages: n[0], routines: n[1], approvals: n[2], memories: n[3], facts: n[4], sessions: n[5], saml_sessions: n[6], push_devices: n[7] }
+        Held {
+            messages: n[0],
+            routines: n[1],
+            approvals: n[2],
+            memories: n[3],
+            facts: n[4],
+            sessions: n[5],
+            saml_sessions: n[6],
+            push_devices: n[7],
+            user_secrets: n[USER_SECRETS],
+        }
     }
 
     fn each(&self) -> [i64; N] {
-        [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices]
+        [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices, self.user_secrets]
     }
 
     pub fn total(&self) -> i64 {
@@ -254,7 +285,7 @@ impl Held {
         *self = Held::of(std::array::from_fn(|i| a[i] + b[i]));
     }
 
-    /// What of it is kept by Bot: all but people's facts and sign-ins.
+    /// What of it is kept by Bot: all but people's facts, sign-ins and own secrets.
     pub fn of_bots(&self) -> Held {
         Held { messages: self.messages, routines: self.routines, approvals: self.approvals, memories: self.memories, ..Held::default() }
     }
@@ -277,6 +308,7 @@ impl Held {
             (self.sessions, "sign-in session", "sign-in sessions"),
             (self.saml_sessions, "SAML sign-in", "SAML sign-ins"),
             (self.push_devices, "push device", "push devices"),
+            (self.user_secrets, "personal secret", "personal secrets"),
         ]
         .into_iter()
         .filter(|(n, _, _)| *n > 0)
@@ -307,12 +339,14 @@ pub struct ChatMove {
     pub sessions: usize,
     pub saml_sessions: usize,
     pub push_devices: usize,
+    /// Secrets people saved for their own Bots (ADR 0293).
+    pub user_secrets: usize,
 }
 
 impl ChatMove {
     /// What moved, as counts.
     pub fn held(&self) -> Held {
-        let n = [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices];
+        let n = [self.messages, self.routines, self.approvals, self.memories, self.facts, self.sessions, self.saml_sessions, self.push_devices, self.user_secrets];
         Held::of(n.map(|n| n as i64))
     }
 }
@@ -350,6 +384,7 @@ fn columns(c: &Connection, schema: &str, table: &str) -> rusqlite::Result<Vec<Co
 /// foreign key to `bots` or `users`, which are in another file: deleting a Bot deletes its
 /// rows here, and each pass deletes those of people gone and of sessions gone.
 fn ensure_table(c: &Connection, schema: &str, k: &Kept, main: &[Col]) -> rusqlite::Result<()> {
+    let composite = k.pk.contains(',');
     let def = |col: &Col, adding: bool| {
         if col.name == k.pk {
             return format!("{} {} PRIMARY KEY", quote(&col.name), col.ty);
@@ -359,7 +394,10 @@ fn ensure_table(c: &Connection, schema: &str, k: &Kept, main: &[Col]) -> rusqlit
         let notnull = if col.notnull && (!adding || col.default.is_some()) { " NOT NULL" } else { "" };
         format!("{} {}{notnull}{default}", quote(&col.name), col.ty)
     };
-    let defs: Vec<String> = main.iter().map(|col| def(col, false)).collect();
+    let mut defs: Vec<String> = main.iter().map(|col| def(col, false)).collect();
+    if composite {
+        defs.push(format!("PRIMARY KEY ({})", k.pk));
+    }
     c.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {schema}.{} ({})", k.name, defs.join(", ")))?;
     let have: Vec<String> = columns(c, schema, k.name)?.into_iter().map(|c| c.name).collect();
     for col in main.iter().filter(|col| !have.contains(&col.name)) {
@@ -417,6 +455,68 @@ fn pinned_region_of(user: &str) -> String {
              WHERE tm.user_id = {user}),
            (SELECT p.region FROM main.residency_pins p WHERE p.subject_type = 'user' AND p.subject_id = {user}))"
     )
+}
+
+/// Makes the TEMP view of kept table `k` that puts each place's rows together (`cols`, quoted,
+/// as botd's own table has them). A move stopped between its copy and its delete leaves a row
+/// in two places until the next pass; each key is read from the first place that has it, so
+/// the scheduler doesn't run a routine twice (updates by id keep both alike).
+fn create_view(c: &Connection, stores: &[ChatStore], k: &Kept, cols: &str) -> rusqlite::Result<()> {
+    let rowid = if k.rowid { ", rowid AS rowid" } else { "" };
+    let places: Vec<&str> = schemas(stores).collect();
+    let t = k.name;
+    let parts: Vec<String> = places
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let earlier: Vec<String> = places[..i].iter().map(|e| format!(" AND NOT EXISTS (SELECT 1 FROM {e}.{t} AS y WHERE {})", same_key(k.pk, "y", "x"))).collect();
+            format!("SELECT {cols}{rowid} FROM {s}.{t} AS x WHERE true{}", earlier.concat())
+        })
+        .collect();
+    c.execute_batch(&format!("CREATE TEMP VIEW {t} AS {}", parts.join(" UNION ALL ")))
+}
+
+/// The schema of `stores` a new row kept by `key` `id` (a Bot's, or a person's) goes to:
+/// its pin region's store, else `main`.
+fn place_in<'a>(c: &Connection, stores: &'a [ChatStore], key: Key, id: &str) -> rusqlite::Result<&'a str> {
+    if stores.is_empty() {
+        return Ok("main");
+    }
+    let region = match key {
+        Key::Bot => pinned_region("?1"),
+        Key::User => pinned_region_of("?1"),
+    };
+    let region: Option<String> = c.query_row(&format!("SELECT {region}"), [id], |r| r.get(0))?;
+    Ok(region.and_then(|r| stores.iter().find(|s| s.region == r)).map_or("main", |s| s.schema.as_str()))
+}
+
+/// Attaches `stores` (as `Db::chat_stores` has them) to `c`, another connection to botd's
+/// database, keyed with `key` as botd's connection attached them, and makes its view of kept
+/// `table` across them, so `c` reads and writes that table as botd's connection does: the
+/// users' secrets' own (ADR 0293).
+pub fn attach_to(c: &Connection, stores: &[ChatStore], key: Option<&str>, table: &str) -> Result<(), String> {
+    let Some(k) = kept(table) else { return Err(format!("{table} isn't kept in chat stores")) };
+    if stores.is_empty() {
+        return Ok(());
+    }
+    for s in stores {
+        let path = s.path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", s.path.display()))?;
+        c.execute(&format!("ATTACH DATABASE ?1 AS {} KEY ?2", s.schema), params![path, key.unwrap_or("")]).map_err(|err| not_a_store(&s.path, &err))?;
+    }
+    let e = |err: rusqlite::Error| format!("chat stores: {err}");
+    let cols = columns(c, "main", table).map_err(e)?.iter().map(|col| quote(&col.name)).collect::<Vec<_>>().join(", ");
+    create_view(c, stores, k, &cols).map_err(e)
+}
+
+/// The schemas of `stores` attached to a connection (`attach_to`), botd's own first.
+pub fn places(stores: &[ChatStore]) -> Vec<&str> {
+    schemas(stores).collect()
+}
+
+/// The schema of `stores` a new row of `user_id`'s goes to: their pin region's store, else
+/// `main` (ADR 0293).
+pub fn user_place<'a>(c: &Connection, stores: &'a [ChatStore], user_id: &str) -> rusqlite::Result<&'a str> {
+    place_in(c, stores, Key::User, user_id)
 }
 
 /// Deletes the rows of kept tables in `schema` whose parent row isn't there (ADR 0283).
@@ -491,6 +591,8 @@ impl Db {
         let c = self.c();
         let e = |err: rusqlite::Error| format!("chat stores: {err}");
         c.execute_batch(RECORDS).map_err(e)?;
+        // The secrets' own connection makes their tables; a store copies their columns.
+        c.execute_batch(crate::secrets::sealed::SCHEMA).map_err(e)?;
         if !columns(&c, "main", "chat_moves_out").map_err(e)?.iter().any(|col| col.name == "cleared_at") {
             c.execute_batch("ALTER TABLE main.chat_moves_out ADD COLUMN cleared_at INTEGER").map_err(e)?;
         }
@@ -601,21 +703,7 @@ impl Db {
         }
         if !stores.is_empty() {
             for (k, cols) in KEPT.iter().zip(&cols) {
-                // A move stopped between its copy and its delete leaves a row in two places
-                // until the next pass; each id is read from the first place that has it, so
-                // the scheduler doesn't run a routine twice (updates by id keep both alike).
-                let rowid = if k.rowid { ", rowid AS rowid" } else { "" };
-                let places: Vec<&str> = schemas(&stores).collect();
-                let parts: Vec<String> = places
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        let (t, pk) = (k.name, k.pk);
-                        let earlier: Vec<String> = places[..i].iter().map(|e| format!(" AND NOT EXISTS (SELECT 1 FROM {e}.{t} WHERE {pk} = x.{pk})")).collect();
-                        format!("SELECT {cols}{rowid} FROM {s}.{t} AS x WHERE true{}", earlier.concat())
-                    })
-                    .collect();
-                c.execute_batch(&format!("CREATE TEMP VIEW {} AS {}", k.name, parts.join(" UNION ALL "))).map_err(e)?;
+                create_view(&c, &stores, k, cols).map_err(e)?;
             }
         }
         let _ = self.5.set(ChatStores { stores, cols, unflushed: Default::default() });
@@ -629,16 +717,7 @@ impl Db {
 
     /// The schema a new row kept by `key` `id` (a Bot's, or a person's) goes to.
     fn place_by(&self, c: &Connection, key: Key, id: &str) -> rusqlite::Result<&str> {
-        let stores = self.chat_stores_set();
-        if stores.is_empty() {
-            return Ok("main");
-        }
-        let region = match key {
-            Key::Bot => pinned_region("?1"),
-            Key::User => pinned_region_of("?1"),
-        };
-        let region: Option<String> = c.query_row(&format!("SELECT {region}"), [id], |r| r.get(0))?;
-        Ok(region.and_then(|r| stores.iter().find(|s| s.region == r)).map_or("main", |s| s.schema.as_str()))
+        place_in(c, self.chat_stores_set(), key, id)
     }
 
     /// Inserts a message into the place `bot_id`'s chat belongs: `cols` and `vals` without
@@ -792,7 +871,7 @@ impl Db {
             let mut moves = Vec::new();
             let at = now();
             for &(from, to) in &pairs {
-                let copied = |k: &Kept| format!("{} AND {pk} IN (SELECT {pk} FROM {to}.{t})", here(k, to), t = k.name, pk = k.pk);
+                let copied = |k: &Kept| format!("{} AND ({pk}) IN (SELECT {pk} FROM {to}.{t})", here(k, to), t = k.name, pk = k.pk);
                 // Whose rows move, by key: the Bots' (`chat_moves_out`) and the people's (`facts_moves_out`).
                 let theirs = |key: Key| {
                     let col = key.column();
@@ -835,6 +914,7 @@ impl Db {
                     sessions: n[5],
                     saml_sessions: n[6],
                     push_devices: n[PUSH_DEVICES],
+                    user_secrets: n[USER_SECRETS],
                 });
             }
             for s in &set.stores {
@@ -1112,6 +1192,13 @@ impl Db {
         self.seal_in_stores("push_devices", |c, table| sealed::push_tokens_in(c, table, current, previous, forget))
     }
 
+    /// Brings people's own secrets in the stores (ADR 0293) under the master key, as
+    /// `seal_store_approvals` does approvals' inputs; with `forget`, a secret neither key
+    /// opens is deleted, so its owner saves it again.
+    pub fn seal_store_user_secrets(&self, current: &Cipher, previous: Option<&Cipher>, forget: bool) -> Result<StoreApprovals, String> {
+        self.seal_in_stores(SECRETS, |c, table| sealed::user_secrets_in(c, table, current, previous, forget))
+    }
+
     fn seal_in_stores(&self, table: &str, seal: impl Fn(&Connection, &str) -> Result<StoreApprovals, String>) -> Result<StoreApprovals, String> {
         let c = self.c();
         let mut done = StoreApprovals::default();
@@ -1224,23 +1311,31 @@ fn delete_in_copy(c: &Connection, op: &str, whose: &Whose) -> rusqlite::Result<H
     Ok(Held::of(n))
 }
 
-/// Puts the sign-ins (ADR 0283) of the people in `keep` from the store attached as `now`
-/// (None: it is missing or unreadable) into a copy of it opened on `c`, a backup about to be
-/// restored, in place of the copy's own: a session revoked after the backup was made would
-/// otherwise work again, and one made since would end. The caller has `secure_delete` on
-/// and VACUUMs. What of the copy's own was dropped, and what was taken from `now`.
+/// Puts the sign-ins (ADR 0283) and own secrets (ADR 0293) of the people in `keep` from the
+/// store attached as `now` (None: it is missing or unreadable) into a copy of it opened on
+/// `c`, a backup about to be restored, in place of the copy's own: a session revoked after
+/// the backup was made would otherwise work again, and one made since would end; a secret
+/// deleted since would come back, and one replaced since would turn back to its old value.
+/// Without `now`, the copy's sessions are dropped (their people sign in again) and its
+/// secrets kept, the only copy of them left. The caller has `secure_delete` on and VACUUMs.
+/// What of the copy's own was dropped, and what was taken from `now`.
 pub fn sign_ins_from(c: &Connection, now: Option<&str>, keep: &Whose) -> rusqlite::Result<(Held, Held)> {
     let users = keep.lists().1;
     let tx = c.unchecked_transaction()?;
     let (mut dropped, mut taken) = ([0; N], [0; N]);
-    for (i, k) in KEPT.iter().enumerate().filter(|(_, k)| SIGN_INS.contains(&k.name)) {
+    for (i, k) in KEPT.iter().enumerate().filter(|(_, k)| SIGN_INS.contains(&k.name) || k.name == SECRETS) {
         let t = k.name;
         if !has_table(&tx, "main", t)? {
             continue;
         }
+        // A store from before ADR 0293 has no secrets to put in place of the copy's.
+        let replaced = now.map(|now| has_table(&tx, now, t)).transpose()?.unwrap_or(false);
+        if t == SECRETS && !replaced {
+            continue;
+        }
         dropped[i] = tx.execute(&format!("DELETE FROM main.{t}"), [])? as i64;
         let Some(now) = now else { continue };
-        if !has_table(&tx, now, t)? {
+        if !replaced {
             continue;
         }
         let theirs: Vec<String> = columns(&tx, now, t)?.into_iter().map(|col| col.name).collect();
@@ -1285,7 +1380,7 @@ pub fn compare_copy(c: &Connection, schema: &str) -> rusqlite::Result<(Held, Hel
     for (i, k) in KEPT.iter().enumerate() {
         let (t, pk) = (k.name, k.pk);
         let count = |from: &str, other: Option<&str>| {
-            let not_in = other.map(|o| format!(" WHERE {pk} NOT IN (SELECT {pk} FROM {o}.{t})")).unwrap_or_default();
+            let not_in = other.map(|o| format!(" WHERE ({pk}) NOT IN (SELECT {pk} FROM {o}.{t})")).unwrap_or_default();
             c.query_row(&format!("SELECT COUNT(*) FROM {from}.{t}{not_in}"), [], |r| r.get(0))
         };
         match (has_table(c, "main", t)?, has_table(c, schema, t)?) {
@@ -1386,7 +1481,7 @@ mod tests {
     }
 
     fn mv(from: Option<&str>, to: Option<&str>, bots: usize, n: [usize; 3]) -> ChatMove {
-        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2], memories: 0, facts: 0, sessions: 0, saml_sessions: 0, push_devices: 0 }
+        ChatMove { from: from.map(str::to_string), to: to.map(str::to_string), bots, messages: n[0], routines: n[1], approvals: n[2], memories: 0, facts: 0, sessions: 0, saml_sessions: 0, push_devices: 0, user_secrets: 0 }
     }
 
     fn rows_in(path: &Path) -> i64 {
@@ -2343,6 +2438,142 @@ mod tests {
             s.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
         };
         assert_eq!(unique, ["push_devices_session", "push_devices_token", "sessions_token"]);
+    }
+
+    /// People's own secrets on a connection of their own, as botd runs them, with the stores
+    /// botd's database attached.
+    fn own_secrets(d: &Dirs, db: &Db) -> sealed::UserSecrets {
+        let s = sealed::UserSecrets::new(sealed::connect(&d.dir.path().join("app.sqlite")).unwrap(), sealed::cipher());
+        s.attach_stores(&db.chat_stores(), None).unwrap();
+        s
+    }
+
+    fn secrets_move(from: Option<&str>, to: Option<&str>, n: usize) -> ChatMove {
+        ChatMove { user_secrets: n, ..mv(from, to, 0, [0, 0, 0]) }
+    }
+
+    fn secret(s: &sealed::UserSecrets, user: &str, name: &str) -> Option<String> {
+        s.get(user, name).unwrap().map(|v| v.expose().to_string())
+    }
+
+    #[test]
+    fn a_pinned_persons_own_secrets_are_kept_in_their_store_and_move_with_the_pin() {
+        let d = Dirs::new();
+        let db = d.up();
+        let s = own_secrets(&d, &db);
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        assert!(!s.put(&ada, "OPENAI_API_KEY", "sk-0293-adas-first").unwrap());
+        assert_eq!(count(&db, "main", SECRETS), 1);
+
+        // Pinned, it moves to the store and still opens there.
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![secrets_move(None, Some("gb-lon"), 1)]);
+        assert_eq!((count(&db, "main", SECRETS), count(&db, "chats_0", SECRETS)), (0, 1));
+        assert_eq!(secret(&s, &ada, "OPENAI_API_KEY").as_deref(), Some("sk-0293-adas-first"));
+
+        // Saved, changed and deleted where it is kept; someone unpinned stays in botd's own.
+        assert!(!s.put(&ada, "GITHUB_TOKEN", "ghp-0293-adas").unwrap());
+        assert!(s.put(&ada, "OPENAI_API_KEY", "sk-0293-adas-second").unwrap());
+        assert!(!s.put(&cy, "GITHUB_TOKEN", "ghp-0293-cys").unwrap());
+        assert_eq!((count(&db, "main", SECRETS), count(&db, "chats_0", SECRETS)), (1, 2));
+        assert_eq!(secret(&s, &ada, "OPENAI_API_KEY").as_deref(), Some("sk-0293-adas-second"));
+        assert_eq!(s.names(&ada).unwrap().into_iter().map(|(n, ..)| n).collect::<Vec<_>>(), ["GITHUB_TOKEN", "OPENAI_API_KEY"]);
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), held: Held { user_secrets: 2, ..Held::default() } }]);
+        let mut values: Vec<(String, String)> = s.all_values().into_iter().map(|(u, v)| (u, v.expose().to_string())).collect();
+        values.sort();
+        assert_eq!(values.len(), 3, "the redactor learns the store's as well: {values:?}");
+        assert!(s.delete(&ada, "GITHUB_TOKEN").unwrap());
+        assert!(!s.delete(&ada, "GITHUB_TOKEN").unwrap());
+        assert_eq!(count(&db, "chats_0", SECRETS), 1);
+
+        // Unpinned, it comes back, and the move is recorded for the store's earlier backups.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![secrets_move(Some("gb-lon"), None, 1)]);
+        assert_eq!((count(&db, "main", SECRETS), count(&db, "chats_0", SECRETS)), (2, 0));
+        let lon = db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
+        assert_eq!(db.moves_out_to_clear(&lon).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert_eq!(secret(&s, &ada, "OPENAI_API_KEY").as_deref(), Some("sk-0293-adas-second"));
+        assert_eq!(secret(&s, &cy, "GITHUB_TOKEN").as_deref(), Some("ghp-0293-cys"));
+    }
+
+    #[test]
+    fn a_move_cut_off_after_its_copy_keeps_secret_changes_and_deletes() {
+        let d = Dirs::new();
+        let db = d.up();
+        let s = own_secrets(&d, &db);
+        let ada = user(&db, "ada");
+        s.put(&ada, "A", "one").unwrap();
+        s.put(&ada, "B", "two").unwrap();
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!((count(&db, "main", SECRETS), count(&db, "chats_0", SECRETS)), (2, 2), "in both places");
+        // Read once, and changes meanwhile reach both copies, so the next pass keeps them whichever it keeps.
+        assert_eq!(s.names(&ada).unwrap().len(), 2);
+        assert!(s.put(&ada, "A", "one-changed").unwrap());
+        assert!(s.delete(&ada, "B").unwrap());
+        assert_eq!((count(&db, "main", SECRETS), count(&db, "chats_0", SECRETS)), (1, 1));
+        assert_eq!(db.place_chats().unwrap(), vec![secrets_move(None, Some("gb-lon"), 1)]);
+        assert_eq!((count(&db, "main", SECRETS), count(&db, "chats_0", SECRETS)), (0, 1));
+        assert_eq!(secret(&s, &ada, "A").as_deref(), Some("one-changed"));
+        assert_eq!(secret(&s, &ada, "B"), None);
+    }
+
+    #[test]
+    fn startup_seals_a_stores_own_secrets_under_the_current_master_key() {
+        use crate::secrets::key::MasterKey;
+        let d = Dirs::new();
+        let db = d.up();
+        let s = own_secrets(&d, &db);
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        s.put(&ada, "K", "under-the-old-key").unwrap();
+        let (current, previous) = (sealed::cipher(), Cipher::new(&MasterKey::generate()));
+        let context = sealed::user_context(&ada, "K");
+        let set = |v: &str| db.c().execute("UPDATE chats_0.user_secrets SET value = ?1 WHERE user_id = ?2", params![v, ada]).unwrap();
+        set(&previous.seal(&context, b"under-the-old-key"));
+        assert!(s.get(&ada, "K").is_err(), "a value the key doesn't open isn't handed out");
+        let e = db.seal_store_user_secrets(&current, None, false).unwrap_err();
+        assert!(e.contains("gb-lon's chat store") && e.contains("SUPERBOT_FORGET_SEALED=1") && e.contains("ADR 0293"), "{e}");
+        assert_eq!(db.seal_store_user_secrets(&current, Some(&previous), false).unwrap(), StoreApprovals { resealed: 1, ..Default::default() });
+        assert_eq!(secret(&s, &ada, "K").as_deref(), Some("under-the-old-key"));
+        assert_eq!(db.seal_store_user_secrets(&current, Some(&previous), false).unwrap(), StoreApprovals::default());
+        set(&Cipher::new(&MasterKey::generate()).seal(&context, b"x"));
+        assert_eq!(db.seal_store_user_secrets(&current, Some(&previous), false).unwrap(), StoreApprovals { unreadable: 1, ..Default::default() });
+        assert_eq!(db.seal_store_user_secrets(&current, None, true).unwrap(), StoreApprovals { discarded: 1, ..Default::default() });
+        assert_eq!(count(&db, "chats_0", SECRETS), 0, "its owner saves it again");
+        s.put(&ada, "K", "x").unwrap();
+        set("plain-0293");
+        assert_eq!(db.seal_store_user_secrets(&current, None, false).unwrap(), StoreApprovals { sealed: 1, ..Default::default() });
+        let raw: String = db.c().query_row("SELECT value FROM chats_0.user_secrets", [], |r| r.get(0)).unwrap();
+        assert!(sealed::is_sealed(&raw) && secret(&s, &ada, "K").as_deref() == Some("plain-0293"));
+    }
+
+    #[test]
+    fn an_erasure_deletes_a_persons_own_secrets_in_copies_of_a_store() {
+        let d = Dirs::new();
+        let db = d.up();
+        let s = own_secrets(&d, &db);
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        for u in [&ada, &cy] {
+            db.pin_residency(PinOn::User, u, "gb-lon", "DPA-1", None).unwrap();
+            s.put(u, "K", "v").unwrap();
+        }
+        assert_eq!(count(&db, "chats_0", SECRETS), 2);
+        db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        let copy = d.dir.path().join("copy.sqlite");
+        std::fs::copy(d.lon.join("chats.sqlite"), &copy).unwrap();
+        let c = Connection::open(&copy).unwrap();
+        assert_eq!(crate::db::erase_in_copy(&c, &ada, "erased-01", &[]).unwrap().user_secrets, 1);
+        let left: Vec<String> = c.prepare("SELECT user_id FROM user_secrets").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(left, [cy]);
+    }
+
+    #[test]
+    fn describing_what_a_place_holds_names_own_secrets() {
+        assert_eq!(Held { sessions: 1, user_secrets: 2, ..Held::default() }.describe(), "1 sign-in session and 2 personal secrets");
+        assert_eq!(Held { sessions: 1, user_secrets: 2, ..Held::default() }.sign_ins(), Held { sessions: 1, ..Held::default() });
+        assert_eq!(Held { messages: 1, user_secrets: 2, ..Held::default() }.of_bots(), Held { messages: 1, ..Held::default() });
     }
 
     #[test]

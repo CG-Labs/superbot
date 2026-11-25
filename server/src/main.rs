@@ -370,17 +370,15 @@ fn random_hex(n: usize) -> String {
 
 /// The startup lines on a master key rotation (ADR 0096), as `(warning, line)`: logged once
 /// botd's database, its sealed secrets and every regional chat store (ADR 0215, `stores`
-/// re-encrypted from the previous key) are under the new key, with the approvals' tool
-/// inputs and push tokens in those stores (ADR 0228, ADR 0283).
-fn rotation_lines(r: &secrets::Report, stores: usize, approvals: &secrets::sealed::StoreApprovals, push: &secrets::sealed::StoreApprovals) -> Vec<(bool, String)> {
+/// re-encrypted from the previous key) are under the new key, with what the stores seal
+/// (`sealed`, each with what it is): approvals' tool inputs (ADR 0228), push tokens (ADR
+/// 0283) and people's own secrets (ADR 0293).
+fn rotation_lines(r: &secrets::Report, stores: usize, sealed: &[(&str, &secrets::sealed::StoreApprovals)]) -> Vec<(bool, String)> {
     let mut out = Vec::new();
-    let resealed = approvals.resealed + push.resealed;
+    let resealed: usize = sealed.iter().map(|(_, s)| s.resealed).sum();
     let mut and_stores = if stores > 0 { format!(", and re-encrypted {stores} regional chat stores") } else { String::new() };
-    if approvals.resealed > 0 {
-        and_stores += &format!(", and sealed {} approvals' tool inputs in regional chat stores again", approvals.resealed);
-    }
-    if push.resealed > 0 {
-        and_stores += &format!(", and sealed {} push tokens in regional chat stores again", push.resealed);
+    for (what, s) in sealed.iter().filter(|(_, s)| s.resealed > 0) {
+        and_stores += &format!(", and sealed {} {what} in regional chat stores again", s.resealed);
     }
     if let Some((from, done)) = &r.rotated {
         out.push((
@@ -400,13 +398,15 @@ fn rotation_lines(r: &secrets::Report, stores: usize, approvals: &secrets::seale
             _ => (false, format!("Master key rotation from {from}: {} under the new key. Remove the previous key now (docs/ops/master-key-rotation.md).", and_stores.trim_start_matches(", and "))),
         });
     }
-    if approvals.unreadable > 0 {
-        out.push((true, format!("Master key rotation: {} approvals' tool inputs in regional chat stores open with neither key and were left as they were.", approvals.unreadable)));
-    }
-    if push.unreadable > 0 {
-        out.push((true, format!("Master key rotation: {} push tokens in regional chat stores open with neither key and were left as they were.", push.unreadable)));
+    for (what, s) in sealed.iter().filter(|(_, s)| s.unreadable > 0) {
+        out.push((true, format!("Master key rotation: {} {what} in regional chat stores open with neither key and were left as they were.", s.unreadable)));
     }
     out
+}
+
+/// What regional chat stores seal under the master key, for `rotation_lines`.
+fn store_sealed(o: &machines::chat_stores::Opened) -> [(&'static str, &secrets::sealed::StoreApprovals); 3] {
+    [("approvals' tool inputs", &o.approvals), ("push tokens", &o.push_tokens), ("people's own secrets", &o.user_secrets)]
 }
 
 pub fn short_id() -> String {
@@ -583,12 +583,15 @@ async fn main() {
     for line in &opened.lines {
         log_info!("{line}");
     }
+    secrets::global()
+        .attach_chat_stores(&db.chat_stores(), database_encryption::installed().map(database_encryption::DbKey::raw))
+        .unwrap_or_else(|e| exit(format!("Regional chat stores: people's own secrets: {e}")));
     for w in machines::chat_store_copies::check_destinations(&db, control_plane.chat_copies.as_deref(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Regional chat stores: {e}"))) {
         log_warn!("WARNING: {w}");
     }
-    // Only once every regional chat store opens under the new key, and its approvals and
-    // push tokens are sealed under it, can the previous one go.
-    for (warn, line) in rotation_lines(&secrets_report, opened.rekeyed, &opened.approvals, &opened.push_tokens) {
+    // Only once every regional chat store opens under the new key, and its approvals, push
+    // tokens and people's secrets are sealed under it, can the previous one go.
+    for (warn, line) in rotation_lines(&secrets_report, opened.rekeyed, &store_sealed(&opened)) {
         if warn {
             log_warn!("{line}");
         } else {
@@ -3722,30 +3725,44 @@ mod tests {
         };
         let none = secrets::sealed::StoreApprovals::default();
         let resealed = |n: usize| secrets::sealed::StoreApprovals { resealed: n, ..Default::default() };
-        assert!(rotation_lines(&report(false, false), 0, &none, &none).is_empty());
-        let l = rotation_lines(&report(true, false), 2, &none, &none);
+        let unreadable = |n: usize| secrets::sealed::StoreApprovals { unreadable: n, ..Default::default() };
+        let opened = |a: secrets::sealed::StoreApprovals, p: secrets::sealed::StoreApprovals, u: secrets::sealed::StoreApprovals| machines::chat_stores::Opened {
+            approvals: a,
+            push_tokens: p,
+            user_secrets: u,
+            ..Default::default()
+        };
+        let lines = |r: &secrets::Report, stores: usize, o: &machines::chat_stores::Opened| rotation_lines(r, stores, &store_sealed(o));
+        let plain = opened(none.clone(), none.clone(), none.clone());
+        assert!(lines(&report(false, false), 0, &plain).is_empty());
+        let l = lines(&report(true, false), 2, &plain);
         assert_eq!(l.len(), 1);
         assert!(!l[0].0 && l[0].1.contains("sealed 3 values again under the new key (1 already were), and re-encrypted 2 regional chat stores. Remove the previous key now"), "{l:?}");
-        assert!(!rotation_lines(&report(true, false), 0, &none, &none)[0].1.contains("chat stores"));
-        let l = rotation_lines(&report(true, false), 2, &resealed(4), &none);
+        assert!(!lines(&report(true, false), 0, &plain)[0].1.contains("chat stores"));
+        let l = lines(&report(true, false), 2, &opened(resealed(4), none.clone(), none.clone()));
         assert!(l[0].1.contains("re-encrypted 2 regional chat stores, and sealed 4 approvals' tool inputs in regional chat stores again. Remove"), "{l:?}");
         // botd's own data was rotated on an earlier start; a store the previous key still opened isn't "nothing to rotate".
-        let l = rotation_lines(&report(false, true), 1, &none, &none);
+        let l = lines(&report(false, true), 1, &plain);
         assert!(!l[0].0 && l[0].1.contains("re-encrypted 1 regional chat stores under the new key. Remove the previous key now"), "{l:?}");
         // Nor are a store's approvals still sealed under the previous key (ADR 0228).
-        let l = rotation_lines(&report(false, true), 0, &resealed(2), &none);
+        let l = lines(&report(false, true), 0, &opened(resealed(2), none.clone(), none.clone()));
         assert!(!l[0].0 && l[0].1.contains("sealed 2 approvals' tool inputs in regional chat stores again under the new key. Remove the previous key now"), "{l:?}");
-        let l = rotation_lines(&report(false, true), 0, &none, &none);
+        let l = lines(&report(false, true), 0, &plain);
         assert!(l[0].0 && l[0].1.contains("nothing to rotate"), "{l:?}");
-        let l = rotation_lines(&report(true, false), 0, &secrets::sealed::StoreApprovals { unreadable: 1, ..Default::default() }, &none);
+        let l = lines(&report(true, false), 0, &opened(unreadable(1), none.clone(), none.clone()));
         assert!(l[1].0 && l[1].1.contains("1 approvals' tool inputs in regional chat stores open with neither key"), "{l:?}");
         // Push tokens in the stores count as well (ADR 0283).
-        let l = rotation_lines(&report(false, true), 0, &none, &resealed(3));
+        let l = lines(&report(false, true), 0, &opened(none.clone(), resealed(3), none.clone()));
         assert!(!l[0].0 && l[0].1.contains("sealed 3 push tokens in regional chat stores again under the new key. Remove the previous key now"), "{l:?}");
-        let l = rotation_lines(&report(true, false), 1, &resealed(1), &resealed(2));
+        let l = lines(&report(true, false), 1, &opened(resealed(1), resealed(2), none.clone()));
         assert!(l[0].1.contains("re-encrypted 1 regional chat stores, and sealed 1 approvals' tool inputs in regional chat stores again, and sealed 2 push tokens"), "{l:?}");
-        let l = rotation_lines(&report(false, false), 0, &none, &secrets::sealed::StoreApprovals { unreadable: 2, ..Default::default() });
+        let l = lines(&report(false, false), 0, &opened(none.clone(), unreadable(2), none.clone()));
         assert!(l[0].0 && l[0].1.contains("2 push tokens in regional chat stores open with neither key"), "{l:?}");
+        // And people's own secrets (ADR 0293).
+        let l = lines(&report(false, true), 0, &opened(none.clone(), none.clone(), resealed(5)));
+        assert!(!l[0].0 && l[0].1.contains("sealed 5 people's own secrets in regional chat stores again under the new key. Remove the previous key now"), "{l:?}");
+        let l = lines(&report(false, false), 0, &opened(none.clone(), none.clone(), unreadable(1)));
+        assert!(l[0].0 && l[0].1.contains("1 people's own secrets in regional chat stores open with neither key"), "{l:?}");
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

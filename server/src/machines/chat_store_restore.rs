@@ -874,14 +874,24 @@ impl Restore {
         if p.erased.total() > 0 {
             out.push_str(&format!("  Erased in it again: {} of people erased since.\n", p.erased.describe()));
         }
-        match (p.sign_ins_replaced.total(), p.back.is_some()) {
+        let none_if_empty = |h: &Held| if h.total() > 0 { h.describe() } else { "none".to_string() };
+        let (replaced, signed_in) = (p.sign_ins_replaced.sign_ins(), p.signed_in.sign_ins());
+        match (replaced.total(), p.back.is_some()) {
             (0, _) => {}
             (_, true) => out.push_str(&format!(
                 "  Its sign-ins ({}) are replaced by the store's now ({}), so a session revoked since stays revoked (ADR 0283).\n",
-                p.sign_ins_replaced.describe(),
-                if p.signed_in.total() > 0 { p.signed_in.describe() } else { "none".to_string() }
+                replaced.describe(),
+                none_if_empty(&signed_in)
             )),
-            (_, false) => out.push_str(&format!("  Its sign-ins ({}) are dropped, so their people sign in again (ADR 0283).\n", p.sign_ins_replaced.describe())),
+            (_, false) => out.push_str(&format!("  Its sign-ins ({}) are dropped, so their people sign in again (ADR 0283).\n", replaced.describe())),
+        }
+        let secrets = |n: i64| Held { user_secrets: n, ..Held::default() };
+        if p.sign_ins_replaced.user_secrets + p.signed_in.user_secrets > 0 {
+            out.push_str(&format!(
+                "  Its people's own secrets ({}) are replaced by the store's now ({}), so a secret deleted or changed since stays so (ADR 0293).\n",
+                none_if_empty(&secrets(p.sign_ins_replaced.user_secrets)),
+                none_if_empty(&secrets(p.signed_in.user_secrets))
+            ));
         }
         if p.unopened > 0 {
             out.push_str(&format!("  {} saved tool inputs of approvals in it don't open with the master key; botd drops them at start (SUPERBOT_FORGET_SEALED=1).\n", p.unopened));
@@ -1486,6 +1496,55 @@ mod tests {
         let db = Db::open(&w.app).unwrap();
         db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
         assert!(db.session(&old).is_none() && db.session(&new).is_none());
+    }
+
+    fn own_secrets(w: &World, db: &Db) -> sealed::UserSecrets {
+        let s = sealed::UserSecrets::new(sealed::connect(&w.app).unwrap(), sealed::cipher());
+        s.attach_stores(&db.chat_stores(), None).unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_takes_its_own_secrets_from_the_store_it_replaces_or_keeps_them_when_it_is_gone() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
+        let s = own_secrets(&w, &db);
+        s.put(&ada, "A", "deleted-since").unwrap();
+        s.put(&ada, "B", "old-value").unwrap();
+        s.put(&bob, "C", "moved-to-frankfurt").unwrap();
+        backup_pass(&db, 7, now() - DAY);
+        assert!(s.delete(&ada, "A").unwrap());
+        s.put(&ada, "B", "new-value").unwrap();
+        db.pin_residency(PinOn::User, &bob, "de-fra-2", "DPA-2", None).unwrap();
+        db.place_chats().unwrap();
+        drop((s, db));
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.user_secrets, r.plan.dropped.user_secrets), (1, 1), "what it holds once replaced: {r:?}");
+        assert_eq!((r.plan.sign_ins_replaced.user_secrets, r.plan.signed_in.user_secrets), (2, 1), "{r:?}");
+        let text = r.text("gb-lon");
+        assert!(text.contains("Its people's own secrets (2 personal secrets) are replaced by the store's now (1 personal secret), so a secret deleted or changed since stays so"), "{text}");
+        assert!(!text.contains("Its sign-ins"), "it had no sign-ins: {text}");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        let s = own_secrets(&w, &db);
+        let get = |u: &str, n: &str| s.get(u, n).unwrap().map(|v| v.expose().to_string());
+        assert_eq!((get(&ada, "A"), get(&ada, "B").as_deref(), get(&bob, "C").as_deref()), (None, Some("new-value"), Some("moved-to-frankfurt")));
+        backup_pass(&db, 8, now());
+        drop((s, db));
+
+        // With the store gone, the backup's are the only copy left, so they are kept.
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.user_secrets, r.plan.sign_ins_replaced.user_secrets, r.plan.signed_in.user_secrets), (1, 0, 0), "{r:?}");
+        assert!(!r.text("gb-lon").contains("own secrets"), "{}", r.text("gb-lon"));
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        let s = own_secrets(&w, &db);
+        assert_eq!(s.get(&ada, "B").unwrap().map(|v| v.expose().to_string()).as_deref(), Some("new-value"));
     }
 
     #[test]

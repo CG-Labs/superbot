@@ -1,18 +1,19 @@
-//! Regional chat stores (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283): pinned people's
-//! chats, routines, approvals, Bots' memory, their own facts and their sign-in sessions in a
-//! database in their region, the first part of splitting botd's database by region. REGION_DATA_DIRS names a folder per
+//! Regional chat stores (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293): pinned
+//! people's chats, routines, approvals, Bots' memory, their own facts, their sign-in sessions
+//! and their own secrets in a database in their region, the first part of splitting botd's
+//! database by region. REGION_DATA_DIRS names a folder per
 //! region, which the operator puts on storage in that region; botd keeps `chats.sqlite`
 //! there (keyed like its own database) and its backups in `backups/` beside it, never in
 //! DATA_DIR. A Bot's chat, routines, approvals and memory live in the store of its owner's
-//! pin (their team's, else their own), a person's facts (`USER.md`) and sessions (with each
-//! one's SAML sign-in and push device) in the store of the person's pin, and they move when
+//! pin (their team's, else their own), a person's facts (`USER.md`), sessions (with each
+//! one's SAML sign-in and push device) and own secrets in the store of the person's pin, and they move when
 //! that changes: at startup, after a pin or unpin, and on every reconcile pass. botd's own
 //! copy of a Bot's memory or a person's facts is otherwise its file in DATA_DIR. Accounts
 //! and the audit log stay where botd runs; botd still reads and writes the stores from
 //! wherever it runs.
 //!
 //! The storage itself is `db::chats`. This module reads the settings, opens the stores
-//! at startup (sealing their approvals' tool inputs and push tokens under the master key), audits each
+//! at startup (sealing their approvals' tool inputs, push tokens and people's secrets under the master key), audits each
 //! move (`residency.chats_moved`), backs each store up daily in its folder, and says where
 //! a pin's data is for reports, the app and admins. Once a Bot's rows have left a store,
 //! botd rewrites that store's backups without them (ADR 0238), so a pin's data isn't left
@@ -152,6 +153,8 @@ pub struct Opened {
     pub approvals: StoreApprovals,
     /// What bringing their push devices' tokens under the master key did (ADR 0283).
     pub push_tokens: StoreApprovals,
+    /// What bringing people's own secrets in them under the master key did (ADR 0293).
+    pub user_secrets: StoreApprovals,
 }
 
 /// The master keys a start opens stores' approvals with: the current one, the previous
@@ -194,6 +197,7 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
     }
     let approvals = db.seal_store_approvals(keys.current, keys.previous, keys.forget)?;
     let push_tokens = db.seal_store_push_tokens(keys.current, keys.previous, keys.forget)?;
+    let user_secrets = db.seal_store_user_secrets(keys.current, keys.previous, keys.forget)?;
     let mut lines = vec![format!("Regional chat stores: {} (ADR 0215).", s.describe())];
     lines.extend(restored);
     lines.extend(attached.created.iter().map(|r| format!("Regional chat stores: made {r}'s store.")));
@@ -213,6 +217,12 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
             push_tokens.sealed, push_tokens.discarded
         ));
     }
+    if user_secrets.sealed + user_secrets.discarded > 0 {
+        lines.push(format!(
+            "Regional chat stores: sealed {} people's own secrets and dropped {} the master key doesn't open, which their owners save again (ADR 0293).",
+            user_secrets.sealed, user_secrets.discarded
+        ));
+    }
     let scrubbed = db.scrub_chat_stores().map_err(|e| format!("chat stores: {e}"))?;
     if scrubbed > 0 {
         lines.push(format!("Regional chat stores: redacted {scrubbed} saved rows."));
@@ -220,7 +230,7 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
     for m in place(db, data_dir) {
         lines.push(format!("Regional chat stores: moved {} of {} Bots from {} to {}.", moved(&m), m.bots, place_name(&m.from), place_name(&m.to)));
     }
-    Ok(Opened { lines, rekeyed, approvals, push_tokens })
+    Ok(Opened { lines, rekeyed, approvals, push_tokens, user_secrets })
 }
 
 fn moved(m: &ChatMove) -> String {
@@ -231,8 +241,8 @@ fn place_name(region: &Option<String>) -> String {
     region.as_ref().map_or("botd's own database".to_string(), |r| format!("{r}'s chat store"))
 }
 
-/// Moves every Bot's chat, routines, approvals and memory, and every person's facts and
-/// sign-ins, to
+/// Moves every Bot's chat, routines, approvals and memory, and every person's facts,
+/// sign-ins and own secrets, to
 /// where their pin says they belong now, each move audited as `residency.chats_moved` by
 /// botd itself. A failure is logged and left for the next pass.
 ///
@@ -262,7 +272,7 @@ pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
     let moves = match db.place_chats() {
         Ok(m) => m,
         Err(e) => {
-            log_warn!("Regional chat stores: chats, routines, approvals, Bots' memory and people's facts and sessions couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215).");
+            log_warn!("Regional chat stores: chats, routines, approvals, Bots' memory and people's facts, sessions and secrets couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215).");
             return Vec::new();
         }
     };
@@ -275,7 +285,7 @@ pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
     for m in &moves {
         db.record(&Who::system(ACTOR).event(MOVED).details(json!({
             "from": m.from, "to": m.to, "bots": m.bots, "messages": m.messages, "routines": m.routines, "approvals": m.approvals, "memories": m.memories, "facts": m.facts,
-            "sessions": m.sessions, "samlSessions": m.saml_sessions, "pushDevices": m.push_devices,
+            "sessions": m.sessions, "samlSessions": m.saml_sessions, "pushDevices": m.push_devices, "personalKeys": m.user_secrets,
         })));
     }
     moves
@@ -583,7 +593,7 @@ pub fn finish_clearing<T>(db: &Db, cleared: Vec<(String, Result<Clearing, String
             json!({
                 "region": store.region, "bots": done.bots, "users": done.users, "backups": done.backups, "messages": done.held.messages, "routines": done.held.routines,
                 "approvals": done.held.approvals, "memories": done.held.memories, "facts": done.held.facts, "sessions": done.held.sessions,
-                "samlSessions": done.held.saml_sessions, "pushDevices": done.held.push_devices,
+                "samlSessions": done.held.saml_sessions, "pushDevices": done.held.push_devices, "personalKeys": done.held.user_secrets,
             })
         };
         let r = match (failed.is_empty(), copies.get(&store.region)) {
@@ -656,7 +666,7 @@ fn store_view(cp: &ControlPlane, store: &ChatStore, held: &Held) -> Value {
     let b = backups(store);
     json!({
         "region": store.region, "messages": held.messages, "routines": held.routines, "approvals": held.approvals, "memories": held.memories, "facts": held.facts,
-        "sessions": held.sessions, "samlSessions": held.saml_sessions, "pushDevices": held.push_devices,
+        "sessions": held.sessions, "samlSessions": held.saml_sessions, "pushDevices": held.push_devices, "personalKeys": held.user_secrets,
         "backups": b.len(), "lastBackupAt": b.first().map(|(t, _)| *t),
         "offHost": cp.chat_copies.as_deref().and_then(|c| c.view(store)),
     })
@@ -693,7 +703,7 @@ pub fn warnings(app: &App, cp: &ControlPlane, at: i64) -> Vec<String> {
                 whose.push(if bots == 1 { "the rows of 1 Bot".to_string() } else { format!("the rows of {bots} Bots") });
             }
             if users > 0 {
-                whose.push(if users == 1 { "the facts or sign-ins of 1 person".to_string() } else { format!("the facts or sign-ins of {users} people") });
+                whose.push(if users == 1 { "the facts, sign-ins or secrets of 1 person".to_string() } else { format!("the facts, sign-ins or secrets of {users} people") });
             }
             format!("{}'s chat store's backups may still hold {} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region, whose.join(" and "))
         })
@@ -753,6 +763,7 @@ pub fn against(app: &App, cp: &ControlPlane, region: &str, owners: &[String], se
         "sessions": each(|h| h.sessions),
         "samlSessions": each(|h| h.saml_sessions),
         "pushDevices": each(|h| h.push_devices),
+        "personalKeys": each(|h| h.user_secrets),
         "inRegion": elsewhere.total() == 0 && (database.total() == 0 || server_in) && earlier.is_empty(),
         "earlierCopies": earlier,
         "lastBackupAt": last,
@@ -789,11 +800,17 @@ pub fn outside(app: &App, region: &str, user_id: &str) -> Vec<String> {
     if there.total() > 0 {
         out.push(format!("they have {} in another region's chat store (ADR 0283)", there.describe()));
     }
+    if has && database.user_secrets > 0 {
+        out.push(format!("their own secrets are in botd's own database, not {region}'s chat store (ADR 0293)"));
+    }
+    if elsewhere.user_secrets > 0 {
+        out.push("their own secrets are in another region's chat store (ADR 0293)".to_string());
+    }
     out
 }
 
 /// The kinds of rows `against` counts, by their key in it.
-pub(super) const KINDS: [&str; 8] = ["messages", "routines", "approvals", "memories", "facts", "sessions", "samlSessions", "pushDevices"];
+pub(super) const KINDS: [&str; 9] = ["messages", "routines", "approvals", "memories", "facts", "sessions", "samlSessions", "pushDevices", "personalKeys"];
 
 /// Report warnings about `chats` (`against`): no recent backup of the region's store, and
 /// other stores' backups that still hold their chats.
