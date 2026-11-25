@@ -155,15 +155,19 @@ pub struct Opened {
     pub push_tokens: StoreApprovals,
     /// What bringing people's own secrets in them under the master key did (ADR 0293).
     pub user_secrets: StoreApprovals,
+    /// What bringing people's second factors in them under the master key did (ADR 0299).
+    pub second_factors: StoreApprovals,
 }
 
 /// The master keys a start opens stores' approvals with: the current one, the previous
 /// one mid-rotation (SUPERBOT_MASTER_KEY_PREVIOUS), and whether SUPERBOT_FORGET_SEALED=1
-/// drops what neither opens.
+/// drops what neither opens, and whether a rotation renews derived keys
+/// (SUPERBOT_ROTATE_DERIVED_KEYS=1), so second factors' recovery codes go (ADR 0299).
 pub struct Keys<'a> {
     pub current: &'a Cipher,
     pub previous: Option<&'a Cipher>,
     pub forget: bool,
+    pub new_derived_keys: bool,
 }
 
 /// Opens the stores at startup, once botd's database is open and the master key checked:
@@ -198,6 +202,7 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
     let approvals = db.seal_store_approvals(keys.current, keys.previous, keys.forget)?;
     let push_tokens = db.seal_store_push_tokens(keys.current, keys.previous, keys.forget)?;
     let user_secrets = db.seal_store_user_secrets(keys.current, keys.previous, keys.forget)?;
+    let second_factors = db.seal_store_second_factors(keys.current, keys.previous, keys.forget, keys.new_derived_keys)?;
     let mut lines = vec![format!("Regional chat stores: {} (ADR 0215).", s.describe())];
     lines.extend(restored);
     lines.extend(attached.created.iter().map(|r| format!("Regional chat stores: made {r}'s store.")));
@@ -223,6 +228,12 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
             user_secrets.sealed, user_secrets.discarded
         ));
     }
+    if second_factors.sealed + second_factors.discarded > 0 {
+        lines.push(format!(
+            "Regional chat stores: sealed {} people's second factors and dropped {} the master key doesn't open, with their recovery codes, which their owners set up again (ADR 0299).",
+            second_factors.sealed, second_factors.discarded
+        ));
+    }
     let scrubbed = db.scrub_chat_stores().map_err(|e| format!("chat stores: {e}"))?;
     if scrubbed > 0 {
         lines.push(format!("Regional chat stores: redacted {scrubbed} saved rows."));
@@ -230,7 +241,7 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
     for m in place(db, data_dir) {
         lines.push(format!("Regional chat stores: moved {} of {} Bots from {} to {}.", moved(&m), m.bots, place_name(&m.from), place_name(&m.to)));
     }
-    Ok(Opened { lines, rekeyed, approvals, push_tokens, user_secrets })
+    Ok(Opened { lines, rekeyed, approvals, push_tokens, user_secrets, second_factors })
 }
 
 fn moved(m: &ChatMove) -> String {
@@ -242,7 +253,7 @@ fn place_name(region: &Option<String>) -> String {
 }
 
 /// Moves every Bot's chat, routines, approvals and memory, and every person's facts,
-/// sign-ins and own secrets, to
+/// sign-ins, own secrets and second factor, to
 /// where their pin says they belong now, each move audited as `residency.chats_moved` by
 /// botd itself. A failure is logged and left for the next pass.
 ///
@@ -272,7 +283,9 @@ pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
     let moves = match db.place_chats() {
         Ok(m) => m,
         Err(e) => {
-            log_warn!("Regional chat stores: chats, routines, approvals, Bots' memory and people's facts, sessions and secrets couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215).");
+            log_warn!(
+                "Regional chat stores: chats, routines, approvals, Bots' memory and people's facts, sessions, secrets and second factors couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215)."
+            );
             return Vec::new();
         }
     };
@@ -286,6 +299,7 @@ pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
         db.record(&Who::system(ACTOR).event(MOVED).details(json!({
             "from": m.from, "to": m.to, "bots": m.bots, "messages": m.messages, "routines": m.routines, "approvals": m.approvals, "memories": m.memories, "facts": m.facts,
             "sessions": m.sessions, "samlSessions": m.saml_sessions, "pushDevices": m.push_devices, "personalKeys": m.user_secrets,
+            "secondFactors": m.second_factors, "recoveryCodes": m.recovery_codes,
         })));
     }
     moves
@@ -594,6 +608,7 @@ pub fn finish_clearing<T>(db: &Db, cleared: Vec<(String, Result<Clearing, String
                 "region": store.region, "bots": done.bots, "users": done.users, "backups": done.backups, "messages": done.held.messages, "routines": done.held.routines,
                 "approvals": done.held.approvals, "memories": done.held.memories, "facts": done.held.facts, "sessions": done.held.sessions,
                 "samlSessions": done.held.saml_sessions, "pushDevices": done.held.push_devices, "personalKeys": done.held.user_secrets,
+                "secondFactors": done.held.second_factors, "recoveryCodes": done.held.recovery_codes,
             })
         };
         let r = match (failed.is_empty(), copies.get(&store.region)) {
@@ -667,6 +682,7 @@ fn store_view(cp: &ControlPlane, store: &ChatStore, held: &Held) -> Value {
     json!({
         "region": store.region, "messages": held.messages, "routines": held.routines, "approvals": held.approvals, "memories": held.memories, "facts": held.facts,
         "sessions": held.sessions, "samlSessions": held.saml_sessions, "pushDevices": held.push_devices, "personalKeys": held.user_secrets,
+        "secondFactors": held.second_factors, "recoveryCodes": held.recovery_codes,
         "backups": b.len(), "lastBackupAt": b.first().map(|(t, _)| *t),
         "offHost": cp.chat_copies.as_deref().and_then(|c| c.view(store)),
     })
@@ -703,7 +719,11 @@ pub fn warnings(app: &App, cp: &ControlPlane, at: i64) -> Vec<String> {
                 whose.push(if bots == 1 { "the rows of 1 Bot".to_string() } else { format!("the rows of {bots} Bots") });
             }
             if users > 0 {
-                whose.push(if users == 1 { "the facts, sign-ins or secrets of 1 person".to_string() } else { format!("the facts, sign-ins or secrets of {users} people") });
+                whose.push(if users == 1 {
+                    "the facts, sign-ins, secrets or second factor of 1 person".to_string()
+                } else {
+                    format!("the facts, sign-ins, secrets or second factors of {users} people")
+                });
             }
             format!("{}'s chat store's backups may still hold {} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region, whose.join(" and "))
         })
@@ -764,6 +784,8 @@ pub fn against(app: &App, cp: &ControlPlane, region: &str, owners: &[String], se
         "samlSessions": each(|h| h.saml_sessions),
         "pushDevices": each(|h| h.push_devices),
         "personalKeys": each(|h| h.user_secrets),
+        "secondFactors": each(|h| h.second_factors),
+        "recoveryCodes": each(|h| h.recovery_codes),
         "inRegion": elsewhere.total() == 0 && (database.total() == 0 || server_in) && earlier.is_empty(),
         "earlierCopies": earlier,
         "lastBackupAt": last,
@@ -806,11 +828,24 @@ pub fn outside(app: &App, region: &str, user_id: &str) -> Vec<String> {
     if elsewhere.user_secrets > 0 {
         out.push("their own secrets are in another region's chat store (ADR 0293)".to_string());
     }
+    let (here, there) = (database.second_factor(), elsewhere.second_factor());
+    if has && here.total() > 0 {
+        out.push(format!("their {} in botd's own database, not {region}'s chat store (ADR 0299)", factor_words(&here)));
+    }
+    if there.total() > 0 {
+        out.push(format!("their {} in another region's chat store (ADR 0299)", factor_words(&there)));
+    }
     out
 }
 
 /// The kinds of rows `against` counts, by their key in it.
-pub(super) const KINDS: [&str; 9] = ["messages", "routines", "approvals", "memories", "facts", "sessions", "samlSessions", "pushDevices", "personalKeys"];
+pub(super) const KINDS: [&str; 11] =
+    ["messages", "routines", "approvals", "memories", "facts", "sessions", "samlSessions", "pushDevices", "personalKeys", "secondFactors", "recoveryCodes"];
+
+/// "second factor is", or "recovery codes are" when the second factor itself is elsewhere.
+fn factor_words(h: &Held) -> &'static str {
+    if h.second_factors > 0 { "second factor is" } else { "recovery codes are" }
+}
 
 /// Report warnings about `chats` (`against`): no recent backup of the region's store, and
 /// other stores' backups that still hold their chats.

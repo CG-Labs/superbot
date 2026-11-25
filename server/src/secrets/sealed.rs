@@ -587,6 +587,68 @@ pub fn user_secrets_in(c: &Connection, table: &str, current: &Cipher, previous: 
     Ok(done)
 }
 
+/// Brings people's second factors in `table` (a regional store's `<schema>.user_mfa`, ADR
+/// 0299, with its recovery codes in `codes`) under `current`, as `approvals_in` does
+/// approvals' inputs: plaintext sealed, secrets `previous` opens sealed again, and, with
+/// `forget`, second factors neither opens deleted with their recovery codes, so their
+/// owners set them up again (as `discard` does botd's own). With `new_derived_keys`, the
+/// recovery codes of a second factor sealed again are deleted, as `rotate` deletes botd's
+/// own: they are keyed hashes under a derived key that changed. A secret neither key opens,
+/// outside a rotation and without `forget`, refuses (nothing changed).
+pub fn second_factors_in(
+    c: &Connection,
+    table: &str,
+    codes: &str,
+    current: &Cipher,
+    previous: Option<&Cipher>,
+    forget: bool,
+    new_derived_keys: bool,
+) -> Result<StoreApprovals, String> {
+    let db = |e: rusqlite::Error| e.to_string();
+    let tx = c.unchecked_transaction().map_err(db)?;
+    let rows: Vec<(String, String)> = {
+        let mut s = tx.prepare(&format!("SELECT user_id, secret FROM {table}")).map_err(db)?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
+    };
+    let mut done = StoreApprovals::default();
+    let mut refused = 0;
+    for (user, v) in &rows {
+        let context = mfa_context(user);
+        let value = if !is_sealed(v) {
+            done.sealed += 1;
+            current.seal(&context, v.as_bytes())
+        } else if current.open(&context, v).is_ok() {
+            continue;
+        } else if let Some(plain) = previous.and_then(|p| p.open(&context, v).ok()) {
+            done.resealed += 1;
+            if new_derived_keys {
+                tx.execute(&format!("DELETE FROM {codes} WHERE user_id = ?1"), [user]).map_err(db)?;
+            }
+            current.seal(&context, &plain)
+        } else if forget {
+            done.discarded += 1;
+            tx.execute(&format!("DELETE FROM {codes} WHERE user_id = ?1"), [user]).map_err(db)?;
+            tx.execute(&format!("DELETE FROM {table} WHERE user_id = ?1"), [user]).map_err(db)?;
+            continue;
+        } else if previous.is_some() {
+            done.unreadable += 1;
+            continue;
+        } else {
+            refused += 1;
+            continue;
+        };
+        tx.execute(&format!("UPDATE {table} SET secret = ?1 WHERE user_id = ?2"), params![value, user]).map_err(db)?;
+    }
+    if refused > 0 {
+        return Err(format!(
+            "{refused} people's second factors in it don't open with the master key. If the key was rotated, set SUPERBOT_MASTER_KEY_PREVIOUS back to the key before \
+             (docs/ops/master-key-rotation.md); if that key is lost for good, start once with SUPERBOT_FORGET_SEALED=1 to drop them, and their owners set them up again (ADR 0299)."
+        ));
+    }
+    tx.commit().map_err(db)?;
+    Ok(done)
+}
+
 /// Whether `cipher` opens what this database has sealed. True when nothing is sealed yet.
 fn opens(c: &Connection, cipher: &Cipher) -> rusqlite::Result<bool> {
     if let Some(v) = key_check(c)? {

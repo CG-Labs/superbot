@@ -531,6 +531,9 @@ pub struct Plan {
     /// People's own secrets kept from it (the store now missing, ADR 0293) that neither
     /// master key opens, which botd drops at start.
     unopened_secrets: usize,
+    /// People's second factors kept from it (the store now missing, ADR 0299) that neither
+    /// master key opens, which botd drops at start.
+    unopened_factors: usize,
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
@@ -657,6 +660,14 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
             plan.unopened_secrets
         ));
     }
+    plan.unopened_factors = unopened_factors(&c, &place.ciphers).map_err(err)?;
+    if plan.unopened_factors > 0 && !place.forget_sealed {
+        return Err(format!(
+            "{} people's second factors in that backup don't open with the master key or the previous one, so botd wouldn't start with it. \
+             Set SUPERBOT_MASTER_KEY_PREVIOUS to the key they were sealed under; if it's lost for good, set SUPERBOT_FORGET_SEALED=1 so botd drops them at start and their owners set them up again (ADR 0299)",
+            plan.unopened_factors
+        ));
+    }
     match current {
         Current::Readable(k) => {
             attach_now(&c, k)?;
@@ -709,6 +720,26 @@ fn unopened_secrets(c: &Connection, ciphers: &[Arc<Cipher>]) -> rusqlite::Result
         let (user, name, value) = row?;
         let context = sealed::user_context(&user, &name);
         if sealed::is_sealed(&value) && !ciphers.iter().any(|k| k.open(&context, &value).is_ok()) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// How many people's second factors (ADR 0299) are sealed under a key none of `ciphers` is,
+/// which botd refuses at start. None in a backup from before them.
+fn unopened_factors(c: &Connection, ciphers: &[Arc<Cipher>]) -> rusqlite::Result<usize> {
+    let has: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1)", [crate::db::SECOND_FACTOR], |r| r.get(0))?;
+    if !has {
+        return Ok(0);
+    }
+    let mut s = c.prepare("SELECT user_id, secret FROM main.user_mfa")?;
+    let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut n = 0;
+    for row in rows {
+        let (user, secret) = row?;
+        let context = sealed::mfa_context(&user);
+        if sealed::is_sealed(&secret) && !ciphers.iter().any(|k| k.open(&context, &secret).is_ok()) {
             n += 1;
         }
     }
@@ -924,6 +955,14 @@ impl Restore {
                 none_if_empty(&secrets(p.signed_in.user_secrets))
             ));
         }
+        let (replaced, now) = (p.sign_ins_replaced.second_factor(), p.signed_in.second_factor());
+        if replaced.total() + now.total() > 0 {
+            out.push_str(&format!(
+                "  Its people's second factors ({}) are replaced by the store's now ({}), so one turned off or reset since stays so, and a recovery code spent since stays spent (ADR 0299).\n",
+                none_if_empty(&replaced),
+                none_if_empty(&now)
+            ));
+        }
         if p.unopened > 0 {
             out.push_str(&format!("  {} saved tool inputs of approvals in it don't open with the master key; botd drops them at start (SUPERBOT_FORGET_SEALED=1).\n", p.unopened));
         }
@@ -931,6 +970,12 @@ impl Restore {
             out.push_str(&format!(
                 "  {} people's own secrets in it don't open with the master key; botd drops them at start and their owners save them again (SUPERBOT_FORGET_SEALED=1).\n",
                 p.unopened_secrets
+            ));
+        }
+        if p.unopened_factors > 0 {
+            out.push_str(&format!(
+                "  {} people's second factors in it don't open with the master key; botd drops them at start with their recovery codes, and their owners set them up again (SUPERBOT_FORGET_SEALED=1).\n",
+                p.unopened_factors
             ));
         }
         match (&p.back, &p.gone, &p.unreadable) {
@@ -1191,7 +1236,9 @@ mod tests {
         let db = Db::open(&w.app).unwrap();
         let settings = chat_stores::Settings { dirs: w.dirs(), ..chat_stores::Settings::default() };
         let cipher = crate::secrets::sealed::cipher();
-        let opened = chat_stores::open(&db, &settings, w.app.parent().unwrap(), None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+        let opened =
+            chat_stores::open(&db, &settings, w.app.parent().unwrap(), None, chat_stores::Keys { current: &cipher, previous: None, forget: false, new_derived_keys: false })
+                .unwrap();
         let lines: Vec<&String> = opened.lines.iter().filter(|l| l.contains("restore")).collect();
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].contains("was cut off before it replaced the store, so nothing was restored"), "{lines:?}");
@@ -1607,6 +1654,84 @@ mod tests {
         let r = restore(&place, &opts("newest", true), now()).await.unwrap();
         assert_eq!(r.plan.unopened_secrets, 1);
         assert!(r.text("gb-lon").contains("1 people's own secrets in it don't open with the master key; botd drops them at start"), "{}", r.text("gb-lon"));
+    }
+
+    fn factor(user: &str, secret: &str) -> String {
+        sealed::cipher().seal(&sealed::mfa_context(user), secret.as_bytes())
+    }
+
+    fn hashes(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_takes_its_second_factors_from_the_store_it_replaces_or_keeps_them_when_it_is_gone() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
+        let (cy, _) = pinned_bot(&db, "cy", "gb-lon");
+        assert!(db.mfa_enable(&ada, &factor(&ada, "totp-ada"), 1, &hashes(&["a1", "a2"])));
+        assert!(db.mfa_enable(&bob, &factor(&bob, "totp-bob-reset-since"), 1, &hashes(&["b1"])));
+        assert!(db.mfa_enable(&cy, &factor(&cy, "totp-cy-moved"), 1, &[]));
+        backup_pass(&db, 7, now() - DAY);
+        assert!(db.mfa_use_recovery(&ada, "a1"));
+        assert!(db.mfa_delete(&bob));
+        db.pin_residency(PinOn::User, &cy, "de-fra-2", "DPA-2", None).unwrap();
+        db.place_chats().unwrap();
+        drop(db);
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.second_factors, r.plan.held.recovery_codes), (1, 2), "what it holds once replaced: {r:?}");
+        assert_eq!((r.plan.sign_ins_replaced.second_factors, r.plan.sign_ins_replaced.recovery_codes), (2, 3), "{r:?}");
+        assert_eq!((r.plan.signed_in.second_factors, r.plan.signed_in.recovery_codes), (1, 2), "a spent code is kept as spent: {r:?}");
+        let text = r.text("gb-lon");
+        assert!(
+            text.contains("Its people's second factors (2 second factors and 3 recovery codes) are replaced by the store's now (1 second factor and 2 recovery codes), so one turned off or reset since stays so"),
+            "{text}"
+        );
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert!(!db.mfa_use_recovery(&ada, "a1"), "a code spent since stays spent");
+        assert_eq!(db.mfa_recovery_left(&ada), 1);
+        assert!(db.mfa(&bob).is_none(), "a second factor turned off since stays off");
+        assert!(db.mfa(&cy).is_some(), "one moved since is where it was moved");
+        backup_pass(&db, 8, now());
+        drop(db);
+
+        // With the store gone, the backup's are the only copy left, so they are kept.
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.held.second_factors, r.plan.sign_ins_replaced.second_factors, r.plan.signed_in.second_factors), (1, 0, 0), "{r:?}");
+        assert!(!r.text("gb-lon").contains("second factors"), "{}", r.text("gb-lon"));
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert!(db.mfa(&ada).is_some() && db.mfa_recovery_left(&ada) == 1);
+    }
+
+    #[tokio::test]
+    async fn a_backup_keeping_second_factors_sealed_under_a_lost_key_is_refused_unless_botd_drops_them() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        assert!(db.mfa_enable(&ada, &factor(&ada, "totp"), 1, &hashes(&["a1"])));
+        backup_pass(&db, 7, now() - DAY);
+        drop(db);
+        let (_, backup) = chat_stores::backups_strictly(&w.place().store).unwrap().pop().unwrap();
+        let under_lost_key = Cipher::new(&crate::secrets::key::MasterKey::generate()).seal(&sealed::mfa_context(&ada), b"totp");
+        Connection::open(&backup).unwrap().execute("UPDATE user_mfa SET secret = ?1", [under_lost_key]).unwrap();
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+
+        let e = restore(&w.place(), &opts("newest", true), now()).await.unwrap_err();
+        assert!(e.contains("1 people's second factors in that backup don't open") && e.contains("SUPERBOT_MASTER_KEY_PREVIOUS") && e.contains("SUPERBOT_FORGET_SEALED=1"), "{e}");
+        assert!(!w.store().exists() && work_files(&w.lon).is_empty() && notes(&w.lon).is_empty());
+
+        let place = Place { forget_sealed: true, ..w.place() };
+        let r = restore(&place, &opts("newest", true), now()).await.unwrap();
+        assert_eq!(r.plan.unopened_factors, 1);
+        assert!(r.text("gb-lon").contains("1 people's second factors in it don't open with the master key; botd drops them at start"), "{}", r.text("gb-lon"));
     }
 
     #[test]
