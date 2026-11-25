@@ -1091,12 +1091,27 @@ mod tests {
     /// exceptions count.
     #[test]
     fn register_bundles_of_format_7_add_no_file() {
-        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 7);
+        assert!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format >= 7);
         let body = json_file(&json!({ "exceptions": { "reportStale": ["linode: AR-1 (soc2-type2) covers to 2026-09-30"], "noAssuranceReport": [] } }));
         for n in [6, 7] {
             let f = register_bundle_with(n, "vendors.json", Some((&body, &["CC9.2"], &["CC9.2-1"])));
             assert!(f.verified(), "format {n}: {:?}", f.problems);
             assert_eq!(f.exceptions["vendors.json"]["reportStale"], 1);
+        }
+    }
+
+    /// Format 8 put the system description's approval in `policies.json` (ADR 0292) and
+    /// added no file, so a format-7 bundle still checks, and CC2.3-4 is read from the
+    /// manifest like any other row.
+    #[test]
+    fn register_bundles_of_format_8_add_no_file() {
+        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 8);
+        let body = json_file(&json!({ "exceptions": { "notApproved": ["soc2-system-description"], "reviewOverdue": [], "changedSinceApproval": [], "approverNotInRole": [] } }));
+        for n in [7, 8] {
+            let f = register_bundle_with(n, "policies.json", Some((&body, &["CC2.3", "CC3.1", "CC5.3"], &["CC2.3-4", "CC3.1-1", "CC5.3-1"])));
+            assert!(f.verified(), "format {n}: {:?}", f.problems);
+            assert_eq!(f.exceptions["policies.json"]["notApproved"], 1);
+            assert!(f.files.iter().any(|(name, _, rows)| name == "policies.json" && rows.contains(&"CC2.3-4".to_string())));
         }
     }
 
