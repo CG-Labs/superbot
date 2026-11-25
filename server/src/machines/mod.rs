@@ -8,6 +8,7 @@
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod agent;
+pub mod apt;
 pub mod backup;
 pub mod botuser;
 pub mod cgroup;

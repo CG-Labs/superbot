@@ -42,6 +42,7 @@ const INTERNET: &[(&str, &str)] = &[
     ("linodeobjects.com", "Linode Object Storage"),
     ("backblazeb2.com", "Backblaze B2"),
     ("linuxcontainers.org", "linuxcontainers.org's image server"),
+    ("ubuntu.com", "Ubuntu's archive"),
     ("npmjs.org", "npm's registry"),
     ("nodejs.org", "nodejs.org"),
     ("github.com", "GitHub"),
@@ -360,6 +361,7 @@ const INSIDE: &str = "Use one inside your network";
 const MODEL_FIX: &str = "Use a model server inside your network, or a provider's private endpoint (docs/ops/air-gapped.md#model-providers)";
 const S3_FIX: &str = "Use an S3-compatible store inside your network (MinIO, Ceph)";
 const HARNESS_FIX: &str = "Set MACHINE_HARNESS_BUNDLE to this release's harness bundle, or MACHINE_NODE_MIRROR and MACHINE_NPM_REGISTRY to your mirrors (docs/ops/air-gapped.md#harness-clis-on-users-machines)";
+const APT_FIX: &str = "Set MACHINE_APT_MIRROR (amd64) and MACHINE_APT_PORTS_MIRROR (arm64) to your mirrors of Ubuntu's archive (docs/ops/air-gapped.md#ubuntus-packages-on-users-machines)";
 const AUDIT_FIX: &str = "Send it to a SIEM or syslog collector inside your network";
 const SECRETS_FIX: &str = "Use a secrets manager inside your network, a private endpoint, or botd's own store (SECRETS_BACKEND unset)";
 
@@ -588,8 +590,30 @@ impl<'a> Judge<'a> {
         }
         if !linode && !incus {
             self.ok(Area::Machines, "off: botd manages no users' machines");
+        } else {
+            self.machine_packages(linode, incus);
         }
         linode || incus
+    }
+
+    /// Where machines' apt takes Ubuntu's packages and security updates (ADR 0284): amd64
+    /// machines from MACHINE_APT_MIRROR, arm64 ones (only on an arm64 Incus host) from
+    /// MACHINE_APT_PORTS_MIRROR, else Ubuntu's archives.
+    fn machine_packages(&mut self, linode: bool, incus: bool) {
+        let (amd64, arm64) = (self.set("MACHINE_APT_MIRROR"), self.set("MACHINE_APT_PORTS_MIRROR"));
+        let what = "Ubuntu's packages and security updates on machines";
+        if amd64 || !arm64 || linode {
+            let url = self.or("MACHINE_APT_MIRROR", crate::machines::apt::ARCHIVE).to_string();
+            self.address(Area::Machines, "MACHINE_APT_MIRROR", &url, &format!("{what} (amd64)"), APT_FIX);
+        } else {
+            self.push(Area::Machines, Status::Check, Some("MACHINE_APT_MIRROR"), Some("archive.ubuntu.com"), "machines on an amd64 Incus host take Ubuntu's packages from archive.ubuntu.com, on the internet. If any host is amd64, set MACHINE_APT_MIRROR to your mirror of archive.ubuntu.com/ubuntu (docs/ops/air-gapped.md#ubuntus-packages-on-users-machines)".into());
+        }
+        if arm64 {
+            let url = self.get("MACHINE_APT_PORTS_MIRROR").to_string();
+            self.address(Area::Machines, "MACHINE_APT_PORTS_MIRROR", &url, &format!("{what} (arm64)"), APT_FIX);
+        } else if incus && amd64 {
+            self.push(Area::Machines, Status::Check, Some("MACHINE_APT_PORTS_MIRROR"), Some("ports.ubuntu.com"), "machines on an arm64 Incus host take Ubuntu's packages from ports.ubuntu.com, on the internet. If any host is arm64, set MACHINE_APT_PORTS_MIRROR to your mirror of ports.ubuntu.com/ubuntu-ports (docs/ops/air-gapped.md#ubuntus-packages-on-users-machines)".into());
+        }
     }
 
     fn machine_harnesses(&mut self, tiers: Option<&crate::tiers::Tiers>) {
@@ -1366,6 +1390,7 @@ mod tests {
             "MACHINE_NPM_REGISTRY",
             "MACHINE_HERMES_BUNDLE",
             "MACHINE_HARNESS_LOGINS",
+            "MACHINE_APT_MIRROR",
             "ANTHROPIC_BASE_URL",
             "SSO_ENTRA_AUTHORITY",
             "SSO_GITHUB_URL",
@@ -1406,6 +1431,8 @@ mod tests {
                 ("INCUS_URL", "https://10.0.0.5:8443"),
                 ("INCUS_HOSTS", "b=https://10.0.0.6:8443"),
                 ("INCUS_IMAGE_SERVER", "local"),
+                ("MACHINE_APT_MIRROR", "https://apt.corp.example/ubuntu"),
+                ("MACHINE_APT_PORTS_MIRROR", "https://10.0.0.21/ubuntu-ports"),
                 ("MACHINE_HARNESSES", "claude,codex,hermes"),
                 ("MACHINE_HARNESS_BUNDLE", "/srv/superbot-harnesses-1.0.0-x86_64.tar.gz"),
                 ("MACHINE_HERMES_BUNDLE", "/srv/superbot-hermes-v1.0.0-x86_64.tar.gz"),
@@ -1437,6 +1464,8 @@ mod tests {
             "SSO_CORP_ISSUER",
             "INCUS_URL",
             "INCUS_HOSTS",
+            "MACHINE_APT_MIRROR",
+            "MACHINE_APT_PORTS_MIRROR",
             "SMTP_HOST",
             "NOTIFY_WEBHOOK_URL",
             "NOTIFY_WEBHOOK_URL_BOT_A1B2C3D4",
@@ -1457,6 +1486,29 @@ mod tests {
         assert!(of(&f, Area::Machines).iter().any(|x| x.detail.contains("INCUS_IMAGE_SERVER=local")));
         assert_eq!(by(&f, "AUDIT_EXPORT").host.as_deref(), Some("siem.corp.example"));
         assert!(by(&f, "SSO_CORP_ISSUER").detail.contains("under corp.example, given with --internal"));
+    }
+
+    #[test]
+    fn machines_take_ubuntus_packages_from_the_internet_unless_given_a_mirror() {
+        let linode = [("LINODE_TOKEN", "lin-not-real"), ("MACHINE_HARNESSES", "none")];
+        let f = findings(&linode, &[]);
+        let apt = by(&f, "MACHINE_APT_MIRROR");
+        assert_eq!((apt.status, apt.host.as_deref()), (Status::Internet, Some("archive.ubuntu.com")), "{f:#?}");
+        assert!(apt.detail.contains("Ubuntu's archive") && apt.detail.contains("Set MACHINE_APT_MIRROR"), "{}", apt.detail);
+        assert!(f.iter().all(|x| x.setting.as_deref() != Some("MACHINE_APT_PORTS_MIRROR")), "Linode machines are amd64");
+        let f = findings(&[linode[0], linode[1], ("MACHINE_APT_MIRROR", "https://apt.internal/ubuntu")], &[]);
+        assert_eq!(by(&f, "MACHINE_APT_MIRROR").status, Status::Ok);
+
+        let incus = [("MACHINE_PROVIDER", "incus"), ("INCUS_URL", "https://10.0.0.5:8443"), ("INCUS_IMAGE_SERVER", "local"), ("MACHINE_HARNESSES", "none")];
+        let amd64 = findings(&[incus[0], incus[1], incus[2], incus[3], ("MACHINE_APT_MIRROR", "https://apt.internal/ubuntu")], &[]);
+        let ports = by(&amd64, "MACHINE_APT_PORTS_MIRROR");
+        assert_eq!((ports.status, ports.host.as_deref()), (Status::Check, Some("ports.ubuntu.com")), "an arm64 host would still reach out");
+        let arm64 = findings(&[incus[0], incus[1], incus[2], incus[3], ("MACHINE_APT_PORTS_MIRROR", "https://apt.internal/ubuntu-ports")], &[]);
+        assert_eq!(by(&arm64, "MACHINE_APT_PORTS_MIRROR").status, Status::Ok);
+        assert_eq!(by(&arm64, "MACHINE_APT_MIRROR").status, Status::Check, "an amd64 host would still reach out");
+        let none = findings(&incus, &[]);
+        assert_eq!(by(&none, "MACHINE_APT_MIRROR").status, Status::Internet);
+        assert!(none.iter().all(|x| x.setting.as_deref() != Some("MACHINE_APT_PORTS_MIRROR")), "one finding is enough");
     }
 
     #[test]

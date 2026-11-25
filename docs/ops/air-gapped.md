@@ -1,6 +1,6 @@
 # Air-gapped installs
 
-SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md), and Hermes Agent with Docker Compose from the Hermes bundle in [ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md).
+SuperBot runs on a server with no internet access. You make (or download) an **offline bundle** on a connected machine, check it, carry it in, and install or upgrade from it with `install.sh --offline`. Nothing on the server then calls GitHub, a package registry, Let's Encrypt or CG-Labs. The license is checked offline too. The design is in [ADR 0128](../adr/0128-air-gapped-self-host.md), release bundles and registry mirrors in [ADR 0140](../adr/0140-release-bundles-and-registry-mirrors.md), signatures and multi-arch indexes in mirrors in [ADR 0147](../adr/0147-signatures-and-multi-arch-indexes-in-mirrors.md), how every release's bundles are checked end to end in [ADR 0172](../adr/0172-release-bundles-checked-end-to-end.md), harness installs on users' machines from your own mirrors in [ADR 0186](../adr/0186-harness-installs-from-internal-mirrors.md), Hermes Agent from a Hermes bundle in [ADR 0200](../adr/0200-hermes-agent-bundle-for-air-gapped-installs.md), Hermes Agent on users' machines from that bundle in [ADR 0210](../adr/0210-hermes-agent-on-air-gapped-machines.md), Claude Code, Codex and Pi on the server from a harness bundle in [ADR 0232](../adr/0232-harness-cli-bundle-for-air-gapped-servers.md), and on users' machines from that bundle in [ADR 0242](../adr/0242-harness-bundle-on-air-gapped-machines.md), Hermes Agent with Docker Compose from the Hermes bundle in [ADR 0275](../adr/0275-hermes-agent-bundle-for-docker-compose.md), and Ubuntu's packages on users' machines from your apt mirror in [ADR 0284](../adr/0284-ubuntu-packages-on-machines-from-an-apt-mirror.md).
 
 ## What a bundle holds
 
@@ -362,6 +362,27 @@ MACHINE_HERMES_BUNDLE=/var/lib/superbot/superbot-hermes-v0.23.3-x86_64.tar.gz,/v
 
 Without `MACHINE_HERMES_BUNDLE`, machines run Hermes's installer, which needs the internet. Then leave `hermes` out of `MACHINE_HARNESSES` and set it explicitly: unset, it defaults to the managed tiers' harness, Hermes on the shipped plans. botd's startup log and `botctl machine mirror` name any harness still fetched from the internet.
 
+## Ubuntu's packages on users' machines
+
+Users' machines run Ubuntu 24.04 (noble). At first boot they install `nftables` and `unattended-upgrades` for their hardening ([ADR 0126](../adr/0126-per-user-machine-hardening.md)), and the packages for screens, with apt, and `unattended-upgrades` then takes security updates. Out of the box apt fetches all of them from `archive.ubuntu.com` (`ports.ubuntu.com` for arm64), which isn't reachable here: the first boot can't install them, so the machine has no egress rules and no screens, and it never gets a security update. Point machines at your own mirror of Ubuntu's archive instead ([ADR 0284](../adr/0284-ubuntu-packages-on-machines-from-an-apt-mirror.md)):
+
+```sh
+MACHINE_APT_MIRROR=https://mirror.corp.example/ubuntu
+MACHINE_APT_PORTS_MIRROR=https://mirror.corp.example/ubuntu-ports
+MACHINE_MIRROR_CA_FILE=/etc/superbot/mirror-ca.pem
+```
+
+- **`MACHINE_APT_MIRROR`** is a mirror of `http://archive.ubuntu.com/ubuntu`, for amd64 machines (every Linode machine, and containers on an amd64 Incus host). **`MACHINE_APT_PORTS_MIRROR`** is a mirror of `http://ports.ubuntu.com/ubuntu-ports`, for containers on an arm64 Incus host. Set the ones for the arches you run. An Artifactory or Nexus apt remote, aptly or apt-mirror does, with the `noble`, `noble-updates` and `noble-security` suites and the `main`, `restricted`, `universe` and `multiverse` components. A machine with no mirror for its arch keeps Ubuntu's archive.
+- Both must be `https://`, with no login, query or fragment in the URL. They need `MACHINE_CONTROL_URL`, and botd won't start with a value it can't use.
+- **`MACHINE_MIRROR_CA_FILE`** is the same CA setting as for the [harness mirrors](#harness-clis-on-users-machines). apt trusts it for the mirrors' hosts only (`Acquire::https::<host>::CAInfo`), besides the machine's own roots.
+- At first boot, before anything is installed, the machine writes `/etc/apt/sources.list.d/ubuntu.sources` for its arch, with the three suites, and blanks `/etc/apt/sources.list` if the image filled it. It also tells cloud-init to leave apt's sources alone, so a container restored onto another Incus host keeps them.
+- **apt still checks Ubuntu's signatures.** The sources keep `Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg`, so a mirror can serve Ubuntu's packages but can't change them: a Release file signed by another key, or a package that differs from its index, is refused. So mirror Ubuntu's archive as published (`InRelease` with Ubuntu's signature); a mirror you re-sign with your own key won't work. Keep its `Origin: Ubuntu` too, which `unattended-upgrades` matches on.
+- **Keep the mirror current.** Security updates reach machines only as fast as the mirror takes them from Ubuntu. `botctl machine mirror` warns when `noble-updates` or `noble-security` is over a week old.
+- **Incus containers** never reach private addresses, so open the mirror's address and port with `INCUS_EGRESS_ALLOW`, as for the [harness mirrors](#harness-clis-on-users-machines). Linode machines' outbound rules drop private addresses too.
+- Only new machines read it: it is set once, at first boot. An existing machine keeps its sources until it is made again from the base image. Restoring a backup keeps the sources saved in it, so a machine backed up before you set the mirror still uses Ubuntu's archive after a restore.
+
+`botctl machine mirror` checks the apt mirror too, as machines would and trusting what they would. For each arch, it reads each suite's `InRelease` and says what apt would refuse: not clearsigned, another release, missing the arch or the `main` and `universe` components, or past its `Valid-Until`. It then reads the `main` and `universe` package lists, checks each against its `InRelease`, and checks they list every package machines install. Entries are named `ubuntu` (one per suite) and `ubuntu-packages`, and the mirror's address is in `blocked` while machines' firewall would drop it. botd doesn't check Ubuntu's signature itself; apt on each machine does.
+
 ## Model providers
 
 Bots need a model provider, and in an air-gapped network it must be one inside it: a self-hosted model server with an OpenAI-compatible API (vLLM, Ollama, TGI, ...), or a provider's private endpoint reachable from your network. Model provider URLs must be `https://`, or `http://` on the server itself ([ADR 0097](../adr/0097-model-providers-over-https.md)):
@@ -381,6 +402,7 @@ Logins that go through a vendor's website (`claude login`, `codex login`) don't 
 | `--with-hermes` | Downloads Hermes Agent: with `--offline`, give `--hermes-bundle` ([Hermes Agent](#hermes-agent)) |
 | Hermes Agent with Compose | The published image has none: load the Hermes bundle into a volume with `load-hermes` ([above](#hermes-agent-with-docker-compose)) |
 | Harness CLIs on users' machines | Claude Code, Codex and Pi from botd's harness bundle (`MACHINE_HARNESS_BUNDLE`, [above](#claude-code-codex-and-pi-from-botds-harness-bundle)), or from your Node.js and npm mirrors ([above](#harness-clis-on-users-machines)); Hermes Agent from botd's Hermes bundle (`MACHINE_HERMES_BUNDLE`, [above](#hermes-agent-on-users-machines)) |
+| Ubuntu's packages and security updates on users' machines | From your mirror of Ubuntu's archive (`MACHINE_APT_MIRROR`, `MACHINE_APT_PORTS_MIRROR`, [above](#ubuntus-packages-on-users-machines)) |
 | Billing (Stripe), push notifications (`PUSH_PROVIDER=expo`), Turnstile on the sign-up form | Need the internet: leave them off (the default) |
 | Managed machines on Linode | Need the internet: use Incus hosts inside your network, or none. Incus fetches images from `images.linuxcontainers.org` unless you import them and set `INCUS_IMAGE_SERVER=local` ([guide](incus-containers.md)) |
 | Off-host backups | An S3-compatible store inside your network (MinIO, Ceph) |
@@ -412,7 +434,7 @@ It exits 1 while anything is `internet`, else 0, and 2 for a usage error. `insta
 | License | Nothing: the license is checked offline |
 | Sign-in | Each SSO provider's issuer, authority or metadata URL (`SSO_*`), defaults included; for native SAML, the sign-in and logout URLs in its metadata file (metadata saved with botctl is read by `botctl offline check`) |
 | Model providers | The tiers file's `providers` and routes, `SUPERBOT_HERMES_BASE_URL`, `ANTHROPIC_BASE_URL`, or an API key with no base URL |
-| Machines | `LINODE_TOKEN`; `INCUS_URL`, `INCUS_HOSTS` and `INCUS_IMAGE_SERVER` |
+| Machines | `LINODE_TOKEN`; `INCUS_URL`, `INCUS_HOSTS` and `INCUS_IMAGE_SERVER`; `MACHINE_APT_MIRROR` and `MACHINE_APT_PORTS_MIRROR` (Ubuntu's archive without them) |
 | Harnesses on machines | `MACHINE_HARNESSES` (or the managed tiers' harnesses), `MACHINE_HARNESS_BUNDLE`, `MACHINE_NODE_MIRROR`, `MACHINE_NPM_REGISTRY`, `MACHINE_HERMES_BUNDLE`, `MACHINE_HARNESS_LOGINS` |
 | Billing | `BILLING` |
 | Push notifications | `PUSH_PROVIDER` |

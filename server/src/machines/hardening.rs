@@ -263,6 +263,10 @@ ExecStart=/usr/local/lib/superbot/egress
 WantedBy=multi-user.target superbot-machine.service
 ";
 
+/// What FIRSTBOOT installs with apt when the image lacks it, which an apt mirror must
+/// carry (ADR 0284).
+pub const PACKAGES: &[&str] = &["nftables", "unattended-upgrades"];
+
 /// The first boot's hardening, before it installs the agent: each step's outcome goes
 /// to the status file, and none of them stops the machine from enrolling. Packages
 /// it needs are installed only if missing.
