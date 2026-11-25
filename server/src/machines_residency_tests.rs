@@ -713,7 +713,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
     assert!(md.contains("## Chats") && md.contains("- **Messages in it:** 3"), "{md}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0 }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
     assert_eq!(lon_row["chatStore"]["messages"].as_i64(), Some(3), "{regions}");
@@ -762,7 +762,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert!(r["notCovered"][0].as_str().unwrap().starts_with("botd's own database (accounts, chats,"), "{r}");
     assert_eq!(r["status"].as_str(), Some("kept"), "old backups are disclosed, not unkept: {r}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1 }), "the move is done; only old backups are left: {me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true }), "the move is done; only old backups are left: {me}");
 
     // Left there for hours (a check that keeps failing), admins are warned.
     app.db.conn_for_tests().execute("UPDATE main.chat_moves_out SET moved_at = moved_at - 4 * 3600000 WHERE region = 'gb-lon'", []).unwrap();
@@ -785,7 +785,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert!(!r["warnings"].to_string().contains("backups of gb-lon's chat store"), "{r}");
     assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()));
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0 }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(!regions["residency"]["warnings"].to_string().contains("may still hold the rows"), "{regions}");
 }

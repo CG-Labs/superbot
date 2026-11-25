@@ -35,13 +35,16 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
   const c = v.chats;
   const moving = !!c?.store && (c.moving ?? !c.inRegion);
   const chatsHeld = !!c?.store && !moving && !s?.inRegion;
-  if (moving) lines.push(`Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins are being moved to ${p.region}'s own database.`);
+  const kept = c?.signIns
+    ? "Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins"
+    : "Your chats, routines, approvals, Bots' memory and the facts your Bots keep about you";
+  if (moving) lines.push(`${kept} are being moved to ${p.region}'s own database.`);
   else if (c?.store) {
-    lines.push(`Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins are kept in ${p.region}, in a database of their own there.`);
+    lines.push(`${kept} are kept in ${p.region}, in a database of their own there.`);
     const n = c.earlierBackups ?? 0;
     if (n > 0) lines.push(`${n === 1 ? "A backup" : `${n} backups`} from before they moved still ${n === 1 ? "holds" : "hold"} earlier copies in another region until SuperBot clears them out.`);
   }
-  const what = chatsHeld ? "account" : "account, sign-ins, chats, routines, approvals, Bots' memory and the facts your Bots keep about you";
+  const what = chatsHeld ? (c?.signIns ? "account" : "account and sign-ins") : "account, sign-ins, chats, routines, approvals, Bots' memory and the facts your Bots keep about you";
   if (s?.inRegion) lines.push(`SuperBot's own copy of your ${what} is in ${p.region}.`);
   else if (s) {
     const where =

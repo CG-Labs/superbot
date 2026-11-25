@@ -26,14 +26,14 @@ A person's sessions, their SAML sign-ins and push devices are kept in the store 
 Reads go through the views every place shares, so signing in, checking a session, listing them and finding the phones to notify are unchanged. Writes name the place:
 
 - A new session is written to the store of the person's pin.
-- A SAML sign-in and a push device are written where their session is, so the three always move together.
+- A SAML sign-in and a push device are written where their session is (to every copy of it, see below), so the three always move together.
 - Touching, revoking, pruning and erasing run on every place.
 
 ### Moving them
 
 `place_chats` moves the three with the person's pin, on the same passes as facts: a pin, startup and every reconcile. A store has no foreign keys, so a move deletes a session's SAML sign-in and push device before the session (botd's own tables would delete them with it, uncounted). Pruning, and each move, sweeps a store of SAML sign-ins and push devices whose session is gone.
 
-A move cut off between its copy and its delete leaves a session in two places for one pass. Revoking it reaches both, and revoking all of someone's sessions tells their IdP once.
+A move cut off between its copy and its delete leaves a session in two places until the next pass, which keeps either copy. So every write reaches both: a push device or SAML sign-in changed meanwhile is written to each copy of its session, and so isn't lost or turned back to an old token or setting. Revoking reaches both, and revoking all of someone's sessions tells their IdP once.
 
 Moves are audited with `sessions`, `samlSessions` and `pushDevices` in `residency.chats_moved`, and reconcile returns `sessionsMoved`, `samlSessionsMoved` and `pushDevicesMoved`. They are recorded per person (`facts_moves_out`), so a store's backups are cleared of them once they leave.
 
@@ -49,7 +49,7 @@ A backup of a store holds sessions as they were when it was made. Restored as th
 
 - Reports, `GET /api/regions` and the app count sign-ins with the rest (`chats.sessions`, `chats.samlSessions`, `chats.pushDevices`; "Sign-in sessions", "SAML sign-ins" and "Push devices" rows in the Markdown report). A pinned person's session left in botd's own database counts as outside the region until the next pass.
 - What a pin doesn't cover names accounts and the audit log, no longer sessions.
-- The app says "Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins are kept in ...". The DPA template (annex IV) says the same.
+- The app says "Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins are kept in ..." only when the server says its store keeps sign-ins (`chats.signIns` in `GET /api/me/residency`). A server from before this keeps them in its own database, and the app says so. The DPA template (annex IV) says the same.
 
 ## Consequences
 
@@ -65,8 +65,8 @@ A backup of a store holds sessions as they were when it was made. Restored as th
 
 ## Tests
 
-- `db::chats`: a pinned person's sessions, SAML sign-ins and push devices move to the store and back with the pin; new ones, touches and revokes reach the store, and a token moved between sessions stays one device; pruning and erasure clear them in a store; a move cut off after its copy still revokes once; push tokens in a store are sealed at startup; stores gain the unique indexes; copies of a store are cleared of sessions by person.
+- `db::chats`: a pinned person's sessions, SAML sign-ins and push devices move to the store and back with the pin; new ones, touches and revokes reach the store, and a token moved between sessions stays one device; pruning and erasure clear them in a store; a move cut off after its copy keeps push device and SAML changes made meanwhile, and still revokes once; push tokens in a store are sealed at startup; stores gain the unique indexes; copies of a store are cleared of sessions by person.
 - `machines::chat_store_restore`: a restore takes sign-ins from the store it replaces, so a session revoked since stays revoked; with the store gone, the backup's are dropped.
 - `main`: the rotation lines count push tokens in stores.
 - HTTP (`machines_residency_tests.rs`): a pin moves a session into London's store and it still signs in; a new sign-in lands there; the report counts them; a session left outside makes the pin unkept until reconcile; signing out ends it there; unpinned, they come back.
-- Client (`residency.test.ts`): Settings names sign-ins with the rest.
+- Client (`residency.test.ts`): Settings names sign-ins with the rest, and not on a server from before this.

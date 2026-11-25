@@ -114,14 +114,20 @@ describe("where your Bots run (ADR 0267)", () => {
 
 describe("chats, routines, approvals, Bots' memory, owners' facts and sign-ins in the region's own database (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283)", () => {
   it("says chats are kept in the region and leaves them out of the server's copy", () => {
-    const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true } }));
+    const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true, signIns: true } }));
     expect(held.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins are kept in gb-lon, in a database of their own there.");
     expect(held.lines).toContain("SuperBot's own copy of your account isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
     expect(held.warnings).toEqual([]);
   });
 
+  it("leaves sign-ins out of the store and in the server's copy on servers from before ADR 0283", () => {
+    const older = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true } }));
+    expect(older.lines).toContain("Your chats, routines, approvals, Bots' memory and the facts your Bots keep about you are kept in gb-lon, in a database of their own there.");
+    expect(older.lines).toContain("SuperBot's own copy of your account and sign-ins isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
+  });
+
   it("says when the move is done but older backups elsewhere still hold copies", () => {
-    const done = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: false, moving: false, earlierBackups: 2 } }));
+    const done = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: false, moving: false, earlierBackups: 2, signIns: true } }));
     expect(done.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins are kept in gb-lon, in a database of their own there.");
     expect(done.lines).toContain("2 backups from before they moved still hold earlier copies in another region until SuperBot clears them out.");
     expect(done.lines.some((l) => l.includes("being moved"))).toBe(false);
@@ -131,7 +137,7 @@ describe("chats, routines, approvals, Bots' memory, owners' facts and sign-ins i
   });
 
   it("says when they are still moving, and says nothing without a store", () => {
-    const moving = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: false } }));
+    const moving = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: false, signIns: true } }));
     expect(moving.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you and your sign-ins are being moved to gb-lon's own database.");
     expect(moving.lines).toContain("SuperBot's own copy of your account, sign-ins, chats, routines, approvals, Bots' memory and the facts your Bots keep about you isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
     const none = residencyLines(view({ serverData: { region: "gb-lon", inRegion: true }, chats: { store: false, inRegion: true } }));
