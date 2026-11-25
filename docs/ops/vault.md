@@ -291,9 +291,33 @@ botd's own token must still outlive the run (see above): Vault ends a token's le
 
 ## Day to day
 
-- **Rotate** a value in Vault (`vault kv put ...`). botd uses it within `SECRETS_CACHE_SECONDS`; no restart. Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart.
+- **Rotate** a value in Vault (`vault kv put ...`). botd uses it within `SECRETS_CACHE_SECONDS`; no restart. To use it now, refresh botd's cache ([below](#rotating-a-value-now)). Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart; the refresh names them.
 - **Move a key from the sealed store to Vault**: put it in Vault, check `botctl secrets` shows the sealed copy as shadowed by `vault`, then `botctl secret rm NAME`.
 - **Audit**: `botctl audit --action secret.read` (or the client's audit log) shows each read that reached Vault and each failure, by name, never the value. AppRole, Kubernetes and JWT logins are `secret.vault_login`. Cache hits aren't logged; Vault's own audit device has its side.
+
+## Rotating a value now
+
+After a leak, don't wait out the cache. Rotate the value in Vault, then:
+
+```sh
+botctl secrets refresh OPENAI_API_KEY     # or several names, or none for everything cached
+```
+
+botd reads each name again at once (in every folder that has it cached, users' folders included) and lists its folders again, so new runs get the new value and a new name reaches Bots straight away. It says, per name, `changed`, `unchanged`, `added`, `removed`, `found`, `not there` or `unavailable`, never a value, and exits non-zero if any read failed or botd needs a restart:
+
+```text
+vault read again: 1 name, 1 changed.
+  1 changed, 0 added, 0 removed, 0 unchanged, 0 found, 0 not there, 0 unavailable.
+  OPENAI_API_KEY in bots: changed
+```
+
+- **Restart needed**: botd's startup settings keep what they read until a restart. With no names, the refresh also reads every name they read from Vault and flags those whose value has changed since (`restart botd: it read the old value at startup`), including one that was missing at startup and is set now.
+- **Vault down**: a name that can't be read is left with nothing cached, as when the cache runs out, so runs that need it are refused until Vault answers. A refresh never keeps the old value.
+- **Running Bots** keep the environment they started with. Revoke the old key at its provider to cut them off too. Short-lived credentials for each run aren't cached, so a refresh doesn't touch them.
+- **Audit**: `secret.cache_refreshed`, by the admin, with the counts and the names that changed, failed or need a restart. Each read is also a `secret.read`, as usual.
+- The API is `POST /api/secrets/refresh` with `{"names": [...]}` or no body, for admins. It answers 409 with `SECRETS_BACKEND=local` or while another refresh runs.
+
+See [ADR 0291](../adr/0291-refreshing-the-external-secrets-cache.md).
 
 ## When Vault is down
 
@@ -303,7 +327,7 @@ botd fails closed. Within the cache time, cached answers stand. After that:
 - botd never falls back to an older value or to the sealed store's copy.
 - `GET /api/secrets` answers 503; the server log has Vault's reason (`Vault answered 503 ...`, `AppRole login at auth/approle answered 400 ...`, `the JWT in VAULT_JWT_FILE (...) expired 120 s ago`).
 
-Runs work again as soon as Vault answers. A longer `SECRETS_CACHE_SECONDS` rides out longer outages but delays rotations.
+Runs work again as soon as Vault answers. A longer `SECRETS_CACHE_SECONDS` rides out longer outages but delays rotations; `botctl secrets refresh` lands a rotation at once whatever the cache time.
 
 ## Turning it off
 

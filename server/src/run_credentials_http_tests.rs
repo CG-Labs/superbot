@@ -86,7 +86,7 @@ async fn refusals(port: u16, admin: &str, bot: &str) -> Vec<Value> {
     audit_list(&body)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_run_gets_a_new_lease_revoked_when_it_ends_and_none_refuses_it() {
     let (port, app, admin, _) = serve_app().await;
     fake_claude(&app);
@@ -116,7 +116,7 @@ async fn a_run_gets_a_new_lease_revoked_when_it_ends_and_none_refuses_it() {
     crate::secrets::redact::forget_for(&ada_id, "stale-saved-session-5e6f");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_plans_provider_key_may_come_only_from_a_lease() {
     let (port, app, admin, _) = serve_app().await;
     app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
@@ -172,7 +172,7 @@ async fn a_run_stops_when_its_sts_session_expires() {
     assert!(f.revoked.lock().unwrap().is_empty(), "an STS session is never revoked");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_run_outlives_its_leases_ttl_by_renewing_them_until_the_max_ttl_stops_it() {
     let (port, app, admin, _) = serve_app().await;
     slow_claude(&app);
