@@ -8597,17 +8597,18 @@ impl Db {
             > 0
     }
 
-    /// Kept where its session is, so the two move together (ADR 0283).
+    /// Kept where its session is (every copy of it), so the two move together (ADR 0283).
     pub fn add_saml_session(&self, session_id: &str, l: &SamlLogin) {
         let c = self.c();
-        let Ok(Some(place)) = self.place_holding(&c, "sessions", session_id) else { return };
-        let _ = c.execute(
-            &format!(
-                "INSERT OR REPLACE INTO {place}.saml_sessions (session_id, user_id, name_id, name_id_format, name_qualifier, sp_name_qualifier, session_index)
-                 SELECT ?1, user_id, ?2, ?3, ?4, ?5, ?6 FROM {place}.sessions WHERE id = ?1"
-            ),
-            params![session_id, l.name_id, l.format, l.name_qualifier, l.sp_name_qualifier, l.session_index],
-        );
+        for place in self.places_holding(&c, "sessions", session_id).unwrap_or_default() {
+            let _ = c.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {place}.saml_sessions (session_id, user_id, name_id, name_id_format, name_qualifier, sp_name_qualifier, session_index)
+                     SELECT ?1, user_id, ?2, ?3, ?4, ?5, ?6 FROM {place}.sessions WHERE id = ?1"
+                ),
+                params![session_id, l.name_id, l.format, l.name_qualifier, l.sp_name_qualifier, l.session_index],
+            );
+        }
     }
 
     pub fn saml_session(&self, session_id: &str) -> Option<SamlLogin> {
@@ -9317,17 +9318,24 @@ impl Db {
         let stored: Option<(String, i64)> =
             tx.query_row("SELECT id, created_at FROM push_devices WHERE session_id = ?", [session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap();
         let (id, created) = stored.unwrap_or_else(|| (format!("pd{}", crate::random_hex(8)), at));
-        // Kept where its session is, so the two move together (ADR 0283).
-        let place = self.place_holding(&tx, "sessions", session_id).unwrap().unwrap_or("main");
-        tx.execute(
-            &format!(
-                "INSERT INTO {place}.push_devices (id, user_id, session_id, provider, token_hash, token, platform, approvals, routines, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(session_id) DO UPDATE SET provider = ?4, token_hash = ?5, token = ?6, platform = ?7, approvals = ?8, routines = ?9, updated_at = ?11"
-            ),
-            params![id, user_id, session_id, provider, token_hash, sealed::seal_field(PUSH_TOKEN_CONTEXT, token), platform, approvals, routines, created, at],
-        )
-        .unwrap();
+        // Kept where its session is, every copy of it, so the two move together and a move's
+        // next pass keeps this whichever copy it keeps (ADR 0283).
+        let mut places = self.places_holding(&tx, "sessions", session_id).unwrap();
+        if places.is_empty() {
+            places.push("main");
+        }
+        let sealed_token = sealed::seal_field(PUSH_TOKEN_CONTEXT, token);
+        for place in places {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {place}.push_devices (id, user_id, session_id, provider, token_hash, token, platform, approvals, routines, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(session_id) DO UPDATE SET provider = ?4, token_hash = ?5, token = ?6, platform = ?7, approvals = ?8, routines = ?9, updated_at = ?11"
+                ),
+                params![id, user_id, session_id, provider, token_hash, sealed_token, platform, approvals, routines, created, at],
+            )
+            .unwrap();
+        }
         self.on_places(
             &tx,
             "DELETE FROM {push_devices} WHERE user_id = ?1 AND id NOT IN (SELECT id FROM push_devices WHERE user_id = ?1 ORDER BY updated_at DESC, id LIMIT ?2)",

@@ -685,15 +685,17 @@ impl Db {
         self.place_by(c, Key::User, user_id)
     }
 
-    /// The schema holding row `id` of kept `table`, botd's own first. None: no place has it.
-    pub(super) fn place_holding(&self, c: &Connection, table: &str, id: &str) -> rusqlite::Result<Option<&str>> {
+    /// The schemas holding row `id` of kept `table`, botd's own first: two while a move cut
+    /// off between its copy and its delete waits for the next pass, which keeps either copy.
+    pub(super) fn places_holding(&self, c: &Connection, table: &str, id: &str) -> rusqlite::Result<Vec<&str>> {
         let pk = kept(table).map_or("id", |k| k.pk);
+        let mut out = Vec::new();
         for s in schemas(self.chat_stores_set()) {
             if c.query_row(&format!("SELECT 1 FROM {s}.{table} WHERE {pk} = ?1"), [id], |_| Ok(())).optional()?.is_some() {
-                return Ok(Some(s));
+                out.push(s);
             }
         }
-        Ok(None)
+        Ok(out)
     }
 
     /// Runs `sql` (with `RETURNING`, naming kept tables as `on_places` does) on every place,
@@ -2272,7 +2274,7 @@ mod tests {
     }
 
     #[test]
-    fn a_move_cut_off_after_its_copy_leaves_sessions_that_still_revoke_once() {
+    fn a_move_cut_off_after_its_copy_keeps_sign_in_changes_and_revokes_once() {
         let d = Dirs::new();
         let db = d.up();
         let ada = user(&db, "ada");
@@ -2282,9 +2284,22 @@ mod tests {
         CRASH_AFTER_COPY.with(|c| c.set(true));
         assert!(db.place_chats().is_err());
         assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([1, 0, 1], [1, 0, 1]), "in both places");
+        // Changes meanwhile reach both copies, so the next pass keeps them whichever it keeps.
+        db.put_push_device(&ada, &s, "fcm", "push-2", "ios", true, false);
+        db.add_saml_session(&s, &saml("idx-1"));
+        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([1, 1, 1], [1, 1, 1]));
+        assert_eq!(db.place_chats().unwrap(), vec![sign_ins_move(None, Some("gb-lon"), [1, 1, 1])]);
+        let d = db.session_push_device(&s).unwrap();
+        assert_eq!((d.token.as_str(), d.routines, db.saml_session(&s).is_some()), ("push-2", false, true));
+        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([0, 0, 0], [1, 1, 1]));
+
+        // Unpinned and cut off again, revoking reaches both copies and tells the IdP once.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
         assert_eq!(db.revoke_user_sessions(&ada, "ops", "offboarded").len(), 1, "told to the IdP once");
-        assert_eq!(db.place_chats().unwrap(), vec![sign_ins_move(None, Some("gb-lon"), [1, 0, 0])]);
-        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([0, 0, 0], [1, 0, 0]));
+        assert_eq!(db.place_chats().unwrap(), vec![sign_ins_move(Some("gb-lon"), None, [1, 1, 0])]);
+        assert_eq!((sign_ins(&db, "main"), sign_ins(&db, "chats_0")), ([1, 1, 0], [0, 0, 0]));
         assert!(db.session(&s).unwrap().revoked_at.is_some());
     }
 
