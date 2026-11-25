@@ -49,8 +49,7 @@ pub fn source_id(entity_id: &str) -> [u8; 20] {
     d.as_ref().try_into().expect("SHA-1 is 20 bytes")
 }
 
-/// Reads the `SAMLart` the browser brought. It must be a type 4 artifact from `idp_entity_id`.
-pub fn parse(raw: &str, idp_entity_id: &str) -> Result<Artifact, Refused> {
+fn decode(raw: &str) -> Result<Vec<u8>, Refused> {
     let bad = || Refused("bad_artifact", None);
     let raw = raw.trim();
     if raw.len() > 128 {
@@ -61,6 +60,19 @@ pub fn parse(raw: &str, idp_entity_id: &str) -> Result<Artifact, Refused> {
     if bytes.len() != LEN || bytes[..2] != TYPE_CODE {
         return Err(bad());
     }
+    Ok(bytes)
+}
+
+/// Which of `entity_ids` an artifact's `SourceID` names, before it is resolved: which of a
+/// provider's several IdPs to resolve an unsolicited one at (ADR 0290). `parse` checks it again.
+pub fn claimed_source<'a>(raw: &str, entity_ids: &'a [String]) -> Option<&'a str> {
+    let bytes = decode(raw).ok()?;
+    entity_ids.iter().find(|e| bytes[4..24] == source_id(e)).map(String::as_str)
+}
+
+/// Reads the `SAMLart` the browser brought. It must be a type 4 artifact from `idp_entity_id`.
+pub fn parse(raw: &str, idp_entity_id: &str) -> Result<Artifact, Refused> {
+    let bytes = decode(raw)?;
     if bytes[4..24] != source_id(idp_entity_id) {
         return Err(Refused("wrong_artifact_source", None));
     }
@@ -309,6 +321,16 @@ mod tests {
             assert_eq!(parse(&bad, IDP), Err(Refused("bad_artifact", None)), "{bad}");
         }
         assert_eq!(hex(&source_id("https://idp.example.org/idp/shibboleth")), hex(&aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA1_FOR_LEGACY_USE_ONLY, b"https://idp.example.org/idp/shibboleth").as_ref()[..20]));
+    }
+
+    #[test]
+    fn an_artifacts_source_picks_one_of_the_listed_idps_only() {
+        let listed = [IDP.to_string(), "https://login.uni-b.example/saml".to_string()];
+        assert_eq!(claimed_source(&artifact(&listed[1], 1), &listed), Some(listed[1].as_str()));
+        assert_eq!(claimed_source(&artifact(IDP, 4), &listed), Some(IDP));
+        assert_eq!(claimed_source(&artifact("https://evil.example/idp", 1), &listed), None);
+        assert_eq!(claimed_source("not base64!", &listed), None);
+        assert_eq!(claimed_source(&artifact(IDP, 1), &[]), None);
     }
 
     fn hex(b: &[u8]) -> String {

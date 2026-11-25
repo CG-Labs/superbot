@@ -69,7 +69,7 @@ No. No SOC 2 audit has started. A [SOC 2 control mapping](soc2-control-mapping.m
 Yes, in CI: `cargo audit` and `npm audit` run on every lockfile change and weekly. CI fails on any RustSec vulnerability and any High or Critical npm advisory; accepted findings are listed with reasons ([ADR 0092](../adr/0092-dependency-vulnerability-scanning.md), [ADR 0115](../adr/0115-client-markdown-renderer-and-npm-audit-at-high.md)). Every container image is scanned with Grype on each build and weekly; CI fails on a Critical vulnerability with a fix, and published images are signed with cosign and carry build provenance ([ADR 0101](../adr/0101-image-scanning-and-signing.md)).
 
 **Who is responsible for which controls?**
-It depends on who runs the server. When you self-host, you are the operator: hosting, physical security, backups off the host, alert channels and your own policies are yours. On the managed service, those are the provider's. Either way, you decide who gets access and enforce MFA at your IdP. See [how to read the mapping](soc2-control-mapping.md#how-to-read-it).
+It depends on who runs the server. When you self-host, you are the operator: hosting, physical security, backups off the host, alert channels and your own policies are yours. On the managed service, those are the provider's. Either way, you decide who gets access and enforce MFA at your IdP. See [how to read the mapping](soc2-control-mapping.md#how-to-read-it), and the controls the managed service relies on customers for, drafted in the [system description](soc2-system-description.md#dc6-complementary-user-entity-controls).
 
 **Is the code open?**
 Yes. The code and every design decision ([ADRs](../adr/)) are public, so each answer here can be checked.

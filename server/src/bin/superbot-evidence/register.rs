@@ -36,8 +36,9 @@ use std::path::Path;
 /// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214), 3
 /// `incidents.json` (ADR 0223), 4 `access.json` (ADR 0231), 5 `vulnerabilities.json`
 /// (ADR 0241), 6 `production-changes.json` (ADR 0270), 7 vendors' assurance reports in
-/// `vendors.json` (ADR 0279).
-pub const FORMAT: u32 = 7;
+/// `vendors.json` (ADR 0279), 8 the system description's approval in `policies.json`
+/// (ADR 0292).
+pub const FORMAT: u32 = 8;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -53,6 +54,9 @@ const MAX_ACCESS_REVIEW_BYTES: u64 = 64 << 20;
 pub const ROLES: [&str; 6] = ["Management", "Security owner", "Engineering lead", "Operator", "People lead", "Privacy lead"];
 /// The policy set, by file name, when no `--policies` folder is given.
 pub const POLICIES: [&str; 9] = ["information-security", "access-control", "change-management", "incident-response", "vendor-management", "business-continuity", "data-classification-and-retention", "acceptable-use", "code-of-conduct"];
+/// The SOC 2 system description (docs/security/soc2-system-description.md, CC2.3-4,
+/// ADR 0292): approved in `policyApprovals` like a policy, but not one of the set.
+pub const SYSTEM_DESCRIPTION: &str = "soc2-system-description";
 /// The policies everyone with access acknowledges at hire and yearly (policy set README).
 pub const ACKNOWLEDGED: [&str; 3] = ["information-security", "acceptable-use", "code-of-conduct"];
 /// The code of conduct and ethics policy (CC1.1-1, ADR 0214).
@@ -189,7 +193,7 @@ pub const MAX_PERIOD_DAYS: i64 = 31;
 /// register that stopped being kept shows as a gap in the coverage report.
 pub const SECTIONS: [Section; 12] = [
     Section { file: "roles.json", criteria: &["CC1.3"], rows: &["CC1.3-1"] },
-    Section { file: "policies.json", criteria: &["CC3.1", "CC5.3"], rows: &["CC3.1-1", "CC5.3-1"] },
+    Section { file: "policies.json", criteria: &["CC2.3", "CC3.1", "CC5.3"], rows: &["CC2.3-4", "CC3.1-1", "CC5.3-1"] },
     Section { file: "people.json", criteria: &["CC1.4", "CC2.2"], rows: &["CC1.4-1", "CC2.2-1"] },
     Section { file: "risks.json", criteria: &["CC3.2", "CC3.3"], rows: &["CC3.2-1", "CC3.3-1"] },
     Section { file: "management-reviews.json", criteria: &["CC1.2"], rows: &["CC1.2-1"] },
@@ -217,8 +221,9 @@ after the period are left out.
 
   roles.json               each role's holders and deputies in the period, the days
                            without either, and holders who weren't personnel
-  policies.json            each policy's latest approval, whether the text approved is
-                           the text in force, and whether its yearly review is overdue
+  policies.json            each policy's latest approval, and the SOC 2 system
+                           description's, whether the text approved is the text in
+                           force, and whether its yearly review is overdue
   people.json              everyone with access in the period, by register id, with their
                            acknowledgements and training, due, late or overdue
   risks.json               the open risks, scored, treated and reviewed, the full yearly
@@ -876,13 +881,26 @@ pub struct Policy {
     pub sha256: Option<String>,
 }
 
-/// The built-in policy set, approved by management, with no text to compare.
+/// The built-in policy set and the system description, approved by management, with no
+/// text to compare.
 pub fn builtin_policies() -> Vec<Policy> {
-    POLICIES.iter().map(|id| Policy { id: id.to_string(), approver: "Management".into(), sha256: None }).collect()
+    POLICIES.iter().chain([&SYSTEM_DESCRIPTION]).map(|id| Policy { id: id.to_string(), approver: "Management".into(), sha256: None }).collect()
+}
+
+/// A document's approver, from its header (`| Approver | Management |`), and its SHA-256.
+fn read_document(name: &str, bytes: &[u8]) -> Result<(String, String), String> {
+    let approver = String::from_utf8_lossy(bytes)
+        .lines()
+        .find_map(|l| l.strip_prefix("| Approver |").map(|r| r.trim().trim_end_matches('|').trim().to_string()))
+        .unwrap_or_else(|| "Management".into());
+    if !ROLES.contains(&approver.as_str()) {
+        return Err(format!("{name}: its approver ({approver:.40}) isn't one of the roles: {}", ROLES.join(", ")));
+    }
+    Ok((approver, sha256(bytes)))
 }
 
 /// The policies in a folder: every `.md` file but `README.md`, with the approver its
-/// header names (`| Approver | Management |`) and the file's SHA-256.
+/// header names and the file's SHA-256.
 pub fn read_policies(dir: &Path) -> Result<Vec<Policy>, String> {
     let mut out = Vec::new();
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -890,21 +908,30 @@ pub fn read_policies(dir: &Path) -> Result<Vec<Policy>, String> {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(id) = name.strip_suffix(".md").filter(|id| *id != "README" && !id.starts_with('.')) else { continue };
         let bytes = std::fs::read(e.path()).map_err(|err| format!("{name}: {err}"))?;
-        let text = String::from_utf8_lossy(&bytes);
-        let approver = text
-            .lines()
-            .find_map(|l| l.strip_prefix("| Approver |").map(|r| r.trim().trim_end_matches('|').trim().to_string()))
-            .unwrap_or_else(|| "Management".into());
-        if !ROLES.contains(&approver.as_str()) {
-            return Err(format!("{name}: its approver ({approver:.40}) isn't one of the roles: {}", ROLES.join(", ")));
-        }
-        out.push(Policy { id: id.to_string(), approver, sha256: Some(sha256(&bytes)) });
+        let (approver, sha256) = read_document(&name, &bytes)?;
+        out.push(Policy { id: id.to_string(), approver, sha256: Some(sha256) });
     }
     if out.is_empty() {
         return Err(format!("{} has no policies (.md files other than README.md)", dir.display()));
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
+}
+
+/// The system description as given with `--description`, or the built-in one with no text
+/// to compare. A file that isn't it (no DC1 to DC9 sections) is refused, since an approval
+/// compared with the wrong text would say nothing.
+pub fn read_description(file: Option<&str>) -> Result<Policy, String> {
+    let Some(file) = file else {
+        return Ok(Policy { id: SYSTEM_DESCRIPTION.into(), approver: "Management".into(), sha256: None });
+    };
+    let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    if !(1..=9).all(|n| text.lines().any(|l| l.starts_with(&format!("## DC{n} ")))) {
+        return Err(format!("{file} isn't the SOC 2 system description: it needs a `## DCn` section for each of DC1 to DC9 (docs/security/soc2-system-description.md)"));
+    }
+    let (approver, sha256) = read_document(file, &bytes)?;
+    Ok(Policy { id: SYSTEM_DESCRIPTION.into(), approver, sha256: Some(sha256) })
 }
 
 fn plain_id(s: &str) -> bool {
@@ -1675,8 +1702,9 @@ impl Check<'_> {
         let cut = self.cut();
         let (mut not_approved, mut overdue, mut changed, mut wrong_approver) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut rows = Vec::new();
-        let mut out = Vec::new();
+        let (mut out, mut description) = (Vec::new(), Value::Null);
         for pol in self.policies {
+            let is_description = pol.id == SYSTEM_DESCRIPTION;
             let mut approvals: Vec<&Approval> = self.r.policy_approvals.iter().filter(|a| a.policy == pol.id && a.approved_at < cut).collect();
             approvals.sort_by_key(|a| a.approved_at);
             let approver = self.approver_of(&pol.id);
@@ -1692,6 +1720,8 @@ impl Check<'_> {
                 Some(a) => {
                     if age(cut, a.approved_at) > YEAR_DAYS {
                         overdue.push(json!(format!("{} (approved {})", pol.id, a.approved_at)));
+                    } else if is_description {
+                        rows.push("CC2.3-4");
                     } else {
                         rows.push(if pol.id == "information-security" { "CC3.1-1" } else { "CC5.3-1" });
                         rows.push("CC5.3-1");
@@ -1701,7 +1731,7 @@ impl Check<'_> {
                     }
                 }
             }
-            out.push(json!({
+            let entry = json!({
                 "policy": pol.id,
                 "approverRole": approver,
                 "approvals": approvals.len(),
@@ -1709,16 +1739,23 @@ impl Check<'_> {
                 "reviewDue": latest.map(|a| ds(plus(a.approved_at, YEAR_DAYS))),
                 "currentSha256": pol.sha256,
                 "textApproved": matches,
-            }));
+                "current": latest.is_some_and(|a| age(cut, a.approved_at) <= YEAR_DAYS),
+            });
+            if is_description {
+                description = entry;
+            } else {
+                out.push(entry);
+            }
         }
         rows.sort_unstable();
         rows.dedup();
         let v = json!({
-            "basis": "each policy's latest approval before the period's end: by someone holding (or deputising) the role its header names as approver on that day, at most a year old (every policy is reviewed yearly), and, when the policy files were given, of the text in force: the file's SHA-256 now is the one approved",
-            "textsChecked": self.policies.iter().any(|p| p.sha256.is_some()),
-            "summary": { "policies": self.policies.len(), "approved": out.iter().filter(|p| !p["latest"].is_null()).count(), "current": self.policies.len() - not_approved.len() - overdue.len() },
+            "basis": "each policy's latest approval before the period's end, and the SOC 2 system description's: by someone holding (or deputising) the role its header names as approver on that day, at most a year old (each is reviewed yearly), and, when the files were given, of the text in force: the file's SHA-256 now is the one approved",
+            "textsChecked": self.policies.iter().any(|p| p.id != SYSTEM_DESCRIPTION && p.sha256.is_some()),
+            "summary": { "policies": out.len(), "approved": out.iter().filter(|p| !p["latest"].is_null()).count(), "current": out.iter().filter(|p| p["current"] == true).count(), "systemDescriptionCurrent": description["current"] == true },
             "exceptions": { "notApproved": not_approved, "reviewOverdue": overdue, "changedSinceApproval": changed, "approverNotInRole": wrong_approver },
             "policies": out,
+            "systemDescription": description,
         });
         (v, rows)
     }
@@ -2864,12 +2901,14 @@ pub fn summary(c: &Check) -> String {
 
 // The command
 
-pub const USAGE: &str = "  superbot-evidence register <register.json> [--policies <folder>] [--baseline <file>]...
-                    [--access-review <system>=<file>]... [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
+pub const USAGE: &str = "  superbot-evidence register <register.json> [--policies <folder>] [--description <file>]
+                    [--baseline <file>]... [--access-review <system>=<file>]...
+                    [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
 
 struct Args {
     register: String,
     policies: Option<String>,
+    description: Option<String>,
     baselines: Vec<String>,
     access_reviews: Vec<String>,
     from: Option<String>,
@@ -2878,7 +2917,7 @@ struct Args {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut a = Args { register: String::new(), policies: None, baselines: Vec::new(), access_reviews: Vec::new(), from: None, to: None, out: None };
+    let mut a = Args { register: String::new(), policies: None, description: None, baselines: Vec::new(), access_reviews: Vec::new(), from: None, to: None, out: None };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let value = |it: &mut std::slice::Iter<String>| it.next().filter(|v| !v.starts_with("--") && !v.is_empty()).cloned().ok_or(format!("{flag} needs a value"));
@@ -2892,6 +2931,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 continue;
             }
             "--policies" => &mut a.policies,
+            "--description" => &mut a.description,
             "--from" => &mut a.from,
             "--to" => &mut a.to,
             "-o" | "--out" => &mut a.out,
@@ -2926,10 +2966,13 @@ pub fn run(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<String
     if p.days() > MAX_PERIOD_DAYS {
         return Err(format!("A register bundle covers one month at most ({MAX_PERIOD_DAYS} days), since what it shows is judged as of the period's end: make one for each month of {} to {}", p.from, p.to));
     }
-    let policies = match &a.policies {
+    let mut policies = match &a.policies {
         Some(dir) => read_policies(Path::new(dir))?,
         None => builtin_policies(),
     };
+    let description = read_description(a.description.as_deref())?;
+    policies.retain(|p| p.id != SYSTEM_DESCRIPTION);
+    policies.push(description);
     let bytes = read_capped(&a.register, MAX_REGISTER_BYTES)?;
     let register = parse(&bytes, &policies).map_err(|e| format!("{}: {e}", a.register))?;
     let mut baselines: Vec<Baseline> = Vec::new();
@@ -2965,7 +3008,12 @@ pub fn run(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<String
         src.sha256,
         p.from,
         p.to,
-        if a.policies.is_some() { ", against the policy files given" } else { ", without the policy files (--policies), so approved texts weren't compared" },
+        match (a.policies.is_some(), a.description.is_some()) {
+            (true, true) => ", against the policy files and system description given",
+            (true, false) => ", against the policy files given, without the system description (--description), so its approved text wasn't compared",
+            (false, true) => ", against the system description given, without the policy files (--policies), so their approved texts weren't compared",
+            (false, false) => ", without the policy files (--policies) or the system description (--description), so approved texts weren't compared",
+        },
         summary(&c),
         b.manifest_sha256,
         b.sha256,
@@ -2990,7 +3038,7 @@ mod tests {
 
     /// A register kept well for the first quarter of 2027, but for what each test breaks.
     fn good() -> Value {
-        let approvals: Vec<Value> = POLICIES.iter().map(|p| json!({ "policy": p, "sha256": ZERO, "commit": "abc1234", "approvedBy": "p-mgmt", "approvedAt": "2027-01-05" })).collect();
+        let approvals: Vec<Value> = POLICIES.iter().chain([&SYSTEM_DESCRIPTION]).map(|p| json!({ "policy": p, "sha256": ZERO, "commit": "abc1234", "approvedBy": "p-mgmt", "approvedAt": "2027-01-05" })).collect();
         let mut acks = Vec::new();
         let mut training = Vec::new();
         for who in ["p-mgmt", "p-sec", "p-eng", "p-ops"] {
@@ -3174,10 +3222,72 @@ mod tests {
         assert_eq!(ex["changedSinceApproval"], json!(["change-management"]));
         assert_eq!(ex["approverNotInRole"], json!(["access-control on 2026-03-01: p-ops didn't hold Management"]));
         assert_eq!(pol["textsChecked"], true);
-        assert_eq!(rows, ["CC3.1-1", "CC5.3-1"]);
+        assert_eq!(rows, ["CC2.3-4", "CC3.1-1", "CC5.3-1"]);
+        assert_eq!((pol["summary"]["policies"].as_u64(), pol["summary"]["current"].as_u64(), pol["summary"]["systemDescriptionCurrent"].as_bool()), (Some(9), Some(7), Some(true)));
+        assert!(pol["policies"].as_array().unwrap().iter().all(|p| p["policy"] != SYSTEM_DESCRIPTION), "the description isn't one of the policies");
         let infosec = pol["policies"].as_array().unwrap().iter().find(|p| p["policy"] == "information-security").unwrap();
         assert_eq!((infosec["latest"]["heldRole"].as_str(), infosec["textApproved"].as_bool()), (Some("Management"), Some(true)));
         check(&good(), &|c| assert_eq!(c.policies().0["textsChecked"], false));
+    }
+
+    #[test]
+    fn the_system_description_is_approved_like_a_policy_and_maps_only_cc2_3_4() {
+        let without = |v: &mut Value| v["policyApprovals"].as_array_mut().unwrap().retain(|a| a["policy"] != SYSTEM_DESCRIPTION);
+        let mut v = good();
+        without(&mut v);
+        check(&v, &|c| {
+            let (pol, rows) = c.policies();
+            assert_eq!(pol["exceptions"]["notApproved"], json!([SYSTEM_DESCRIPTION]));
+            assert_eq!((pol["summary"]["current"].as_u64(), pol["summary"]["systemDescriptionCurrent"].as_bool()), (Some(9), Some(false)));
+            assert_eq!(rows, ["CC3.1-1", "CC5.3-1"], "no approval, no CC2.3-4");
+        });
+
+        let mut v = good();
+        without(&mut v);
+        v["policyApprovals"].as_array_mut().unwrap().push(json!({ "policy": SYSTEM_DESCRIPTION, "sha256": ZERO, "commit": "abc1234", "approvedBy": "p-mgmt", "approvedAt": "2026-02-01" }));
+        check(&v, &|c| {
+            let (pol, rows) = c.policies();
+            assert_eq!(pol["exceptions"]["reviewOverdue"], json!(["soc2-system-description (approved 2026-02-01)"]));
+            assert_eq!(pol["systemDescription"]["reviewDue"], "2027-02-01");
+            assert!(!rows.contains(&"CC2.3-4"), "a description over a year old maps nothing: {rows:?}");
+        });
+
+        let mut v = good();
+        without(&mut v);
+        v["policyApprovals"].as_array_mut().unwrap().push(json!({ "policy": SYSTEM_DESCRIPTION, "sha256": ZERO, "commit": "abc1234", "approvedBy": "p-eng", "approvedAt": "2027-02-01" }));
+        let r = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap();
+        let mut texts = builtin_policies();
+        texts.iter_mut().for_each(|p| p.sha256 = Some(if p.id == SYSTEM_DESCRIPTION { "1".repeat(64) } else { ZERO.into() }));
+        let c = Check { r: &r, p: period(), policies: &texts, baselines: &[], sign_offs: &[] };
+        let (pol, rows) = c.policies();
+        let ex = &pol["exceptions"];
+        assert_eq!(ex["changedSinceApproval"], json!([SYSTEM_DESCRIPTION]));
+        assert_eq!(ex["approverNotInRole"], json!(["soc2-system-description on 2027-02-01: p-eng didn't hold Management"]));
+        assert_eq!((pol["systemDescription"]["textApproved"].as_bool(), pol["systemDescription"]["latest"]["heldRole"].clone()), (Some(false), Value::Null));
+        assert_eq!(rows, ["CC2.3-4", "CC3.1-1", "CC5.3-1"], "approved within a year, though by the wrong role, as the policies are");
+        assert_eq!(pol["policies"].as_array().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn a_description_file_must_be_the_system_description() {
+        assert_eq!(read_description(None).unwrap().sha256, None);
+        let dir = std::env::temp_dir().join(format!("superbot-register-description-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &str| {
+            let f = dir.join(name);
+            std::fs::write(&f, body).unwrap();
+            f.to_string_lossy().into_owned()
+        };
+        let sections: String = (1..=9).map(|n| format!("## DC{n} Section\n\n")).collect();
+        let ok = file("ok.md", &format!("# D\n\n| Field | Value |\n| Approver | Security owner |\n\n{sections}"));
+        let d = read_description(Some(&ok)).unwrap();
+        assert_eq!((d.id.as_str(), d.approver.as_str(), d.sha256.as_deref().map(str::len)), (SYSTEM_DESCRIPTION, "Security owner", Some(64)));
+        let policy = file("policy.md", "# Access control policy\n\n| Approver | Management |\n\n## DC1 Only one\n");
+        assert!(read_description(Some(&policy)).unwrap_err().contains("isn't the SOC 2 system description"));
+        let bad = file("bad.md", &format!("| Approver | The board |\n\n{sections}"));
+        assert!(read_description(Some(&bad)).unwrap_err().contains("isn't one of the roles"));
+        assert!(read_description(Some(&dir.join("missing.md").to_string_lossy())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4296,7 +4406,7 @@ mod tests {
         assert_eq!((manifest["kind"].as_str(), manifest["source"]["registerSha256"].as_str()), (Some("policy-register"), Some(sha256(&bytes).as_str())));
         let file = |n: &str| manifest["files"].as_array().unwrap().iter().find(|f| f["name"] == n).unwrap().clone();
         assert_eq!((file("management-reviews.json")["checklist"].clone(), file("management-reviews.json")["criteria"].clone()), (json!([]), json!([])), "no review within a quarter");
-        assert_eq!((file("policies.json")["checklist"].clone(), file("policies.json")["criteria"].clone()), (json!(["CC3.1-1", "CC5.3-1"]), json!(["CC3.1", "CC5.3"])));
+        assert_eq!((file("policies.json")["checklist"].clone(), file("policies.json")["criteria"].clone()), (json!(["CC2.3-4", "CC3.1-1", "CC5.3-1"]), json!(["CC2.3", "CC3.1", "CC5.3"])));
         let found = crate::coverage::check("b.tar".into(), &b.name, &entries.iter().map(|(n, x)| (n.rsplit('/').next().unwrap().to_string(), x.clone())).collect::<BTreeMap<String, Vec<u8>>>());
         assert!(found.verified(), "{:?}", found.problems);
         assert!(found.warnings.is_empty(), "{:?}", found.warnings);
@@ -4307,9 +4417,9 @@ mod tests {
     #[test]
     fn options() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let a = parse_args(&s(&["r.json", "--policies", "docs", "--baseline", "a.json", "--baseline", "b.json", "--access-review", "botd-1=c.json", "--from", "2027-03-01", "--to", "2027-04-01", "-o", "x.tar"])).unwrap();
-        assert_eq!((a.register.as_str(), a.policies.as_deref(), a.baselines.len(), a.access_reviews.len(), a.out.as_deref()), ("r.json", Some("docs"), 2, 1, Some("x.tar")));
-        for bad in [&[][..], &["--policies", "d"], &["r.json", "s.json"], &["r.json", "--from"], &["r.json", "-o", "a", "-o", "b"], &["r.json", "--token", "x"], &["r.json", "--baseline"], &["r.json", "--access-review"]] {
+        let a = parse_args(&s(&["r.json", "--policies", "docs", "--description", "d.md", "--baseline", "a.json", "--baseline", "b.json", "--access-review", "botd-1=c.json", "--from", "2027-03-01", "--to", "2027-04-01", "-o", "x.tar"])).unwrap();
+        assert_eq!((a.register.as_str(), a.policies.as_deref(), a.description.as_deref(), a.baselines.len(), a.access_reviews.len(), a.out.as_deref()), ("r.json", Some("docs"), Some("d.md"), 2, 1, Some("x.tar")));
+        for bad in [&[][..], &["--policies", "d"], &["r.json", "s.json"], &["r.json", "--from"], &["r.json", "-o", "a", "-o", "b"], &["r.json", "--token", "x"], &["r.json", "--baseline"], &["r.json", "--access-review"], &["r.json", "--description"], &["r.json", "--description", "a", "--description", "b"]] {
             assert!(parse_args(&s(bad)).is_err(), "{bad:?}");
         }
     }
@@ -4323,9 +4433,11 @@ mod tests {
         assert_eq!(real.iter().map(|p| p.id.as_str()).collect::<BTreeSet<_>>(), POLICIES.iter().copied().collect::<BTreeSet<_>>(), "the built-in set is the policy set");
         assert!(real.iter().all(|p| p.approver == "Management" && p.sha256.as_ref().is_some_and(|s| s.len() == 64)));
         let template = include_str!("../../../../docs/security/policy-register-template.json");
-        let r = parse(template.as_bytes(), &real).unwrap();
+        let description = read_description(Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/soc2-system-description.md").to_str().unwrap())).unwrap();
+        assert!(description.approver == "Management" && description.sha256.is_some(), "the description's header names its approver");
+        let r = parse(template.as_bytes(), &[real, vec![description]].concat()).unwrap();
         assert_eq!(r.roles.iter().map(|x| x.role.as_str()).collect::<BTreeSet<_>>(), ROLES.iter().copied().collect::<BTreeSet<_>>());
-        assert_eq!(r.policy_approvals.iter().map(|a| a.policy.as_str()).collect::<BTreeSet<_>>(), POLICIES.iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(r.policy_approvals.iter().map(|a| a.policy.as_str()).collect::<BTreeSet<_>>(), POLICIES.iter().chain([&SYSTEM_DESCRIPTION]).copied().collect::<BTreeSet<_>>());
         assert!(r.people.iter().all(|p| p.name.as_deref().is_none_or(|n| n.starts_with('<'))), "placeholders only");
         assert!(r.risks.iter().any(|x| x.fraud), "the template has a fraud risk to start from");
         assert_eq!(r.systems.iter().map(|s| s.kind.as_str()).collect::<BTreeSet<_>>(), SYSTEM_KINDS.iter().copied().collect::<BTreeSet<_>>(), "the template has a system of each kind");
