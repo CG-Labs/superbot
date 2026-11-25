@@ -453,3 +453,55 @@ async fn the_siem_export_stops_at_a_row_it_cannot_read() {
     let sent = ids(&got);
     assert!(sent.contains(&bad) && sent.windows(2).all(|w| w[0] < w[1]), "{sent:?}");
 }
+
+#[tokio::test]
+async fn the_chain_view_and_metrics_show_sinks_taken_out() {
+    let (port, app, admin, _) = serve_app().await;
+    let stopped_sinks = || {
+        let mut m = String::new();
+        crate::audit_export::render(&app, &mut m);
+        m.lines().find(|l| l.starts_with("superbot_audit_export_stopped_sinks ")).map(String::from)
+    };
+    assert_eq!(stopped_sinks().as_deref(), Some("superbot_audit_export_stopped_sinks 0"), "a series even with export off");
+    let chain = parse(&call(port, "GET", "/api/audit/chain", &admin, "").await.1);
+    assert_eq!(chain["export"], json!({ "enabled": false }), "{chain}");
+
+    // As botd left a named SIEM that ran before and is no longer set.
+    let old = "https://mdr.example.net:443/in/path-token-51c0";
+    app.db.set_audit_export_cursor(old, 2).unwrap();
+    app.db.set_setting(&format!("audit_export:{old}#sink"), &json!({ "kind": "webhook", "name": "mdr", "sink": "https://mdr.example.net:443" }).to_string());
+    export_to(&app, &[]);
+    let stop = app.db.audit_events(&crate::audit::Filter { actions: vec!["audit.export_stopped".into()], ..Default::default() }, 10, true);
+    assert_eq!(stop.len(), 1);
+
+    let (code, body) = call(port, "GET", "/api/audit/chain", &admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    assert!(!body.contains("path-token"), "never a webhook's path: {body}");
+    let export = &parse(&body)["export"];
+    assert_eq!(export["enabled"], json!(false), "{export}");
+    let gone = &export["stopped"][0];
+    assert_eq!(
+        (&gone["kind"], &gone["name"], &gone["sink"], &gone["reason"], &gone["delivered"], &gone["stoppedEvent"], &gone["stoppedAt"]),
+        (&json!("webhook"), &json!("mdr"), &json!("https://mdr.example.net:443"), &json!("export_off"), &json!(2), &json!(stop[0].id), &json!(stop[0].at)),
+        "{export}"
+    );
+    assert_eq!(gone["pending"].as_i64(), Some(app.db.audit_head() - 2));
+    assert_eq!(&parse(&call(port, "GET", "/api/audit/siem", &admin, "").await.1), export, "the same as botctl audit siem");
+    assert_eq!(stopped_sinks().as_deref(), Some("superbot_audit_export_stopped_sinks 1"));
+
+    // Export back on with another SIEM: the stop isn't recorded again, and still shows.
+    let (url, _got) = collector(0).await;
+    export_to(&app, &[("AUDIT_EXPORT", &url)]);
+    let chain = parse(&call(port, "GET", "/api/audit/chain", &admin, "").await.1);
+    assert_eq!((chain["export"]["enabled"].as_bool(), chain["export"]["sinks"].as_array().map(Vec::len)), (Some(true), Some(1)), "{chain}");
+    assert_eq!(chain["export"]["stopped"].as_array().map(|s| s.iter().map(|s| s["name"].clone()).collect::<Vec<_>>()), Some(vec![json!("mdr")]), "{chain}");
+    assert_eq!(app.db.audit_events(&crate::audit::Filter { actions: vec!["audit.export_stopped".into()], ..Default::default() }, 10, true).len(), 1);
+    assert_eq!(stopped_sinks().as_deref(), Some("superbot_audit_export_stopped_sinks 1"));
+
+    // Once retention has deleted the stop, the sink is still listed, without when or why.
+    app.db.execute_raw("DROP TRIGGER IF EXISTS audit_events_no_delete").unwrap();
+    app.db.execute_raw(&format!("DELETE FROM audit_events WHERE id = {}", stop[0].id)).unwrap();
+    let chain = parse(&call(port, "GET", "/api/audit/chain", &admin, "").await.1);
+    let gone = &chain["export"]["stopped"][0];
+    assert_eq!((&gone["name"], &gone["stoppedEvent"], &gone["stoppedAt"], &gone["reason"]), (&json!("mdr"), &json!(stop[0].id), &Value::Null, &Value::Null), "{chain}");
+}
