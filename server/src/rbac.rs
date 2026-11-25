@@ -339,6 +339,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("DELETE", ["team", "invites", _] | ["me", "team-invites", _]) => Write,
         ("PATCH" | "DELETE", ["team", "members", _]) => Write,
         ("PUT" | "DELETE", ["team", "members", _, "custom-role"]) => Write,
+        // Deciding requests for roles within your team (ADR 0263): its owners and admins.
+        ("GET", ["team", "role-requests"]) => Account,
+        ("POST", ["team", "role-requests", _, "approve" | "deny"]) => Write,
         ("POST", ["team", "members", _, "machine"] | ["team", "members", _, "machine", "suspend" | "resume"]) => Write,
         // This session's phone for push notifications (ADR 0080). Handlers refuse Bots.
         // Read-only people can't decide approvals or run routines, so they don't add one;
@@ -710,6 +713,12 @@ mod tests {
             ("DELETE", "/api/team/members/u1/custom-role", Perm::Write),
             ("GET", "/api/team/members/u1/custom-role", Perm::Admin),
             ("PATCH", "/api/team/members/u1/custom-role", Perm::Admin),
+            ("GET", "/api/team/role-requests", Perm::Account),
+            ("POST", "/api/team/role-requests/rq1/approve", Perm::Write),
+            ("POST", "/api/team/role-requests/rq1/deny", Perm::Write),
+            ("POST", "/api/team/role-requests", Perm::Admin),
+            ("GET", "/api/team/role-requests/rq1", Perm::Admin),
+            ("POST", "/api/team/role-requests/rq1/cancel", Perm::Admin),
             ("POST", "/api/team/members/u1/machine", Perm::Write),
             ("POST", "/api/team/members/u1/machine/suspend", Perm::Write),
             ("POST", "/api/team/members/u1/machine/resume", Perm::Write),

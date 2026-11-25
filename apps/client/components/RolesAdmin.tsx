@@ -459,8 +459,30 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   );
 }
 
-/** One pending request: approve it for as long as asked or shorter, or deny it with a note. */
-function RequestRow({ api, q, meId, onDecided }: { api: SuperBotApi; q: RoleRequest; meId?: string | null; onDecided: () => Promise<void> }) {
+/**
+ * One pending request: approve it for as long as asked or shorter, or deny it with a note.
+ * Server admins decide through `/api/role-requests`, a team's owners and admins through
+ * `/api/team/role-requests` (ADR 0263), so the calls come from the screen.
+ */
+export function RequestRow({
+  q,
+  meId,
+  onDecided,
+  approve,
+  deny,
+  decidesYours = "another admin",
+  approveBlocked,
+}: {
+  q: RoleRequest;
+  meId?: string | null;
+  onDecided: () => Promise<void>;
+  approve: (id: string, body: { hours?: number; note?: string }) => Promise<unknown>;
+  deny: (id: string, note?: string) => Promise<unknown>;
+  /** Who decides your own request. */
+  decidesYours?: string;
+  /** Why you can't approve it, though you may deny it. */
+  approveBlocked?: string | null;
+}) {
   const [hours, setHours] = useState(String(q.hours));
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -468,16 +490,16 @@ function RequestRow({ api, q, meId, onDecided }: { api: SuperBotApi; q: RoleRequ
   const yours = !!meId && q.user?.id === meId;
   const name = q.user ? personName(q.user) : "them";
 
-  const decide = async (approve: boolean) => {
-    const title = approve ? `Give ${q.role?.name ?? "the role"} to ${name}?` : `Deny ${name}'s request?`;
-    const body = approve ? "It starts now and ends by itself. The audit log keeps the request and your approval." : "They see your note. They can ask again.";
-    if (!(await confirmAsync(title, body, approve ? "Approve" : "Deny"))) return;
+  const decide = async (yes: boolean) => {
+    const title = yes ? `Give ${q.role?.name ?? "the role"} to ${name}?` : `Deny ${name}'s request?`;
+    const body = yes ? "It starts now and ends by itself. The audit log keeps the request and your approval." : "They see your note. They can ask again.";
+    if (!(await confirmAsync(title, body, yes ? "Approve" : "Deny"))) return;
     setBusy(true);
     setError(null);
     try {
       const why = note.trim() || undefined;
-      if (approve) await api.approveRoleRequest(q.id, { hours: Number(hours), note: why });
-      else await api.denyRoleRequest(q.id, why);
+      if (yes) await approve(q.id, { hours: Number(hours), note: why });
+      else await deny(q.id, why);
       await onDecided();
     } catch (err) {
       setError(message(err));
@@ -497,10 +519,10 @@ function RequestRow({ api, q, meId, onDecided }: { api: SuperBotApi; q: RoleRequ
       </Text>
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {yours ? (
-        <Text style={styles.faint}>Your own request: another admin decides it.</Text>
+        <Text style={styles.faint}>Your own request: {decidesYours} decides it.</Text>
       ) : (
         <>
-          <Chips options={approveChoices(q.hours)} value={hours} onChange={setHours} disabled={busy} />
+          {approveBlocked ? <Text style={styles.faint}>{approveBlocked}</Text> : <Chips options={approveChoices(q.hours)} value={hours} onChange={setHours} disabled={busy} />}
           <TextInput
             style={styles.input}
             value={note}
@@ -512,7 +534,7 @@ function RequestRow({ api, q, meId, onDecided }: { api: SuperBotApi; q: RoleRequ
             accessibilityLabel={`Note for ${name}`}
           />
           <View style={styles.row}>
-            <Button label="Approve" a11y={`Approve ${name}'s request`} primary disabled={busy} onPress={() => void decide(true)} />
+            {approveBlocked ? null : <Button label="Approve" a11y={`Approve ${name}'s request`} primary disabled={busy} onPress={() => void decide(true)} />}
             <Button label="Deny" a11y={`Deny ${name}'s request`} danger disabled={busy} onPress={() => void decide(false)} />
           </View>
         </>
@@ -603,7 +625,14 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
                 <>
                   <Text style={styles.sectionTitle}>Requests ({requests.length})</Text>
                   {requests.map((q) => (
-                    <RequestRow key={q.id} api={api} q={q} meId={meId} onDecided={load} />
+                    <RequestRow
+                      key={q.id}
+                      q={q}
+                      meId={meId}
+                      onDecided={load}
+                      approve={(id, body) => api.approveRoleRequest(id, body)}
+                      deny={(id, note) => api.denyRoleRequest(id, note)}
+                    />
                   ))}
                   <View style={{ height: 12 }} />
                 </>

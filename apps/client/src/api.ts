@@ -62,6 +62,7 @@ import type {
   TeamInvite,
   TeamMember,
   TeamRole,
+  TeamRoleRequestsView,
   TeammateAccounts,
   TeammateLoginsView,
   TeammateRemoval,
@@ -702,6 +703,20 @@ export class SuperBotApi {
   /** Takes away the custom role they hold within the team. */
   async takeTeamCustomRole(userId: string): Promise<void> {
     await this.request("DELETE", `/api/team/members/${encodeURIComponent(userId)}/custom-role`);
+  }
+
+  /** The requests for roles within your team, for its owners and admins (ADR 0263). */
+  async teamRoleRequests(status: RoleRequestStatus | "all" = "pending"): Promise<TeamRoleRequestsView> {
+    return this.request<TeamRoleRequestsView>("GET", `/api/team/role-requests?status=${encodeURIComponent(status)}`);
+  }
+
+  /** Approves a request within your team, for the hours asked or fewer. */
+  async approveTeamRoleRequest(id: string, body: { hours?: number; note?: string } = {}): Promise<{ request: RoleRequest; role: CustomRoleRef }> {
+    return this.request<{ request: RoleRequest; role: CustomRoleRef }>("POST", `/api/team/role-requests/${encodeURIComponent(id)}/approve`, body);
+  }
+
+  async denyTeamRoleRequest(id: string, note?: string): Promise<RoleRequest> {
+    return this.request<RoleRequest>("POST", `/api/team/role-requests/${encodeURIComponent(id)}/deny`, note ? { note } : {});
   }
 
   /** What removing them would do, asked before removing; changes nothing. */
