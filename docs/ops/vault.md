@@ -199,12 +199,12 @@ vault write auth/azure/role/superbot \
 VAULT_AUTH=azure
 VAULT_AZURE_ROLE=superbot
 # VAULT_AZURE_RESOURCE=https://management.azure.com/  # the mount's resource
-# VAULT_AZURE_CREDENTIALS=managed-identity            # or client-secret, workload-identity
+# VAULT_AZURE_CREDENTIALS=managed-identity            # or client-secret, client-certificate, workload-identity
 # VAULT_AZURE_INSTANCE=1                              # send the VM's details, for roles bound to them
 # VAULT_AZURE_MOUNT=azure
 ```
 
-A role bound only to service principal ids needs nothing more. A role bound to a subscription, resource group or scale set needs `VAULT_AZURE_INSTANCE=1`: botd reads the VM's subscription, resource group and name (or scale set) from the instance metadata service and sends them with each login. That needs a managed identity on a VM or scale set, and Vault's own Azure credentials need read access to it.
+Off Azure, `VAULT_AZURE_CREDENTIALS=client-certificate` signs in as a service principal with a certificate rather than a client secret, from the PEM file in `AZURE_CLIENT_CERTIFICATE_PATH` ([ADR 0269](../adr/0269-azure-certificate-credentials.md), [setup](cloud-secrets.md#with-a-certificate)). A role bound only to service principal ids needs nothing more. A role bound to a subscription, resource group or scale set needs `VAULT_AZURE_INSTANCE=1`: botd reads the VM's subscription, resource group and name (or scale set) from the instance metadata service and sends them with each login. That needs a managed identity on a VM or scale set, and Vault's own Azure credentials need read access to it.
 
 **What botd shows.** The startup line, `botctl secrets backend` and the setup report say how botd logs in, for example `AWS login as role superbot at auth/aws, an STS request signed for us-east-1, with the server id header with the instance profile (IMDSv2)`. Logins are audited as `secret.vault_login` with `method` (`aws`, `gcp` or `azure`), `role` and `namespace`. Fetching AWS keys is also audited as `secret.backend_login` against the `vault` store. The audit log never has keys, signatures, JWTs or tokens. botd's AWS keys are masked in Bots' output while botd holds them. The credentials botd signs in with, and the settings that lead to them (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` from the environment, `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, the container's token, Google's key, Entra's client secret), are removed from everything botd starts and can't be saved as Bot secrets. `botd offline check` lists the endpoints botd reaches to log in (the metadata servers, IAM Credentials, Entra ID).
 
