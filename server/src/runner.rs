@@ -678,13 +678,15 @@ impl App {
             return Ok(());
         }
         let file = file.ok_or("the Bot has no memory file")?;
-        // A row still in a store leaves it by a move, so that store's backups are cleared of it.
+        // A row still in a store leaves it only by a move, which records it so that store's
+        // backups are cleared of it. Until one does, the row takes the save.
         if self.db.memory(bot_id).is_some() {
             crate::machines::chat_stores::place_held(&self.db, &self.cfg.data_dir);
+            if self.db.memory(bot_id).is_some() {
+                return self.db.set_memory(bot_id, text).map_err(|e| format!("saving the Bot's memory until it moves back to its file: {e}"));
+            }
         }
-        write_memory_file(&file, text).map_err(|e| format!("writing the Bot's memory: {e}"))?;
-        self.db.delete_memory(bot_id).map_err(|e| format!("deleting the Bot's memory from the database: {e}"))?;
-        Ok(())
+        write_memory_file(&file, text).map_err(|e| format!("writing the Bot's memory: {e}"))
     }
 
     /// Facts about one user, for that user's Bots only: `DATA_DIR/users/<owner>/USER.md`,

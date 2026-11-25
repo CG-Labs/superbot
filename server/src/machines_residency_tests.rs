@@ -941,6 +941,17 @@ async fn a_pinned_persons_bots_memory_is_kept_in_their_regions_chat_store_not_in
     chat_stores::place(&app.db, &app.cfg.data_dir);
     assert_eq!((count(), std::fs::read_to_string(&file).unwrap().as_str()), (0, "saved after the unpin"));
     assert!(app.db.memory(&bot).is_none());
+
+    // When that pass can't take it back to its file, the save goes to its row, never past it,
+    // and a later pass writes it.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-3")).await.0, 200);
+    app.db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    app.keep_memory_text(&bot, "saved while the file was blocked").unwrap();
+    assert_eq!(app.kept_memory(&bot).as_deref(), Some("saved while the file was blocked"));
+    std::fs::remove_dir(&file).unwrap();
+    chat_stores::place(&app.db, &app.cfg.data_dir);
+    assert_eq!((app.db.memory(&bot), std::fs::read_to_string(&file).unwrap().as_str()), (None, "saved while the file was blocked"));
 }
 
 #[tokio::test]
