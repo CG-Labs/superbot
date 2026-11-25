@@ -3667,12 +3667,7 @@ async fn refresh_secrets(State(app): State<AppState>, Extension(who): Extension<
     let Some(x) = secrets::external::active() else {
         return Err(ApiError(StatusCode::CONFLICT, "SECRETS_BACKEND is local: botd reads the environment and the sealed store as they are, with nothing cached to refresh.".into()));
     };
-    let v: Value = if body.iter().all(u8::is_ascii_whitespace) { json!({}) } else { serde_json::from_slice(&body).map_err(|_| bad("Send {\"names\": [\"NAME\", ...]}, or nothing to refresh every name."))? };
-    let names: Option<Vec<String>> = match &v["names"] {
-        Value::Null => None,
-        Value::Array(a) => Some(a.iter().map(|n| n.as_str().map(str::to_string).ok_or_else(|| bad("Each name must be a string."))).collect::<Result<_, _>>()?),
-        _ => return Err(bad("names must be a list of secret names.")),
-    };
+    let names = refresh_body(&body)?.names;
     let report = {
         let x = Arc::clone(&x);
         tokio::task::spawn_blocking(move || x.refresh(names.as_deref())).await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("The refresh stopped: {e}")))?
@@ -3684,6 +3679,26 @@ async fn refresh_secrets(State(app): State<AppState>, Extension(who): Extension<
     let outcome = if report.ok() { Outcome::Success } else { Outcome::Failure };
     app.db.record(&by.event("secret.cache_refreshed").target("secret_store", report.store).outcome(outcome).details(report.audit_details()));
     Ok(Json(report.view()))
+}
+
+/// `POST /api/secrets/refresh`'s body: only `names`, at most `MAX_REFRESH_NAMES` of them.
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RefreshBody {
+    names: Option<Vec<String>>,
+}
+
+/// Room for `MAX_REFRESH_NAMES` names of the longest kind, quoted and spaced.
+const MAX_REFRESH_BODY: usize = 32 * 1024;
+
+fn refresh_body(body: &[u8]) -> Res<RefreshBody> {
+    if body.len() > MAX_REFRESH_BODY {
+        return Err(bad(format!("The body is over {MAX_REFRESH_BODY} bytes; name at most {} secrets.", secrets::external::MAX_REFRESH_NAMES)));
+    }
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(RefreshBody::default());
+    }
+    serde_json::from_slice::<RefreshBody>(body).map_err(|_| bad("Send {\"names\": [\"NAME\", ...]}, or nothing to refresh every name."))
 }
 
 // Your own secrets (ADR 0029): harness logins and API keys that reach only your Bots,
@@ -4287,8 +4302,9 @@ mod tests {
         x.get("HTTP_REFRESH_TOKEN").unwrap();
         f.values.lock().unwrap().insert((Scope::Bots, "HTTP_REFRESH_TOKEN".into()), "http-refresh-new-1".into());
         *TEST_ACTIVE.lock().unwrap() = Some(Arc::clone(&x));
-        for bad in [r#"{"names":"HTTP_REFRESH_TOKEN"}"#, r#"{"names":[1]}"#, r#"{"names":["PATH"]}"#, r#"{"names":[]}"#, "not json"] {
-            assert_eq!(call(port, "POST", "/api/secrets/refresh", &user, bad).await.0, 400, "{bad}");
+        let huge = json!({ "names": vec!["A_TOKEN"; 5000] }).to_string();
+        for bad in [r#"{"names":"HTTP_REFRESH_TOKEN"}"#, r#"{"names":[1]}"#, r#"{"names":["PATH"]}"#, r#"{"names":[]}"#, r#"{"names":null,"all":true}"#, "not json", &huge] {
+            assert_eq!(call(port, "POST", "/api/secrets/refresh", &user, bad).await.0, 400, "{bad:.60}");
         }
         let (code, res) = call(port, "POST", "/api/secrets/refresh", &user, r#"{"names":["HTTP_REFRESH_TOKEN"]}"#).await;
         *TEST_ACTIVE.lock().unwrap() = None;
