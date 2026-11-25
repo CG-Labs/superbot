@@ -773,13 +773,6 @@ configure_env() {
   TZ_VALUE=${TZ_VALUE:-UTC}
   USER_NAME_VALUE=${USER_NAME_VALUE:-Owner}
 
-  # A rollback put back the .env from before the upgrade: its machine settings were checked,
-  # and DATA_DIR was restored where it points, so nothing in it is rewritten.
-  if [[ "$ROLLBACK_RESTORE" == true ]]; then
-    log "Keeping $env_file from before the upgrade as it is (--rollback): settings flags aren't written to it"
-    return 0
-  fi
-
   if [[ "$DRY_RUN" == true ]]; then
     local testing=""
     [[ "$TESTING_MODE_ON" != true ]] || testing=" (TESTING_MODE=on: no license, billing off)"
@@ -2631,9 +2624,14 @@ rollback_feed_restore() {
 # Before anything changes on a rollback: the backup unpacks, opens and passes its checks.
 prepare_rollback() {
   [[ "$ROLLBACK_RESTORE" == true ]] || return 0
-  local dir archive out
+  local dir archive out data_dir
   dir=$(rollback_dir)
   archive="$dir/$(manifest_value "$dir/record" archive)"
+  # The restore puts DATA_DIR where the old .env points, and configure_env then points botd at
+  # the installer's own, as on every install.
+  data_dir=$(env_data_dir "$dir/$(manifest_value "$dir/record" env)" "$(user_home)")
+  [[ "$data_dir" == "$(user_home)/superbot/data" ]] \
+    || die "The .env from before the upgrade sets DATA_DIR=$data_dir, but the installer runs botd with $(user_home)/superbot/data, so the backup would go where botd won't read it. Nothing has changed. Restore it by hand instead (docs/ops/backup-restore.md)."
   if [[ "$archive" == *.age ]]; then
     command -v age >/dev/null 2>&1 || die "The backup taken before the upgrade, $archive, is encrypted, and age isn't installed. Nothing has changed."
     [[ -r "$BACKUP_IDENTITY_FILE" ]] \

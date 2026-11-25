@@ -1286,11 +1286,6 @@ grep -qx "version=$VERSION" "$RB/offline-release" || fail "the rollback didn't r
 grep -qx "systemctl stop superbot.service" "$RB/systemctl" || fail "superbot wasn't stopped for the rollback"
 out=$(rollback) || fail "running the rollback again failed: $out"
 grep -Fq "This host already runs $VERSION: nothing to roll back" <<<"$out" || fail "a second rollback didn't say there's nothing to do: $out"
-sed -i "s,^DATA_DIR=.*,DATA_DIR=$RH/elsewhere," "$RH/superbot/.env"
-kept_env=$(cat "$RH/superbot/.env")
-out=$(rb "ROLLBACK_RESTORE=true DOMAIN=bots.example.test; configure_env") || fail "configure_env failed in a rollback: $out"
-[[ $(cat "$RH/superbot/.env") == "$kept_env" ]] || fail "configure_env rewrote the .env a rollback put back: $(cat "$RH/superbot/.env")"
-grep -Fq "Keeping $RH/superbot/.env from before the upgrade as it is (--rollback)" <<<"$out" || fail "configure_env didn't say it kept the .env: $out"
 ok "--rollback stops botd, puts back DATA_DIR and .env from before the upgrade, keeping what they replace, and records the older release"
 
 rb_host
@@ -1321,6 +1316,8 @@ broken=$RB/dir/$(sed -n 's/^archive=//p' "$RB/dir/record")
 head -c 100 "$RB/dir.good/${broken##*/}" >"$broken"
 sed -i "s/^archive_sha256=.*/archive_sha256=$(sha256sum "$broken" | cut -c1-64)/" "$RB/dir/record"
 refused_rollback "doesn't restore: superbot-restore: could not unpack the archive" "a backup that doesn't unpack"
+sed -i "s,^DATA_DIR=.*,DATA_DIR=$RH/elsewhere," "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")"
+refused_rollback "sets DATA_DIR=$RH/elsewhere, but the installer runs botd with $RH/superbot/data" "an old .env with another DATA_DIR"
 rm -rf "$RB/dir"
 refused_rollback "no backup was taken before an offline upgrade on this host" "no backup"
 printf '#!/bin/sh\ncase " $* " in *" --check "*) cat >/dev/null; exit 0 ;; esac\ncat >/dev/null\necho "superbot-restore: disk full" >&2\nexit 1\n' >"$RB/bundle/deploy/superbot-restore.sh"
@@ -1357,7 +1354,7 @@ grep -Fq -- "--rollback goes back to an older release, but this host runs 0.0.9 
 rm "$RB/offline-release"
 if out=$(rollback); then fail "--rollback went on with no release recorded: $out"; fi
 grep -Fq "this host has no offline release recorded" <<<"$out" || fail "--rollback with no release recorded didn't say why: $out"
-ok "--rollback is refused, changing nothing, for another release's or build's backup, a host upgraded since, a changed or broken backup, or none; a restore that fails before the swap puts the .env back and starts botd, and one that fails while swapping leaves botd stopped"
+ok "--rollback is refused, changing nothing, for another release's or build's backup, a host upgraded since, a changed or broken backup, an old .env with another DATA_DIR, or none; a restore that fails before the swap puts the .env back and starts botd, and one that fails while swapping leaves botd stopped"
 
 if command -v age-keygen >/dev/null 2>&1; then
   age-keygen -o "$RB/identity" 2>/dev/null
