@@ -1709,6 +1709,9 @@ pub struct ScimToken {
     pub label: Option<String>,
     /// The SSO provider whose subjects this tenant's `externalId`s are (from SSO_PROVIDERS).
     pub sso_provider: Option<String>,
+    /// For a native SAML provider, the IdP (entity ID) whose NameIDs they are (ADR 0297).
+    /// None for other providers, and for tenants made before it was recorded.
+    pub sso_idp: Option<String>,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub last_used_at: Option<i64>,
@@ -1733,6 +1736,7 @@ fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
         tenant: r.get("tenant")?,
         label: r.get("label")?,
         sso_provider: r.get("sso_provider")?,
+        sso_idp: r.get("sso_idp")?,
         created_at: r.get("created_at")?,
         created_by: r.get("created_by")?,
         last_used_at: r.get("last_used_at")?,
@@ -1759,6 +1763,21 @@ pub(crate) fn claim_scim_token_notice(c: &Connection, id: &str, from: Option<&st
 pub(crate) fn scim_tenant_tokens(c: &Connection, tenant: &str) -> rusqlite::Result<Vec<ScimToken>> {
     let mut s = c.prepare("SELECT * FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id")?;
     s.query_map([tenant], scim_token_row)?.collect()
+}
+
+/// What a SCIM tenant's `externalId`s are subjects of: its first token's SSO provider and
+/// native SAML IdP.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScimTenantLink {
+    pub provider: Option<String>,
+    pub idp: Option<String>,
+}
+
+fn scim_tenant_link(c: &Connection, tenant: &str) -> rusqlite::Result<Option<ScimTenantLink>> {
+    c.query_row("SELECT sso_provider, sso_idp FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id LIMIT 1", [tenant], |r| {
+        Ok(ScimTenantLink { provider: r.get(0)?, idp: r.get(1)? })
+    })
+    .optional()
 }
 
 /// A user as a SCIM tenant provisioned it: the SCIM attributes botd has no column for
@@ -2439,7 +2458,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 72] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 73] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2512,7 +2531,18 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 72] = [
     migrate_deleted_teams,
     migrate_saml_session_users,
     migrate_saml_group_roles_per_idp,
+    migrate_scim_token_idp,
 ];
+
+/// The native SAML IdP a SCIM tenant's `externalId`s are NameIDs at (ADR 0297). Tokens made
+/// before keep a null: the provider's one IdP, as before.
+fn migrate_scim_token_idp(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('scim_tokens') WHERE name = 'sso_idp'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE scim_tokens ADD COLUMN sso_idp TEXT;")
+}
 
 /// Native SAML sign-ins name their person (ADR 0283), so a regional chat store keeps them
 /// with the session they belong to.
@@ -8837,34 +8867,52 @@ impl Db {
     /// A tenant's first token sets its SSO provider for good: a token naming another gets
     /// `Err` with the tenant's provider. Checked and written in one transaction.
     #[allow(clippy::too_many_arguments)]
+    /// A token for `tenant`. A tenant's first token sets its link, the SSO provider and (for
+    /// native SAML, ADR 0297) the IdP, for good: a later token must name the same provider,
+    /// and takes the tenant's IdP when `sso_idp` is None. A tenant made before IdPs were
+    /// recorded has none, and the first token naming one sets it on all its tokens. Err is
+    /// the tenant's link when this token's differs. Ok also says whether this token named
+    /// the tenant's IdP for its older tokens.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_scim_token(
         &self,
         tenant: &str,
         label: Option<&str>,
         sso_provider: Option<&str>,
+        sso_idp: Option<&str>,
         token_hash: &str,
         by: Option<&str>,
         expires_at: i64,
         scopes: crate::scim::scopes::Scopes,
-    ) -> Result<ScimToken, Option<String>> {
+    ) -> Result<(ScimToken, bool), ScimTenantLink> {
         let id = format!("st{}", crate::random_hex(4));
         let c = self.c();
         let tx = c.unchecked_transaction().unwrap();
-        let first: Option<Option<String>> =
-            tx.query_row("SELECT sso_provider FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id LIMIT 1", [tenant], |r| r.get(0)).optional().unwrap();
-        if let Some(first) = first
-            && first.as_deref() != sso_provider
-        {
-            return Err(first);
+        let first = scim_tenant_link(&tx, tenant).unwrap();
+        let mut idp = sso_idp.map(String::from);
+        let mut idp_set = false;
+        if let Some(first) = first {
+            match (&first.idp, sso_idp) {
+                _ if first.provider.as_deref() != sso_provider => return Err(first),
+                (Some(had), Some(asked)) if had != asked => return Err(first),
+                (Some(had), None) => idp = Some(had.clone()),
+                (None, Some(asked)) => idp_set = tx.execute("UPDATE scim_tokens SET sso_idp = ? WHERE tenant = ? AND sso_idp IS NULL", params![asked, tenant]).unwrap() > 0,
+                _ => {}
+            }
         }
         tx.execute(
-            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![id, tenant, label, sso_provider, token_hash, now(), by, expires_at, scopes.to_stored()],
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, sso_idp, token_hash, created_at, created_by, expires_at, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, tenant, label, sso_provider, idp, token_hash, now(), by, expires_at, scopes.to_stored()],
         )
         .unwrap();
         let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).unwrap();
         tx.commit().unwrap();
-        Ok(t)
+        Ok((t, idp_set))
+    }
+
+    /// The SSO link of `tenant`'s tokens, if it has any.
+    pub fn scim_tenant_link(&self, tenant: &str) -> Option<ScimTenantLink> {
+        scim_tenant_link(&self.c(), tenant).ok().flatten()
     }
 
     pub fn scim_token(&self, id: &str) -> Option<ScimToken> {
@@ -8925,8 +8973,8 @@ impl Db {
             return None;
         }
         tx.execute(
-            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by, expires_at, scopes)
-             SELECT ?1, tenant, label, sso_provider, ?2, ?3, ?4, ?5, ?7 FROM scim_tokens WHERE id = ?6",
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, sso_idp, token_hash, created_at, created_by, expires_at, scopes)
+             SELECT ?1, tenant, label, sso_provider, sso_idp, ?2, ?3, ?4, ?5, ?7 FROM scim_tokens WHERE id = ?6",
             params![id, token_hash, at, by, expires_at, old, scopes.to_stored()],
         )
         .ok()?;

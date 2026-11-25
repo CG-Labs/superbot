@@ -2969,7 +2969,8 @@ const IDP_B: &str = "https://login.uni-b.example/saml";
 
 /// A federation's MDQ server for IdP `IDP` (University A, scope example.com, signer 0) and
 /// `IDP_B` (Beta Institute, scope uni-b.example, signer `b_signer`), both with SLO URLs, each
-/// answer signed by test signer 1; and botd with one provider for both, plus `extra` settings.
+/// answer signed by test signer 1; and botd with SCIM on and one provider for both, plus
+/// `extra` settings.
 async fn serve_federation(extra: &[(&str, &str)], b_signer: usize) -> (Sp, std::path::PathBuf, Vec<Arc<crate::sso::Provider>>) {
     serve_federation_with(extra, b_signer, |_, md| md).await
 }
@@ -3007,7 +3008,11 @@ async fn serve_federation_with(extra: &[(&str, &str)], b_signer: usize, edit: im
     ]);
     vars.extend(extra.iter().map(|(k, v)| (format!("SSO_{up}_{k}"), v.to_string())));
     let mut providers = Vec::new();
-    let (port, app, admin) = serve_vars_with(vars, |a| providers = a.sso.providers.clone()).await;
+    let (port, app, admin) = serve_vars_with(vars, |a| {
+        a.scim.enabled = true;
+        providers = a.sso.providers.clone();
+    })
+    .await;
     let sp = Sp { port, app, admin, id, sp_entity: None };
     // Loads every IdP's metadata, as the startup expiry check does.
     assert_eq!(call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await.0, 200);
@@ -3429,4 +3434,122 @@ async fn a_federation_idps_unsolicited_artifact_is_resolved_at_that_idp_and_rest
     assert_eq!((f["reason"].as_str(), f["idpInitiated"].as_bool(), f["entityId"].as_str()), (Some("unknown_idp"), Some(true), None));
     assert_eq!(sp.audit("auth.saml_idp_initiated").await.len(), 2);
     std::fs::remove_dir_all(dir).ok();
+}
+
+// SCIM with several IdPs of a federation (ADR 0297)
+
+const SCIM_USERS: &str = "/scim/v2/Users";
+
+impl Sp {
+    async fn new_token(&self, body: Value) -> (u16, String) {
+        call(self.port, "POST", "/api/scim/tokens", &self.admin, &body.to_string()).await
+    }
+
+    /// Each SCIM token's id and the IdP it links.
+    async fn token_idps(&self) -> HashMap<String, Value> {
+        let (_, v) = call(self.port, "GET", "/api/scim/tokens", &self.admin, "").await;
+        let v: Value = serde_json::from_str(&v).unwrap();
+        v["tokens"].as_array().unwrap().iter().map(|t| (t["id"].as_str().unwrap().to_string(), t["ssoIdp"].clone())).collect()
+    }
+}
+
+#[tokio::test]
+async fn a_scim_tenant_provisions_people_at_one_idp_of_a_federation() {
+    use crate::scim_http_tests::{okta_user, scim, token};
+    let (sp, dir, _) = serve_federation(&[], 2).await;
+
+    // The tenant must say which IdP's NameIDs its externalIds are, and it must be listed.
+    let (code, e) = sp.new_token(json!({ "tenant": "uni-b", "sso": sp.id })).await;
+    assert!(code == 400 && e.contains("--idp"), "{code} {e}");
+    let (code, e) = sp.new_token(json!({ "tenant": "uni-b", "sso": sp.id, "idp": "https://idp.other.example" })).await;
+    assert!(code == 400 && e.contains("not one of this provider's IdPs"), "{code} {e}");
+    let (code, e) = sp.new_token(json!({ "tenant": "uni-b", "idp": IDP_B })).await;
+    assert!(code == 400 && e.contains("idp needs sso"), "{code} {e}");
+    let (t, first) = token(sp.port, &sp.admin, json!({ "tenant": "uni-b", "sso": sp.id, "idp": IDP_B })).await;
+    let created = &sp.audit("scim.token_created").await[0]["details"];
+    assert_eq!((created["sso"].as_str(), created["idp"].as_str(), created.get("idpSet")), (Some(sp.id.as_str()), Some(IDP_B), None));
+
+    // Its other tokens link the same IdP; naming another is refused.
+    let (_, second) = token(sp.port, &sp.admin, json!({ "tenant": "uni-b", "sso": sp.id })).await;
+    let idps = sp.token_idps().await;
+    assert_eq!((&idps[&first], &idps[&second]), (&json!(IDP_B), &json!(IDP_B)));
+    let (code, e) = sp.new_token(json!({ "tenant": "uni-b", "sso": sp.id, "idp": IDP })).await;
+    assert!(code == 409 && e.contains(IDP_B), "{code} {e}");
+
+    // A person it provisions is B's NameID: signed in at B, not at A.
+    let (code, _, u) = scim(sp.port, &t, "POST", SCIM_USERS, okta_user("bob@uni-b.example", NAME_ID)).await;
+    assert_eq!(code, 201, "{u}");
+    let bob = u["id"].as_str().unwrap().to_string();
+    assert_eq!(sp.app.db.identity(IDP_B, STORED).map(|(_, u)| u.id), Some(bob.clone()));
+    assert!(sp.app.db.identity(IDP, STORED).is_none());
+    let linked = &sp.audit("user.identity_linked").await[0]["details"];
+    assert_eq!((linked["issuer"].as_str(), linked["subject"].as_str()), (Some(IDP_B), Some(STORED)));
+    let (code, _, head) = sp.sign_in_at(IDP_B, |r| {
+        from_b(r);
+        r.attributes[0].1 = "bob@uni-b.example".into();
+    })
+    .await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(bob.clone()));
+    let (code, to, _) = sp.sign_in_at(IDP, |_| {}).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_not_linked"), "the same NameID at A is someone else");
+
+    // B vouches only for its own domains: no one at A's, made or renamed.
+    let (code, head, body) = scim(sp.port, &t, "POST", SCIM_USERS, okta_user("eve@example.com", "eve-at-b")).await;
+    assert_eq!(code, 400, "{body}");
+    crate::scim_http_tests::is_scim_error(&head, &body, 400);
+    assert_eq!(body["scimType"], "invalidValue");
+    assert!(body["detail"].as_str().unwrap().contains("uni-b.example"), "{body}");
+    assert!(sp.app.db.identity(IDP_B, "eve-at-b").is_none(), "nobody made");
+    let to_a = json!({ "Operations": [{ "op": "Replace", "path": "emails[type eq \"work\"].value", "value": "bob@example.com" }] });
+    let (code, _, body) = scim(sp.port, &t, "PATCH", &format!("{SCIM_USERS}/{bob}"), to_a).await;
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(sp.app.db.user(&bob).unwrap().email.as_deref(), Some("bob@uni-b.example"));
+    let (code, _, body) = scim(sp.port, &t, "PUT", &format!("{SCIM_USERS}/{bob}"), okta_user("bob@example.com", NAME_ID)).await;
+    assert_eq!(code, 400, "{body}");
+
+    // Deprovisioning keeps the email, so it never waits on the federation's metadata.
+    let off = json!({ "Operations": [{ "op": "Replace", "path": "active", "value": "False" }] });
+    assert_eq!(scim(sp.port, &t, "PATCH", &format!("{SCIM_USERS}/{bob}"), off).await.0, 200);
+    assert!(!sp.app.db.user(&bob).unwrap().active());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn a_tenant_made_before_idps_were_recorded_names_one_once_its_provider_lists_several() {
+    use crate::scim_http_tests::{okta_user, scim};
+    let (sp, dir, _) = serve_federation(&[], 2).await;
+    let old = users::new_secret(crate::scim::TOKEN_PREFIX);
+    let (made, _) = sp.app.db.create_scim_token("old", None, Some(&sp.id), None, &users::hash(&old), None, db::now() + 86_400_000, Default::default()).unwrap();
+
+    // Without an IdP, botd can't tell whose NameID a person is, and says how to name it.
+    let (code, _, body) = scim(sp.port, &old, "POST", SCIM_USERS, okta_user("bob@uni-b.example", NAME_ID)).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(body["detail"].as_str().unwrap().contains("botctl scim token create old"), "{body}");
+
+    // A new token naming one names it for the tenant's older tokens too.
+    let (code, res) = sp.new_token(json!({ "tenant": "old", "sso": sp.id, "idp": IDP_B })).await;
+    assert_eq!(code, 201, "{res}");
+    let created = &sp.audit("scim.token_created").await[0]["details"];
+    assert_eq!((created["idp"].as_str(), created["idpSet"].as_bool()), (Some(IDP_B), Some(true)));
+    assert_eq!(sp.token_idps().await[&made.id], json!(IDP_B));
+    let (code, _, u) = scim(sp.port, &old, "POST", SCIM_USERS, okta_user("bob@uni-b.example", NAME_ID)).await;
+    assert_eq!(code, 201, "{u}");
+    assert_eq!(sp.app.db.identity(IDP_B, STORED).map(|(_, u)| u.id), u["id"].as_str().map(String::from));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn a_tenant_of_a_provider_with_one_idp_records_it() {
+    use crate::scim_http_tests::{okta_user, scim, token};
+    let sp = serve_with(&[], |a| a.scim.enabled = true).await;
+    let (t, id) = token(sp.port, &sp.admin, json!({ "tenant": "okta", "sso": sp.id })).await;
+    assert_eq!(sp.token_idps().await[&id], json!(IDP), "so the link holds once the provider lists more");
+    let (code, e) = sp.new_token(json!({ "tenant": "okta-2", "sso": sp.id, "idp": IDP_B })).await;
+    assert!(code == 400 && e.contains("not one of this provider's IdPs"), "{code} {e}");
+
+    // One IdP's emails aren't checked: its admin chose it, and it may publish no scope.
+    let (code, _, u) = scim(sp.port, &t, "POST", SCIM_USERS, okta_user("ada@anywhere.example", NAME_ID)).await;
+    assert_eq!(code, 201, "{u}");
+    assert_eq!(sp.app.db.identity(IDP, STORED).map(|(_, u)| u.id), u["id"].as_str().map(String::from));
 }

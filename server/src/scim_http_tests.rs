@@ -486,6 +486,10 @@ async fn an_sso_linked_tenant_provisions_people_who_then_sign_in() {
     let (t, _) = token(port, &admin, json!({ "tenant": "entra", "sso": sso })).await;
     let (code, body) = call(port, "POST", "/api/scim/tokens", &admin, r#"{"tenant":"entra"}"#).await;
     assert_eq!(code, 409, "a tenant's tokens all link the same provider: {body}");
+    let (_, list) = call(port, "GET", "/api/scim/tokens", &admin, "").await;
+    assert_eq!(parse(&list)["tokens"][0]["ssoIdp"], Value::Null, "an IdP is only native SAML's");
+    let (code, body) = call(port, "POST", "/api/scim/tokens", &admin, &json!({ "tenant": "entra-x", "sso": sso, "idp": "https://idp.example/" }).to_string()).await;
+    assert!(code == 400 && body.contains("only for native SAML"), "{code} {body}");
 
     let mut ada = okta_user("ada@corp.example", "");
     ada.as_object_mut().unwrap().remove("externalId");
