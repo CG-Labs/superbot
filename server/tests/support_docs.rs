@@ -371,6 +371,38 @@ fn the_escalation_check_page_documents_every_option_and_code() {
 }
 
 #[test]
+fn the_tam_cadence_page_documents_every_option_field_and_item() {
+    let code = fs::read_to_string(repo().join("server/src/tam_cadence.rs")).unwrap();
+    let usage = code.split("pub const USAGE: &str = \"").nth(1).unwrap().split("\";").next().unwrap();
+    let page = read("tam-cadence.md");
+    let options: HashSet<&str> = usage.split(|c: char| c.is_whitespace() || "[]|".contains(c)).filter(|w| w.starts_with("--")).collect();
+    assert!(options.len() >= 11, "the usage's options: {options:?}");
+    for o in options {
+        assert!(page.contains(&format!("`{o}")), "tam-cadence.md doesn't explain {o}");
+    }
+    let export = page.split("\n## The export\n").nth(1).expect("tam-cadence.md has an export section").split("\n## ").next().unwrap();
+    let fields = code.split("pub fn name(self) -> &'static str {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let fields: Vec<&str> = fields.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(fields.len(), 12, "{fields:?}");
+    for f in fields {
+        assert!(export.contains(&format!("| `{f}` |")), "tam-cadence.md has no row for the {f} field");
+    }
+    let flags = page.split("\n## What it flags\n").nth(1).expect("tam-cadence.md has a What it flags section").split("\n## ").next().unwrap();
+    let items = code.split("pub fn code(self) -> &'static str {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let items: Vec<&str> = items.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert_eq!(items.len(), 7, "{items:?}");
+    for i in items {
+        assert!(flags.contains(&format!("| `{i}` |")), "tam-cadence.md has no row for {i}");
+    }
+    for needle in ["ADR 0295", "tells nobody", "exits 1", "Severity 1", "5 business days", "31 days", "183 days", "(tam.md#cadence)", "(readiness.md#the-tam-list)"] {
+        assert!(page.contains(needle), "tam-cadence.md doesn't mention {needle}");
+    }
+    for name in ["tam.md", "README.md", "readiness.md"] {
+        assert!(read(name).contains("(tam-cadence.md"), "{name} doesn't point at the TAM cadence check");
+    }
+}
+
+#[test]
 fn the_support_check_page_documents_every_check_and_option() {
     let code = fs::read_to_string(repo().join("server/src/support_check.rs")).unwrap();
     let usage = code.split("const USAGE: &str = \"").nth(1).unwrap().split("\n\n").next().unwrap();
