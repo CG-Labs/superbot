@@ -80,7 +80,7 @@ Optional settings:
 - `MACHINE_REGIONS`, with cluster member names. With hosts tagged by region it lists data regions instead; see [data regions](#data-regions).
 - `INCUS_IMAGE_SERVER=local`, if images are imported by hand.
 - `INCUS_EGRESS_DENY`, with the host's other public addresses and anything else containers must never reach.
-- `INCUS_EGRESS_ALLOW`, exact `address:port` pairs containers may reach over TCP though they are private, such as internal package mirrors ([air-gapped](air-gapped.md#harness-clis-on-users-machines)). For example `10.0.0.20:443,[fd00::20]:443`.
+- `INCUS_EGRESS_ALLOW`, exact `address:port` pairs containers may reach over TCP though they are private, such as internal package mirrors ([harness](air-gapped.md#harness-clis-on-users-machines) and [apt](air-gapped.md#ubuntus-packages-on-users-machines) mirrors). For example `10.0.0.20:443,[fd00::20]:443`.
 
 botd dials each container's agent at its bridge address, so botd needs a route to `10.150.0.0/24`:
 
