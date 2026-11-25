@@ -230,7 +230,7 @@ pub fn untar(b: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 // Checking one bundle
 
 /// A bundle found in the store, and what checking it showed.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Found {
     /// Where it is, relative to the store.
     pub path: String,
@@ -383,9 +383,12 @@ pub fn check(path: String, name: &str, files: &BTreeMap<String, Vec<u8>>) -> Fou
     f
 }
 
+/// A bundle's files, by name.
+pub type Files = BTreeMap<String, Vec<u8>>;
+
 /// One bundle's files from its folder name and the tar's entries; `None` when the tar
 /// isn't a bundle at all.
-fn from_entries(path: String, entries: Vec<(String, Vec<u8>)>) -> Option<Found> {
+fn from_entries(path: String, entries: Vec<(String, Vec<u8>)>) -> Option<(Found, Files)> {
     let tops: BTreeSet<&str> = entries.iter().map(|(n, _)| n.split('/').next().unwrap_or_default()).collect();
     let bundles: Vec<&str> = tops.iter().copied().filter(|t| kind_of(t).is_some()).collect();
     match bundles.as_slice() {
@@ -408,19 +411,32 @@ fn from_entries(path: String, entries: Vec<(String, Vec<u8>)>) -> Option<Found> 
             let mut f = check(path, top, &files);
             f.problems.extend(nested.into_iter().map(|n| format!("{n} isn't a file of the bundle's folder")));
             f.problems.extend(repeated.into_iter().map(|n| format!("{n} is in the tar more than once, so not every copy can be checked")));
-            Some(f)
+            Some((f, files))
         }
-        _ => Some(Found { path, name: bundles.join(", "), problems: vec!["the tar holds more than one folder; keep one bundle per tar, as made".into()], ..Found::default() }),
+        _ => Some((Found { path, name: bundles.join(", "), problems: vec!["the tar holds more than one folder; keep one bundle per tar, as made".into()], ..Found::default() }, Files::new())),
     }
 }
 
 /// Every bundle in the store, as a `.tar` (as made) or unpacked into its folder, and the
 /// other files that were passed over. Hidden files (botd's partial writes) are skipped.
 pub fn scan(store: &Path) -> Result<(Vec<Found>, Vec<String>), String> {
+    let (found, other) = scan_keeping(store, &[])?;
+    Ok((found.into_iter().map(|(f, _)| f).collect(), other))
+}
+
+/// Bundles found with the files kept from each.
+pub type Kept = Vec<(Found, Files)>;
+
+/// `scan`, keeping each bundle's files named in `keep` to read what they hold.
+pub fn scan_keeping(store: &Path, keep: &[&str]) -> Result<(Kept, Vec<String>), String> {
     fn rel(store: &Path, p: &Path) -> String {
         p.strip_prefix(store).unwrap_or(p).to_string_lossy().into_owned()
     }
-    fn walk(store: &Path, dir: &Path, depth: usize, found: &mut Vec<Found>, other: &mut Vec<String>) -> Result<(), String> {
+    fn kept((f, mut files): (Found, Files), keep: &[&str]) -> (Found, Files) {
+        files.retain(|n, _| keep.contains(&n.as_str()));
+        (f, files)
+    }
+    fn walk(store: &Path, dir: &Path, depth: usize, keep: &[&str], found: &mut Kept, other: &mut Vec<String>) -> Result<(), String> {
         let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.filter_map(Result::ok).collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
@@ -432,23 +448,23 @@ pub fn scan(store: &Path) -> Result<(Vec<Found>, Vec<String>), String> {
             if meta.is_dir() {
                 // Named as a bundle is enough: one that lost its manifest and sums must still fail.
                 if kind_of(&name).is_some() {
-                    found.push(folder(rel(store, &p), &name, &p));
+                    found.push(kept(folder(rel(store, &p), &name, &p), keep));
                 } else if depth < MAX_DEPTH {
-                    walk(store, &p, depth + 1, found, other)?;
+                    walk(store, &p, depth + 1, keep, found, other)?;
                 }
             } else if name.ends_with(".tar") {
                 if meta.len() > MAX_TAR {
-                    found.push(Found { path: rel(store, &p), name, problems: vec![format!("it is over {} MiB, larger than any bundle", MAX_TAR >> 20)], ..Found::default() });
+                    found.push((Found { path: rel(store, &p), name, problems: vec![format!("it is over {} MiB, larger than any bundle", MAX_TAR >> 20)], ..Found::default() }, Files::new()));
                     continue;
                 }
                 let read = std::fs::read(&p).map_err(|e| e.to_string()).and_then(|b| untar(&b));
                 match read {
                     Ok(entries) => match from_entries(rel(store, &p), entries) {
-                        Some(f) => found.push(f),
+                        Some(f) => found.push(kept(f, keep)),
                         None => other.push(rel(store, &p)),
                     },
                     // Bundles are renamed in stores, so a damaged tar may be one whatever its name.
-                    Err(why) => found.push(Found { path: rel(store, &p), name: name.trim_end_matches(".tar").into(), problems: vec![format!("it can't be read as a tar, so it can't be checked: {why}")], ..Found::default() }),
+                    Err(why) => found.push((Found { path: rel(store, &p), name: name.trim_end_matches(".tar").into(), problems: vec![format!("it can't be read as a tar, so it can't be checked: {why}")], ..Found::default() }, Files::new())),
                 }
             } else {
                 other.push(rel(store, &p));
@@ -456,7 +472,7 @@ pub fn scan(store: &Path) -> Result<(Vec<Found>, Vec<String>), String> {
         }
         Ok(())
     }
-    fn folder(path: String, name: &str, dir: &Path) -> Found {
+    fn folder(path: String, name: &str, dir: &Path) -> (Found, Files) {
         let mut files = BTreeMap::new();
         let mut odd = Vec::new();
         for e in std::fs::read_dir(dir).into_iter().flatten().filter_map(Result::ok) {
@@ -473,13 +489,13 @@ pub fn scan(store: &Path) -> Result<(Vec<Found>, Vec<String>), String> {
         }
         let mut f = check(path, name, &files);
         f.problems.extend(odd);
-        f
+        (f, files)
     }
     if !store.is_dir() {
         return Err(format!("{} isn't a folder", store.display()));
     }
     let (mut found, mut other) = (Vec::new(), Vec::new());
-    walk(store, store, 0, &mut found, &mut other)?;
+    walk(store, store, 0, keep, &mut found, &mut other)?;
     Ok((found, other))
 }
 
@@ -1232,7 +1248,7 @@ mod tests {
             drills::build(None, &[], &period, &src, now).tar,
             register::build(&rc, &rsrc, now).tar,
         ] {
-            let f = from_entries("b.tar".into(), untar(&tar).unwrap()).expect("a bundle");
+            let (f, _) = from_entries("b.tar".into(), untar(&tar).unwrap()).expect("a bundle");
             assert!(f.verified(), "{}: {:?}", f.name, f.problems);
             assert_eq!(f.period, Some(period));
             assert!(f.warnings.is_empty(), "{:?}", f.warnings);
@@ -1245,7 +1261,9 @@ mod tests {
         let entries: Vec<(String, Vec<u8>)> = files.iter().map(|(n, b)| (format!("{name}/{n}"), b.clone())).collect();
         let tar = crate::ustar::tar(&entries, 0);
         assert_eq!(untar(&tar).unwrap().len(), files.len());
-        assert!(from_entries("v.tar".into(), untar(&tar).unwrap()).unwrap().verified());
+        let (f, kept) = from_entries("v.tar".into(), untar(&tar).unwrap()).unwrap();
+        assert!(f.verified());
+        assert_eq!(kept, files, "every file, as read");
 
         // GNU tar's `./` names and a directory entry.
         let mut repacked = vec![(format!("./{name}/README.txt"), b"readme\n".to_vec())];
@@ -1259,7 +1277,7 @@ mod tests {
         let mut all = dir[..512].to_vec();
         all.extend(raw);
         all.resize(all.len() + 1024, 0);
-        let f = from_entries("v.tar".into(), untar(&all).unwrap()).unwrap();
+        let (f, _) = from_entries("v.tar".into(), untar(&all).unwrap()).unwrap();
         assert!(f.verified(), "{:?}", f.problems);
 
         // Long names: a pax header's path and a GNU long name each name the next file; a
@@ -1298,11 +1316,11 @@ mod tests {
         // A changed copy hidden before the original: only the last would reach the check.
         let mut twice = vec![(format!("{name}/accepted-findings.json"), b"changed".to_vec())];
         twice.extend(entries.iter().cloned());
-        let f = from_entries("d.tar".into(), untar(&crate::ustar::tar(&twice, 0)).unwrap()).unwrap();
+        let (f, _) = from_entries("d.tar".into(), untar(&crate::ustar::tar(&twice, 0)).unwrap()).unwrap();
         assert!(!f.verified() && f.problems.iter().any(|x| x.contains("accepted-findings.json is in the tar more than once")), "{:?}", f.problems);
 
         let two = crate::ustar::tar(&[(format!("{name}/a"), vec![]), ("superbot-evidence-2027-01-01_2027-02-01-x/b".into(), vec![])], 0);
-        assert!(from_entries("t.tar".into(), untar(&two).unwrap()).unwrap().problems[0].contains("more than one folder"));
+        assert!(from_entries("t.tar".into(), untar(&two).unwrap()).unwrap().0.problems[0].contains("more than one folder"));
         assert!(from_entries("o.tar".into(), untar(&crate::ustar::tar(&[("photos/a.jpg".into(), vec![1])], 0)).unwrap()).is_none());
     }
 
