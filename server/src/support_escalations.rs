@@ -242,14 +242,14 @@ pub fn check(tickets: &str, replies: Option<&str>, o: &Options, u: &UpdateOption
 }
 
 /// A ticket id from the export, on one line.
-fn one_line(s: &str) -> String {
+pub fn one_line(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// A ticket id for a Markdown table: a code span on one line, so nothing in it becomes a
 /// link (bare URLs included), a tag or emphasis. Its fence is longer than any run of
 /// backticks in it, and `|` stays escaped, since GitHub splits cells even inside code.
-fn md_cell(s: &str) -> String {
+pub fn md_cell(s: &str) -> String {
     let id = one_line(s).replace('|', "\\|");
     let run = id.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(run + 1);

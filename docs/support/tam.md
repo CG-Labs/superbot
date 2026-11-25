@@ -32,6 +32,8 @@ A TAM doesn't replace support: tickets still go to `<support-email>` or `<suppor
 | Before each upgrade | Release notes and any action needed; the change window | The customer's owner | Agreed window |
 | Within 5 business days of a Severity 1 | The incident review ([drafted from botd's records](incident-review.md#the-review-draft)), shared and walked through | The customer's owner and sponsor | Actions with owners |
 
+`botctl tam-cadence` checks this cadence across every account from the CRM's export: each kickoff, check-in, health check, business review, restore drill and Severity 1 walk-through overdue or due soon, and each renewal coming up, by account and by TAM ([TAM cadence check](tam-cadence.md)). Record each step's date in the customer's record as it happens, so the check reads what was done.
+
 The health score is a prompt, not a verdict: a TAM who sees a signal at risk calls the customer before the next scheduled check-in, and a TAM who knows something the score can't (a reorganisation, a merger, a champion leaving) acts on that too.
 
 ## Kickoff agenda

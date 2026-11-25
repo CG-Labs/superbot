@@ -713,7 +713,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
     assert!(md.contains("## Chats") && md.contains("- **Messages in it:** 3"), "{md}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
     assert_eq!(lon_row["chatStore"]["messages"].as_i64(), Some(3), "{regions}");
@@ -762,7 +762,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert!(r["notCovered"][0].as_str().unwrap().starts_with("botd's own database (accounts, chats,"), "{r}");
     assert_eq!(r["status"].as_str(), Some("kept"), "old backups are disclosed, not unkept: {r}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true }), "the move is done; only old backups are left: {me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true, "secrets": true }), "the move is done; only old backups are left: {me}");
 
     // Left there for hours (a check that keeps failing), admins are warned.
     app.db.conn_for_tests().execute("UPDATE main.chat_moves_out SET moved_at = moved_at - 4 * 3600000 WHERE region = 'gb-lon'", []).unwrap();
@@ -785,7 +785,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert!(!r["warnings"].to_string().contains("backups of gb-lon's chat store"), "{r}");
     assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()));
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(!regions["residency"]["warnings"].to_string().contains("may still hold the rows"), "{regions}");
 }
@@ -1068,7 +1068,7 @@ async fn a_pinned_persons_sign_ins_are_kept_in_their_regions_chat_store() {
     // The report counts them.
     let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
     assert_eq!((r["status"].as_str(), r["chats"]["sessions"]["inStore"].as_i64(), r["chats"]["sessions"]["inServerDatabase"].as_i64()), (Some("kept"), Some(2), Some(0)), "{r}");
-    assert!(r["notCovered"][0].as_str().unwrap().contains("owners' facts and sign-ins, which are in the region's chat store (accounts, the audit log"), "{r}");
+    assert!(r["notCovered"][0].as_str().unwrap().contains("owners' facts, sign-ins and own secrets, which are in the region's chat store (accounts, the audit log"), "{r}");
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
     assert!(md.contains("- **Sign-in sessions in it:** 2"), "{md}");
 
@@ -1091,6 +1091,45 @@ async fn a_pinned_persons_sign_ins_are_kept_in_their_regions_chat_store() {
     assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
     assert_eq!(count(), 0);
     assert_eq!(call(port, "GET", "/api/me/residency", &ada_s, "").await.0, 200);
+}
+
+#[tokio::test]
+async fn a_pinned_persons_own_secrets_are_kept_in_their_regions_chat_store() {
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false }).unwrap();
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let value = cipher.seal(&crate::secrets::sealed::user_context(&ada, "OPENAI_API_KEY"), b"sk-0293");
+    app.db.conn_for_tests().execute("INSERT INTO main.user_secrets VALUES (?1, 'OPENAI_API_KEY', ?2, 1, 1)", [&ada, &value]).unwrap();
+    let count = || rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM user_secrets", [], |r| r.get::<_, i64>(0)).unwrap();
+
+    // A pin moves it into London's store, audited, and the report counts it there.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    assert_eq!(count(), 1);
+    let moved = audit(port, &admin, chat_stores::MOVED).await;
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["personalKeys"].as_i64()), (Some("gb-lon"), Some(1)), "{moved:?}");
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["status"].as_str(), r["chats"]["personalKeys"]["inStore"].as_i64(), r["chats"]["personalKeys"]["inServerDatabase"].as_i64()), (Some("kept"), Some(1), Some(0)), "{r}");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("- **Personal secrets in it:** 1"), "{md}");
+
+    // One left in botd's own database makes the pin unkept until reconcile moves it.
+    app.db.conn_for_tests().execute_batch("INSERT INTO main.user_secrets SELECT * FROM chats_0.user_secrets; DELETE FROM chats_0.user_secrets;").unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert!(r["outside"].to_string().contains("their own secrets are in botd's own database, not gb-lon's chat store (ADR 0293)"), "{r}");
+    assert_eq!(reconcile_as(port, &admin).await["personalKeysMoved"].as_i64(), Some(1));
+    assert_eq!(count(), 1);
+
+    // Unpinned, it comes back to botd's own database.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!(count(), 0);
 }
 
 #[tokio::test]

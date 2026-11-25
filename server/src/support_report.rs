@@ -165,7 +165,7 @@ impl Calendar {
         (self.close - self.open) * 60
     }
 
-    fn is_business_day(&self, d: NaiveDate) -> bool {
+    pub fn is_business_day(&self, d: NaiveDate) -> bool {
         self.weekdays[d.weekday().num_days_from_monday() as usize] && !self.holidays.contains(&d)
     }
 
