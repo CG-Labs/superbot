@@ -9,7 +9,8 @@
 //! ADR 0231: production access in `access.json`, with a managed server's review matched to
 //! the sign-off in its evidence bundle's `access-review.json`. ADR 0241: vulnerabilities
 //! found outside the scans and penetration tests in `vulnerabilities.json`. ADR 0270:
-//! production and emergency changes in `production-changes.json`.
+//! production and emergency changes in `production-changes.json`. ADR 0279: vendors'
+//! assurance reports in `vendors.json`.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -132,6 +133,13 @@ fn register() -> Value {
                 "approved": "2026-10-12", "approvedBy": "p-c", "made": "2026-10-12", "madeBy": "p-c", "verified": "2026-10-12", "reviewed": "2026-10-13", "reviewedBy": "p-b",
             },
         ],
+        "assuranceReports": [
+            {
+                "id": "AR-1", "vendor": "hosting", "kind": "soc2-type2", "coversFrom": "2025-07-01", "coversTo": "2026-06-30", "reportSha256": hex(b"soc 2 report"), "opinion": "qualified", "risk": "R-1",
+                "cuecsSha256": hex(b"cuec note"), "bridgedTo": "2026-09-30", "bridgeSha256": hex(b"bridge letter"), "reviewed": "2026-10-05", "reviewedBy": "p-b", "notes": "Umbrella Audit's report",
+            },
+            { "id": "AR-2", "vendor": "code-host", "kind": "questionnaire", "coversTo": "2026-05-20", "reportSha256": hex(b"answers"), "reviewed": "2026-06-01", "reviewedBy": "p-b" },
+        ],
     })
 }
 
@@ -184,7 +192,7 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         "people.json: no exceptions; evidence for CC1.4-1, CC2.2-1",
         "risks.json: no exceptions; evidence for CC3.2-1, CC3.3-1",
         "management-reviews.json: no exceptions; evidence for CC1.2-1",
-        "vendors.json: no exceptions; evidence for CC6.4-1, CC9.2-1",
+        "vendors.json: opinionNotUnqualified 1; evidence for CC6.4-1, CC9.2-1",
         "policy-exceptions.json: baselineExceptionNotApproved 1; evidence for CC5.1-1",
         "conduct.json: triagedLate 1; evidence for CC1.1-1",
         "incidents.json: reviewOverdue 1; evidence for CC7.3-1, CC7.4-1, CC7.4-2, CC7.5-1",
@@ -202,16 +210,19 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         assert_eq!(fs::metadata(&tar).unwrap().permissions().mode() & 0o777, 0o600, "private to its owner");
     }
     let raw = fs::read(&tar).unwrap();
-    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex", "Initech", "carol-gh", "initech.test", "Hooli", "Grace", "Ivan"] {
+    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex", "Initech", "carol-gh", "initech.test", "Hooli", "Grace", "Ivan", "Umbrella"] {
         assert!(!raw.windows(never.len()).any(|w| w == never.as_bytes()), "{never:?} is in the bundle");
     }
     let folder = unpack(&dir, &tar);
     let manifest = json_in(&folder, "manifest.json");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(6), Some(true), Some(2)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(7), Some(true), Some(2)));
     assert_eq!(manifest["source"]["accessReviewFiles"], 1);
     assert_eq!(manifest["source"]["registerSha256"].as_str(), Some(hex(&fs::read(dir.join("register.json")).unwrap()).as_str()), "identifies the register kept beside it");
     let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
     assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json", "incidents.json", "access.json", "vulnerabilities.json", "production-changes.json"]);
+    let vendors = json_in(&folder, "vendors.json");
+    assert_eq!(vendors["exceptions"]["opinionNotUnqualified"], json!(["AR-1 of hosting (soc2-type2, reviewed 2026-10-05): qualified"]), "{vendors:#}");
+    assert_eq!((vendors["assuranceReports"][1]["coveredTo"].as_str(), vendors["assuranceReports"][1]["risk"].as_str(), vendors["assuranceReports"][1]["heldRole"].as_str()), (Some("2026-09-30"), Some("R-1"), Some("Security owner")), "{vendors:#}");
     let changes = json_in(&folder, "production-changes.json");
     assert_eq!(changes["exceptions"]["notChecked"], json!(["CHG-1 standard on botd-1 (made 2026-10-07, not checked, due 2026-10-08)"]), "{changes:#}");
     assert_eq!((changes["changes"][0]["heldRole"].as_str(), changes["changes"][1]["heldRole"].as_str(), changes["changes"][1]["makerHadAccess"].as_bool()), (Some("Management"), Some("Incident commander"), Some(true)), "{changes:#}");

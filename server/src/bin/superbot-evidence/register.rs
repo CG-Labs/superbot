@@ -6,7 +6,8 @@
 //! against the policies' cadences (a role without a holder, a policy unapproved, changed
 //! since approval or past its yearly review, an acknowledgement or training overdue, a risk
 //! unreviewed or accepted without management, a quarter without a management review, a
-//! vendor unassessed or unreviewed, an exception over a year or unreviewed, a server's
+//! vendor unassessed or unreviewed or its assurance report stale, unreviewed or with
+//! findings untreated, an exception over a year or unreviewed, a server's
 //! baseline exception the register never approved, a conduct concern triaged or closed
 //! late, a security event triaged late or by someone who can't lead it, a breach notice,
 //! post-incident review or action overdue, a year without a tabletop exercise, production
@@ -21,8 +22,8 @@
 //!
 //! Never in it: names, titles, notes or reasons from the register, nor the register
 //! itself. People, risks, vendors, exceptions, incidents, systems, vulnerabilities,
-//! penetration tests and changes are named by their register ids; the register's SHA-256
-//! identifies the copy kept beside the bundle.
+//! penetration tests, changes and assurance reports are named by their register ids; the
+//! register's SHA-256 identifies the copy kept beside the bundle.
 
 use crate::changes::{Bundle, Section, json_file, rfc3339, sha256};
 use crate::period::Period;
@@ -34,8 +35,9 @@ use std::path::Path;
 
 /// Bumped when a file's shape changes: 2 added `conduct.json` (ADR 0214), 3
 /// `incidents.json` (ADR 0223), 4 `access.json` (ADR 0231), 5 `vulnerabilities.json`
-/// (ADR 0241), 6 `production-changes.json` (ADR 0270).
-pub const FORMAT: u32 = 6;
+/// (ADR 0241), 6 `production-changes.json` (ADR 0270), 7 vendors' assurance reports in
+/// `vendors.json` (ADR 0279).
+pub const FORMAT: u32 = 7;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -149,6 +151,22 @@ pub const FOLLOW_UP_BUSINESS_DAYS: u32 = 5;
 /// operator (incident response plan, "Roles").
 pub const EMERGENCY_APPROVER: &str = "Security owner";
 
+/// Vendors' assurance reports (ADR 0279), under the vendor management policy: a SOC 2
+/// report (Type II over a period, Type I at a date), an ISO 27001 certificate (from its
+/// issue to its expiry), or a security questionnaire's answers where a vendor has none.
+pub const ASSURANCE_KINDS: [&str; 4] = ["soc2-type2", "soc2-type1", "iso27001", "questionnaire"];
+/// The kinds an independent auditor stands behind: a hosting provider's physical and
+/// environmental controls, which the service inherits (CC6.4-1), need one of these.
+pub const INDEPENDENT_KINDS: [&str; 2] = ["soc2-type2", "iso27001"];
+/// A SOC 2 auditor's opinion: only `unqualified` says the controls were as described.
+pub const OPINIONS: [&str; 4] = ["unqualified", "qualified", "adverse", "disclaimed"];
+/// A SOC 2 report whose period (or the vendor's bridge letter after it) ended more than
+/// this many days before the period's end no longer speaks for the vendor's controls now.
+pub const REPORT_STALE_DAYS: i64 = 92;
+/// The roles whose holders or deputies review assurance reports: the vendor management
+/// policy's owner, or the management that approves it.
+pub const REPORT_REVIEWERS: [&str; 2] = ["Security owner", "Management"];
+
 /// Yearly: policy reviews, acknowledgements, training, risk and vendor reviews.
 pub const YEAR_DAYS: i64 = 365;
 /// Quarterly: management reviews and exception reviews.
@@ -207,7 +225,10 @@ after the period are left out.
                            reviews, accepted risks and who accepted them, fraud risks
   management-reviews.json  the quarterly management reviews, who attended (by role), and
                            quarters without one
-  vendors.json             vendors in use, assessed before use and reviewed yearly
+  vendors.json             vendors in use, assessed before use and reviewed yearly, and
+                           their assurance reports: reviewed within a year by the
+                           security owner or management, still current, complementary
+                           controls noted and findings treated as risks
   policy-exceptions.json   exceptions in force, their approvals, ends and quarterly
                            reviews, and each server's baseline exceptions held to them
   conduct.json             the code of conduct's approval and acknowledgements, and
@@ -318,6 +339,8 @@ pub struct Register {
     pub pen_tests: Vec<PenTest>,
     #[serde(default)]
     pub changes: Vec<Change>,
+    #[serde(default)]
+    pub assurance_reports: Vec<AssuranceReport>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -764,6 +787,79 @@ pub struct Change {
     #[serde(default)]
     #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
     pub notes: Option<String>,
+}
+
+/// One review of a vendor's assurance report, by id: the report, the note of how the
+/// provider meets its complementary user entity controls, and any bridge letter stay in
+/// the store, identified by their SHA-256.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AssuranceReport {
+    pub id: String,
+    pub vendor: String,
+    pub kind: String,
+    /// The first day the report speaks for: a Type II's period start, an ISO 27001
+    /// certificate's issue. Required for a Type II, never for a Type I.
+    #[serde(default, deserialize_with = "opt_day")]
+    pub covers_from: Option<NaiveDate>,
+    /// The last: a Type II's period end, a Type I's date, the certificate's expiry, the
+    /// day a questionnaire was answered.
+    #[serde(deserialize_with = "day")]
+    pub covers_to: NaiveDate,
+    pub report_sha256: String,
+    /// A SOC 2 auditor's opinion: required for SOC 2 reports, never for the others.
+    #[serde(default)]
+    pub opinion: Option<String>,
+    /// The SOC 2 auditor found deviations in its tests of controls.
+    #[serde(default)]
+    pub deviations: bool,
+    /// The register's risk that treats the report's deviations or opinion.
+    #[serde(default)]
+    pub risk: Option<String>,
+    /// The SHA-256 of the note of how the provider meets each complementary user entity
+    /// control the report expects of its customers.
+    #[serde(default)]
+    pub cuecs_sha256: Option<String>,
+    /// The vendor's bridge letter for the time since a SOC 2 report's period: the day it
+    /// speaks to, and its SHA-256 (together).
+    #[serde(default, deserialize_with = "opt_day")]
+    pub bridged_to: Option<NaiveDate>,
+    #[serde(default)]
+    pub bridge_sha256: Option<String>,
+    #[serde(deserialize_with = "day")]
+    pub reviewed: NaiveDate,
+    pub reviewed_by: String,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
+}
+
+impl AssuranceReport {
+    fn soc2(&self) -> bool {
+        self.kind.starts_with("soc2-")
+    }
+
+    /// The last day it speaks for the vendor, a bridge letter included.
+    fn covered_to(&self) -> NaiveDate {
+        self.bridged_to.map_or(self.covers_to, |b| b.max(self.covers_to))
+    }
+
+    /// Whether it no longer speaks for the vendor at `cut`: an ISO 27001 certificate
+    /// expired, or a SOC 2 report (with its bridge letter) more than `REPORT_STALE_DAYS`
+    /// old. A questionnaire is held to the yearly review only.
+    fn stale(&self, cut: NaiveDate) -> bool {
+        match self.kind.as_str() {
+            "iso27001" => plus(self.covers_to, 1) < cut,
+            "questionnaire" => false,
+            _ => age(cut, self.covered_to()) > REPORT_STALE_DAYS,
+        }
+    }
+}
+
+/// The SOC 2 auditor found something: deviations in its tests, or an opinion other than
+/// unqualified.
+fn report_findings(x: &AssuranceReport) -> bool {
+    x.deviations || x.opinion.as_deref().is_some_and(|o| o != "unqualified")
 }
 
 fn standard_kind() -> String {
@@ -1242,6 +1338,58 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
             bad.push(format!("{what}: verified, reviewed and followedUp can't be before made"));
         }
     }
+    unique("assurance report", r.assurance_reports.iter().map(|x| x.id.as_str()).collect(), &mut bad);
+    for x in &r.assurance_reports {
+        let what = format!("assurance report {}", x.id);
+        let soc2 = x.soc2();
+        if !r.vendors.iter().any(|v| v.id == x.vendor) {
+            bad.push(format!("{what} names the vendor {:.64}, which isn't in vendors", x.vendor));
+        }
+        if !ASSURANCE_KINDS.contains(&x.kind.as_str()) {
+            bad.push(format!("{what}: kind is {}", ASSURANCE_KINDS.join(", ")));
+        }
+        match (x.kind.as_str(), x.covers_from) {
+            ("soc2-type2", None) => bad.push(format!("{what}: a Type II report covers a period, so coversFrom is its first day")),
+            ("soc2-type1", Some(_)) => bad.push(format!("{what}: a Type I report is as of one day, coversTo; it has no coversFrom")),
+            (_, Some(f)) if f >= x.covers_to => bad.push(format!("{what}: coversFrom must be before coversTo")),
+            _ => {}
+        }
+        known(&what, &x.reviewed_by, &mut bad);
+        if !hex(&x.report_sha256, 64..=64) {
+            bad.push(format!("{what}: reportSha256 is the report's (or certificate's, or answers') SHA-256, 64 lowercase hex digits"));
+        }
+        if soc2 != x.opinion.is_some() {
+            bad.push(format!("{what}: opinion is the SOC 2 auditor's, required for SOC 2 reports and only for them"));
+        }
+        if x.opinion.as_deref().is_some_and(|o| !OPINIONS.contains(&o)) {
+            bad.push(format!("{what}: opinion is {}", OPINIONS.join(", ")));
+        }
+        if x.deviations && !soc2 {
+            bad.push(format!("{what}: deviations are a SOC 2 auditor's, found in its tests of controls"));
+        }
+        if x.risk.as_deref().is_some_and(|k| !r.risks.iter().any(|p| p.id == k)) {
+            bad.push(format!("{what} names the risk {:.64}, which isn't in risks", x.risk.as_deref().unwrap_or_default()));
+        }
+        if x.cuecs_sha256.as_deref().is_some_and(|s| !hex(s, 64..=64)) {
+            bad.push(format!("{what}: cuecsSha256 is the SHA-256 of the note of how the provider meets the report's complementary user entity controls, 64 lowercase hex digits"));
+        }
+        if x.bridged_to.is_some() != x.bridge_sha256.is_some() {
+            bad.push(format!("{what}: bridgedTo and bridgeSha256 go together"));
+        }
+        if x.bridged_to.is_some() && !soc2 {
+            bad.push(format!("{what}: a bridge letter tops up a SOC 2 report's period"));
+        }
+        if x.bridge_sha256.as_deref().is_some_and(|s| !hex(s, 64..=64)) {
+            bad.push(format!("{what}: bridgeSha256 is the bridge letter's SHA-256, 64 lowercase hex digits"));
+        }
+        if x.bridged_to.is_some_and(|b| b <= x.covers_to) {
+            bad.push(format!("{what}: bridgedTo comes after coversTo"));
+        }
+        let issued = if x.kind == "iso27001" { x.covers_from } else { Some(x.covers_to) };
+        if issued.is_some_and(|i| x.reviewed < i) {
+            bad.push(format!("{what}: reviewed can't be before the report speaks for (coversTo; an ISO 27001 certificate's coversFrom)"));
+        }
+    }
     for m in &r.management_reviews {
         for id in &m.emergency_changes {
             match r.changes.iter().find(|x| &x.id == id) {
@@ -1458,6 +1606,7 @@ impl Check<'_> {
             + r.vulnerabilities.iter().filter(|x| x.received >= c).count()
             + r.pen_tests.iter().filter(|x| x.reported >= c).count()
             + r.changes.iter().filter(|x| x.made >= c).count()
+            + r.assurance_reports.iter().filter(|x| x.reviewed >= c).count()
     }
 
     pub fn roles(&self) -> (Value, Vec<&'static str>) {
@@ -1749,15 +1898,46 @@ impl Check<'_> {
         (v, rows)
     }
 
+    /// Whether a report review holds up: by someone holding or deputising a reviewer's
+    /// role, with a SOC 2 report's complementary controls noted and any deviations or
+    /// modified opinion treated in the risk register.
+    fn report_sound(&self, x: &AssuranceReport) -> bool {
+        self.held(&x.reviewed_by, &REPORT_REVIEWERS, x.reviewed).is_some() && (!x.soc2() || x.cuecs_sha256.is_some()) && (!report_findings(x) || x.risk.is_some())
+    }
+
     pub fn vendors(&self) -> (Value, Vec<&'static str>) {
         let (p, cut) = (self.p, self.cut());
         let (mut unassessed, mut unapproved, mut overdue) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut no_report, mut stale, mut not_independent, mut not_in_role, mut no_cuecs, mut untreated, mut modified) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut out = Vec::new();
         let mut rows = BTreeSet::new();
+        let mut hosting_sound = Vec::new();
         let in_use: Vec<&Vendor> = self.r.vendors.iter().filter(|v| v.since < cut && v.until.is_none_or(|u| u > p.from)).collect();
+        let reviewed: Vec<&AssuranceReport> = {
+            let mut v: Vec<&AssuranceReport> = self.r.assurance_reports.iter().filter(|x| x.reviewed < cut).collect();
+            v.sort_by_key(|x| (x.reviewed, x.id.clone()));
+            v
+        };
+        for x in reviewed.iter().filter(|x| x.reviewed >= p.from) {
+            let label = format!("{} of {} ({}, reviewed {})", x.id, x.vendor, x.kind, x.reviewed);
+            if self.held(&x.reviewed_by, &REPORT_REVIEWERS, x.reviewed).is_none() {
+                not_in_role.push(json!(format!("{label}: {} didn't hold {}", x.reviewed_by, REPORT_REVIEWERS.join(" or "))));
+            }
+            if x.soc2() && x.cuecs_sha256.is_none() {
+                no_cuecs.push(json!(label.clone()));
+            }
+            if x.opinion.as_deref().is_some_and(|o| o != "unqualified") {
+                modified.push(json!(format!("{label}: {}", x.opinion.as_deref().unwrap_or_default())));
+            }
+            if report_findings(x) && x.risk.is_none() {
+                untreated.push(json!(label));
+            }
+        }
         for v in &in_use {
             let assessed = v.assessed.filter(|a| *a < cut);
-            let last = assessed.into_iter().chain(v.reviewed.iter().copied()).filter(|d| *d < cut).max();
+            let current: Vec<&&AssuranceReport> = reviewed.iter().filter(|x| x.vendor == v.id && age(cut, x.reviewed) <= YEAR_DAYS).collect();
+            let newest = current.iter().max_by_key(|x| (x.covered_to(), x.reviewed)).copied();
+            let last = assessed.into_iter().chain(v.reviewed.iter().copied()).chain(reviewed.iter().filter(|x| x.vendor == v.id).map(|x| x.reviewed)).filter(|d| *d < cut).max();
             let at_end = v.until.is_none_or(|u| u >= cut);
             let assessed_by = v.approved_by.as_deref().zip(assessed).and_then(|(by, at)| self.held(by, &["Security owner", "Management"], at));
             if v.tier != "low" {
@@ -1772,22 +1952,52 @@ impl Check<'_> {
                 }
                 if last.is_some_and(|d| age(cut, d) <= YEAR_DAYS) {
                     rows.insert("CC9.2-1");
+                }
+                if at_end {
+                    match newest {
+                        None => no_report.push(json!(format!("{}{}", v.id, reviewed.iter().filter(|x| x.vendor == v.id).map(|x| x.reviewed).max().map(|d| format!(" (last {d})")).unwrap_or_default()))),
+                        Some(x) if x.stale(cut) => stale.push(json!(format!("{}: {} ({}) covers to {}", v.id, x.id, x.kind, x.covered_to()))),
+                        _ => {}
+                    }
                     if v.hosting {
-                        rows.insert("CC6.4-1");
+                        if !current.iter().any(|x| INDEPENDENT_KINDS.contains(&x.kind.as_str())) {
+                            not_independent.push(json!(v.id));
+                        }
+                        hosting_sound.push(current.iter().any(|x| INDEPENDENT_KINDS.contains(&x.kind.as_str()) && !x.stale(cut) && self.report_sound(x)));
                     }
                 }
             }
             out.push(json!({
                 "id": v.id, "tier": v.tier, "hosting": v.hosting, "since": ds(v.since), "until": v.until.map(ds), "inUseAtEnd": at_end,
                 "assessed": assessed.map(ds), "approvedBy": assessed.and(v.approved_by.as_deref()), "heldRole": assessed_by, "lastReviewed": last.map(ds), "reviewDue": last.map(|d| ds(plus(d, YEAR_DAYS))),
+                "newestReport": newest.map(|x| x.id.as_str()), "reportCoveredTo": newest.map(|x| ds(x.covered_to())), "reportStale": newest.map(|x| x.stale(cut)),
             }));
         }
+        if !hosting_sound.is_empty() && hosting_sound.iter().all(|ok| *ok) {
+            rows.insert("CC6.4-1");
+        }
         let no_hosting: Vec<Value> = if in_use.iter().any(|v| v.hosting && v.tier != "low") { vec![] } else { vec![json!("no critical or high vendor in use is marked hosting")] };
+        let reports: Vec<Value> = reviewed
+            .iter()
+            .filter(|x| age(cut, x.reviewed) <= YEAR_DAYS)
+            .map(|x| {
+                json!({
+                    "id": x.id, "vendor": x.vendor, "kind": x.kind, "coversFrom": x.covers_from.map(ds), "coversTo": ds(x.covers_to), "bridgedTo": x.bridged_to.map(ds), "coveredTo": ds(x.covered_to()),
+                    "reportSha256": x.report_sha256, "bridgeSha256": x.bridge_sha256, "opinion": x.opinion, "deviations": x.deviations, "risk": x.risk, "cuecsSha256": x.cuecs_sha256,
+                    "reviewed": ds(x.reviewed), "reviewedBy": x.reviewed_by, "heldRole": self.held(&x.reviewed_by, &REPORT_REVIEWERS, x.reviewed), "staleAtEnd": x.stale(cut),
+                })
+            })
+            .collect();
         let v = json!({
-            "basis": "every critical and high vendor in use in the period is assessed before use (an assessment dated on or after the period's end isn't this period's) and approved by someone holding or deputising the Security owner or Management, and reviewed within a year while in use (vendor management policy); a hosting provider's yearly review of its assurance report covers physical security (CC6.4-1); low vendors are listed only",
-            "summary": { "inUse": out.len(), "criticalOrHigh": in_use.iter().filter(|v| v.tier != "low").count(), "hosting": in_use.iter().filter(|v| v.hosting).count() },
-            "exceptions": { "notAssessedBeforeUse": unassessed, "notApproved": unapproved, "reviewOverdue": overdue, "noHostingVendor": no_hosting },
+            "basis": format!("every critical and high vendor in use in the period is assessed before use (an assessment dated on or after the period's end isn't this period's) and approved by someone holding or deputising the Security owner or Management, and reviewed within a year while in use, a review of its assurance report counting (vendor management policy); each in use at the period's end has an assurance report reviewed within a year (a SOC 2 report, an ISO 27001 certificate, or a questionnaire's answers where it has neither) that still speaks for it: a SOC 2 report whose period, or the vendor's bridge letter after it, ended at most {REPORT_STALE_DAYS} days before the period's end, an ISO 27001 certificate not expired; a hosting provider's is a SOC 2 Type II report or an ISO 27001 certificate, since the service inherits its physical security (CC6.4-1); each report reviewed in the period is reviewed by someone holding or deputising {}, a SOC 2 report with a note of how the provider meets each complementary user entity control it expects, and deviations or an opinion other than unqualified treated by a risk in the register; low vendors are listed only", REPORT_REVIEWERS.join(" or ")),
+            "summary": { "inUse": out.len(), "criticalOrHigh": in_use.iter().filter(|v| v.tier != "low").count(), "hosting": in_use.iter().filter(|v| v.hosting).count(), "reportsReviewedInPeriod": reviewed.iter().filter(|x| x.reviewed >= p.from).count(), "reportsInTheYear": reports.len() },
+            "exceptions": {
+                "notAssessedBeforeUse": unassessed, "notApproved": unapproved, "reviewOverdue": overdue, "noHostingVendor": no_hosting,
+                "noAssuranceReport": no_report, "reportStale": stale, "hostingWithoutIndependentReport": not_independent,
+                "reviewerNotInRole": not_in_role, "cuecsNotNoted": no_cuecs, "opinionNotUnqualified": modified, "findingsWithoutRisk": untreated,
+            },
             "vendors": out,
+            "assuranceReports": reports,
         });
         (v, rows.into_iter().collect())
     }
@@ -2859,6 +3069,12 @@ mod tests {
                     "made": "2027-03-10", "madeBy": "p-ops", "verified": "2027-03-11", "reviewed": "2027-03-12", "reviewedBy": "p-sec", "code": true, "pullRequest": 412, "followedUp": "2027-03-15",
                 },
             ],
+            "assuranceReports": [
+                {
+                    "id": "AR-01", "vendor": "linode", "kind": "soc2-type2", "coversFrom": "2025-10-01", "coversTo": "2026-09-30", "reportSha256": ZERO, "opinion": "unqualified",
+                    "cuecsSha256": ZERO, "bridgedTo": "2026-12-31", "bridgeSha256": ZERO, "reviewed": "2027-01-08", "reviewedBy": "p-sec", "notes": "Umbrella Audit LLP's report",
+                },
+            ],
         })
     }
 
@@ -3067,6 +3283,137 @@ mod tests {
             let ex = &c.vendors().0["exceptions"];
             assert_eq!((ex["notAssessedBeforeUse"].clone(), ex["notApproved"].clone()), (json!(["linode (in use since 2027-01-15)"]), json!(["linode"])), "an assessment after the period isn't this period's");
         });
+    }
+
+    #[test]
+    fn assurance_reports_reviewed_current_and_treated() {
+        check(&good(), &|c| {
+            let (x, rows) = c.vendors();
+            let linode = &x["vendors"][0];
+            assert_eq!((linode["newestReport"].as_str(), linode["reportCoveredTo"].as_str(), linode["reportStale"].as_bool()), (Some("AR-01"), Some("2026-12-31"), Some(false)), "{x:#}");
+            assert_eq!((x["assuranceReports"][0]["heldRole"].as_str(), x["assuranceReports"][0]["coveredTo"].as_str()), (Some("Security owner"), Some("2026-12-31")));
+            assert_eq!(x["summary"]["reportsReviewedInPeriod"], 0, "reviewed in January");
+            assert_eq!(rows, ["CC6.4-1", "CC9.2-1"]);
+            assert!(!x.to_string().contains("Umbrella"), "no notes");
+        });
+
+        // Without its bridge letter the report ended over a quarter before the period's end.
+        let mut v = good();
+        let ar = v["assuranceReports"][0].as_object_mut().unwrap();
+        ar.remove("bridgedTo");
+        ar.remove("bridgeSha256");
+        check(&v, &|c| {
+            let (x, rows) = c.vendors();
+            assert_eq!(x["exceptions"]["reportStale"], json!(["linode: AR-01 (soc2-type2) covers to 2026-09-30"]));
+            assert_eq!(rows, ["CC9.2-1"], "a stale report isn't evidence of the hosting provider's controls now");
+        });
+
+        // A hosting provider's questionnaire isn't independent; a high vendor's is enough.
+        let mut v = good();
+        v["vendors"].as_array_mut().unwrap().push(json!({ "id": "smtp", "tier": "high", "since": "2027-01-01", "assessed": "2026-12-20", "approvedBy": "p-sec" }));
+        v["assuranceReports"] = json!([
+            { "id": "AR-02", "vendor": "linode", "kind": "questionnaire", "coversTo": "2027-01-05", "reportSha256": ZERO, "reviewed": "2027-01-08", "reviewedBy": "p-sec" },
+            { "id": "AR-03", "vendor": "smtp", "kind": "questionnaire", "coversTo": "2026-12-18", "reportSha256": ZERO, "reviewed": "2026-12-20", "reviewedBy": "p-sec" },
+        ]);
+        check(&v, &|c| {
+            let (x, rows) = c.vendors();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["hostingWithoutIndependentReport"], json!(["linode"]));
+            assert_eq!((ex["noAssuranceReport"].clone(), ex["reportStale"].clone()), (json!([]), json!([])), "a questionnaire is held to the yearly review only");
+            assert_eq!(rows, ["CC9.2-1"]);
+        });
+
+        // Reviewed in the period: by someone without the role, a Type I with no note of its
+        // complementary controls, a qualified opinion with no risk, deviations with one.
+        let mut v = good();
+        v["vendors"].as_array_mut().unwrap().push(json!({ "id": "s3", "tier": "critical", "since": "2027-01-01", "assessed": "2026-12-20", "approvedBy": "p-sec" }));
+        v["vendors"].as_array_mut().unwrap().push(json!({ "id": "stripe", "tier": "high", "since": "2026-01-01", "assessed": "2025-12-20", "approvedBy": "p-sec", "reviewed": ["2026-12-01"] }));
+        let list = v["assuranceReports"].as_array_mut().unwrap();
+        list.push(json!({ "id": "AR-04", "vendor": "s3", "kind": "soc2-type1", "coversTo": "2027-02-28", "reportSha256": ZERO, "opinion": "unqualified", "reviewed": "2027-03-10", "reviewedBy": "p-eng" }));
+        list.push(json!({ "id": "AR-05", "vendor": "linode", "kind": "soc2-type2", "coversFrom": "2026-01-01", "coversTo": "2026-12-31", "reportSha256": ZERO, "opinion": "qualified", "cuecsSha256": ZERO, "reviewed": "2027-03-12", "reviewedBy": "p-mgmt" }));
+        list.push(json!({ "id": "AR-06", "vendor": "stripe", "kind": "soc2-type2", "coversFrom": "2026-04-01", "coversTo": "2027-03-01", "reportSha256": ZERO, "opinion": "unqualified", "deviations": true, "risk": "R-01", "cuecsSha256": ZERO, "reviewed": "2027-03-20", "reviewedBy": "p-sec" }));
+        check(&v, &|c| {
+            let (x, rows) = c.vendors();
+            let ex = &x["exceptions"];
+            assert_eq!(ex["reviewerNotInRole"], json!(["AR-04 of s3 (soc2-type1, reviewed 2027-03-10): p-eng didn't hold Security owner or Management"]));
+            assert_eq!(ex["cuecsNotNoted"], json!(["AR-04 of s3 (soc2-type1, reviewed 2027-03-10)"]));
+            assert_eq!(ex["opinionNotUnqualified"], json!(["AR-05 of linode (soc2-type2, reviewed 2027-03-12): qualified"]));
+            assert_eq!(ex["findingsWithoutRisk"], json!(["AR-05 of linode (soc2-type2, reviewed 2027-03-12)"]), "AR-06's deviations are treated by R-01");
+            assert_eq!(x["summary"]["reportsReviewedInPeriod"], 3);
+            assert_eq!(rows, ["CC6.4-1", "CC9.2-1"], "AR-01 still holds for linode");
+            assert_eq!(x["vendors"][0]["newestReport"], "AR-05", "the one that covers furthest");
+        });
+        v["assuranceReports"].as_array_mut().unwrap().retain(|x| x["id"] != "AR-01");
+        check(&v, &|c| assert_eq!(c.vendors().1, ["CC9.2-1"], "AR-05's qualified opinion is untreated"));
+        v["assuranceReports"][1]["risk"] = json!("R-03");
+        check(&v, &|c| assert_eq!(c.vendors().1, ["CC6.4-1", "CC9.2-1"], "treated by an accepted risk"));
+
+        // An ISO 27001 certificate holds until it expires; none in the year is flagged.
+        let mut v = good();
+        v["assuranceReports"] = json!([{ "id": "AR-07", "vendor": "linode", "kind": "iso27001", "coversFrom": "2024-03-01", "coversTo": "2027-03-31", "reportSha256": ZERO, "reviewed": "2027-01-08", "reviewedBy": "p-sec" }]);
+        check(&v, &|c| assert_eq!((exceptions(&c.vendors().0), c.vendors().1), (0, vec!["CC6.4-1", "CC9.2-1"]), "valid through the period's last day"));
+        v["assuranceReports"][0]["coversTo"] = json!("2027-03-30");
+        check(&v, &|c| assert_eq!(c.vendors().0["exceptions"]["reportStale"], json!(["linode: AR-07 (iso27001) covers to 2027-03-30"])));
+        v["assuranceReports"][0]["reviewed"] = json!("2026-03-01");
+        v["assuranceReports"][0]["coversTo"] = json!("2027-06-30");
+        check(&v, &|c| {
+            let (x, rows) = c.vendors();
+            assert_eq!((x["exceptions"]["noAssuranceReport"].clone(), x["exceptions"]["hostingWithoutIndependentReport"].clone()), (json!(["linode (last 2026-03-01)"]), json!(["linode"])));
+            assert_eq!(rows, ["CC9.2-1"], "January's assessment still counts as linode's review, but no report does");
+        });
+        // A review after the period isn't this period's.
+        let mut v = good();
+        v["assuranceReports"][0]["reviewed"] = json!("2027-04-01");
+        check(&v, &|c| {
+            assert_eq!(c.after_period(), 1);
+            assert_eq!(c.vendors().0["exceptions"]["noAssuranceReport"], json!(["linode"]));
+        });
+    }
+
+    #[test]
+    fn assurance_reports_that_dont_hold_together_are_refused() {
+        let mut v = good();
+        let list = v["assuranceReports"].as_array_mut().unwrap();
+        list.push(json!({ "id": "AR-01", "vendor": "nope", "kind": "soc3", "coversTo": "2027-01-01", "reportSha256": "abc", "reviewed": "2027-01-02", "reviewedBy": "p-x" }));
+        list.push(json!({ "id": "AR-X1", "vendor": "linode", "kind": "soc2-type2", "coversTo": "2027-01-01", "reportSha256": ZERO, "reviewed": "2026-12-01", "reviewedBy": "p-sec", "risk": "R-99", "cuecsSha256": "x", "bridgedTo": "2026-12-01" }));
+        list.push(json!({ "id": "AR-X2", "vendor": "linode", "kind": "soc2-type1", "coversFrom": "2026-01-01", "coversTo": "2027-01-01", "reportSha256": ZERO, "opinion": "fine", "reviewed": "2027-01-02", "reviewedBy": "p-sec" }));
+        list.push(json!({ "id": "AR-X3", "vendor": "linode", "kind": "iso27001", "coversFrom": "2027-02-01", "coversTo": "2027-01-01", "reportSha256": ZERO, "opinion": "unqualified", "deviations": true, "bridgedTo": "2027-02-01", "bridgeSha256": ZERO, "reviewed": "2027-01-02", "reviewedBy": "p-sec" }));
+        list.push(json!({ "id": "AR X4", "vendor": "linode", "kind": "questionnaire", "coversTo": "2027-01-01", "reportSha256": ZERO, "reviewed": "2027-01-02", "reviewedBy": "p-sec" }));
+        let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
+        for want in [
+            "assurance report id AR-01 is used twice",
+            "assurance report id AR X4 isn't plain",
+            "assurance report AR-01 names the vendor nope, which isn't in vendors",
+            "assurance report AR-01: kind is soc2-type2, soc2-type1, iso27001, questionnaire",
+            "assurance report AR-01 names p-x, who isn't in people",
+            "assurance report AR-01: reportSha256 is the report's",
+            "assurance report AR-X1: a Type II report covers a period, so coversFrom is its first day",
+            "assurance report AR-X1: opinion is the SOC 2 auditor's, required for SOC 2 reports and only for them",
+            "assurance report AR-X1 names the risk R-99, which isn't in risks",
+            "assurance report AR-X1: cuecsSha256 is the SHA-256",
+            "assurance report AR-X1: bridgedTo and bridgeSha256 go together",
+            "assurance report AR-X1: bridgedTo comes after coversTo",
+            "assurance report AR-X1: reviewed can't be before the report speaks for",
+            "assurance report AR-X2: a Type I report is as of one day, coversTo; it has no coversFrom",
+            "assurance report AR-X2: opinion is unqualified, qualified, adverse, disclaimed",
+            "assurance report AR-X3: coversFrom must be before coversTo",
+            "assurance report AR-X3: opinion is the SOC 2 auditor's",
+            "assurance report AR-X3: deviations are a SOC 2 auditor's",
+            "assurance report AR-X3: a bridge letter tops up a SOC 2 report's period",
+            "assurance report AR-X3: reviewed can't be before the report speaks for",
+        ] {
+            assert!(e.contains(want), "{want}\n{e}");
+        }
+    }
+
+    /// The staleness window and the reviewers are the vendor management policy's.
+    #[test]
+    fn the_report_rules_are_the_policys() {
+        let policy = include_str!("../../../../docs/security/policies/vendor-management.md");
+        assert!(policy.contains(&format!("ended more than {REPORT_STALE_DAYS} days ago")), "the policy's bridge letter rule");
+        assert!(policy.contains("SOC 2 Type II report or an ISO 27001 certificate"), "the policy's hosting provider rule");
+        assert!(policy.contains("[policy register](../policy-register.md#vendors-assurance-reports)"), "the policy says where they are recorded");
+        assert!(policy.contains(&format!("| Owner | {} |", REPORT_REVIEWERS[0])) && policy.contains(&format!("| Approver | {} |", REPORT_REVIEWERS[1])));
     }
 
     #[test]
@@ -3962,6 +4309,7 @@ mod tests {
         assert_eq!(r.systems.iter().map(|s| s.kind.as_str()).collect::<BTreeSet<_>>(), SYSTEM_KINDS.iter().copied().collect::<BTreeSet<_>>(), "the template has a system of each kind");
         assert!(!r.access.is_empty() && !r.access_reviews.is_empty());
         assert!(r.changes.iter().any(|x| x.approved_by.as_deref().is_some_and(|by| by != x.made_by)), "the template has a change approved by someone else");
+        assert!(r.assurance_reports.iter().any(|x| INDEPENDENT_KINDS.contains(&x.kind.as_str()) && r.vendors.iter().any(|v| v.hosting && v.id == x.vendor)), "the template has a hosting provider's report");
     }
 
     /// Every file maps to criteria the control mapping has and rows the readiness checklist

@@ -76,5 +76,8 @@
   "penTests": [],
   "changes": [
     { "id": "CHG-0001", "system": "hosting", "recorded": "2026-12-01", "recordSha256": "0000000000000000000000000000000000000000000000000000000000000000", "approved": "2026-12-01", "approvedBy": "person-2", "made": "2026-12-02", "madeBy": "person-3", "verified": "2026-12-02", "notes": "<the change record: a pull request, issue or ticket saying what, why, the risk and how to roll back>" }
+  ],
+  "assuranceReports": [
+    { "id": "AR-0001", "vendor": "hosting", "kind": "soc2-type2", "coversFrom": "2025-10-01", "coversTo": "2026-09-30", "reportSha256": "0000000000000000000000000000000000000000000000000000000000000000", "opinion": "unqualified", "cuecsSha256": "0000000000000000000000000000000000000000000000000000000000000000", "reviewed": "2026-12-01", "reviewedBy": "person-2", "notes": "<the hosting provider's SOC 2 Type II report, and the note of how the provider meets each complementary user entity control it lists; ask for a bridge letter once its period is over 92 days old>" }
   ]
 }

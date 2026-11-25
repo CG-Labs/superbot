@@ -99,7 +99,9 @@ JSON file kept outside this repository) and writes one bundle for the period (a 
 most, judged as of its end) of what it shows: each role's holder and deputy every day, each policy's latest approval (by the
 role its header names, within a year, and with --policies, of the text in force),
 everyone's acknowledgements and training, the open risks and their reviews, a management
-review each quarter, vendors assessed before use and reviewed yearly, exceptions
+review each quarter, vendors assessed before use and reviewed yearly, their SOC 2 or
+ISO 27001 reports reviewed in the year, still current, with complementary controls
+noted and findings treated as risks (ADR 0279), exceptions
 approved, ended within a year and reviewed quarterly, conduct concerns triaged within
 7 days and closed within 90 (ADR 0214), and security events triaged in time by the
 security owner or operator, breach notices sent within the DPA's hours, post-incident
