@@ -14,7 +14,7 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Support bundle](support-bundle.md) | `botctl support-bundle`: what it collects, what it never collects, and how to send it |
 | [Bundle triage](triage.md) | `botctl support-triage`: the first read of a customer's bundle, offline: what it shows, the severity that suggests, the runbook for each problem, and what to ask next |
 | [Support check and the offline bundle](support-check.md) | `botd support check` and `botd support bundle`: diagnostics and a bundle without botd, for a server that won't start, before an upgrade and after a restore |
-| [Technical account managers](tam.md) | The named TAM for Enterprise customers: what they do, the cadence from kickoff to renewal, and handover |
+| [Technical account managers](tam.md) | The named TAM for Enterprise customers: what they do, the cadence from kickoff to renewal, and handover, drafted from botd's records by `botctl tam-handover` |
 | [Customer health score](health-score.md) | `botctl health-score`: six signals from botd's own records, how they're scored, and what to do about each; its daily [history](health-score.md#history) and the console's Support tab |
 | [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist, judged from botd's records by `botctl health-check` |
 | [Quarterly business review](qbr-template.md) | The template for the review with the customer's owner and sponsor, drafted from botd's records by `botctl business-review` |
@@ -58,7 +58,7 @@ Check `<status-page-url>` (the server's `/status`) first: a known incident there
 ## For the Provider
 
 - Keep [tiers](tiers.md) in step with the published plans (`/pricing`, from the tiers file, [ADR 0121](../adr/0121-published-plans.md)) and the [SLO](../slo.md). A plan's support line can also go in its `features` in the tiers file, so buyers see it on `/pricing`.
-- Name a TAM and a backup for each Enterprise customer before its kickoff ([TAM programme](tam.md)), and keep each TAM's accounts few enough to hold the [cadence](tam.md#cadence).
+- Name a TAM and a backup for each Enterprise customer before its kickoff ([TAM programme](tam.md)), and keep each TAM's accounts few enough to hold the [cadence](tam.md#cadence). When a customer changes TAM, or its TAM is away for more than two weeks, draft the [handover](tam.md#draft-it-first) with `botctl tam-handover` on the day.
 - Staff an on-call rota before selling Severity 1 response outside business hours. Response targets are a promise only once the rota exists.
 - Check all three with `botctl support-readiness` before selling a plan and each month ([support readiness](readiness.md#when-to-run-it)): the contacts filled in, the rota without gaps, and the TAM list.
 - Check each new customer's server with `botctl onboarding` ([onboarding check](onboarding-check.md#where-it-fits)) at kickoff, weekly until go-live, and before confirming go-live: nothing open, and every item to confirm confirmed.
