@@ -1080,6 +1080,81 @@ grep -Fq "botd offline check didn't run (status 2)" <<<"$out" || fail "an offlin
 [[ -z $( (OFFLINE_BUNDLE='' BIN_DIR=$T/obin; offline_settings_check /home/sb) 2>&1) ]] || fail "an online install ran the offline check"
 ok "an offline install's summary says what botd's settings reach on the internet (botd offline check)"
 
+# The bundle's botd checks machines' settings in .env before an offline upgrade changes anything
+# (ADR 0294), as botd's user, with only the .env and --machine-*-bundle over it.
+MH=$T/mhome
+mkdir -p "$MH/superbot" "$T/mbundle/bin"
+cat >"$T/mbundle/bin/botd" <<EOF
+#!/bin/sh
+# Usage: botd machines check
+[ "\$1 \$2 \$3 \$4" = "machines check --home $MH" ] || { echo "botd \$*"; exit 2; }
+[ -z "\${LEAK:-}" ] || { echo "the installer's environment reached botd"; exit 3; }
+[ "\$(pwd)" = / ] || { echo "botd ran in \$(pwd)"; exit 3; }
+shift 4
+echo "\$*" >"$T/mbundle/args"
+case \$(cat "$T/mbundle/mode") in
+  ok) printf 'Settings: %s/superbot/.env, over botd'"'"'s environment\nMachines: incus, enrolling at https://10.0.0.5:8443\nx86_64 Hermes bundle /srv/b/superbot-hermes-v0.24.0-x86_64.tar.gz: Hermes Agent v0.24.0 (bbbbbbbbbbbb), SHA-256 cc\nbotd would start with these machine settings.\n' "$MH"; exit 0 ;;
+  stale) printf 'Settings: x\nbotd wouldn'"'"'t start with these settings: Machine enrollment: MACHINE_HERMES_BUNDLE: /srv/b/superbot-hermes-v0.23.3-x86_64.tar.gz holds Hermes Agent caafe5389ae5, but machines'"'"' plan pins bbbbbbbbbbbb: use the Hermes bundle made for this release\n'; exit 1 ;;
+  *) echo "no such subcommand"; exit 2 ;;
+esac
+EOF
+chmod 0755 "$T/mbundle/bin/botd"
+mcheck() {
+  echo "$1" >"$T/mbundle/mode"
+  shift
+  (
+    OFFLINE_BUNDLE=$B OFFLINE_DIR=$T/mbundle OFFLINE_VERSION=0.2.0 DRY_RUN=false SUPERBOT_USER=sb LEAK=1
+    export LEAK
+    id() { [[ $1 == sb ]]; }
+    user_home() { echo "$MH"; }
+    sudo() { [[ $1 == -u ]] || { echo "sudo $*"; return 9; }; echo "$2" >"$T/mbundle/as"; shift 2; "$@"; }
+    local a
+    for a in "$@"; do declare "$a"; done
+    machine_settings_check
+  ) 2>&1
+}
+: >"$T/mbundle/args"
+[[ -z $(mcheck ok) ]] || fail "machines' settings were checked with no .env"
+echo 'MACHINE_CONTROL_URL=https://10.0.0.5:8443' >"$MH/superbot/.env"
+out=$(mcheck ok) || fail "a good machine settings check stopped the install: $out"
+for want in "Machines' settings: the bundle's botd would start with them (botd machines check)" "    Machines: incus, enrolling at" "    x86_64 Hermes bundle /srv/b/superbot-hermes-v0.24.0"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a good machine settings check didn't say $want: $out"
+done
+[[ $(cat "$T/mbundle/as") == sb && -z $(cat "$T/mbundle/args") ]] || fail "the check didn't run as botd's user with only the .env: $(cat "$T/mbundle/as" "$T/mbundle/args")"
+NEW_BUNDLES="--set MACHINE_HERMES_BUNDLE=/srv/b/superbot-hermes-v0.24.0-x86_64.tar.gz --set MACHINE_HARNESS_BUNDLE=/srv/b/h-x86_64.tar.gz=abc"
+out=$(mcheck ok MACHINE_HERMES_BUNDLE_VALUE=/srv/b/superbot-hermes-v0.24.0-x86_64.tar.gz MACHINE_HARNESS_BUNDLE_VALUE=/srv/b/h-x86_64.tar.gz=abc) \
+  || fail "a good check with new bundles stopped the install: $out"
+[[ $(cat "$T/mbundle/args") == "$NEW_BUNDLES" ]] || fail "the check wasn't given the new bundles: $(cat "$T/mbundle/args")"
+if out=$(mcheck stale); then fail "an upgrade went on though its botd wouldn't start: $out"; fi
+for want in "!! The bundle's botd (0.2.0) wouldn't start with $MH/superbot/.env: Machine enrollment: MACHINE_HERMES_BUNDLE: /srv/b/superbot-hermes-v0.23.3" \
+  "Nothing has changed" "re-run with --machine-hermes-bundle or --machine-harness-bundle" "docs/ops/air-gapped.md#upgrading"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a refused check didn't say $want: $out"
+done
+out=$(mcheck stale DRY_RUN=true) || fail "a dry run stopped on the check: $out"
+grep -Fq "[dry-run] would stop here: The bundle's botd (0.2.0) wouldn't start with" <<<"$out" || fail "a dry run didn't say the upgrade would stop: $out"
+out=$(mcheck old) || fail "a botd that can't run the check stopped the install: $out"
+grep -Fq "botd machines check didn't run (status 2)" <<<"$out" || fail "a check that didn't run wasn't said: $out"
+{ echo '#!/bin/sh'; echo "echo ran >$T/mbundle/args"; } >"$T/mbundle/bin/botd"
+echo "not run" >"$T/mbundle/args"
+out=$(mcheck ok) || fail "a bundle's botd from before the check stopped the install: $out"
+grep -Fq "The bundle's botd (0.2.0) can't check machines' settings" <<<"$out" || fail "an older botd wasn't said: $out"
+[[ $(cat "$T/mbundle/args") == "not run" ]] || fail "an older botd was run, which would start as the server"
+[[ -z $( (OFFLINE_BUNDLE=''; machine_settings_check) 2>&1) ]] || fail "an online install checked machines' settings"
+ok "an offline upgrade stops before changing anything when the bundle's botd wouldn't start with machines' settings (botd machines check)"
+
+flags() { (parse_args "$@"; check_offline_flags) 2>&1; }
+if out=$(flags --machine-hermes-bundle /srv/b/h.tar.gz); then fail "--machine-hermes-bundle was taken online: $out"; fi
+grep -Fq "are for --offline --upgrade" <<<"$out" || fail "--machine-hermes-bundle online didn't say why: $out"
+if out=$(flags --offline "$B" --machine-harness-bundle /srv/b/n.tar.gz); then fail "--machine-harness-bundle was taken on a new install: $out"; fi
+grep -Fq "use them with --upgrade" <<<"$out" || fail "--machine-harness-bundle without --upgrade didn't say why: $out"
+flags --offline "$B" --upgrade --machine-harness-bundle /srv/b/n.tar.gz >/dev/null || fail "--machine-harness-bundle with --offline --upgrade was refused"
+printf 'A=1\nMACHINE_HERMES_BUNDLE=/srv/b/old.tar.gz\n' >"$T/menv"
+(MACHINE_HERMES_BUNDLE_VALUE=/srv/b/new.tar.gz=abc MACHINE_HARNESS_BUNDLE_VALUE=/srv/b/n.tar.gz; configure_machine_bundles "$T/menv") >/dev/null
+[[ $(cat "$T/menv") == $'A=1\nMACHINE_HERMES_BUNDLE=/srv/b/new.tar.gz=abc\nMACHINE_HARNESS_BUNDLE=/srv/b/n.tar.gz' ]] || fail "the new bundles weren't written to .env: $(cat "$T/menv")"
+(configure_machine_bundles "$T/menv") >/dev/null
+[[ $(cat "$T/menv") == $'A=1\nMACHINE_HERMES_BUNDLE=/srv/b/new.tar.gz=abc\nMACHINE_HARNESS_BUNDLE=/srv/b/n.tar.gz' ]] || fail ".env changed without the flags"
+ok "--machine-hermes-bundle and --machine-harness-bundle are for --offline --upgrade, and set .env"
+
 # A dry run of the whole offline install, as main runs it, without root. With unprivileged
 # namespaces, it runs with no network at all.
 cat >"$T/run.sh" <<'EOF'
