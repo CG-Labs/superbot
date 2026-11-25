@@ -264,10 +264,11 @@ async fn release(http: &Fetch, base: &str, suite: &str, arch: &str, now: chrono:
     if !missing.is_empty() {
         return Err(format!("it lacks the {} component", missing.join(" and ")));
     }
-    if let Some(until) = f.get("Valid-Until").and_then(|v| date(v))
-        && until < now
-    {
-        return Err(format!("its InRelease expired at {until} (Valid-Until), so apt refuses it"));
+    if let Some(v) = f.get("Valid-Until") {
+        let until = date(v).ok_or_else(|| format!("its Valid-Until \"{}\" isn't a date botd can read, so botd can't tell whether apt would refuse it", crate::audit::clip(v, 60)))?;
+        if until < now {
+            return Err(format!("its InRelease expired at {until} (Valid-Until), so apt refuses it"));
+        }
     }
     let mut warning = None;
     if suite != CODENAME {

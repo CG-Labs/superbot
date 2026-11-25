@@ -266,6 +266,7 @@ async fn the_check_says_what_apt_would_refuse_and_when_the_mirror_falls_behind()
         (unsigned(&release("noble-security", "noble", "riscv64", "main universe", "")), &format!("carries no {a} packages") as &str),
         (unsigned(&release("noble-security", "noble", a, "main restricted", "")), "lacks the universe component"),
         (unsigned(&release("noble-security", "noble", a, "main universe", "Valid-Until: Mon, 02 Jan 2023 00:00:00 UTC\n")), "expired"),
+        (unsigned(&release("noble-security", "noble", a, "main universe", "Valid-Until: next Tuesday\n")), "isn't a date botd can read"),
         (release("noble-security", "noble", a, "main universe", ""), "isn't clearsigned"),
         (unsigned(&release("noble-security", "noble", a, "main universe", "")).replace("Hash: SHA512", "Hash: SHA512\nComment: x"), "isn't clearsigned"),
     ] {
