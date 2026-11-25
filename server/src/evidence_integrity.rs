@@ -7,9 +7,10 @@
 //! A stretch only counts against a control while botd was writing events: a server that
 //! was down wrote none and checked nothing, which uptime evidence covers, not this file.
 //! Its manifest entry names CC2.1-2 only while every export took every event of the
-//! period, and CC7.2-2 only while, as well, the chain was checked within a day all
-//! through it, the last check passed and checkpoints kept up, so a month the log wasn't
-//! guarded is a gap in the coverage report.
+//! period (none started past some of them or came back short, ADR 0264), and CC7.2-2
+//! only while, as well, the chain was checked within a day all through it, the last
+//! check passed and checkpoints kept up, so a month the log wasn't guarded is a gap in
+//! the coverage report.
 
 use crate::audit::Filter;
 use crate::audit_checkpoint::{self, CHECKPOINT, FAILING, OWN, TIMESTAMPED};
@@ -29,6 +30,9 @@ pub const ACTIONS: [&str; 5] = ["audit.verified", "audit.checkpoint*", "audit.ti
 
 pub const VERIFIED: &str = "audit.verified";
 const EXPORT_FAILING: &str = "audit.export_failing";
+const EXPORT_STARTED: &str = "audit.export_started";
+const EXPORT_STOPPED: &str = "audit.export_stopped";
+const EXPORT_RESUMED: &str = "audit.export_resumed";
 const STARTED: &str = "server.started";
 const HOUR_MS: i64 = 3_600_000;
 /// The daily check starts a day after the last one ended and a minute after botd
@@ -68,6 +72,7 @@ impl Check {
 }
 
 /// Fed every event of the period in order, after [`begin`] read where things stood.
+#[derive(Default)]
 pub struct Integrity {
     every_ms: i64,
     listed: Tally,
@@ -81,6 +86,13 @@ pub struct Integrity {
     daily: BTreeMap<String, BTreeMap<&'static str, u64>>,
     export_failures: Vec<Value>,
     timestamp_failures: Vec<Value>,
+    /// The period's first event, which a sink starting past it skipped.
+    first_id: Option<i64>,
+    /// Sinks started, stopped and back (ADR 0264), and those that left out events.
+    export_changes: Vec<Value>,
+    export_stopped: Vec<Value>,
+    export_skipped: Vec<Value>,
+    export_missed: Vec<Value>,
 }
 
 fn whole(e: &AuditEvent) -> bool {
@@ -89,6 +101,22 @@ fn whole(e: &AuditEvent) -> bool {
 
 fn code(v: &Value) -> Option<String> {
     v.as_str().map(|s| crate::support::reason_code(s).to_string())
+}
+
+/// A sink's name as botd allows it (lowercase letters and digits), never anything else.
+fn plain_name(v: &Value) -> Option<&str> {
+    v.as_str().filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
+}
+
+/// A sink started, stopped or back (ADR 0264): codes, ids and counts, never its address.
+fn change_of(e: &AuditEvent) -> Value {
+    let d = &e.details;
+    let missed = d["missed"].is_object().then(|| json!({ "after": d["missed"]["after"].as_i64(), "through": d["missed"]["through"].as_i64() }));
+    json!({
+        "id": e.id, "time": rfc3339(e.at), "change": e.action.trim_start_matches("audit.export_"), "kind": code(&d["kind"]), "name": plain_name(&d["name"]),
+        "reason": code(&d["reason"]), "start": code(&d["start"]), "after": d["after"].as_i64(), "skipped": d["skipped"].as_i64(),
+        "delivered": d["delivered"].as_i64(), "pending": d["pending"].as_i64(), "missed": missed,
+    })
 }
 
 fn check_of(e: &AuditEvent) -> Check {
@@ -106,19 +134,7 @@ pub fn begin(app: &App, p: &Period) -> Integrity {
     let checkpoint = before(&[CHECKPOINT], 1).pop().map(|e| e.id);
     let after = app.db.audit_events(&Filter { after: checkpoint, to: Some(start), ..Default::default() }, 200, true);
     let unsealed = after.iter().find(|e| !OWN.contains(&e.action.as_str())).map(|e| e.at.max(started.unwrap_or(i64::MIN)));
-    Integrity {
-        every_ms: audit_checkpoint::state(app).settings.every as i64 * 60_000,
-        listed: Tally::default(),
-        checks: Vec::new(),
-        last_check,
-        check_from,
-        check_gaps: Vec::new(),
-        unsealed_since: unsealed,
-        seal_gaps: Vec::new(),
-        daily: BTreeMap::new(),
-        export_failures: Vec::new(),
-        timestamp_failures: Vec::new(),
-    }
+    Integrity { every_ms: audit_checkpoint::state(app).settings.every as i64 * 60_000, last_check, check_from, unsealed_since: unsealed, ..Default::default() }
 }
 
 impl Integrity {
@@ -138,6 +154,7 @@ impl Integrity {
 
     pub fn feed(&mut self, e: &AuditEvent) {
         let action = e.action.as_str();
+        self.first_id.get_or_insert(e.id);
         if ACTIONS.iter().any(|a| matches(a, action)) {
             self.listed.add(e);
         }
@@ -184,6 +201,18 @@ impl Integrity {
                 self.day(e, "exportFailures");
                 self.export_failures.push(json!({ "id": e.id, "time": rfc3339(e.at), "kind": code(&e.details["kind"]), "reason": code(&e.details["reason"]), "pending": e.details["pending"] }));
             }
+            EXPORT_STARTED | EXPORT_STOPPED | EXPORT_RESUMED => {
+                let v = change_of(e);
+                self.export_changes.push(v.clone());
+                // Started past an event of this period: that sink never had it.
+                let skipped = v["skipped"].as_i64().unwrap_or(0) > 0 && v["after"].as_i64().zip(self.first_id).is_some_and(|(after, first)| after >= first);
+                match action {
+                    EXPORT_STOPPED => self.export_stopped.push(v),
+                    EXPORT_STARTED if skipped => self.export_skipped.push(v),
+                    EXPORT_RESUMED if !v["missed"].is_null() => self.export_missed.push(v),
+                    _ => {}
+                }
+            }
             _ => {}
         }
         if action != VERIFIED && !Self::open(&self.check_gaps) && e.at > self.check_from + CHECK_WITHIN_MS {
@@ -213,7 +242,7 @@ impl Integrity {
             .into_iter()
             .flatten()
             .map(|s| {
-                let name = s["name"].as_str().filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+                let name = plain_name(&s["name"]);
                 json!({
                     "kind": s["kind"], "name": name, "delivered": s["delivered"], "pending": s["pending"],
                     "deliveredThroughPeriod": s["delivered"].as_i64().is_some_and(|d| d >= through),
@@ -223,7 +252,7 @@ impl Integrity {
             })
             .collect();
         let behind: Vec<Value> = sinks.iter().filter(|s| s["deliveredThroughPeriod"] != true).map(|s| json!({ "kind": s["kind"], "name": s["name"], "delivered": s["delivered"], "pending": s["pending"] })).collect();
-        let exported = read_all && !sinks.is_empty() && behind.is_empty();
+        let exported = read_all && !sinks.is_empty() && behind.is_empty() && self.export_skipped.is_empty() && self.export_missed.is_empty();
         let checkpoints_on = self.every_ms > 0;
         let mut last_failed: Vec<&Check> = self.last_check.iter().chain(&latest).filter(|c| !c.ok).collect();
         last_failed.dedup_by_key(|c| c.id);
@@ -275,7 +304,7 @@ impl Integrity {
                 "enabled": ts["enabled"], "trustAnchors": ts["trustAnchors"], "stamped": ts["stamped"], "pending": ts["pending"],
                 "failing": ts["failing"], "failingSince": ts["failingSince"].as_i64().map(rfc3339),
             },
-            "export": { "enabled": !sinks.is_empty(), "periodLastEvent": last_id, "sinks": sinks },
+            "export": { "enabled": !sinks.is_empty(), "periodLastEvent": last_id, "sinks": sinks, "changes": self.export_changes },
             "checks": self.checks,
             "daily": self.daily,
             "exceptions": {
@@ -287,6 +316,9 @@ impl Integrity {
                 "checkpointGaps": self.seal_gaps.iter().map(|g| g.view("nextCheckpoint")).collect::<Vec<_>>(),
                 "exportBehind": behind,
                 "exportFailures": self.export_failures,
+                "exportStopped": self.export_stopped,
+                "exportSkipped": self.export_skipped,
+                "exportMissed": self.export_missed,
                 "timestampFailures": self.timestamp_failures,
             },
             "period": self.listed.view(),
@@ -342,19 +374,7 @@ mod tests {
     }
 
     fn fresh(every_minutes: i64) -> Integrity {
-        Integrity {
-            every_ms: every_minutes * 60_000,
-            listed: Tally::default(),
-            checks: Vec::new(),
-            last_check: None,
-            check_from: 0,
-            check_gaps: Vec::new(),
-            unsealed_since: None,
-            seal_gaps: Vec::new(),
-            daily: BTreeMap::new(),
-            export_failures: Vec::new(),
-            timestamp_failures: Vec::new(),
-        }
+        Integrity { every_ms: every_minutes * 60_000, ..Default::default() }
     }
 
     /// Feeds `(hour, action)` pairs, with checks passing unless their outcome says so.
@@ -439,5 +459,27 @@ mod tests {
         i.feed(&event(1, H, EXPORT_FAILING, "failure", json!({ "kind": "webhook", "reason": "status", "pending": 12, "sink": "https://siem.example.com", "error": "HTTP 503 from siem.example.com" })));
         let text = json!(i.export_failures).to_string();
         assert!(text.contains("\"pending\":12") && text.contains("webhook") && !text.contains("example.com"), "{text}");
+    }
+
+    #[test]
+    fn sinks_that_skipped_or_missed_the_periods_events_are_kept_apart_from_ones_that_stopped() {
+        let mut i = fresh(60);
+        i.feed(&event(10, H, "user.created", "success", json!({})));
+        i.feed(&event(11, 2 * H, EXPORT_STOPPED, "success", json!({ "kind": "webhook", "name": "old", "sink": "https://siem.example.com:443", "reason": "removed", "delivered": 10, "pending": 0 })));
+        i.feed(&event(12, 2 * H, EXPORT_STARTED, "success", json!({ "kind": "syslog", "name": "soc", "sink": "syslog+tls://soc.example.com:6514", "start": "new", "after": 11, "skipped": 2 })));
+        i.feed(&event(13, 2 * H, EXPORT_STARTED, "success", json!({ "kind": "s3", "sink": "s3://audit/prod", "start": "all", "after": 0, "skipped": 0 })));
+        i.feed(&event(14, 3 * H, EXPORT_RESUMED, "success", json!({ "kind": "datadog", "name": "dd", "sink": "datadog://datadoghq.eu", "after": 3, "stoppedEvent": 5, "missed": { "after": 3, "through": 9 } })));
+        assert_eq!(i.export_changes.iter().map(|c| c["change"].as_str().unwrap()).collect::<Vec<_>>(), ["stopped", "started", "started", "resumed"]);
+        assert_eq!(i.export_stopped.len(), 1, "listed, but a stop leaves the sinks still running to judge");
+        assert_eq!(i.export_skipped.iter().map(|c| c["name"].as_str()).collect::<Vec<_>>(), [Some("soc")], "started with new past event 10 of the period");
+        assert_eq!(i.export_missed[0]["missed"], json!({ "after": 3, "through": 9 }));
+        let text = json!(i.export_changes).to_string();
+        assert!(!text.contains("example.com") && !text.contains("s3://") && !text.contains("datadoghq"), "kinds and names, never addresses: {text}");
+
+        // A sink set with new as the period's first event left none of the period out.
+        let mut i = fresh(60);
+        i.feed(&event(20, H, EXPORT_STARTED, "success", json!({ "kind": "webhook", "start": "new", "after": 19, "skipped": 19 })));
+        i.feed(&event(21, H, "user.created", "success", json!({})));
+        assert!(i.export_skipped.is_empty() && i.export_changes.len() == 1);
     }
 }

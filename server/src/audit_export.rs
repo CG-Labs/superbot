@@ -24,7 +24,9 @@
 //! in the database (per sink) moves only when a batch is accepted, a failed batch is
 //! tried again with backoff for as long as it takes, and retention never deletes an
 //! event before it is delivered. Payloads are the audit log's own rows, already
-//! scrubbed of secrets; the sink's credentials never go in them.
+//! scrubbed of secrets; the sink's credentials never go in them. A sink starting with no
+//! cursor, taken out of `AUDIT_EXPORT`, or back after either is recorded on the chain
+//! (`audit.export_started`, `audit.export_stopped`, `audit.export_resumed`, ADR 0264).
 
 use crate::audit::{Actor, Event, Filter, Outcome};
 use crate::db::{now, AuditEvent};
@@ -685,6 +687,128 @@ fn digests_after(app: &App, sinks: &[Arc<Exporter>]) -> i64 {
     }
 }
 
+/// Saved beside a sink's cursor, `audit_export:<id>#sink` (ADR 0264): its kind, name and
+/// what it shows, so a sink taken out of `AUDIT_EXPORT` can still be named in
+/// `audit.export_stopped`, and the id of that event once it is recorded. Never a header
+/// or a webhook's path.
+fn record_key(id: &str) -> String {
+    format!("audit_export:{id}#sink")
+}
+
+/// A sink's saved record or, for one that last ran before botd kept them, what its id
+/// gives away safely: the kind, and the address without a webhook's path.
+fn known(app: &App, id: &str) -> Value {
+    if let Some(v) = app.db.setting(&record_key(id)).and_then(|s| serde_json::from_str::<Value>(&s).ok()).filter(Value::is_object) {
+        return v;
+    }
+    let Some((scheme, rest)) = id.split_once("://") else { return json!({ "kind": "unknown", "sink": null }) };
+    let kind = match scheme {
+        "https" | "http" => "webhook",
+        "syslog+tls" | "syslog+tcp" => "syslog",
+        "s3" => "s3",
+        "azure-monitor" => "azure-monitor",
+        "google-secops" => "google-secops",
+        "datadog" => "datadog",
+        _ => return json!({ "kind": "unknown", "sink": null }),
+    };
+    let (first, after) = rest.split_once('/').unwrap_or((rest, ""));
+    // An archive's id leads with its store's host; what it shows is the bucket and prefix.
+    let shown = if kind == "s3" { format!("s3://{after}") } else { format!("{scheme}://{first}") };
+    json!({ "kind": kind, "sink": shown })
+}
+
+fn save_record(app: &App, id: &str, record: &Value) {
+    if !app.db.write_settings(&[(&record_key(id), Some(&record.to_string()))]) {
+        log_warn!("Audit export: couldn't save what {id} is; a later audit.export_stopped names only its kind.");
+    }
+}
+
+/// `audit.export_stopped` for each sink with a cursor that `AUDIT_EXPORT` no longer lists
+/// (ADR 0264), once: `removed` while other sinks run, `export_off` when none does. What
+/// it delivered and what it hadn't yet say which events never reached it.
+fn note_stopped(app: &App, sinks: &[Sink], head: i64) {
+    let cursors = match app.db.audit_export_cursors() {
+        Ok(c) => c,
+        Err(e) => {
+            log_warn!("Audit export: couldn't read which sinks ran before ({e}); a sink taken out isn't recorded as stopped until botd starts again.");
+            return;
+        }
+    };
+    for (id, delivered) in cursors {
+        if sinks.iter().any(|s| s.id == id) {
+            continue;
+        }
+        let mut record = known(app, &id);
+        if record["stopped"].is_i64() {
+            continue;
+        }
+        let pending = (head - delivered).max(0);
+        let mut d = json!({ "sink": record["sink"], "kind": record["kind"] });
+        if let Some(n) = record["name"].as_str() {
+            d["name"] = json!(n);
+        }
+        d["reason"] = json!(if sinks.is_empty() { "export_off" } else { "removed" });
+        d["delivered"] = json!(delivered);
+        d["pending"] = json!(pending);
+        let shown = record["sink"].as_str().unwrap_or("a sink").to_string();
+        log_warn!("WARNING: audit export to {shown} has stopped: AUDIT_EXPORT no longer lists it. It last took event {delivered}, {pending} behind; recorded as audit.export_stopped.");
+        match app.db.try_record(&Event::new(Actor::system("audit_export"), "audit.export_stopped").target("audit", "export").details(d)) {
+            Ok(event) => {
+                record["stopped"] = json!(event);
+                save_record(app, &id, &record);
+            }
+            Err(e) => log_warn!("Audit export: couldn't record that {shown} stopped ({e}); trying again when botd next starts."),
+        }
+    }
+}
+
+/// `audit.export_started` for a sink with no cursor (ADR 0264): how it started, the last
+/// event it won't get, and how many kept events that leaves out.
+fn note_started(app: &App, sink: &Sink, start: Start, after: i64) {
+    let mut d = sink.about();
+    d["start"] = json!(match start {
+        Start::All => "all",
+        Start::New => "new",
+    });
+    d["after"] = json!(after);
+    d["skipped"] = json!(if after > 0 { app.db.audit_kept_through(after) } else { 0 });
+    app.db.record(&Event::new(Actor::system("audit_export"), "audit.export_started").target("audit", "export").details(d));
+}
+
+/// `audit.export_resumed` for a sink back after `audit.export_stopped`, or whose cursor
+/// retention has passed (ADR 0264): `missed` names the events deleted before it took them.
+fn note_resumed(app: &App, sink: &Sink, after: i64) {
+    let stopped = app.db.setting(&record_key(&sink.id)).and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|r| r["stopped"].as_i64());
+    let pruned = app.db.audit_chain_anchor().map(|a| a.id).filter(|&through| through > after);
+    if stopped.is_none() && pruned.is_none() {
+        return;
+    }
+    let mut d = sink.about();
+    d["after"] = json!(after);
+    d["stoppedEvent"] = json!(stopped);
+    if let Some(through) = pruned {
+        log_warn!("WARNING: audit export to {} resumes after event {after}, but retention has deleted events up to {through}: it never gets those.", sink.label());
+        d["missed"] = json!({ "after": after, "through": through });
+    }
+    app.db.record(&Event::new(Actor::system("audit_export"), "audit.export_resumed").target("audit", "export").details(d));
+}
+
+/// Sinks recorded as stopped and not set now, for `GET /api/audit/siem`.
+fn stopped(app: &App, head: i64) -> Vec<Value> {
+    let running: Vec<String> = app.audit_export.get().map(|x| x.sinks.iter().map(|s| s.sink.id.clone()).collect()).unwrap_or_default();
+    app.db
+        .audit_export_cursors()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(id, _)| !running.contains(id))
+        .filter_map(|(id, delivered)| {
+            let r = known(app, &id);
+            let event = r["stopped"].as_i64()?;
+            Some(json!({ "kind": r["kind"], "name": r["name"], "sink": r["sink"], "delivered": delivered, "pending": (head - delivered).max(0), "stoppedEvent": event }))
+        })
+        .collect()
+}
+
 impl Exports {
     /// The last event every sink accepted: retention keeps everything after it.
     pub fn delivered(&self) -> i64 {
@@ -710,35 +834,55 @@ impl Exports {
     }
 }
 
-/// Starts the export to each sink set. Before retention starts, so its first pass
-/// already keeps what isn't delivered.
+/// Starts the export to each sink set, recording sinks that stopped, started or came
+/// back (ADR 0264). Before retention starts, so its first pass already keeps what isn't
+/// delivered.
 pub fn start(app: &Arc<App>, settings: Settings) {
+    let Some(xs) = open(app, settings) else { return };
+    let (sinks, after) = (xs.sinks.clone(), xs.digests_after);
+    if app.audit_export.set(Arc::new(xs)).is_ok() {
+        for x in sinks {
+            tokio::spawn(run(app.clone(), x, after));
+        }
+    }
+}
+
+/// Each sink at its cursor, new ones saved where they start; None while export is off.
+fn open(app: &App, settings: Settings) -> Option<Exports> {
+    // A new sink starting with `new` still gets this start's own events.
+    let head = app.db.audit_head();
+    note_stopped(app, &settings.sinks, head);
     if settings.sinks.is_empty() {
-        return;
+        return None;
     }
     let sinks: Vec<Arc<Exporter>> = settings
         .sinks
         .into_iter()
         .map(|sink| {
-            let delivered = app.db.audit_export_cursor(&sink.id).unwrap_or_else(|| {
-                let from = match sink.start.unwrap_or(settings.start) {
-                    Start::All => 0,
-                    Start::New => app.db.audit_head(),
-                };
-                if let Err(e) = app.db.set_audit_export_cursor(&sink.id, from) {
-                    log_warn!("Audit export: couldn't save where {} starts ({e}); trying again after the first delivery.", sink.label());
+            let delivered = match app.db.audit_export_cursor(&sink.id) {
+                Some(at) => {
+                    note_resumed(app, &sink, at);
+                    at
                 }
-                from
-            });
+                None => {
+                    let start = sink.start.unwrap_or(settings.start);
+                    let from = match start {
+                        Start::All => 0,
+                        Start::New => head,
+                    };
+                    if let Err(e) = app.db.set_audit_export_cursor(&sink.id, from) {
+                        log_warn!("Audit export: couldn't save where {} starts ({e}); trying again after the first delivery.", sink.label());
+                    }
+                    note_started(app, &sink, start, from);
+                    from
+                }
+            };
+            save_record(app, &sink.id, &json!({ "kind": sink.kind(), "name": sink.name, "sink": sink.shown }));
             Arc::new(Exporter::new(sink, delivered))
         })
         .collect();
-    let after = digests_after(app, &sinks);
-    if app.audit_export.set(Arc::new(Exports { sinks: sinks.clone(), digests_after: after })).is_ok() {
-        for x in sinks {
-            tokio::spawn(run(app.clone(), x, after));
-        }
-    }
+    let digests_after = digests_after(app, &sinks);
+    Some(Exports { sinks, digests_after })
 }
 
 async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
@@ -1071,11 +1215,18 @@ fn platform_tls() -> Arc<rustls::ClientConfig> {
 }
 
 /// `GET /api/audit/siem`: whether the export is on, where to, and how far it got. Admins only.
+/// Sinks taken out of `AUDIT_EXPORT` are under `stopped` (ADR 0264).
 pub async fn get(axum::extract::State(app): axum::extract::State<Arc<App>>) -> axum::Json<Value> {
-    axum::Json(match app.audit_export.get() {
-        Some(x) => x.view(app.db.audit_head()),
+    let head = app.db.audit_head();
+    let mut v = match app.audit_export.get() {
+        Some(x) => x.view(head),
         None => json!({ "enabled": false }),
-    })
+    };
+    let stopped = stopped(&app, head);
+    if !stopped.is_empty() {
+        v["stopped"] = Value::Array(stopped);
+    }
+    axum::Json(v)
 }
 
 /// How far behind each sink is, when the export is on, labelled by its kind and, for a
@@ -1535,6 +1686,74 @@ pub(crate) mod tests {
         assert_eq!(digests_after(&app, &[]), 100, "a batch it resends when back is the same as before");
         app.db.set_audit_export_cursor(old, 400).unwrap();
         assert_eq!(digests_after(&app, &[]), 100, "saved once");
+    }
+
+    #[test]
+    fn sinks_starting_stopping_and_coming_back_are_recorded_once_each() {
+        use crate::audit::{Actor, Event};
+        let app = crate::runner::test_app();
+        let changes = || -> Vec<Value> {
+            let actions = ["audit.export_started", "audit.export_stopped", "audit.export_resumed"].map(String::from).to_vec();
+            app.db.audit_events(&Filter { actions, ..Default::default() }, 100, true).into_iter().map(|e| json!({ "id": e.id, "action": e.action, "d": e.details })).collect()
+        };
+        let siem = "siem=https://siem.example.net/in/path-token-7f3a";
+        let soc = "soc=syslog+tls://soc.example.net";
+        let start_soc = ("AUDIT_EXPORT_START_SOC", "new");
+        for _ in 0..2 {
+            app.db.record(&Event::new(Actor::system("test"), "test.before"));
+        }
+        let head = app.db.audit_head();
+        let both = format!("{siem},{soc}");
+
+        let xs = open(&app, settings(&[("AUDIT_EXPORT", &both), start_soc]).unwrap()).unwrap();
+        assert_eq!(xs.sinks.iter().map(|x| x.delivered()).collect::<Vec<_>>(), [0, head], "where each starts is unchanged");
+        let c = changes();
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert_eq!((&c[0]["action"], &c[0]["d"]["name"], &c[0]["d"]["start"], &c[0]["d"]["after"], &c[0]["d"]["skipped"]), (&json!("audit.export_started"), &json!("siem"), &json!("all"), &json!(0), &json!(0)));
+        assert_eq!((&c[1]["d"]["name"], &c[1]["d"]["start"], &c[1]["d"]["after"]), (&json!("soc"), &json!("new"), &json!(head)));
+        assert_eq!(c[1]["d"]["skipped"].as_i64(), Some(app.db.audit_kept_through(head)), "the events kept that it never gets");
+        assert!(c[1]["id"].as_i64().unwrap() > head, "a sink starting with new still gets its own start");
+
+        open(&app, settings(&[("AUDIT_EXPORT", &both), start_soc]).unwrap()).unwrap();
+        assert_eq!(changes().len(), 2, "a restart records nothing");
+
+        app.db.set_audit_export_cursor("syslog+tls://soc.example.net:6514", head + 1).unwrap();
+        app.db.set_audit_export_cursor("syslog+tls://soc.example.net:6514#batch", head + 9).unwrap();
+        open(&app, settings(&[("AUDIT_EXPORT", siem)]).unwrap()).unwrap();
+        let c = changes();
+        let gone = &c[2]["d"];
+        assert_eq!((c.len(), &c[2]["action"]), (3, &json!("audit.export_stopped")), "{c:?}");
+        assert_eq!((&gone["name"], &gone["kind"], &gone["sink"], &gone["reason"], &gone["delivered"]), (&json!("soc"), &json!("syslog"), &json!("syslog+tls://soc.example.net:6514"), &json!("removed"), &json!(head + 1)));
+        assert_eq!(gone["pending"].as_i64(), Some(c[2]["id"].as_i64().unwrap() - 1 - (head + 1)), "what it hadn't taken when it stopped");
+        open(&app, settings(&[("AUDIT_EXPORT", siem)]).unwrap()).unwrap();
+        assert_eq!(changes().len(), 3, "once");
+
+        // Export off altogether; and a sink from before botd kept records, its path left out.
+        app.db.set_audit_export_cursor("https://legacy.example.net:443/hidden/token-9c1d", 1).unwrap();
+        assert!(open(&app, settings(&[]).unwrap()).is_none());
+        let c = changes();
+        assert_eq!(c.len(), 5, "{c:?}");
+        let off: Vec<(&Value, &Value, &Value)> = c[3..].iter().map(|e| (&e["d"]["kind"], &e["d"]["sink"], &e["d"]["reason"])).collect();
+        assert!(off.contains(&(&json!("webhook"), &json!("https://siem.example.net:443"), &json!("export_off"))), "{off:?}");
+        assert!(off.contains(&(&json!("webhook"), &json!("https://legacy.example.net:443"), &json!("export_off"))), "{off:?}");
+        let text = json!(c).to_string();
+        assert!(!text.contains("path-token") && !text.contains("hidden"), "a webhook's path never goes in an event: {text}");
+        let listed = stopped(&app, app.db.audit_head());
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert!(listed.iter().all(|s| s["stoppedEvent"].is_i64() && s["pending"].is_i64()), "{listed:?}");
+
+        // Back after retention deleted events it hadn't taken.
+        let pruned_through = head + 2;
+        app.db.with_conn(|c| crate::audit_chain::set_anchor(c, &crate::audit_chain::Link { id: pruned_through, hash: "00".repeat(32) })).unwrap();
+        let soc_stopped = c[2]["id"].as_i64().unwrap();
+        let xs = open(&app, settings(&[("AUDIT_EXPORT", soc)]).unwrap()).unwrap();
+        assert_eq!(xs.sinks[0].delivered(), head + 1, "it resumes at its cursor, as before");
+        let c = changes();
+        let back = c.last().unwrap();
+        assert_eq!((&back["action"], &back["d"]["name"], &back["d"]["stoppedEvent"], &back["d"]["missed"]), (&json!("audit.export_resumed"), &json!("soc"), &json!(soc_stopped), &json!({ "after": head + 1, "through": pruned_through })));
+        assert_eq!(stopped(&app, app.db.audit_head()).iter().filter(|s| s["kind"] == "syslog").count(), 0, "no longer stopped");
+        open(&app, settings(&[("AUDIT_EXPORT", soc)]).unwrap()).unwrap();
+        assert_eq!(changes().len(), c.len() + 1, "only retention's gap is recorded again: the stop is cleared");
     }
 
     #[test]

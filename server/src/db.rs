@@ -9554,6 +9554,29 @@ impl Db {
         Ok(furthest)
     }
 
+    /// Every sink that has a cursor, set now or not, with the last event it delivered
+    /// (ADR 0264). Keys with a `#` (a sink's batch, start, check or record, and the
+    /// digests marker) aren't sinks.
+    pub fn audit_export_cursors(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        let c = self.c();
+        let mut q = c.prepare("SELECT key, value FROM settings WHERE key LIKE 'audit\\_export:%' ESCAPE '\\' ORDER BY key")?;
+        let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            let sink = &key["audit_export:".len()..];
+            if let (false, Ok(at)) = (sink.contains('#'), value.parse()) {
+                out.push((sink.to_string(), at));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Audit events still kept up to and including `id`.
+    pub fn audit_kept_through(&self, id: i64) -> i64 {
+        self.c().query_row("SELECT COUNT(*) FROM audit_events WHERE id <= ?", [id], |r| r.get(0)).unwrap_or(0)
+    }
+
     pub fn set_audit_export_cursor(&self, sink: &str, delivered: i64) -> rusqlite::Result<()> {
         self.c().execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",

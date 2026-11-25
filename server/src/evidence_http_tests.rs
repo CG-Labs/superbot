@@ -477,3 +477,32 @@ async fn the_audit_logs_guarding_is_evidence_only_while_it_held() {
     assert_eq!((v["chain"]["lastCheck"]["reason"].as_str(), v["chain"]["periodLastCheck"]["ok"].as_bool()), (Some("contents"), Some(true)), "{v}");
     assert_eq!(v["exceptions"]["lastCheckFailed"][0]["reason"], "contents", "{v}");
 }
+
+/// A sink first set mid-period with `AUDIT_EXPORT_START=new` never had the period's
+/// earlier events (ADR 0264): its start is listed and neither row is named, while one
+/// set with the default, `all`, took them and names both.
+#[tokio::test]
+async fn a_sink_started_past_the_periods_events_is_a_gap() {
+    for (start, held) in [("new", false), ("all", true)] {
+        let (_, app, _, _) = serve_app().await;
+        let p = Period { from: today(), to: today().succ_opt().unwrap() };
+        let inputs = Inputs { sessions: users::SessionConfig::default(), mfa: mfa::Policy::Off };
+        let by = audit::Who::system("audit_checkpoint");
+        app.db.record(&Event::new(Actor::system("test"), "user.created"));
+        let (url, _) = crate::audit_chain_http_tests::collector(0).await;
+        crate::audit_chain_http_tests::export_to(&app, &[("AUDIT_EXPORT", &url), ("AUDIT_EXPORT_START", start)]);
+        let delivered = || app.audit_export.get().is_some_and(|x| x.delivered() >= app.db.audit_head());
+        crate::audit_chain::daily(&app).await;
+        crate::audit_checkpoint::create(&app, &by, crate::audit_checkpoint::Trigger::Schedule).unwrap();
+        crate::audit_chain_http_tests::until("delivery", delivered).await;
+        let (_, f) = files(&evidence::build(&app, &inputs, &p, db::now(), false).tar);
+        let (v, m) = (parse(file(&f, "audit-integrity.json")), parse(file(&f, "manifest.json")));
+        let change = &v["export"]["changes"][0];
+        assert_eq!((change["change"].as_str(), change["kind"].as_str(), change["start"].as_str()), (Some("started"), Some("webhook"), Some(start)), "{v}");
+        assert_eq!(v["exceptions"]["exportSkipped"].as_array().map(Vec::len), Some(usize::from(!held)), "{v}");
+        assert_eq!(v["summary"]["exportedEveryEvent"], held, "{v}");
+        let rows = if held { (json!(["CC2.1", "CC7.2"]), json!(["CC2.1-2", "CC7.2-2"])) } else { (json!([]), json!([])) };
+        assert_eq!(listed(&m, "audit-integrity.json"), rows, "start {start}: {v}");
+        assert!(!v.to_string().contains("127.0.0.1"), "no sink address: {v}");
+    }
+}

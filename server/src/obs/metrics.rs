@@ -19,9 +19,11 @@ pub const RUN_BUCKETS: [f64; 11] = [1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 60
 pub const RUN_RESULTS: [&str; 8] = ["done", "error", "timeout", "stopped", "interrupted", "account_removed", "unguarded", "policy"];
 
 /// Audit actions counted in `superbot_events_total`: what an operator alerts on.
-pub const EVENTS: [&str; 41] = [
+pub const EVENTS: [&str; 43] = [
     "audit.export_failing",
     "audit.export_recovered",
+    "audit.export_stopped",
+    "audit.export_resumed",
     "audit.verified",
     "auth.login",
     "auth.login_failed",
