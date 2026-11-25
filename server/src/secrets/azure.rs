@@ -43,9 +43,10 @@ pub enum Auth {
     /// A system-assigned identity, or the user-assigned one with this client id.
     ManagedIdentity { client_id: Option<String> },
     ClientSecret { tenant: String, client_id: String, secret: Zeroizing<String> },
-    /// A PEM file with the app's certificate and its RSA key (`AZURE_CLIENT_CERTIFICATE_PATH`),
-    /// read again for every sign-in so a renewed certificate needs no restart.
-    ClientCertificate { tenant: String, client_id: String, path: PathBuf },
+    /// A PEM or PFX file with the app's certificate and its RSA key
+    /// (`AZURE_CLIENT_CERTIFICATE_PATH`), read again for every sign-in so a renewed
+    /// certificate needs no restart, and the password that opens it (ADR 0280).
+    ClientCertificate { tenant: String, client_id: String, path: PathBuf, password: Option<Zeroizing<String>> },
     /// A token file the platform keeps fresh (AKS writes `AZURE_FEDERATED_TOKEN_FILE`),
     /// read again for every sign-in.
     WorkloadIdentity { tenant: String, client_id: String, token_file: PathBuf },
@@ -157,17 +158,19 @@ fn sign_in_settings(var: &dyn Fn(&str) -> String, store: &dyn SecretStore, metho
         "client-certificate" => {
             let file = var("AZURE_CLIENT_CERTIFICATE_PATH");
             if file.trim().is_empty() {
-                return Err(format!("{method_var}=client-certificate needs AZURE_CLIENT_CERTIFICATE_PATH, a PEM file with the certificate and its private key"));
-            }
-            if !var("AZURE_CLIENT_CERTIFICATE_PASSWORD").is_empty() {
-                return Err("AZURE_CLIENT_CERTIFICATE_PASSWORD isn't supported: botd reads an unencrypted PEM file, kept readable only by its own user (from a PFX: openssl pkcs12 -in cert.pfx -nodes -out cert.pem)".into());
+                return Err(format!("{method_var}=client-certificate needs AZURE_CLIENT_CERTIFICATE_PATH, a PEM or PFX file with the certificate and its private key"));
             }
             if matches!(var("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN").trim().to_ascii_lowercase().as_str(), "1" | "true") {
                 return Err("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN isn't supported: upload the certificate to the app registration instead of trusting it by subject name".into());
             }
+            let password = store.get("AZURE_CLIENT_CERTIFICATE_PASSWORD").map_err(|e| format!("AZURE_CLIENT_CERTIFICATE_PASSWORD: {e}"))?;
+            let password = password.map(|p| {
+                super::redact::register(p.expose());
+                Zeroizing::new(p.expose().to_string())
+            });
             let (tenant, client_id, path) = (tenant()?, client_id()?, PathBuf::from(file.trim()));
-            certificate(&path).map_err(|e| format!("AZURE_CLIENT_CERTIFICATE_PATH: {e}"))?;
-            Auth::ClientCertificate { tenant, client_id, path }
+            certificate(&path, password.as_deref().map(String::as_str)).map_err(|e| format!("AZURE_CLIENT_CERTIFICATE_PATH: {e}"))?;
+            Auth::ClientCertificate { tenant, client_id, path, password }
         }
         "workload-identity" => {
             let file = var("AZURE_FEDERATED_TOKEN_FILE");
@@ -307,7 +310,7 @@ fn pem_blocks(text: &str) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>, String> {
             }
         } else if let Some((_, b64)) = open.as_mut() {
             if line.starts_with("Proc-Type:") {
-                return Err("its private key is encrypted; botd needs it unencrypted, in a file only botd's user can read".into());
+                return Err("its private key is encrypted the legacy OpenSSL way; write it as PKCS#8 (openssl pkcs8 -topk8 -v2 aes-256-cbc) or as a PFX file".into());
             }
             b64.push_str(line);
         }
@@ -318,34 +321,83 @@ fn pem_blocks(text: &str) -> Result<Vec<(String, Zeroizing<Vec<u8>>)>, String> {
     Ok(out)
 }
 
-/// The certificate and private key in the PEM file at `path`: one RSA key (PKCS#8 or
-/// PKCS#1), unencrypted, and the certificate for that key (the file may hold its chain),
-/// valid now. Errors never quote the file.
-fn certificate(path: &Path) -> Result<Certificate, String> {
-    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?);
-    let blocks = pem_blocks(&text)?;
-    let mut keys = Vec::new();
+const PASSWORD_SETTINGS: &str = "AZURE_CLIENT_CERTIFICATE_PASSWORD (or AZURE_CLIENT_CERTIFICATE_PASSWORD_FILE)";
+
+fn rsa_pkcs8(der: &[u8]) -> Result<RsaKeyPair, String> {
+    RsaKeyPair::from_pkcs8(der).map_err(|e| format!("its private key isn't an RSA key Entra can check ({e})"))
+}
+
+/// The keys and certificates of a PEM file. An `ENCRYPTED PRIVATE KEY` (PKCS#8 with PBES2,
+/// as `openssl pkcs8 -topk8` writes it) is opened with `password`; a password with nothing
+/// to open is refused, so a wrong file isn't mistaken for the right one.
+fn pem_material(text: &str, password: Option<&str>) -> Result<(Vec<RsaKeyPair>, Vec<Vec<u8>>), String> {
+    let blocks = pem_blocks(text)?;
+    let (mut keys, mut encrypted) = (Vec::new(), false);
     for (label, der) in &blocks {
         match label.as_str() {
-            "PRIVATE KEY" => keys.push(RsaKeyPair::from_pkcs8(der).map_err(|e| format!("its private key isn't an RSA key Entra can check ({e})"))?),
+            "PRIVATE KEY" => keys.push(rsa_pkcs8(der)?),
             "RSA PRIVATE KEY" => keys.push(RsaKeyPair::from_der(der).map_err(|e| format!("its RSA private key can't be used ({e})"))?),
-            "ENCRYPTED PRIVATE KEY" => return Err("its private key is encrypted; botd needs it unencrypted, in a file only botd's user can read".into()),
+            "ENCRYPTED PRIVATE KEY" => {
+                encrypted = true;
+                let password = password.ok_or(format!("its private key is encrypted; set {PASSWORD_SETTINGS} to the password that opens it"))?;
+                let info = pkcs8::EncryptedPrivateKeyInfoRef::try_from(der.as_slice()).map_err(|_| "its encrypted private key isn't PKCS#8".to_string())?;
+                let plain = info.decrypt(password).map_err(|e| match e {
+                    pkcs8::Error::EncryptedPrivateKey(pkcs8::pkcs5::Error::UnsupportedAlgorithm { .. } | pkcs8::pkcs5::Error::NoPbes1CryptSupport) => {
+                        "its private key is encrypted with a scheme botd doesn't read; re-encrypt it with openssl pkcs8 -topk8 -v2 aes-256-cbc".to_string()
+                    }
+                    _ => "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open its private key".to_string(),
+                })?;
+                keys.push(rsa_pkcs8(plain.as_bytes())?);
+            }
             "EC PRIVATE KEY" => return Err("its private key is an EC key; Entra app certificates are RSA".into()),
             _ => {}
         }
     }
+    if password.is_some() && !encrypted {
+        return Err("AZURE_CLIENT_CERTIFICATE_PASSWORD is set, but its private key isn't encrypted".into());
+    }
+    let certs = blocks.iter().filter(|(l, _)| l == "CERTIFICATE").map(|(_, der)| der.to_vec()).collect();
+    Ok((keys, certs))
+}
+
+/// The keys and certificates of a PKCS#12 (PFX) file, its MAC checked and its bags opened
+/// with `password`, or with the empty password when none is set.
+fn pfx_material(der: &[u8], password: Option<&str>) -> Result<(Vec<RsaKeyPair>, Vec<Vec<u8>>), String> {
+    let archive = p12_keystore::Pkcs12Archive::from_pkcs12(der, password.unwrap_or("")).map_err(|e| match e {
+        p12_keystore::error::Error::MacError(_) | p12_keystore::error::Error::UnpadError | p12_keystore::error::Error::Pkcs5Error(_) => match password {
+            Some(_) => "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open it".to_string(),
+            None => format!("it is a PFX file with a password; set {PASSWORD_SETTINGS}"),
+        },
+        p12_keystore::error::Error::UnsupportedEncryptionScheme | p12_keystore::error::Error::UnsupportedMacAlgorithm => {
+            "it is a PFX file protected with a scheme botd doesn't read; export it again with AES-256 (openssl pkcs12 -export, or Windows' AES256-SHA256)".to_string()
+        }
+        _ => "it is neither a PEM file nor a PFX file botd can read".to_string(),
+    })?;
+    let keys = archive.keys.iter().map(|k| rsa_pkcs8(k.key.as_der())).collect::<Result<_, _>>()?;
+    Ok((keys, archive.certs.iter().map(|c| c.cert.as_der().to_vec()).collect()))
+}
+
+/// The certificate and private key in the file at `path`: PEM, or PFX when it isn't text.
+/// It must hold one RSA key and the certificate for that key (the file may hold its chain),
+/// valid now. Errors never quote the file or the password.
+fn certificate(path: &Path, password: Option<&str>) -> Result<Certificate, String> {
+    let bytes = Zeroizing::new(std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    let (mut keys, certs) = match std::str::from_utf8(&bytes) {
+        Ok(text) if text.contains("-----BEGIN ") => pem_material(text, password)?,
+        _ if bytes.first() == Some(&0x30) => pfx_material(&bytes, password)?,
+        _ => return Err("it has no private key (PEM \"PRIVATE KEY\" or \"RSA PRIVATE KEY\", or a PFX file)".into()),
+    };
     let key = match keys.len() {
         1 => keys.remove(0),
-        0 => return Err("it has no private key (PEM \"PRIVATE KEY\" or \"RSA PRIVATE KEY\")".into()),
+        0 => return Err("it has no private key (PEM \"PRIVATE KEY\" or \"RSA PRIVATE KEY\", or a PFX file)".into()),
         _ => return Err("it has more than one private key".into()),
     };
     let public = key.public_key().as_ref().to_vec();
-    let certs: Vec<&[u8]> = blocks.iter().filter(|(l, _)| l == "CERTIFICATE").map(|(_, der)| der.as_slice()).collect();
     if certs.is_empty() {
-        return Err("it has no certificate (PEM \"CERTIFICATE\")".into());
+        return Err("it has no certificate (PEM \"CERTIFICATE\", or a PFX certificate bag)".into());
     }
     let der = certs
-        .into_iter()
+        .iter()
         .find(|der| x509_parser::parse_x509_certificate(der).is_ok_and(|(_, c)| c.public_key().subject_public_key.data.as_ref() == public.as_slice()))
         .ok_or("none of its certificates is for its private key")?;
     let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|_| "its certificate isn't X.509".to_string())?;
@@ -400,8 +452,8 @@ async fn sign_in(label: &str, http: &reqwest::Client, local: &reqwest::Client, a
             let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_secret", secret), ("scope", &scope)];
             http.post(token_url(authority, tenant)).form(&form)
         }
-        Auth::ClientCertificate { tenant, client_id, path } => {
-            let cert = certificate(path).map_err(|e| Error::Unavailable(format!("{label}: AZURE_CLIENT_CERTIFICATE_PATH: {e}")))?;
+        Auth::ClientCertificate { tenant, client_id, path, password } => {
+            let cert = certificate(path, password.as_deref().map(String::as_str)).map_err(|e| Error::Unavailable(format!("{label}: AZURE_CLIENT_CERTIFICATE_PATH: {e}")))?;
             let url = token_url(authority, tenant);
             let assertion = certificate_assertion(&cert, client_id, &url).map_err(|e| Error::Unavailable(format!("{label}: {e}")))?;
             let form = [("grant_type", "client_credentials"), ("client_id", client_id), ("client_assertion_type", ASSERTION_TYPE), ("client_assertion", &assertion), ("scope", &scope)];
@@ -1561,10 +1613,29 @@ mod tests {
     /// A self-signed RSA certificate valid from `from` to `until` days from now, and its key.
     struct TestCert {
         cert_pem: String,
+        cert_der: Vec<u8>,
         key_pem: String,
         pkcs8: Vec<u8>,
         x5t: String,
         public: Vec<u8>,
+    }
+
+    fn pem_block(label: &str, der: &[u8]) -> String {
+        let b64 = STANDARD.encode(der);
+        let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
+        format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", lines.join("\n"))
+    }
+
+    /// A PFX file holding each `(key, certificates)` chain, as `openssl pkcs12 -export` or
+    /// Windows writes one.
+    fn pfx_of(chains: &[(&[u8], &[&[u8]])], password: &str, alg: p12_keystore::EncryptionAlgorithm) -> Vec<u8> {
+        let mut ks = p12_keystore::KeyStore::new();
+        for (i, (key, certs)) in chains.iter().enumerate() {
+            let certs = certs.iter().map(|c| p12_keystore::Certificate::from_der(c).unwrap());
+            let chain = p12_keystore::PrivateKeyChain::new(vec![i as u8 + 1], p12_keystore::PrivateKey::from_der(key).unwrap(), certs);
+            ks.add_entry(&format!("key-{i}"), p12_keystore::KeyStoreEntry::PrivateKeyChain(chain));
+        }
+        ks.writer(password).encryption_algorithm(alg).encryption_iterations(1000).mac_iterations(1000).write().unwrap()
     }
 
     impl TestCert {
@@ -1577,11 +1648,23 @@ mod tests {
             let cert = params.self_signed(&key).unwrap();
             let pkcs8 = key.serialize_der();
             let public = RsaKeyPair::from_pkcs8(&pkcs8).unwrap().public_key().as_ref().to_vec();
-            TestCert { cert_pem: cert.pem(), key_pem: key.serialize_pem(), pkcs8, x5t: URL_SAFE_NO_PAD.encode(Sha256::digest(cert.der())), public }
+            TestCert { cert_pem: cert.pem(), cert_der: cert.der().to_vec(), key_pem: key.serialize_pem(), pkcs8, x5t: URL_SAFE_NO_PAD.encode(Sha256::digest(cert.der())), public }
         }
 
         fn pem(&self) -> String {
             format!("{}{}", self.cert_pem, self.key_pem)
+        }
+
+        fn pfx(&self, password: &str, alg: p12_keystore::EncryptionAlgorithm) -> Vec<u8> {
+            pfx_of(&[(&self.pkcs8, &[&self.cert_der])], password, alg)
+        }
+
+        /// The certificate and its key as PKCS#8 encrypted with PBES2 (PBKDF2-SHA256 and
+        /// AES-256-CBC), as `openssl pkcs8 -topk8 -v2 aes-256-cbc` writes it.
+        fn encrypted_pem(&self, password: &str) -> String {
+            let params = pkcs8::pkcs5::pbes2::Parameters::generate_pbkdf2_sha256_aes256cbc(1000, &[7; 16], [9; 16]).unwrap();
+            let info = pkcs8::PrivateKeyInfoRef::try_from(self.pkcs8.as_slice()).unwrap();
+            format!("{}{}", self.cert_pem, pem_block("ENCRYPTED PRIVATE KEY", info.encrypt_with_params(params, password).unwrap().as_bytes()))
         }
 
         /// The same key as PKCS#1 (`RSA PRIVATE KEY`), as older OpenSSL writes it: the
@@ -1603,10 +1686,92 @@ mod tests {
         }
     }
 
-    fn cert_file(name: &str, pem: &str) -> PathBuf {
+    fn cert_file(name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
         let file = crate::db::temp_path(name).join("cert.pem");
-        std::fs::write(&file, pem).unwrap();
+        std::fs::write(&file, contents).unwrap();
         file
+    }
+
+    #[test]
+    fn pfx_files_and_encrypted_keys_sign_in_with_their_password() {
+        use p12_keystore::EncryptionAlgorithm::{PbeWithHmacSha256AndAes256 as Aes, PbeWithShaAnd3KeyTripleDesCbc as TripleDes, PbeWithShaAnd40BitRc4Cbc as Rc2};
+        let (url, f) = stand_in();
+        put(&f, "superbot-server-SMTP-PASSWORD", "smtp-from-azure-pfx-1");
+        let (a, b, c) = (TestCert::new(-1, 30), TestCert::new(-1, 60), TestCert::new(-1, 90));
+        f.certs.lock().unwrap().extend([(a.x5t.clone(), a.public.clone()), (b.x5t.clone(), b.public.clone()), (c.x5t.clone(), c.public.clone())]);
+        let password = "pfx-password-0123456789";
+        let file = cert_file("azure-pfx", a.pfx(password, Aes));
+        let dir = file.parent().unwrap().to_path_buf();
+        let password_file = dir.join("password");
+        std::fs::write(&password_file, format!("{password}\n")).unwrap();
+        let (path, password_path) = (file.to_str().unwrap(), password_file.to_str().unwrap());
+        let creds = [("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "tenant-1"), ("AZURE_CLIENT_ID", "client-1"), ("AZURE_CLIENT_CERTIFICATE_PATH", path), ("AZURE_CLIENT_CERTIFICATE_PASSWORD_FILE", password_path)];
+        let s = Arc::new(ExternalStore::new(Box::new(KeyVault::new(config(&url, &creds)).unwrap()), Duration::ZERO));
+        assert_eq!(s.get("SMTP_PASSWORD").unwrap().unwrap().expose(), "smtp-from-azure-pfx-1");
+        assert_eq!(*f.last_x5t.lock().unwrap(), a.x5t, "a PFX file with its password, from a file");
+
+        // Renewed files are read at the next sign-in with the same password: older PFX
+        // schemes, and a PEM file with an encrypted PKCS#8 key.
+        for (contents, x5t) in [(b.pfx(password, TripleDes), &b.x5t), (c.pfx(password, Rc2), &c.x5t), (a.encrypted_pem(password).into_bytes(), &a.x5t)] {
+            std::fs::write(&file, contents).unwrap();
+            f.tokens.lock().unwrap().clear();
+            assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+            assert_eq!(*f.last_x5t.lock().unwrap(), *x5t);
+        }
+
+        // A file the password doesn't open fails closed before Entra is asked, never with
+        // the key read before, and never naming the password.
+        let calls = f.entra_calls.load(Ordering::SeqCst);
+        for (contents, err) in [(b.pfx("another-password", Aes), "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open it"), (b.encrypted_pem("another-password").into_bytes(), "doesn't open its private key"), (b.pem().into_bytes(), "isn't encrypted")] {
+            std::fs::write(&file, contents).unwrap();
+            f.tokens.lock().unwrap().clear();
+            let e = s.get("SMTP_PASSWORD").unwrap_err().to_string();
+            assert!(e.contains("AZURE_CLIENT_CERTIFICATE_PATH") && e.contains(err) && !e.contains(password), "expected {err:?}: {e}");
+        }
+        assert_eq!(f.entra_calls.load(Ordering::SeqCst), calls);
+        let logins = audited("azure-keyvault");
+        assert!(logins.iter().any(|e| e.outcome == Outcome::Failure && e.details["method"] == "client-certificate"));
+        assert!(!format!("{logins:?}").contains(password));
+
+        // A PFX with the empty password needs no setting.
+        let file = cert_file("azure-pfx-empty", b.pfx("", Aes));
+        let creds = [("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "tenant-1"), ("AZURE_CLIENT_ID", "client-1"), ("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap())];
+        let s = Arc::new(ExternalStore::new(Box::new(KeyVault::new(config(&url, &creds)).unwrap()), Duration::ZERO));
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        assert_eq!(*f.last_x5t.lock().unwrap(), b.x5t);
+        redact::forget("smtp-from-azure-pfx-1");
+        redact::forget(password);
+    }
+
+    /// Files OpenSSL itself writes, when it is installed: PFX files in its default
+    /// (AES-256) and older (3DES, SHA-1 MAC) schemes, with and without a password, and a
+    /// PKCS#8 key it encrypted.
+    #[test]
+    fn files_openssl_writes_are_read() {
+        if std::process::Command::new("openssl").arg("version").output().is_err() {
+            return;
+        }
+        let cert = TestCert::new(-1, 30);
+        let dir = crate::db::temp_path("azure-openssl");
+        let (pem, key) = (dir.join("in.pem"), dir.join("key.pem"));
+        std::fs::write(&pem, cert.pem()).unwrap();
+        std::fs::write(&key, &cert.key_pem).unwrap();
+        let openssl = |args: &[&str]| {
+            let out = std::process::Command::new("openssl").args(args).output().unwrap();
+            assert!(out.status.success(), "openssl {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let (pem, key) = (pem.to_str().unwrap(), key.to_str().unwrap());
+        let legacy = ["-certpbe", "PBE-SHA1-3DES", "-keypbe", "PBE-SHA1-3DES", "-macalg", "sha1"];
+        for (name, pass, extra) in [("aes.pfx", "openssl-pass", &[][..]), ("legacy.pfx", "openssl-pass", &legacy[..]), ("empty.pfx", "", &[][..])] {
+            let out = dir.join(name);
+            openssl(&[&["pkcs12", "-export", "-in", pem, "-out", out.to_str().unwrap(), "-passout"][..], &[format!("pass:{pass}").as_str()], extra].concat());
+            let got = certificate(&out, (!pass.is_empty()).then_some(pass)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(got.x5t_s256, cert.x5t, "{name}");
+        }
+        let enc = dir.join("enc.pem");
+        openssl(&["pkcs8", "-topk8", "-v2", "aes-256-cbc", "-in", key, "-out", enc.to_str().unwrap(), "-passout", "pass:openssl-pass"]);
+        std::fs::write(&enc, format!("{}{}", cert.cert_pem, std::fs::read_to_string(&enc).unwrap())).unwrap();
+        assert_eq!(certificate(&enc, Some("openssl-pass")).unwrap().x5t_s256, cert.x5t);
     }
 
     #[test]
@@ -1642,7 +1807,7 @@ mod tests {
         // A certificate the app doesn't have is refused, naming its thumbprint, never the key.
         std::fs::write(&file, unknown.pem()).unwrap();
         f.tokens.lock().unwrap().clear();
-        let thumbprint = certificate(&file).unwrap().thumbprint;
+        let thumbprint = certificate(&file, None).unwrap().thumbprint;
         assert_eq!(thumbprint.len(), 40);
         let e = s.get("SMTP_PASSWORD").unwrap_err().to_string();
         assert!(e.contains("401") && e.contains("invalid_client") && e.contains(&thumbprint) && e.contains("app client-1") && !e.contains("PRIVATE KEY") && !e.contains("AADSTS"), "{e}");
@@ -1688,7 +1853,7 @@ mod tests {
         let kv = "https://kv1.vault.azure.net";
         let with = |extra: &[(&str, &str)]| {
             let pairs = [&[("AZURE_KEYVAULT_URL", kv), ("AZURE_KEYVAULT_AUTH", "client-certificate"), ("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c")][..], extra].concat();
-            Config::from_env(&settings(&pairs), &EnvStore::fixed(&[]))
+            Config::from_env(&settings(&pairs), &EnvStore::fixed(extra))
         };
         let in_file = |pem: &str| {
             let file = cert_file("azure-cert-check", pem);
@@ -1705,8 +1870,8 @@ mod tests {
             (format!("{}{}", good.pem(), other.key_pem), "more than one private key"),
             (format!("{}{ec}", good.cert_pem), "isn't an RSA key"),
             (format!("{}-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n", good.cert_pem), "EC key"),
-            (format!("{}-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n", good.cert_pem), "encrypted"),
-            (format!("{}-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n", good.cert_pem), "encrypted"),
+            (good.encrypted_pem("pem-password"), "its private key is encrypted; set AZURE_CLIENT_CERTIFICATE_PASSWORD"),
+            (format!("{}-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n", good.cert_pem), "encrypted the legacy OpenSSL way"),
             (format!("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n{}", good.key_pem), "isn't base64"),
             (format!("{}-----END CERTIFICATE-----\n", good.key_pem), "no matching BEGIN"),
             (format!("{}-----BEGIN PRIVATE KEY-----\nMIIE", good.pem()), "has no END; was the file cut short?"),
@@ -1717,12 +1882,41 @@ mod tests {
             let e = in_file(&pem).err().unwrap_or_default();
             assert!(e.starts_with("AZURE_CLIENT_CERTIFICATE_PATH: ") && e.contains(err) && !e.contains(secret_part), "expected {err:?}: {e}");
         }
-        let file = cert_file("azure-cert-settings", &good.pem());
+        // PFX files: the password opens them; their key and certificates are checked as a PEM file's.
+        use p12_keystore::EncryptionAlgorithm::PbeWithHmacSha256AndAes256 as Aes;
+        let ec_pkcs8 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap().serialize_der();
+        let pw = ("AZURE_CLIENT_CERTIFICATE_PASSWORD", "pfx-password");
+        let pfx_with = |contents: Vec<u8>, extra: &[(&str, &str)]| {
+            let file = cert_file("azure-pfx-check", contents);
+            with(&[&[("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap())][..], extra].concat())
+        };
+        assert!(pfx_with(good.pfx("pfx-password", Aes), &[pw]).is_ok());
+        assert!(pfx_with(pfx_of(&[(&good.pkcs8, &[&ca.cert_der, &good.cert_der])], "pfx-password", Aes), &[pw]).is_ok(), "with its chain, in any order");
+        assert!(in_file(&good.encrypted_pem("pem-password")).is_err() && with(&[("AZURE_CLIENT_CERTIFICATE_PATH", cert_file("azure-enc-ok", good.encrypted_pem("pem-password")).to_str().unwrap()), ("AZURE_CLIENT_CERTIFICATE_PASSWORD", "pem-password")]).is_ok());
+        let mut cut = good.pfx("", Aes);
+        cut.truncate(cut.len() / 2);
+        for (contents, extra, err) in [
+            (good.pfx("pfx-password", Aes), vec![], "it is a PFX file with a password; set AZURE_CLIENT_CERTIFICATE_PASSWORD"),
+            (good.pfx("pfx-password", Aes), vec![("AZURE_CLIENT_CERTIFICATE_PASSWORD", "wrong-password")], "AZURE_CLIENT_CERTIFICATE_PASSWORD doesn't open it"),
+            (pfx_of(&[(&good.pkcs8, &[&good.cert_der]), (&other.pkcs8, &[&other.cert_der])], "pfx-password", Aes), vec![pw], "more than one private key"),
+            (pfx_of(&[(&good.pkcs8, &[&other.cert_der])], "pfx-password", Aes), vec![pw], "none of its certificates is for its private key"),
+            (pfx_of(&[(&ec_pkcs8, &[&good.cert_der])], "pfx-password", Aes), vec![pw], "isn't an RSA key"),
+            (pfx_of(&[(&good.pkcs8, &[])], "pfx-password", Aes), vec![pw], "no certificate"),
+            (TestCert::new(-30, -1).pfx("pfx-password", Aes), vec![pw], "expired on"),
+            (cut, vec![], "neither a PEM file nor a PFX file"),
+            (vec![0x30, 0x03, 0x02, 0x01, 0x03], vec![], "neither a PEM file nor a PFX file"),
+            (vec![0xff, 0xfe, 0x00], vec![], "no private key"),
+        ] {
+            let e = pfx_with(contents, &extra).err().unwrap_or_default();
+            assert!(e.starts_with("AZURE_CLIENT_CERTIFICATE_PATH: ") && e.contains(err) && !e.contains("pfx-password") && !e.contains("wrong-password"), "expected {err:?}: {e}");
+        }
+        let file = cert_file("azure-cert-settings", good.pem());
         let path = ("AZURE_CLIENT_CERTIFICATE_PATH", file.to_str().unwrap());
         for (extra, err) in [
             (vec![], "needs AZURE_CLIENT_CERTIFICATE_PATH"),
             (vec![("AZURE_CLIENT_CERTIFICATE_PATH", "/nonexistent/superbot/cert.pem")], "AZURE_CLIENT_CERTIFICATE_PATH: /nonexistent/superbot/cert.pem"),
-            (vec![path, ("AZURE_CLIENT_CERTIFICATE_PASSWORD", "pfx-password")], "AZURE_CLIENT_CERTIFICATE_PASSWORD isn't supported"),
+            (vec![path, pw], "AZURE_CLIENT_CERTIFICATE_PASSWORD is set, but its private key isn't encrypted"),
+            (vec![path, pw, ("AZURE_CLIENT_CERTIFICATE_PASSWORD_FILE", "/nonexistent/superbot/password")], "not both"),
             (vec![path, ("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN", "true")], "AZURE_CLIENT_SEND_CERTIFICATE_CHAIN isn't supported"),
             (vec![path, ("AZURE_TENANT_ID", "")], "AZURE_TENANT_ID"),
         ] {
