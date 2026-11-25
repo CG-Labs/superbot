@@ -715,9 +715,14 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             if jit_role.is_some() && allowed_domains.is_empty() {
                 return Err(format!("{} without {} would let anyone SAML IdP {idps} signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
             }
-            if several && attributes.groups.is_some() {
-                // Every IdP names its own groups: one's "admins" isn't another's.
-                return Err(format!("{} can't be used with {}: group names from one IdP would grant roles to another's people", key("GROUPS_ATTRIBUTE"), key("IDP_ENTITY_IDS")));
+            // Every IdP names its own groups: one's "staff" isn't another's. Only a value scoped
+            // to an IdP's own domain says whose it is (ADR 0287).
+            if several && let Some(g) = required_groups.iter().find(|g| saml_sp::group_scope(g).is_none()) {
+                return Err(format!(
+                    "{}: {g} isn't scoped to a domain, like member@uni.example. With {}, a required group must say whose it is, or one IdP's group would let another's people in",
+                    key("REQUIRED_GROUPS"),
+                    key("IDP_ENTITY_IDS")
+                ));
             }
             let sign_requests = match var(&key("SIGN_REQUESTS")).map(|v| v.to_ascii_lowercase()).as_deref() {
                 None | Some("false") => false,
@@ -1305,7 +1310,7 @@ async fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provi
     };
     let user = match groups {
         Some(g) => {
-            saml_roles::signed_in(app, a, source, p, &user, g, true).await;
+            saml_roles::signed_in(app, a, source, p, &claims.issuer, &user, g, true).await;
             app.db.user(&user.id).unwrap_or(user)
         }
         None => user,
@@ -1432,15 +1437,18 @@ async fn check_saml(a: &Auth, app: &AppState, p: &Provider, entity: &str, msg: &
         }
     }
     checked.claims.response_binding = Some(msg.binding.as_str());
-    // Several IdPs (ADR 0282): each speaks only for its own domains, as the federation says.
-    if p.several_idps()
-        && let Some(email) = checked.claims.email.as_deref()
-        && !idp.in_scope(email)
-    {
-        if p.takes_email(email).is_some() {
-            return Err((Refused("email_out_of_scope", None), true));
+    // Several IdPs (ADR 0282, 0287): each speaks only for its own domains, as the federation
+    // says, for emails and scoped groups alike.
+    if p.several_idps() {
+        if let Some(email) = checked.claims.email.as_deref()
+            && !idp.in_scope(email)
+        {
+            if p.takes_email(email).is_some() {
+                return Err((Refused("email_out_of_scope", None), true));
+            }
+            checked.claims.email = None;
         }
-        checked.claims.email = None;
+        checked.groups_out_of_scope = idp.scope_groups(&mut checked.groups);
     }
     Ok(checked)
 }
@@ -1545,14 +1553,17 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
             saml_sp::Groups::Unknown(why) => Some(("groups_unknown", json!({ "groups": why }))),
             saml_sp::Groups::NotRead => Some(("groups_unknown", json!({ "groups": "not_read" }))),
         };
-        if let Some((reason, extra)) = refusal {
+        if let Some((reason, mut extra)) = refusal {
             a.limiter.fail(&ip, at);
+            if !checked.groups_out_of_scope.is_empty() {
+                extra["groupsOutOfScope"] = json!(checked.groups_out_of_scope.iter().take(20).map(|g| crate::audit::clip(g, 128)).collect::<Vec<_>>());
+            }
             failed(a, source, id, reason, Some(&checked.claims), extra);
             // The IdP still vouched for their groups: what a group they left gave goes now.
             if let Some((i, user)) = app.db.identity(&checked.claims.issuer, &checked.claims.subject)
                 && i.provider == p.id
             {
-                saml_roles::signed_in(app, a, source, p, &user, &checked.groups, false).await;
+                saml_roles::signed_in(app, a, source, p, &checked.claims.issuer, &user, &checked.groups, false).await;
             }
             return ret.fail("sso_not_allowed");
         }
@@ -3411,7 +3422,12 @@ mod tests {
         assert!(err(&[("SSO_CORP_IDP_ENTITY_IDS", many)]).contains("at most"));
         assert!(err(&[two, ("SSO_CORP_IDP_MDQ_URL", ""), ("SSO_CORP_IDP_METADATA_URL", "https://idp.example/m")]).contains("needs SSO_CORP_IDP_MDQ_URL"));
         assert!(err(&[two, ("SSO_CORP_IDP_MDQ_URL", "")]).contains("needs SSO_CORP_IDP_MDQ_URL"), "nor imported");
-        assert!(err(&[two, ("SSO_CORP_GROUPS_ATTRIBUTE", "groups")]).contains("grant roles to another's people"));
+        // Groups are each IdP's (ADR 0287): a required group must be scoped to say whose.
+        assert!(several(&[two, ("SSO_CORP_GROUPS_ATTRIBUTE", "groups")]).is_ok());
+        assert!(err(&[two, ("SSO_CORP_GROUPS_ATTRIBUTE", "groups"), ("SSO_CORP_REQUIRED_GROUPS", "member@a.example,staff")]).contains("staff isn't scoped to a domain"));
+        assert!(err(&[two, ("SSO_CORP_GROUPS_ATTRIBUTE", "groups"), ("SSO_CORP_REQUIRED_GROUPS", "member@localhost")]).contains("isn't scoped"));
+        let s = several(&[two, ("SSO_CORP_GROUPS_ATTRIBUTE", "groups"), ("SSO_CORP_REQUIRED_GROUPS", "member@a.example, faculty@b.example")]).unwrap();
+        assert!(matches!(&s.providers[0].kind, Kind::SamlSp { required_groups, .. } if required_groups == &["member@a.example", "faculty@b.example"]));
         assert!(err(&[two, ("SSO_CORP_IDP_INITIATED", "restart")]).contains("IdP chooser"));
         assert!(native(&[("SSO_CORP_IDP_ENTITY_ID", ""), two]).err().unwrap().contains("needs SSO_CORP_IDP_MDQ_URL"));
         assert!(saml(&[("SSO_ADFS_IDP_ENTITY_IDS", "https://a.example/idp,https://b.example/idp")]).is_err(), "a native setting on the bridge");

@@ -1593,7 +1593,7 @@ async fn a_provider_that_stops_reading_groups_takes_back_what_its_groups_gave() 
     let u = sp.link();
     let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
     // Mapped while it read groups, then restarted without.
-    let m = sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
+    let m = sp.app.db.create_saml_role_mapping(&sp.id, None, "Auditors", &auditor.id, None).unwrap();
     assert!(sp.app.db.grant_saml_role(&m, &u.id));
     let (code, _, _) = sp.sign_in(in_groups(&["Auditors"])).await;
     assert_eq!(code, 200);
@@ -1608,8 +1608,8 @@ async fn a_change_by_hand_to_another_providers_grant_holds_against_this_ones_gro
     let sp = serve(&[("GROUPS_ATTRIBUTE", "groups")]).await;
     let u = sp.link();
     let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
-    sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
-    let theirs = sp.app.db.create_saml_role_mapping("other", "Auditors", &auditor.id, None).unwrap();
+    sp.app.db.create_saml_role_mapping(&sp.id, None, "Auditors", &auditor.id, None).unwrap();
+    let theirs = sp.app.db.create_saml_role_mapping("other", None, "Auditors", &auditor.id, None).unwrap();
     assert!(sp.app.db.grant_saml_role(&theirs, &u.id));
     let (code, e) = call(sp.port, "DELETE", &format!("/api/roles/{}/users/{}", auditor.id, u.id), &sp.admin, "").await;
     assert_eq!(code, 200, "{e}");
@@ -1625,7 +1625,7 @@ async fn a_sign_in_refused_for_required_groups_still_takes_back_what_a_left_grou
     let sp = serve_with(&[("GROUPS_ATTRIBUTE", "groups"), ("REQUIRED_GROUPS", "SuperBot Users")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
     let u = sp.link();
     let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
-    sp.app.db.create_saml_role_mapping(&sp.id, "Auditors", &auditor.id, None).unwrap();
+    sp.app.db.create_saml_role_mapping(&sp.id, None, "Auditors", &auditor.id, None).unwrap();
     let role_id = || sp.app.db.user(&u.id).unwrap().role_id;
 
     // Refused: never given anything.
@@ -3159,5 +3159,153 @@ async fn idps_sharing_a_certificate_are_each_warned_about_it() {
     let mut warned: Vec<String> = sp.audit("sso.saml_certificate_expiring").await.iter().filter(|e| e["details"]["role"] == "idp_signing").map(|e| e["details"]["entityId"].as_str().unwrap().to_string()).collect();
     warned.sort();
     assert_eq!(warned, [IDP, IDP_B], "one notice each, not one for both");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// Groups with several IdPs of a federation (ADR 0287)
+
+impl Sp {
+    /// A user linked at IdP `idp` with NameID `subject`, as stored.
+    fn link_at(&self, idp: &str, subject: &str, email: &str, role: Role) -> (User, String) {
+        let u = self.app.db.create_user(None, Some(email), email, role).unwrap();
+        let i = self.app.db.link_identity(&u.id, &NewIdentity { provider: &self.id, issuer: idp, subject, tenant: None, email: None, created_by: Some("test") }).unwrap();
+        (u, i.id)
+    }
+}
+
+#[tokio::test]
+async fn each_idp_of_a_federation_maps_its_own_groups() {
+    let (sp, dir, _) = serve_federation(&[("GROUPS_ATTRIBUTE", "groups")], 2).await;
+    let (port, admin, id) = (sp.port, sp.admin.clone(), sp.id.clone());
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+    let map = async |body: Value| {
+        let (code, v) = call(port, "POST", "/api/sso/role-mappings", &admin, &body.to_string()).await;
+        (code, serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v)))
+    };
+
+    // Each mapping says whose group it is.
+    let (code, e) = map(json!({ "provider": id, "group": "staff", "role": "Auditor" })).await;
+    assert!(code == 400 && e.to_string().contains("--idp"), "{code} {e}");
+    let (code, e) = map(json!({ "provider": id, "group": "staff", "role": "Auditor", "idp": "https://idp.other.example" })).await;
+    assert!(code == 400 && e.to_string().contains("not one of this provider's IdPs"), "{code} {e}");
+    assert_eq!(map(json!({ "provider": id, "group": "staff", "role": "Auditor", "idp": 7 })).await.0, 400);
+    let (code, at_a) = map(json!({ "provider": id, "group": "staff", "role": "Auditor", "idp": IDP })).await;
+    assert_eq!(code, 201, "{at_a}");
+    assert_eq!((at_a["idp"].as_str(), at_a["active"].as_bool()), (Some(IDP), Some(true)));
+    assert_eq!(sp.audit("sso.saml_role_mapped").await[0]["details"]["idp"], IDP);
+    let (code, e) = map(json!({ "provider": id, "group": "staff", "role": "Auditor", "idp": IDP })).await;
+    assert!(code == 409 && e.to_string().contains(&format!("at {IDP}")), "{code} {e}");
+    let (_, all) = call(port, "GET", "/api/sso/role-mappings", &admin, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&all).unwrap()["providers"][0]["idps"], json!([IDP, IDP_B]));
+
+    let (ada, _) = sp.link_at(IDP, STORED, "ada@example.com", Role::Readonly);
+    let (bob, _) = sp.link_at(IDP_B, "00ubob", "bob@uni-b.example", Role::Readonly);
+    let role_of = |u: &User| sp.app.db.user(&u.id).unwrap().role_id;
+    let at_b = |groups: &'static [&'static str]| {
+        move |r: &mut Response| {
+            from_b(r);
+            r.name_id = "00uBOB".into();
+            in_groups(groups)(r);
+        }
+    };
+
+    // B's "staff" isn't A's.
+    let (code, _, _) = sp.sign_in_at(IDP_B, at_b(&["staff"])).await;
+    assert_eq!((code, role_of(&bob)), (200, None));
+    let (code, _, _) = sp.sign_in_at(IDP, in_groups(&["staff"])).await;
+    assert_eq!((code, role_of(&ada)), (200, Some(auditor.id.clone())));
+    let given = &sp.audit("role.assigned").await[0]["details"];
+    assert_eq!((given["idp"].as_str(), given["user"].as_str()), (Some(IDP), Some(ada.id.as_str())));
+    let (code, at_b_map) = map(json!({ "provider": id, "group": "staff", "role": auditor.id, "idp": IDP_B })).await;
+    assert_eq!(code, 201, "{at_b_map}");
+    sp.sign_in_at(IDP_B, at_b(&["staff"])).await;
+    assert_eq!(role_of(&bob), Some(auditor.id.clone()));
+    assert_eq!(sp.audit("role.assigned").await[0]["details"]["mapping"], at_b_map["id"]);
+
+    // Someone at both IdPs: only the IdP whose group gave the role can say they left it.
+    let (carol, at_a_identity) = sp.link_at(IDP, "00ucarol", "carol@example.com", Role::Readonly);
+    let carol_b = sp.app.db.link_identity(&carol.id, &NewIdentity { provider: &id, issuer: IDP_B, subject: "00ucarol", tenant: None, email: None, created_by: Some("test") }).unwrap();
+    let carol_at_a = |groups: &'static [&'static str]| {
+        move |r: &mut Response| {
+            r.name_id = "00uCAROL".into();
+            in_groups(groups)(r);
+        }
+    };
+    let carol_at_b = |groups: &'static [&'static str]| {
+        move |r: &mut Response| {
+            from_b(r);
+            r.name_id = "00uCAROL".into();
+            in_groups(groups)(r);
+        }
+    };
+    sp.sign_in_at(IDP, carol_at_a(&["staff"])).await;
+    assert_eq!(role_of(&carol), Some(auditor.id.clone()));
+    sp.sign_in_at(IDP_B, carol_at_b(&[])).await;
+    assert_eq!(role_of(&carol), Some(auditor.id.clone()), "B can't say she left A's group");
+    let (code, e) = call(port, "DELETE", &format!("/api/users/{}/identities/{}", carol.id, carol_b.id), &admin, "").await;
+    assert_eq!(code, 200, "{e}");
+    assert_eq!(role_of(&carol), Some(auditor.id.clone()), "unlinked at B, still linked at A");
+    sp.sign_in_at(IDP, carol_at_a(&["everyone"])).await;
+    assert_eq!(role_of(&carol), None);
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "left_group");
+    sp.sign_in_at(IDP, carol_at_a(&["staff"])).await;
+    let (code, _) = call(port, "DELETE", &format!("/api/users/{}/identities/{at_a_identity}", carol.id), &admin, "").await;
+    assert_eq!((code, role_of(&carol)), (200, None));
+    assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "unlinked");
+
+    // A mapping for an IdP the provider no longer has (made when it had one IdP, or for one
+    // taken off the list) gives nothing, and what it gave goes at the next sign-in.
+    for (n, stale) in [None, Some("https://idp.gone.example")].into_iter().enumerate() {
+        let m = sp.app.db.create_saml_role_mapping(&id, stale, &format!("old-staff-{n}"), &auditor.id, None).unwrap();
+        let (_, v) = call(port, "GET", &format!("/api/sso/role-mappings/{}", m.id), &admin, "").await;
+        assert_eq!(serde_json::from_str::<Value>(&v).unwrap()["active"], false, "{v}");
+        let (dave, _) = sp.link_at(IDP, &format!("00udave{n}"), &format!("dave{n}@example.com"), Role::Readonly);
+        assert!(sp.app.db.grant_saml_role(&m, &dave.id));
+        let group = m.group.clone();
+        sp.sign_in_at(IDP, move |r| {
+            r.name_id = format!("00uDAVE{n}");
+            r.multi_attributes = vec![("groups".into(), vec![group])];
+        })
+        .await;
+        assert_eq!(role_of(&dave), None, "{stale:?}");
+        assert_eq!(sp.audit("role.unassigned").await[0]["details"]["reason"], "idp_not_listed");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn with_several_idps_a_group_scoped_to_another_idps_domain_never_counts() {
+    let (sp, dir, _) = serve_federation(&[("GROUPS_ATTRIBUTE", "groups"), ("REQUIRED_GROUPS", "member@example.com,member@uni-b.example")], 2).await;
+    let (bob, _) = sp.link_at(IDP_B, "00ubob", "bob@uni-b.example", Role::Member);
+    let at_b = |groups: &'static [&'static str]| {
+        move |r: &mut Response| {
+            from_b(r);
+            r.name_id = "00uBOB".into();
+            in_groups(groups)(r);
+        }
+    };
+
+    // B says Bob is a member at A: dropped, so he's in no required group.
+    let (code, to, _) = sp.sign_in_at(IDP_B, at_b(&["member@example.com", "MEMBER@Example.com", "staff"])).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_not_allowed"));
+    let f = sp.last_failure().await;
+    assert_eq!((f["reason"].as_str(), f["groupsOutOfScope"].clone()), (Some("not_in_group"), json!(["member@example.com", "MEMBER@Example.com"])));
+    let (code, _, head) = sp.sign_in_at(IDP_B, at_b(&["member@uni-b.example"])).await;
+    assert_eq!(code, 200);
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(bob.id.clone()));
+
+    // A's own scope counts at A, B's doesn't.
+    let ada = sp.link();
+    let (code, to, _) = sp.sign_in_at(IDP, in_groups(&["member@uni-b.example"])).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_not_allowed"));
+    let (code, _, head) = sp.sign_in_at(IDP, in_groups(&["member@example.com"])).await;
+    assert_eq!(code, 200);
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(ada.id.clone()));
+
+    // Mappings see the same groups: a scoped value out of the IdP's scope gives nothing.
+    let auditor = sp.app.db.create_custom_role("Auditor", "", Role::Member, &["audit.view"], None, None).unwrap();
+    sp.app.db.create_saml_role_mapping(&sp.id, Some(IDP_B), "faculty@example.com", &auditor.id, None).unwrap();
+    sp.sign_in_at(IDP_B, at_b(&["member@uni-b.example", "faculty@example.com"])).await;
+    assert_eq!(sp.app.db.user(&bob.id).unwrap().role_id, None);
     std::fs::remove_dir_all(dir).ok();
 }
