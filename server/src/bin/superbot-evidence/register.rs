@@ -1350,6 +1350,7 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
         }
         match (x.kind.as_str(), x.covers_from) {
             ("soc2-type2", None) => bad.push(format!("{what}: a Type II report covers a period, so coversFrom is its first day")),
+            ("iso27001", None) => bad.push(format!("{what}: an ISO 27001 certificate runs from its issue, coversFrom, to its expiry, coversTo")),
             ("soc2-type1", Some(_)) => bad.push(format!("{what}: a Type I report is as of one day, coversTo; it has no coversFrom")),
             (_, Some(f)) if f >= x.covers_to => bad.push(format!("{what}: coversFrom must be before coversTo")),
             _ => {}
@@ -1384,6 +1385,9 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
         }
         if x.bridged_to.is_some_and(|b| b <= x.covers_to) {
             bad.push(format!("{what}: bridgedTo comes after coversTo"));
+        }
+        if x.bridged_to.is_some_and(|b| b > x.reviewed) {
+            bad.push(format!("{what}: bridgedTo can't be after reviewed: a bridge letter speaking to a later day is a later review"));
         }
         let issued = if x.kind == "iso27001" { x.covers_from } else { Some(x.covers_to) };
         if issued.is_some_and(|i| x.reviewed < i) {
@@ -1902,7 +1906,13 @@ impl Check<'_> {
     /// role, with a SOC 2 report's complementary controls noted and any deviations or
     /// modified opinion treated in the risk register.
     fn report_sound(&self, x: &AssuranceReport) -> bool {
-        self.held(&x.reviewed_by, &REPORT_REVIEWERS, x.reviewed).is_some() && (!x.soc2() || x.cuecs_sha256.is_some()) && (!report_findings(x) || x.risk.is_some())
+        self.held(&x.reviewed_by, &REPORT_REVIEWERS, x.reviewed).is_some() && (!x.soc2() || x.cuecs_sha256.is_some()) && (!report_findings(x) || self.risk_treats(x))
+    }
+
+    /// Whether the report names a risk the register had identified before the period's
+    /// end: one added later can't have treated this period's findings.
+    fn risk_treats(&self, x: &AssuranceReport) -> bool {
+        x.risk.as_deref().is_some_and(|id| self.r.risks.iter().any(|k| k.id == id && k.identified < self.cut()))
     }
 
     pub fn vendors(&self) -> (Value, Vec<&'static str>) {
@@ -1929,7 +1939,7 @@ impl Check<'_> {
             if x.opinion.as_deref().is_some_and(|o| o != "unqualified") {
                 modified.push(json!(format!("{label}: {}", x.opinion.as_deref().unwrap_or_default())));
             }
-            if report_findings(x) && x.risk.is_none() {
+            if report_findings(x) && !self.risk_treats(x) {
                 untreated.push(json!(label));
             }
         }
@@ -3347,6 +3357,14 @@ mod tests {
         check(&v, &|c| assert_eq!(c.vendors().1, ["CC9.2-1"], "AR-05's qualified opinion is untreated"));
         v["assuranceReports"][1]["risk"] = json!("R-03");
         check(&v, &|c| assert_eq!(c.vendors().1, ["CC6.4-1", "CC9.2-1"], "treated by an accepted risk"));
+        v["risks"][2]["identified"] = json!("2027-04-01");
+        v["risks"][2]["acceptedAt"] = json!("2027-04-02");
+        v["risks"][2].as_object_mut().unwrap().remove("acceptedUntil");
+        check(&v, &|c| {
+            let (x, rows) = c.vendors();
+            assert_eq!(x["exceptions"]["findingsWithoutRisk"], json!(["AR-05 of linode (soc2-type2, reviewed 2027-03-12)"]), "a risk identified after the period didn't treat it");
+            assert_eq!(rows, ["CC9.2-1"]);
+        });
 
         // An ISO 27001 certificate holds until it expires; none in the year is flagged.
         let mut v = good();
@@ -3379,6 +3397,8 @@ mod tests {
         list.push(json!({ "id": "AR-X2", "vendor": "linode", "kind": "soc2-type1", "coversFrom": "2026-01-01", "coversTo": "2027-01-01", "reportSha256": ZERO, "opinion": "fine", "reviewed": "2027-01-02", "reviewedBy": "p-sec" }));
         list.push(json!({ "id": "AR-X3", "vendor": "linode", "kind": "iso27001", "coversFrom": "2027-02-01", "coversTo": "2027-01-01", "reportSha256": ZERO, "opinion": "unqualified", "deviations": true, "bridgedTo": "2027-02-01", "bridgeSha256": ZERO, "reviewed": "2027-01-02", "reviewedBy": "p-sec" }));
         list.push(json!({ "id": "AR X4", "vendor": "linode", "kind": "questionnaire", "coversTo": "2027-01-01", "reportSha256": ZERO, "reviewed": "2027-01-02", "reviewedBy": "p-sec" }));
+        list.push(json!({ "id": "AR-X5", "vendor": "linode", "kind": "iso27001", "coversTo": "2028-01-01", "reportSha256": ZERO, "reviewed": "2027-01-02", "reviewedBy": "p-sec" }));
+        list.push(json!({ "id": "AR-X6", "vendor": "linode", "kind": "soc2-type2", "coversFrom": "2026-01-01", "coversTo": "2026-12-31", "reportSha256": ZERO, "opinion": "unqualified", "bridgedTo": "2027-06-30", "bridgeSha256": ZERO, "reviewed": "2027-01-08", "reviewedBy": "p-sec" }));
         let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
         for want in [
             "assurance report id AR-01 is used twice",
@@ -3401,6 +3421,8 @@ mod tests {
             "assurance report AR-X3: deviations are a SOC 2 auditor's",
             "assurance report AR-X3: a bridge letter tops up a SOC 2 report's period",
             "assurance report AR-X3: reviewed can't be before the report speaks for",
+            "assurance report AR-X5: an ISO 27001 certificate runs from its issue, coversFrom, to its expiry, coversTo",
+            "assurance report AR-X6: bridgedTo can't be after reviewed",
         ] {
             assert!(e.contains(want), "{want}\n{e}");
         }
