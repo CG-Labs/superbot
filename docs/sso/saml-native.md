@@ -339,7 +339,7 @@ SSO_CORP_METADATA_SIGNING_CERT_FILE=/etc/superbot/corp-idp-metadata.pem
 - Signed metadata past its `validUntil` is refused, so an old copy can't be served again.
 - A refused copy never replaces the one in use. From a URL, botd keeps the last good copy and tries again later. An import is refused, and the stored copy stays. A bad file stops botd from starting.
 - The copy in use is never used past its `validUntil` either, not even as the last good one ([ADR 0281](../adr/0281-saml-metadata-from-mdq.md)). From a URL or MDQ, botd fetches it again; from a file or an import, sign-ins fail as `idp_metadata_expired` until you give botd a fresh signed copy. `botctl sso saml corp` shows `Valid until` under the metadata. Unsigned metadata's `validUntil` vouches for nothing, so it ends nothing.
-- Refusals are audited as `sso.saml_metadata_refused` (`botctl audit --action sso.saml_metadata_refused`), with the source, the reason (`unsigned`, `bad_signature`, `wrapped`, `weak_algorithm`, `bad_algorithm`, `expired`, and for MDQ `no_valid_until` and `valid_too_long`), and whether a good copy is still in use (`kept`). `botctl sso saml corp` shows the setting and the trusted certificates.
+- Refusals are audited as `sso.saml_metadata_refused` (`botctl audit --action sso.saml_metadata_refused`), with the source, the reason (`unsigned`, `bad_signature`, `wrapped`, `weak_algorithm`, `bad_algorithm`, `expired`, and for MDQ `not_one_entity`, `no_valid_until` and `valid_too_long`), and whether a good copy is still in use (`kept`). `botctl sso saml corp` shows the setting and the trusted certificates.
 
 ### Metadata from a federation (MDQ)
 

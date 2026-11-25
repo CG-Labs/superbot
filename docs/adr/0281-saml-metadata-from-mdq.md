@@ -26,10 +26,10 @@ botd could already read and check a signed aggregate up to 1 MB, or one entity's
 - **Fetching** is as for a metadata URL: when needed, refreshed daily, retried at most once per gap after a failure, at most 1 MB, over the SSO HTTP client (no redirects). A 404 is logged as the server not knowing the entity.
 - **A signer is required.** The provider needs `METADATA_SIGNING_CERT_FILE`, the federation's MDQ signing certificate, and `SIGNED_METADATA=allow` is refused at startup. Without them botd won't start.
 - **The answer** (`MetadataTrust::query`) must be:
-  - the IdP's own `EntityDescriptor` at the root. An `EntitiesDescriptor` is refused, whether signed as a whole or only around the entity: that is not what the protocol returns for one entity, and a signature on part of a document leaves the rest unchecked;
+  - the IdP's own `EntityDescriptor` at the root. An `EntitiesDescriptor` is refused, whether signed as a whole or only around the entity: that is not what the protocol returns for one entity, and a signature on part of a document leaves the rest unchecked (`not_one_entity`);
   - signed at the root (Shibboleth's `requireSignedRoot`) by a certificate in the file, with the algorithms ADR 0151 takes (`unsigned`, `bad_signature`, `weak_algorithm`);
   - with a `validUntil` (`no_valid_until`), not past (`expired`), and at most 30 days ahead (`valid_too_long`). 30 days covers federations' MDQ answers (InCommon's are valid for 14 days) and limits how long a stolen or cached answer can be served again.
-- **Refusals** are audited as `sso.saml_metadata_refused` with `source: "mdq"`, and the last good copy stays, as for a metadata URL.
+- **Refusals** are audited as `sso.saml_metadata_refused` with `source: "mdq"`, and the last good copy stays, as for a metadata URL, but only until its own `validUntil`: an expired copy is never used, and that is checked again after a refresh that fails.
 - **Everything else is the same.** The `EntityDescriptor` is read as before: SSO, SLO and artifact resolution endpoints, signing certificates, `WantAuthnRequestsSigned`. Certificate expiry warnings (ADR 0198) cover the federation's signer and the IdP's certificates, and refresh first when due. `botd offline check` and `botctl offline check` (ADR 0257, 0266) list the MDQ URL as an address botd reaches.
 
 ### No signed copy past its validUntil

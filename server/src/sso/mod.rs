@@ -3248,6 +3248,24 @@ mod tests {
         assert!(p.idp_metadata(&http, Duration::ZERO).await.is_ok(), "no validUntil: no end");
         p.set_idp(copy(Some(db::now() - 1)));
         assert_eq!(p.idp_metadata(&http, Duration::ZERO).await.unwrap_err(), jwt::Invalid("idp_metadata_expired"), "not even as the last good copy");
+
+        // A refresh that fails after the copy's validUntil passed while it waited.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let slow = axum::Router::new().fallback(|| async {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        });
+        tokio::spawn(async move { axum::serve(listener, slow).await.unwrap() });
+        let url: &'static str = Box::leak(format!("http://127.0.0.1:{port}/md").into_boxed_str());
+        let s = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "saml"), ("SSO_CORP_IDP_ENTITY_ID", IDP)], &[("SSO_CORP_IDP_METADATA_URL", url)]).unwrap();
+        let p = &s.providers[0];
+        p.set_idp(copy(Some(db::now() + 500)));
+        p.age_idp(Duration::from_secs(25 * 3600));
+        assert_eq!(p.idp_metadata(&http, Duration::ZERO).await.unwrap_err(), jwt::Invalid("idp_metadata_expired"), "checked again after the wait");
+        p.set_idp(copy(Some(db::now() + 60_000)));
+        p.age_idp(Duration::from_secs(25 * 3600));
+        assert!(p.idp_metadata(&http, Duration::ZERO).await.is_ok(), "still valid after the failed refresh: kept");
     }
 
     fn random_hex() -> String {

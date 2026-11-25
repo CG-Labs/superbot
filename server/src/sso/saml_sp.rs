@@ -489,7 +489,7 @@ pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, bindi
         return Err(MetadataRefused::bad(if found.is_empty() { "no EntityDescriptor in the metadata".into() } else { format!("the metadata is for {}, not {entity_id}", found.join(", ")) }));
     };
     if trust.is_some_and(|t| t.query) && entity != doc.root_element() {
-        return Err(MetadataRefused::bad(format!("the MDQ answer must be {entity_id}'s EntityDescriptor alone, not an EntitiesDescriptor: check SSO_<ID>_IDP_MDQ_URL is the MDQ server's base URL")));
+        return Err(MetadataRefused { reason: "not_one_entity", message: format!("the MDQ answer must be {entity_id}'s EntityDescriptor alone, not an EntitiesDescriptor: check SSO_<ID>_IDP_MDQ_URL is the MDQ server's base URL") });
     }
     let valid_until = match trust {
         Some(t) => check_signed(doc.root_element(), entity, t, now_ms).map_err(|e| MetadataRefused { message: format!("the metadata can't be trusted: {}", e.message), ..e })?,
@@ -2826,7 +2826,7 @@ pub(crate) mod tests {
         let aggregate = |inner: &str| format!(r#"<md:EntitiesDescriptor xmlns:md="{METADATA}" validUntil="{}">{inner}</md:EntitiesDescriptor>"#, instant(week));
         for xml in [signed_metadata(&aggregate(&entity), anchor), aggregate(&signed_metadata(&entity, anchor))] {
             let e = load_idp_metadata(&xml, IDP, false, RequestBinding::Auto, ResponseBinding::Post, Some(&t), NOW).unwrap_err();
-            assert!(e.reason == "bad_metadata" && e.message.contains("EntityDescriptor alone"), "{e:?}");
+            assert!(e.reason == "not_one_entity" && e.untrusted() && e.message.contains("EntityDescriptor alone"), "{e:?}");
         }
         let other = signed_metadata(&until(week).replace(IDP, "https://other.example/saml"), anchor);
         assert!(load_idp_metadata(&other, IDP, false, RequestBinding::Auto, ResponseBinding::Post, Some(&t), NOW).unwrap_err().message.contains("is for https://other.example/saml"), "another entity's answer");

@@ -669,10 +669,17 @@ impl Provider {
         {
             return Ok(m.clone());
         }
+        // The fetch can outlast the copy's validUntil: ask again before handing it out.
+        let unexpired = |m: Option<Arc<IdpMetadata>>, e: Invalid| match m {
+            Some(m) if m.valid_at(crate::db::now()) => Ok(m),
+            Some(_) => Err(Invalid("idp_metadata_expired")),
+            None if expired => Err(missing),
+            None => Err(e),
+        };
         if let Some((at, e)) = c.idp_failed
             && at.elapsed() < gap
         {
-            return stale.ok_or(if expired { missing } else { e });
+            return unexpired(stale, e);
         }
         let got = get_text(http, url).await.and_then(|xml| {
             saml_sp::load_idp_metadata(&xml, entity_id, *sign_requests, *request_binding, *response_binding, metadata_trust.as_ref(), crate::db::now()).map_err(|e| {
@@ -694,7 +701,7 @@ impl Provider {
                 if expired {
                     crate::obs::log::log_warn!("SSO {}: the IdP metadata in use has passed its validUntil and no fresh copy loaded from {url}", self.id);
                 }
-                stale.ok_or(if expired { missing } else { e })
+                unexpired(stale, e)
             }
         }
     }

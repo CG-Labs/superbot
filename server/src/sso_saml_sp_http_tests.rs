@@ -1358,6 +1358,8 @@ async fn mdq_answers_are_fetched_for_the_one_entity_and_held_to_mdqs_rules() {
     let (code, _, head) = sp.sign_in(|_| {}).await;
     assert_eq!(code, 200, "the last good copy, still within its validUntil");
     assert_eq!(signed_in_as(sp.port, &head).await, Some(u.id));
+    let refused = &sp.audit("sso.saml_metadata_refused").await[0];
+    assert_eq!((refused["details"]["reason"].as_str(), refused["details"]["source"].as_str(), refused["details"]["kept"].as_bool()), (Some("not_one_entity"), Some("mdq"), Some(true)));
     std::fs::remove_dir_all(dir).ok();
 }
 
