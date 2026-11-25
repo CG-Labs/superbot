@@ -8498,7 +8498,7 @@ impl Db {
         let id = format!("s{}", crate::random_hex(8));
         {
             let c = self.c();
-            let place = self.place_for_user(&c, &s.user_id).unwrap();
+            let place = self.place_for_user(&c, s.user_id).unwrap();
             c.execute(
                 &format!(
                     "INSERT INTO {place}.sessions (id, token_hash, user_id, kind, method, idp_subject, idp_provider, label, ip, user_agent, created_at, last_seen_at, expires_at, mfa)
