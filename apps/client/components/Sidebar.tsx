@@ -182,7 +182,8 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
                   action={{ label: "New Bot", onPress: onNewBot }}
                 />
               ) : null
-            ) : (
+            ) : !compact ? null : (
+              // Wide windows say this in the chat pane beside the list.
               <EmptyState
                 compact
                 glyph="+"

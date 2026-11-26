@@ -175,9 +175,9 @@ describe("Sidebar Bots for screen readers", () => {
 });
 
 describe("Sidebar empty states", () => {
-  it("offers a first Bot when there are none", async () => {
+  it("offers a first Bot on phones when there are none", async () => {
     const props = setup(MEMBER);
-    await render(<Sidebar {...props} />);
+    await render(<Sidebar {...props} compact />);
     expect(screen.getByRole("heading", { name: "No Bots yet" })).toBeOnTheScreen();
     // The empty state's button, beside the "+" at the top.
     const buttons = screen.getAllByRole("button", { name: "New Bot" });
@@ -189,9 +189,14 @@ describe("Sidebar empty states", () => {
   it("tells read-only people where shared Bots appear, with nothing to press", async () => {
     const props = setup(READONLY);
     mockCtx.canWrite = false;
-    await render(<Sidebar {...props} />);
+    await render(<Sidebar {...props} compact />);
     expect(screen.getByText("Bots shared with you show up here.")).toBeOnTheScreen();
     expect(screen.queryByRole("button", { name: "New Bot" })).toBeNull();
+  });
+
+  it("leaves the first-Bot offer to the chat pane on wide windows", async () => {
+    await render(<Sidebar {...setup(MEMBER)} />);
+    expect(screen.queryByRole("heading", { name: "No Bots yet" })).toBeNull();
   });
 
   it("suggests more Bots beside the main one", async () => {
