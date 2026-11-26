@@ -28,6 +28,9 @@
 //!   `EncryptedID` (ADR 0151), read only from the verified assertion, decrypted like an
 //!   assertion and holding exactly one NameID. The caller then refuses a second use of the
 //!   assertion's ID, and keeps the NameID and `SessionIndex` for single logout (`saml_slo`).
+//!   With `SUBJECT=subject-id` or `pairwise-id` (ADR 0319), the person is that attribute
+//!   instead: exactly one valid value, scoped to one of the IdP's `shibmd:Scope`s, and the
+//!   NameID, transient or not, is kept only for single logout.
 //! - **Groups**, only when the provider names a groups attribute (ADR 0160): every value of
 //!   it in the verified assertion. Entra's overage claim, or more than `MAX_GROUPS` values,
 //!   make the groups unknown, which the caller treats as in none.
@@ -97,12 +100,77 @@ pub const MAX_GROUP_LEN: usize = 256;
 /// Which assertion attributes hold the email and name. None: the usual names above.
 /// `groups` has no default: groups are read only from the attribute an admin names (ADR 0160).
 /// Nor has `authn_methods`, the attribute that lists how the person signed in (ADR 0190).
+/// `subject` says what names the person: the NameID, or a subject identifier attribute (ADR 0319).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attributes {
     pub email: Option<String>,
     pub name: Option<String>,
     pub groups: Option<String>,
     pub authn_methods: Option<String>,
+    pub subject: Subject,
+}
+
+/// What a native provider knows people by (`SSO_<ID>_SUBJECT`, ADR 0319). NameId: the NameID,
+/// which must not be transient. SubjectId or PairwiseId: that attribute of the OASIS SAML V2.0
+/// Subject Identifier Attributes Profile, one scoped value at one of the IdP's `shibmd:Scope`s;
+/// the NameID, any format, is then kept only for single logout.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Subject {
+    #[default]
+    NameId,
+    SubjectId,
+    PairwiseId,
+}
+
+/// The two attributes, as the profile names them (with the `uri` name format).
+pub const SUBJECT_ID: &str = "urn:oasis:names:tc:SAML:attribute:subject-id";
+pub const PAIRWISE_ID: &str = "urn:oasis:names:tc:SAML:attribute:pairwise-id";
+/// The entity attribute an SP's metadata says which one it requires with.
+pub const SUBJECT_ID_REQ: &str = "urn:oasis:names:tc:SAML:profiles:subject-id:req";
+const ATTRNAME_URI: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:uri";
+
+impl Subject {
+    pub fn parse(s: &str) -> Option<Subject> {
+        match s.to_ascii_lowercase().as_str() {
+            "nameid" => Some(Subject::NameId),
+            "subject-id" => Some(Subject::SubjectId),
+            "pairwise-id" => Some(Subject::PairwiseId),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Subject::NameId => "nameid",
+            Subject::SubjectId => "subject-id",
+            Subject::PairwiseId => "pairwise-id",
+        }
+    }
+
+    /// The assertion attribute it is read from, if not the NameID.
+    pub fn attribute(self) -> Option<&'static str> {
+        match self {
+            Subject::NameId => None,
+            Subject::SubjectId => Some(SUBJECT_ID),
+            Subject::PairwiseId => Some(PAIRWISE_ID),
+        }
+    }
+}
+
+/// A subject identifier value as the profile defines it (section 3.3.1): a unique ID of 1 to
+/// 127 letters, digits, `=` and `-`, then `@` and a scope of 1 to 127 letters, digits, `-` and
+/// `.`, each starting with a letter or digit; surrounding whitespace isn't part of it. Values
+/// are compared without case, so it's kept lowercase, as identities keep SAML subjects.
+pub fn subject_id_value(v: &str) -> Option<String> {
+    let v = v.trim_matches([' ', '\t', '\n', '\r']);
+    let (id, scope) = v.split_once('@')?;
+    let part = |p: &str, more: &[u8]| (1..=127).contains(&p.len()) && p.as_bytes()[0].is_ascii_alphanumeric() && p.bytes().all(|b| b.is_ascii_alphanumeric() || more.contains(&b));
+    (part(id, b"=-") && part(scope, b"-.")).then(|| v.to_ascii_lowercase())
+}
+
+/// The scope of a value `subject_id_value` took: what follows its `@`.
+pub fn subject_id_scope(v: &str) -> &str {
+    v.rsplit_once('@').map_or("", |(_, s)| s)
 }
 
 /// The most authentication context values a provider requires, or are read from one assertion.
@@ -811,7 +879,19 @@ fn encryption_methods(aes_cbc: AesCbc) -> String {
 /// the ciphers taken (`aes_cbc`). During a rollover each use lists the key in use first, then
 /// the next one (ADR 0181). The ACS takes responses over `response` only (ADR 0268). With
 /// several IdPs, `discovery` is where a discovery service sends the browser back (ADR 0314).
-pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc, response: ResponseBinding, discovery: Option<&str>) -> String {
+/// With a subject identifier attribute (ADR 0319), the entity says it requires that one
+/// (`subject-id:req`), and asks for transient NameIDs, which only logout uses.
+pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc, response: ResponseBinding, discovery: Option<&str>, subject: Subject) -> String {
+    let (entity_extensions, name_id_format) = match subject.attribute() {
+        None => (String::new(), PERSISTENT),
+        Some(_) => (
+            format!(
+                "\n  <md:Extensions><mdattr:EntityAttributes xmlns:mdattr=\"{MDATTR}\"><saml:Attribute xmlns:saml=\"{ASSERTION}\" Name=\"{SUBJECT_ID_REQ}\" NameFormat=\"{ATTRNAME_URI}\"><saml:AttributeValue>{}</saml:AttributeValue></saml:Attribute></mdattr:EntityAttributes></md:Extensions>",
+                subject.as_str()
+            ),
+            TRANSIENT,
+        ),
+    };
     let signed = signing.is_some_and(|s| s.sign_requests);
     let key_info = |cert: &str| format!(r#"<ds:KeyInfo xmlns:ds="{}"><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#, xmldsig::DSIG);
     // Extensions come first in a role descriptor.
@@ -834,9 +914,9 @@ pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], ae
     }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<md:EntityDescriptor xmlns:md="{METADATA}" entityID="{}">
+<md:EntityDescriptor xmlns:md="{METADATA}" entityID="{}">{entity_extensions}
   <md:SPSSODescriptor AuthnRequestsSigned="{signed}" WantAssertionsSigned="true" protocolSupportEnumeration="{PROTOCOL}">{keys}
-    <md:NameIDFormat>{PERSISTENT}</md:NameIDFormat>
+    <md:NameIDFormat>{name_id_format}</md:NameIDFormat>
     <md:AssertionConsumerService Binding="{}" Location="{}" index="0" isDefault="true"/>
   </md:SPSSODescriptor>
 </md:EntityDescriptor>
@@ -1298,6 +1378,26 @@ fn attribute<'a>(assertion: Node<'a, '_>, names: &[&str]) -> Option<&'a str> {
     })
 }
 
+/// The one value of subject identifier attribute `name` in the (verified) assertion (ADR
+/// 0319), checked and lowercased by `subject_id_value`. None of it is `no_subject_id`; two
+/// attributes, two values, markup or a malformed value are `bad_subject_id`, never one of them
+/// picked. The profile makes it single-valued, so a second value means the IdP is wrong.
+fn subject_attribute(assertion: Node, name: &str) -> Result<String, Refused> {
+    let bad = || Refused("bad_subject_id", None);
+    let attrs: Vec<Node> = assertion.children().filter(|c| is(*c, ASSERTION, "AttributeStatement")).flat_map(|s| s.children().filter(|c| is(*c, ASSERTION, "Attribute"))).filter(|a| a.attribute("Name") == Some(name)).collect();
+    let attr = match attrs.as_slice() {
+        [] => return Err(Refused("no_subject_id", None)),
+        [a] => *a,
+        _ => return Err(bad()),
+    };
+    if attr.attribute("NameFormat").is_some_and(|f| f != ATTRNAME_URI) {
+        return Err(bad());
+    }
+    let values: Vec<Node> = attr.children().filter(|c| is(*c, ASSERTION, "AttributeValue")).collect();
+    let [v] = values.as_slice() else { return Err(bad()) };
+    text_of(*v).and_then(subject_id_value).ok_or_else(bad)
+}
+
 /// Every value of every `name` attribute in the (verified) assertion's attribute statements.
 /// Values that aren't plain text, are empty, or are longer than `MAX_GROUP_LEN` are left out:
 /// a group never matched only takes access away.
@@ -1671,10 +1771,20 @@ pub fn check_response_xml(xml: &str, e: &Expect) -> Result<Checked, Refused> {
     let (nid, id_with) = name_id_with(subject, e.decrypt)?;
     let mut decrypted_with: Vec<usize> = decrypted_with.into_iter().chain(id_with).collect();
     decrypted_with.dedup();
-    if nid.format.as_deref() == Some(TRANSIENT) {
-        return Err(Refused("transient_subject", None));
-    }
-    let raw = nid.value.as_str();
+    // A subject identifier attribute (ADR 0319) names the person only within a scope the
+    // IdP's metadata lists, so no IdP speaks for another's people.
+    let subject = match e.attributes.subject.attribute() {
+        None if nid.format.as_deref() == Some(TRANSIENT) => return Err(Refused("transient_subject", None)),
+        None => super::saml::subject(&nid.value),
+        Some(name) => {
+            let v = subject_attribute(assertion, name)?;
+            if !e.idp.scopes.iter().any(|s| s == subject_id_scope(&v)) {
+                return Err(Refused("subject_id_scope", None));
+            }
+            v
+        }
+    };
+    let subject_from = e.attributes.subject.attribute().map(|_| e.attributes.subject.as_str());
     let pick = |set: &Option<String>, defaults: &[&str]| match set {
         Some(n) => attribute(assertion, &[n.as_str()]),
         None => attribute(assertion, defaults),
@@ -1682,7 +1792,7 @@ pub fn check_response_xml(xml: &str, e: &Expect) -> Result<Checked, Refused> {
     let email = pick(&e.attributes.email, &EMAIL_ATTRIBUTES).filter(|m| m.len() <= 254 && crate::users::valid_email(m)).map(String::from);
     let name = pick(&e.attributes.name, &NAME_ATTRIBUTES).map(|n| crate::audit::clip(n, 100));
     let how = read_authn(assertion, e.attributes.authn_methods.as_deref());
-    let claims = Claims { issuer: e.idp.entity_id.clone(), subject: super::saml::subject(raw), tenant: None, email, name, username: None, authn_context: how.class().map(String::from), encryption, response_binding: None };
+    let claims = Claims { issuer: e.idp.entity_id.clone(), subject, tenant: None, email, name, username: None, authn_context: how.class().map(String::from), encryption, response_binding: None, subject_from };
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
@@ -2297,7 +2407,7 @@ pub(crate) mod tests {
         let slo = "https://bot.example.com/api/auth/sso/okta/slo";
         let slo_soap = "https://bot.example.com/api/auth/sso/okta/slo/soap";
         for sign_requests in [false, true] {
-            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off, ResponseBinding::Post, None);
+            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
             let doc = roxmltree::Document::parse(&md).unwrap();
             let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
             assert_eq!(spsso.attribute("AuthnRequestsSigned"), Some(if sign_requests { "true" } else { "false" }));
@@ -2308,7 +2418,7 @@ pub(crate) mod tests {
             let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
             assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         }
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None).contains("SingleLogoutService"), "no key, no logout");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId).contains("SingleLogoutService"), "no key, no logout");
     }
 
     #[test]
@@ -2317,14 +2427,14 @@ pub(crate) mod tests {
         let back = "https://bot.example.com/api/auth/sso/fed/discovery";
         let (key, _) = SpKey::generate("sp").unwrap();
         let signing = SpSigning { certs: &[&key.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false };
-        let md = sp_metadata(&sp, Some(&signing), &[], AesCbc::Off, ResponseBinding::Post, Some(back));
+        let md = sp_metadata(&sp, Some(&signing), &[], AesCbc::Off, ResponseBinding::Post, Some(back), Subject::NameId);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
         assert_eq!(order[..2], ["Extensions", "KeyDescriptor"], "Extensions first, as the schema says");
         let r = doc.descendants().find(|n| is(*n, IDP_DISCOVERY, "DiscoveryResponse")).unwrap();
         assert_eq!((r.attribute("Binding"), r.attribute("Location"), r.attribute("index"), r.attribute("isDefault")), (Some(IDP_DISCOVERY), Some(back), Some("0"), Some("true")));
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None).contains("Extensions"), "one IdP: nothing to discover");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId).contains("Extensions"), "one IdP: nothing to discover");
 
         let to = url::Url::parse(&discovery_request("https://service.seamlessaccess.org/ds/", SP, &format!("{back}?session=token&state=s&1"))).unwrap();
         let q: Vec<(String, String)> = to.query_pairs().into_owned().collect();
@@ -2337,7 +2447,7 @@ pub(crate) mod tests {
     #[test]
     fn writes_sp_metadata_and_a_redirect_authn_request() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None);
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let root = doc.root_element();
         assert_eq!(root.attribute("entityID"), Some(SP));
@@ -2367,7 +2477,7 @@ pub(crate) mod tests {
     #[test]
     fn artifact_responses_are_asked_for_and_offered_alone() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Artifact, None);
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Artifact, None, Subject::NameId);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let acs: Vec<_> = doc.descendants().filter(|n| is(*n, METADATA, "AssertionConsumerService")).map(|n| (n.attribute("Binding"), n.attribute("Location"), n.attribute("index"))).collect();
         assert_eq!(acs, [(Some(ARTIFACT), Some(ACS), Some("0"))], "one ACS, so the IdP can't fall back to posting");
@@ -2425,7 +2535,7 @@ pub(crate) mod tests {
         no_attrs.attributes.clear();
         assert_eq!(check(&no_attrs.xml()).unwrap().claims.email, None);
         let idp = idp();
-        let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None, authn_methods: None };
+        let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None, authn_methods: None, subject: Subject::NameId };
         let mut custom = base();
         custom.attributes = vec![("email".into(), "personal@evil.example".into()), ("work_mail".into(), "ada@example.com".into())];
         let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &mapped, now_ms: NOW, decrypt: &[], require_encrypted: false, aes_cbc: AesCbc::Off }).unwrap();
@@ -2485,6 +2595,111 @@ pub(crate) mod tests {
         let wrapped = plain.xml().replace("</samlp:Response>", r#"<saml:AttributeStatement><saml:Attribute Name="groups"><saml:AttributeValue>Admins</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></samlp:Response>"#);
         let c = check_response(&STANDARD.encode(wrapped), &e).unwrap();
         assert_eq!(c.groups, Groups::Listed(s(&["Users"])));
+    }
+
+    #[test]
+    fn subject_id_values_follow_the_profiles_grammar() {
+        assert_eq!(subject_id_value("8f2a91c4@uni.example").as_deref(), Some("8f2a91c4@uni.example"));
+        assert_eq!(subject_id_value(" \tABC=x-1@Uni-A.Example\r\n").as_deref(), Some("abc=x-1@uni-a.example"), "XML whitespace stripped, compared without case");
+        assert_eq!(subject_id_value("ab@uni..example").as_deref(), Some("ab@uni..example"), "the scope isn't held to DNS");
+        let (id, scope) = ("a".repeat(127), format!("s{}", ".x".repeat(63)));
+        assert!(subject_id_value(&format!("{id}@{scope}")).is_some(), "127 characters each");
+        for bad in ["", "abc", "@uni.example", "abc@", "-abc@uni.example", "=abc@uni.example", "abc@-uni.example", "abc@.uni.example", "a.b@uni.example", "a b@uni.example", "abc@uni_example", "abc@uni.example@other.example", "é@uni.example", "abc@uni.example/x"] {
+            assert_eq!(subject_id_value(bad), None, "{bad:?}");
+        }
+        assert_eq!(subject_id_value(&format!("{id}a@uni.example")), None, "a unique ID over 127 characters");
+        assert_eq!(subject_id_value(&format!("abc@{scope}x")), None, "a scope over 127 characters");
+        assert_eq!(subject_id_scope("abc@uni.example"), "uni.example");
+        for (v, s) in [("nameid", Subject::NameId), ("Subject-ID", Subject::SubjectId), ("pairwise-id", Subject::PairwiseId)] {
+            assert_eq!(Subject::parse(v), Some(s));
+        }
+        assert_eq!(Subject::parse("any"), None, "one attribute per provider, never whichever comes");
+    }
+
+    fn subject_of(r: &Response, subject: Subject, scopes: &[&str]) -> Result<Checked, Refused> {
+        let idp = parse_idp_metadata(&with_ui(&metadata(), "University A", scopes), IDP, false).unwrap();
+        let attributes = Attributes { subject, ..Attributes::default() };
+        check_response(&r.posted(), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false, aes_cbc: AesCbc::Off })
+    }
+
+    #[test]
+    fn a_subject_identifier_attribute_names_the_person_within_the_idps_scopes() {
+        let uni = &["uni.example"];
+        let mut r = base();
+        (r.name_id, r.name_id_format) = ("_9f1c2e7a".into(), TRANSIENT.into());
+        r.attributes.push((SUBJECT_ID.into(), "8F2A91C4@uni.example".into()));
+        let c = subject_of(&r, Subject::SubjectId, uni).unwrap();
+        assert_eq!((c.claims.subject.as_str(), c.claims.subject_from, c.claims.issuer.as_str()), ("8f2a91c4@uni.example", Some("subject-id"), IDP));
+        assert_eq!((c.login.name_id.as_str(), c.login.format.as_deref()), ("_9f1c2e7a", Some(TRANSIENT)), "the NameID as sent, for logout");
+        assert_eq!(subject_of(&r, Subject::NameId, uni).unwrap_err().0, "transient_subject", "without the setting, as before");
+        let mut persistent = r.clone();
+        (persistent.name_id, persistent.name_id_format) = ("00u1ADA-Persistent".into(), PERSISTENT.into());
+        assert_eq!(subject_of(&persistent, Subject::SubjectId, uni).unwrap().claims.subject, "8f2a91c4@uni.example", "the attribute, not a persistent NameID beside it");
+        assert_eq!(subject_of(&persistent, Subject::NameId, uni).unwrap().claims.subject_from, None);
+
+        // Each setting reads its own attribute, and never falls back to the NameID or the other.
+        assert_eq!(subject_of(&r, Subject::PairwiseId, uni).unwrap_err().0, "no_subject_id");
+        assert_eq!(subject_of(&persistent, Subject::PairwiseId, uni).unwrap_err().0, "no_subject_id");
+        let mut pairwise = r.clone();
+        pairwise.attributes.push((PAIRWISE_ID.into(), "Q7JZ3X=@uni.example".into()));
+        let c = subject_of(&pairwise, Subject::PairwiseId, uni).unwrap();
+        assert_eq!((c.claims.subject.as_str(), c.claims.subject_from), ("q7jz3x=@uni.example", Some("pairwise-id")));
+
+        // Only at a scope the IdP's metadata lists, exactly: not another's, nor a subdomain.
+        assert_eq!(subject_of(&r, Subject::SubjectId, &["other.example"]).unwrap_err().0, "subject_id_scope");
+        assert_eq!(subject_of(&r, Subject::SubjectId, &[]).unwrap_err().0, "subject_id_scope", "metadata with no shibmd:Scope vouches for none");
+        assert!(subject_of(&r, Subject::SubjectId, &["other.example", "UNI.example"]).is_ok(), "scopes are read lowercase");
+        let mut sub = r.clone();
+        sub.attributes.last_mut().unwrap().1 = "8f2a91c4@staff.uni.example".into();
+        assert_eq!(subject_of(&sub, Subject::SubjectId, uni).unwrap_err().0, "subject_id_scope");
+        let regexp = with_ui(&metadata(), "University A", &[]).replace("<mdui:UIInfo>", r#"<shibmd:Scope regexp="true">^.*\.example$</shibmd:Scope><mdui:UIInfo>"#);
+        assert!(parse_idp_metadata(&regexp, IDP, false).unwrap().scopes.is_empty(), "a regular expression is no scope");
+
+        // One value of one attribute, in the profile's syntax, as plain text: anything else is refused, not picked from.
+        let bad = |edit: &dyn Fn(&mut Response)| {
+            let mut b = r.clone();
+            edit(&mut b);
+            subject_of(&b, Subject::SubjectId, uni).err().map_or("ok", |e| e.0)
+        };
+        assert_eq!(bad(&|b| b.attributes.push((SUBJECT_ID.into(), "other@uni.example".into()))), "bad_subject_id", "two attributes");
+        assert_eq!(bad(&|b| b.multi_attributes = vec![(SUBJECT_ID.into(), vec!["a1@uni.example".into(), "b2@uni.example".into()])]), "bad_subject_id", "two values");
+        for v in ["8f2a91c4", "8f2a91c4@", "a.b@uni.example", "", "<b>x</b>@uni.example"] {
+            assert_eq!(bad(&|b| b.attributes.last_mut().unwrap().1 = v.into()), "bad_subject_id", "{v:?}");
+        }
+        let format = |f: &str| format!(r#"{SUBJECT_ID}" NameFormat="{f}"#);
+        assert_eq!(bad(&|b| b.attributes.last_mut().unwrap().0 = format("urn:oasis:names:tc:SAML:2.0:attrname-format:basic")), "bad_subject_id");
+        assert_eq!(bad(&|b| b.attributes.last_mut().unwrap().0 = format(ATTRNAME_URI)), "ok");
+        assert_eq!(bad(&|b| b.attributes.last_mut().unwrap().0 = "subject-id".into()), "no_subject_id", "only the profile's name");
+
+        // Outside the signed assertion, or added after it was signed, it's never read.
+        let mut unsigned = base();
+        (unsigned.name_id, unsigned.name_id_format) = ("_9f1c2e7a".into(), TRANSIENT.into());
+        let added = unsigned.xml_with(|a| a.replace("</saml:AttributeStatement>", &format!(r#"<saml:Attribute Name="{SUBJECT_ID}"><saml:AttributeValue>8f2a91c4@uni.example</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>"#)));
+        let idp = parse_idp_metadata(&with_ui(&metadata(), "University A", uni), IDP, false).unwrap();
+        let attributes = Attributes { subject: Subject::SubjectId, ..Attributes::default() };
+        let e = Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false, aes_cbc: AesCbc::Off };
+        assert_eq!(check_response(&STANDARD.encode(added), &e).unwrap_err().0, "bad_signature");
+        let beside = unsigned.xml().replace("</samlp:Response>", &format!(r#"<saml:AttributeStatement><saml:Attribute Name="{SUBJECT_ID}"><saml:AttributeValue>8f2a91c4@uni.example</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></samlp:Response>"#));
+        assert_eq!(check_response(&STANDARD.encode(beside), &e).unwrap_err().0, "no_subject_id");
+    }
+
+    #[test]
+    fn sp_metadata_says_which_subject_identifier_it_requires() {
+        let sp = Sp { entity_id: SP, acs: ACS };
+        let plain = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
+        assert!(!plain.contains(SUBJECT_ID_REQ) && plain.contains(&format!("<md:NameIDFormat>{PERSISTENT}</md:NameIDFormat>")), "{plain}");
+        for s in [Subject::SubjectId, Subject::PairwiseId] {
+            let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, Some("https://bot.example.com/api/auth/sso/okta/discovery"), s);
+            let doc = roxmltree::Document::parse(&md).unwrap();
+            let kids = elements(doc.root_element());
+            assert!(is(kids[0], METADATA, "Extensions") && is(kids[1], METADATA, "SPSSODescriptor"), "the entity's Extensions come first: {md}");
+            let attr = kids[0].descendants().find(|n| is(*n, ASSERTION, "Attribute")).unwrap();
+            assert!(is(attr.parent().unwrap(), MDATTR, "EntityAttributes"));
+            assert_eq!((attr.attribute("Name"), attr.attribute("NameFormat")), (Some(SUBJECT_ID_REQ), Some(ATTRNAME_URI)));
+            assert_eq!(attr.children().filter(|c| c.is_element()).map(|v| v.text().unwrap()).collect::<Vec<_>>(), vec![s.as_str()]);
+            assert!(md.contains(&format!("<md:NameIDFormat>{TRANSIENT}</md:NameIDFormat>")) && !md.contains(PERSISTENT), "only for logout: {md}");
+            assert!(md.contains("idpdisc:DiscoveryResponse"), "the role's own Extensions stay");
+        }
     }
 
     const MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
@@ -3242,7 +3457,7 @@ pub(crate) mod tests {
         let sp = Sp { entity_id: SP, acs: ACS };
         let (sign, _) = SpKey::generate("sp").unwrap();
         let enc = &enc_keys()[0];
-        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off, ResponseBinding::Post, None);
+        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<String> = elements(spsso).iter().map(|n| format!("{}{}", n.tag_name().name(), n.attribute("use").map(|u| format!("/{u}")).unwrap_or_default())).collect();
@@ -3257,10 +3472,10 @@ pub(crate) mod tests {
         let mut r = encrypted();
         r.encrypt = Some(ok);
         assert_eq!(enc_reason(&r.xml()), "ok");
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None).contains("encryption"), "off: nothing to encrypt to");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId).contains("encryption"), "off: nothing to encrypt to");
 
         // With AES-CBC taken (ADR 0218), it's offered after GCM, so an IdP that picks the first keeps GCM.
-        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse, ResponseBinding::Post, None);
+        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse, ResponseBinding::Post, None, Subject::NameId);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let methods: Vec<&str> = doc.descendants().filter(|n| is(*n, METADATA, "EncryptionMethod")).filter_map(|n| n.attribute("Algorithm")).collect();
         assert_eq!(&methods[..4], [AES256_GCM, AES128_GCM, AES256_CBC, AES128_CBC]);

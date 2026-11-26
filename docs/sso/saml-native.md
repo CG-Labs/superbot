@@ -183,6 +183,7 @@ With [several IdPs of a federation](#several-idps-of-a-federation), the setting 
 | `SSO_<ID>_IDP_MDQ_URL` | | Or a federation's MDQ server, its https base URL (InCommon: `https://mdq.incommon.org`): botd asks it for each IdP alone, daily. Needs `METADATA_SIGNING_CERT_FILE` ([below](#metadata-from-a-federation-mdq)). |
 | `SSO_<ID>_IDP_AGGREGATE_URL` | | Or a federation's signed aggregate of every member's metadata, https (InCommon: `https://md.incommon.org/InCommon/InCommon-metadata.xml`): botd reads it daily as it downloads, for every listed IdP at once. Needs `METADATA_SIGNING_CERT_FILE` ([below](#a-federations-aggregate)). |
 | `SSO_<ID>_SP_ENTITY_ID` | `<SSO_PUBLIC_URL>/api/auth/sso/<id>/metadata` | Our entity ID (the audience), if the IdP needs another. |
+| `SSO_<ID>_SUBJECT` | `nameid` | What names a person: `nameid`, the persistent NameID; `subject-id` or `pairwise-id`, that attribute of the OASIS Subject Identifier profile, at one of the IdP's `shibmd:Scope`s, with any NameID kept only for logout ([below](#subject-identifiers-subject-id-and-pairwise-id)). |
 | `SSO_<ID>_EMAIL_ATTRIBUTE` | `email`, `mail`, or the emailaddress claim URI | The attribute with the email. |
 | `SSO_<ID>_NAME_ATTRIBUTE` | `displayName`, `name`, or the displayname claim URI | The attribute with the display name. |
 | `SSO_<ID>_ALLOWED_DOMAINS` | | Only these email domains, comma separated (exact; list subdomains on their own). |
@@ -437,6 +438,22 @@ SSO_UNI_DISCOVERY_URL=https://service.seamlessaccess.org/ds/
 - **What it sees.** The `return` URL holds the sign-in's own parameters (`session`, and for apps their `redirect`, PKCE `challenge`, `state` and `label`), none of which signs anyone in. No cookie is set before the pick.
 - **Limits.** An https URL with no fragment; it may have a query of its own (like `?lang=en`), but not the protocol's `entityID`, `return`, `returnIDParam`, `policy` or `isPassive`, which botd sets. Refused with one IdP: there is nothing to choose.
 
+#### Subject identifiers (subject-id and pairwise-id)
+
+Many federation IdPs send only a transient NameID, new at every sign-in, and say who the person is in an attribute of the [OASIS SAML V2.0 Subject Identifier Attributes Profile](https://docs.oasis-open.org/security/saml-subject-id-attr/v1.0/saml-subject-id-attr-v1.0.html), which the REFEDS and InCommon baselines recommend over persistent NameIDs. botd refuses a transient NameID as `transient_subject`; to take these IdPs, say which attribute names people ([ADR 0319](../adr/0319-saml-subject-identifier-attributes.md)):
+
+```bash
+SSO_UNI_SUBJECT=pairwise-id   # or subject-id; nameid (the default) is the persistent NameID
+```
+
+- **Which one.** `subject-id` (`urn:oasis:names:tc:SAML:attribute:subject-id`) is the same for every service the person uses, so it can link them across services; `pairwise-id` (`urn:oasis:names:tc:SAML:attribute:pairwise-id`) is different for each service, and the better choice when SuperBot needn't match people with another service. A provider reads one of them, never whichever comes, and never falls back to the NameID: a person known by one value can't be signed in by another.
+- **What's checked.** The attribute must be in the signed assertion, once, with one value like `8f2a91c4@uni.example` (a unique ID, `@`, and a scope; NameFormat `uri` if any), else the sign-in fails as `no_subject_id` or `bad_subject_id`. The scope must be one of the `shibmd:Scope`s in the IdP's metadata, exactly (no subdomains, no regular expressions), else `subject_id_scope`: any IdP could send any value, and the federation's signed metadata says which scopes each one may vouch for. An IdP whose metadata lists no scope (common outside federations) can't sign anyone in this way.
+- **Who is who.** The value, lowercased, is the identity, stored under the IdP that signed it, so links, SCIM `externalId`s and role mappings use it: `botctl user link <user> uni 8f2a91c4@uni.example --idp https://idp.uni-a.example/idp/shibboleth`. A value that isn't in the profile's syntax is refused there, with a hint. A SCIM tenant's `externalId`s are checked the same way, but not against the scopes, which sign-in checks.
+- **The NameID is for logout.** Any NameID (most often transient) is still required, kept as sent, and used only in logout messages: an IdP's LogoutRequest is matched to the sessions that sign-in made by that exact NameID (and SessionIndex), and botd's own LogoutRequests send it back. `auth.slo` events show it as `nameId`, beside the person's `subject`.
+- **What the IdP is told.** SuperBot's metadata asks for the attribute (the entity attribute `urn:oasis:names:tc:SAML:profiles:subject-id:req`, value `subject-id` or `pairwise-id`) and its NameIDFormat becomes transient. Most federation IdPs read it and release the attribute; give the federation or IdP admin the updated metadata. `botctl sso saml uni` shows what people are known by and, with one IdP, its scopes.
+- **Works with one IdP too.** Any IdP that releases the attribute and lists its scopes in its metadata. `auth.login` and refused sign-ins carry `subjectFrom` (`subject-id` or `pairwise-id`).
+- **Switching** from NameIDs (or between the two attributes) changes every identity: re-link people, or let SCIM send the new `externalId`s, before people sign in again.
+
 #### Groups with several IdPs
 
 One institution's `staff` group isn't another's, so with several IdPs botd keeps groups apart by IdP ([ADR 0287](../adr/0287-saml-groups-per-idp-of-a-federation.md)). Federations send who someone is at an institution as *scoped* values, like eduPersonScopedAffiliation (`urn:oid:1.3.6.1.4.1.5923.1.1.1.9`, values like `member@uni-a.example`):
@@ -568,7 +585,9 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `idp_initiated_loop` | With `IDP_INITIATED=restart`, the IdP answered SuperBot's request with another unsolicited response: it ignores AuthnRequests. Fix the app at the IdP, or point the tile at the start URL. |
 | `expired`, `not_yet_valid` | Clocks differ by more than two minutes: fix NTP. |
 | `replayed` | The same assertion was posted twice. |
-| `transient_subject`, `missing_subject` | Use a persistent NameID. |
+| `transient_subject`, `missing_subject` | Use a persistent NameID, or, if the IdP sends a transient one with a subject identifier attribute, set `SUBJECT` ([above](#subject-identifiers-subject-id-and-pairwise-id)). |
+| `no_subject_id`, `bad_subject_id` | `SUBJECT` is set, and the signed assertion lacks that attribute, or has it twice, with more or fewer than one value, a NameFormat other than `uri`, or a value not like `8f2a91c4@uni.example`. The IdP must release it (SuperBot's metadata asks for it). |
+| `subject_id_scope` | The attribute's scope (after `@`) isn't one of the `shibmd:Scope`s in the IdP's metadata, or it lists none. `botctl sso saml <id>` shows them; the IdP's operators register scopes with the federation. |
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
 | `email_out_of_scope` | With [several IdPs](#several-idps-of-a-federation) and `ALLOWED_DOMAINS`: the IdP sent an email at a domain the federation doesn't list for it (`botctl sso saml <id>` shows each IdP's email domains). Its operators must add the scope in the federation's registry. |
 | `unknown_idp` | With several IdPs: the start URL's `idp` (also what a [discovery service](#a-federations-discovery-service) picked), or an app tile's `Issuer` (`idpInitiated: true`; an artifact's `SourceID`), isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was, when it could be read). With `IDP_ENTITY_IDS=all`: it isn't a SAML IdP in the aggregate as last read, or lacks one of `IDP_ENTITY_CATEGORIES`. |

@@ -3944,3 +3944,138 @@ async fn one_idp_publishes_no_discovery_response() {
     let (code, head, _) = crate::tests::call_with(sp.port, "GET", &header(&head, "location").unwrap(), "", "", "").await;
     assert!(code == 303 && header(&head, "location").unwrap().starts_with(SSO_URL), "{head}");
 }
+
+// Subject identifier attributes (ADR 0319)
+
+const TRANSIENT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:transient";
+
+/// An answer naming the person by attribute `name` = `value`, with a throwaway transient
+/// NameID `name_id`, in the IdP session `index`.
+fn known_by<'a>(name: &'a str, value: &'a str, name_id: &'a str, index: &'a str) -> impl FnOnce(&mut Response) + 'a {
+    move |r| {
+        (r.name_id, r.name_id_format, r.session_index) = (name_id.into(), TRANSIENT.into(), index.into());
+        r.attributes.push((name.into(), value.into()));
+    }
+}
+
+impl Sp {
+    /// A web sign-in answered with the response `tweak` makes: the session cookie header.
+    async fn cookie_with(&self, tweak: impl FnOnce(&mut Response)) -> String {
+        let (code, _, head) = self.sign_in(tweak).await;
+        assert_eq!(code, 200, "{head}");
+        let session = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
+        format!("Cookie: {}\r\n", session.split(';').next().unwrap())
+    }
+}
+
+#[tokio::test]
+async fn people_known_by_subject_id_sign_in_and_out_with_a_new_name_id_each_time() {
+    use crate::sso::saml_sp::{SUBJECT_ID, SUBJECT_ID_REQ};
+    let (stub, soap_url) = SoapIdp::start().await;
+    let xml = test_idp::with_soap_slo(&test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata(), "University A", &["uni.example"])), &soap_url);
+    let sp = serve_importing(&[("SUBJECT", "subject-id")], |a| a.limiter = users::Limiter::new(1000, 60_000), &xml).await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    assert!(md.contains(&format!(r#"Name="{SUBJECT_ID_REQ}""#)) && md.contains("<saml:AttributeValue>subject-id</saml:AttributeValue>"), "{md}");
+    assert!(md.contains(&format!("<md:NameIDFormat>{TRANSIENT}</md:NameIDFormat>")), "{md}");
+    assert_eq!(sp.view().await["subject"], "subject-id");
+
+    // Not linked yet: the failure names the attribute's value, not the throwaway NameID.
+    let (_, to, _) = sp.sign_in(known_by(SUBJECT_ID, "8F2A91C4@uni.example", "_t0", "_s0")).await;
+    assert_eq!(to, "/login?error=sso_not_linked");
+    let f = sp.last_failure().await;
+    assert_eq!((f["reason"].as_str(), f["subject"].as_str(), f["subjectFrom"].as_str()), (Some("not_linked"), Some("8f2a91c4@uni.example"), Some("subject-id")));
+
+    // An admin links that value; a NameID is no subject-id.
+    let u = sp.app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+    let path = format!("/api/users/{}/identities", u.id);
+    let (code, e) = call(sp.port, "POST", &path, &sp.admin, &json!({ "provider": sp.id, "subject": NAME_ID }).to_string()).await;
+    assert!(code == 400 && e.contains("subject-id"), "{code} {e}");
+    let (code, i) = call(sp.port, "POST", &path, &sp.admin, &json!({ "provider": sp.id, "subject": "8F2A91C4@uni.example" }).to_string()).await;
+    assert_eq!(code, 201, "{i}");
+
+    // Each sign-in brings a new NameID; the attribute finds the same person every time.
+    let first = sp.cookie_with(known_by(SUBJECT_ID, " 8f2a91c4@UNI.example\n", "_T1x", "_s1")).await;
+    let second = sp.cookie_with(known_by(SUBJECT_ID, "8f2a91c4@uni.example", "_t2", "_s2")).await;
+    assert_eq!((sp.who(&first).await, sp.who(&second).await), (Some(u.id.clone()), Some(u.id.clone())));
+    let login = &sp.audit("auth.login").await[0];
+    assert_eq!((login["details"]["subject"].as_str(), login["details"]["subjectFrom"].as_str()), (Some("8f2a91c4@uni.example"), Some("subject-id")));
+
+    // No attribute, someone else's scope, or not the profile's syntax: refused, never the NameID instead.
+    type Tweak = Box<dyn FnOnce(&mut Response)>;
+    let cases: Vec<(&str, Tweak)> = vec![
+        ("no_subject_id", Box::new(|r| r.name_id_format = TRANSIENT.into())),
+        ("no_subject_id", Box::new(|r| r.name_id = "8f2a91c4@uni.example".into())),
+        ("subject_id_scope", Box::new(known_by(SUBJECT_ID, "8f2a91c4@example.com", "_t3", "_s3"))),
+        ("bad_subject_id", Box::new(known_by(SUBJECT_ID, "8f2a91c4", "_t3", "_s3"))),
+    ];
+    for (want, tweak) in cases {
+        let (code, to, head) = sp.sign_in(tweak).await;
+        assert!(code == 303 && to.starts_with("/login?error="), "{want}: {code} {to}");
+        assert!(signed_in_as(sp.port, &head).await.is_none(), "{want}");
+        assert_eq!(sp.last_failure().await["reason"], want);
+    }
+
+    // The IdP signs out by the NameID it sent then, matched as sent: not the attribute, nor another case.
+    let now = db::now();
+    for name_id in ["_t1x", "8f2a91c4@uni.example"] {
+        assert_eq!(sp.slo_get(&Logout::request(&sp.slo(), name_id, None, now).redirect()).await.0, 303);
+        assert_eq!(sp.audit("auth.slo").await[0]["details"]["revoked"], 0, "{name_id}");
+    }
+    let l = Logout::request(&sp.slo(), "_T1x", Some("_s1"), now);
+    assert_eq!(sp.slo_get(&l.redirect()).await.0, 303);
+    assert_eq!((sp.who(&first).await, sp.who(&second).await), (None, Some(u.id.clone())));
+    let slo = &sp.audit("auth.slo").await[0];
+    assert_eq!((slo["actorId"].as_str(), slo["actorSubject"].as_str()), (Some(u.id.as_str()), Some(format!("{IDP}|8f2a91c4@uni.example").as_str())));
+    let d = &slo["details"];
+    assert_eq!((d["revoked"].as_u64(), d["subject"].as_str(), d["nameId"].as_str()), (Some(1), Some("8f2a91c4@uni.example"), Some("_T1x")));
+
+    // Ended here, botd tells the IdP with the NameID of that sign-in.
+    let id = sp.session_in(&u.id, "_s2");
+    let (code, body) = call(sp.port, "DELETE", &format!("/api/sessions/{id}"), &sp.admin, "").await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(sp.audited("auth.slo_response", 0).await["outcome"], "success");
+    let sent = stub.last().1;
+    assert!(sent.contains(">_t2</saml:NameID>") && sent.contains(TRANSIENT) && !sent.contains("8f2a91c4"), "{sent}");
+    assert_eq!(sp.who(&second).await, None);
+}
+
+#[tokio::test]
+async fn each_federation_idp_vouches_only_for_its_own_scopes() {
+    use crate::sso::saml_sp::PAIRWISE_ID;
+    let (sp, dir, _) = serve_federation(&[("SUBJECT", "pairwise-id")], 2).await;
+    let link = |issuer: &str, subject: &str, email: &str| {
+        let u = sp.app.db.create_user(None, Some(email), "Someone", Role::Member).unwrap();
+        sp.app.db.link_identity(&u.id, &NewIdentity { provider: &sp.id, issuer, subject, tenant: None, email: None, created_by: Some("test") }).unwrap();
+        u.id
+    };
+    let ada = link(IDP, "q7jz3x@example.com", "ada@example.com");
+    let bea = link(IDP_B, "q7jz3x@uni-b.example", "bea@uni-b.example");
+    let at = |idp: &'static str, value: &'static str| {
+        move |r: &mut Response| {
+            known_by(PAIRWISE_ID, value, "_t", "_s1")(r);
+            if idp == IDP_B {
+                from_b(r);
+            }
+        }
+    };
+    let (code, _, head) = sp.sign_in_at(IDP, at(IDP, "q7jz3x@example.com")).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(ada)));
+    let (code, _, head) = sp.sign_in_at(IDP_B, at(IDP_B, "Q7JZ3X@uni-b.example")).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await), (200, Some(bea)));
+    // IdP B, signed by its own key, can't speak for University A's people.
+    let (_, to, head) = sp.sign_in_at(IDP_B, at(IDP_B, "q7jz3x@example.com")).await;
+    assert!(to.starts_with("/login?error=") && signed_in_as(sp.port, &head).await.is_none(), "{to}");
+    assert_eq!(sp.last_failure().await["reason"], "subject_id_scope");
+
+    // B's SCIM tenant sends pairwise-ids as externalIds, never NameIDs.
+    use crate::scim_http_tests::{okta_user, scim, token};
+    let (t, _) = token(sp.port, &sp.admin, json!({ "tenant": "uni-b", "sso": sp.id, "idp": IDP_B })).await;
+    let (code, _, body) = scim(sp.port, &t, "POST", SCIM_USERS, okta_user("cy@uni-b.example", NAME_ID)).await;
+    assert_eq!((code, body["scimType"].as_str()), (400, Some("invalidValue")), "{body}");
+    assert!(body["detail"].as_str().unwrap().contains("pairwise-id"), "{body}");
+    let (code, _, u) = scim(sp.port, &t, "POST", SCIM_USERS, okta_user("cy@uni-b.example", "Z9K2@Uni-B.example")).await;
+    assert_eq!(code, 201, "{u}");
+    let (code, _, head) = sp.sign_in_at(IDP_B, at(IDP_B, "z9k2@uni-b.example")).await;
+    assert_eq!((code, signed_in_as(sp.port, &head).await.as_deref()), (200, u["id"].as_str()));
+    std::fs::remove_dir_all(dir).ok();
+}

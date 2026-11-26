@@ -8781,6 +8781,28 @@ impl Db {
                 .unwrap();
             s.query_map(params![provider, idp_subject, before], |r| Ok((session_row(r)?, r.get("saml_session_index")?))).unwrap().filter_map(Result::ok).collect()
         };
+        self.revoke_saml_found(found, indexes, reason)
+    }
+
+    /// `revoke_saml_sessions` for a provider that knows people by a subject identifier
+    /// attribute (ADR 0319): the IdP's LogoutRequest names its NameID, often transient, so the
+    /// sessions are those IdP `issuer` made with `name_id` exactly as it sent it.
+    pub fn revoke_saml_sessions_by_name_id(&self, provider: &str, issuer: &str, name_id: &str, indexes: &[String], before: i64, reason: &str) -> Vec<Session> {
+        let prefix = format!("{issuer}|");
+        let found: Vec<(Session, Option<String>)> = {
+            let c = self.c();
+            let mut s = c
+                .prepare(
+                    "SELECT s.*, m.session_index AS saml_session_index FROM sessions s JOIN saml_sessions m ON m.session_id = s.id
+                     WHERE s.idp_provider = ? AND substr(s.idp_subject, 1, ?) = ? AND m.name_id = ? AND s.revoked_at IS NULL AND s.created_at <= ? ORDER BY s.created_at, s.id",
+                )
+                .unwrap();
+            s.query_map(params![provider, prefix.chars().count() as i64, prefix, name_id, before], |r| Ok((session_row(r)?, r.get("saml_session_index")?))).unwrap().filter_map(Result::ok).collect()
+        };
+        self.revoke_saml_found(found, indexes, reason)
+    }
+
+    fn revoke_saml_found(&self, found: Vec<(Session, Option<String>)>, indexes: &[String], reason: &str) -> Vec<Session> {
         found
             .into_iter()
             .filter(|(_, index)| indexes.is_empty() || index.as_ref().is_none_or(|i| indexes.contains(i)))
