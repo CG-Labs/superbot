@@ -174,6 +174,8 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0278-tam-handover-draft.md"));
     files.push(repo().join("docs/adr/0286-update-targets-from-a-replies-export.md"));
     files.push(repo().join("docs/adr/0289-escalations-due-now-from-the-ticket-exports.md"));
+    files.push(repo().join("docs/adr/0295-tam-cadence-across-accounts.md"));
+    files.push(repo().join("docs/adr/0307-health-score-alerts.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -663,6 +665,28 @@ fn the_tam_page_documents_the_handover_draft() {
         assert!(draft.contains(&format!("| {p} |")), "tam.md's table doesn't say what botd fills in for {p}");
     }
     assert!(read("README.md").contains("botctl tam-handover"), "README.md doesn't point at botctl tam-handover");
+}
+
+/// ADR 0307: the health score page explains the alerts: the audit action, every gauge
+/// `health_alert::render` writes and the rule file, every alert of which is a ticket;
+/// the TAM page and the index point at them.
+#[test]
+fn the_health_score_page_documents_its_alerts() {
+    let page = read("health-score.md");
+    let alerts = page.split("\n## Alerts\n").nth(1).expect("health-score.md has Alerts").split("\n## ").next().unwrap();
+    let code = fs::read_to_string(repo().join("server/src/health_alert.rs")).unwrap();
+    assert!(code.contains("pub const FELL: &str = \"support.health_score_fell\";"));
+    let render = code.split("pub fn render(").nth(1).unwrap().split("\n}\n").next().unwrap();
+    let gauges: Vec<&str> = render.split("metrics::family(out, \"").skip(1).filter_map(|r| r.split('"').next()).collect();
+    assert_eq!(gauges.len(), 4, "the gauges: {gauges:?}");
+    for needle in gauges.iter().copied().chain(["support.health_score_fell", "superbot-health-score.rules.yml", "HEALTH_SCORE_HISTORY_DAYS"]) {
+        assert!(alerts.contains(needle), "health-score.md's alerts don't mention {needle}");
+    }
+    let rules = fs::read_to_string(repo().join("deploy/prometheus/superbot-health-score.rules.yml")).unwrap();
+    assert_eq!(rules.matches("- alert:").count(), 4);
+    assert_eq!(rules.matches("severity: ticket").count(), 4, "the score changes once a day: nothing pages");
+    assert!(read("tam.md").contains("(health-score.md#alerts)"), "tam.md doesn't point at the alerts");
+    assert!(read("README.md").contains("(health-score.md#alerts)"), "README.md doesn't point at the alerts");
 }
 
 /// ADR 0131, 0243: the support bundle's page lists every file `support::build` writes,

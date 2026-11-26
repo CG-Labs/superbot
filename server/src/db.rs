@@ -12036,6 +12036,13 @@ impl Db {
         s.query_map([from], |r| Ok(HealthScoreDay { day: r.get(0)?, at: r.get(1)?, window_days: r.get(2)?, score: r.get(3)?, band: r.get(4)?, signals: r.get(5)? }))?.collect()
     }
 
+    /// The newest `n` days, newest first.
+    pub fn health_scores_newest(&self, n: u32) -> rusqlite::Result<Vec<HealthScoreDay>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT day, at, window_days, score, band, signals FROM health_scores ORDER BY day DESC LIMIT ?")?;
+        s.query_map([n], |r| Ok(HealthScoreDay { day: r.get(0)?, at: r.get(1)?, window_days: r.get(2)?, score: r.get(3)?, band: r.get(4)?, signals: r.get(5)? }))?.collect()
+    }
+
     /// Deletes the days before `before` (`YYYY-MM-DD`); how many went.
     pub fn health_scores_prune(&self, before: &str) -> rusqlite::Result<usize> {
         self.c().execute("DELETE FROM health_scores WHERE day < ?", [before])
