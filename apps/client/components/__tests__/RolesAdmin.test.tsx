@@ -396,6 +396,21 @@ describe("RolesAdmin: two approvers for chosen roles (ADR 0320)", () => {
     await waitFor(() => expect(api.approveRoleRequest).toHaveBeenCalledWith("q1", { hours: 4, note: undefined }));
   });
 
+  it("caps the picked hours when a reload brings a shorter first approval", async () => {
+    const api = mockApi();
+    const other = request({ id: "q2", approvals: 1, user: { id: "u4", name: "Rex", email: "rex@example.com" } });
+    api.roleRequests.mockResolvedValueOnce({ requests: [request(), other], pending: 2, pendingDays: 7 });
+    api.roleRequests.mockResolvedValue({ requests: [request({ firstApproval: first })], pending: 1, pendingDays: 7 });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByText(/Waiting for two approvers/)).toBeTruthy();
+    // Someone else gives the first approval, for 4 hours, while this admin decides Rex's.
+    await u.press(screen.getByLabelText("Deny Rex's request"));
+    expect(await screen.findByRole("radio", { name: "4 hours (as first approved)" })).toBeTruthy();
+    await u.press(screen.getByLabelText("Approve Cy's request"));
+    await waitFor(() => expect(api.approveRoleRequest).toHaveBeenCalledWith("q1", { hours: 4, note: undefined }));
+  });
+
   it("leaves the second approval to someone else, but lets the first approver deny", async () => {
     const api = mockApi();
     api.roleRequests.mockResolvedValue({ requests: [request({ firstApproval: { ...first, by: { id: "me", name: "Me" } } })], pending: 1, pendingDays: 7 });

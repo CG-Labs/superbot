@@ -44,6 +44,7 @@ import type {
   Role,
   RoleDraft,
   RoleGiving,
+  RoleApproval,
   RoleRequest,
   RoleRequestDraft,
   RoleRequestStatus,
@@ -711,8 +712,8 @@ export class SuperBotApi {
   }
 
   /** Approves a request within your team, for the hours asked or fewer. */
-  async approveTeamRoleRequest(id: string, body: { hours?: number; note?: string } = {}): Promise<{ request: RoleRequest; role: CustomRoleRef }> {
-    return this.request<{ request: RoleRequest; role: CustomRoleRef }>("POST", `/api/team/role-requests/${encodeURIComponent(id)}/approve`, body);
+  async approveTeamRoleRequest(id: string, body: { hours?: number; note?: string } = {}): Promise<RoleApproval> {
+    return this.request<RoleApproval>("POST", `/api/team/role-requests/${encodeURIComponent(id)}/approve`, body);
   }
 
   async denyTeamRoleRequest(id: string, note?: string): Promise<RoleRequest> {
@@ -855,8 +856,8 @@ export class SuperBotApi {
   }
 
   /** Gives the role for the hours asked, or `hours` when fewer. */
-  async approveRoleRequest(id: string, body: { hours?: number; note?: string } = {}): Promise<{ request: RoleRequest; role: CustomRoleRef }> {
-    return this.request<{ request: RoleRequest; role: CustomRoleRef }>("POST", `/api/role-requests/${encodeURIComponent(id)}/approve`, body);
+  async approveRoleRequest(id: string, body: { hours?: number; note?: string } = {}): Promise<RoleApproval> {
+    return this.request<RoleApproval>("POST", `/api/role-requests/${encodeURIComponent(id)}/approve`, body);
   }
 
   async denyRoleRequest(id: string, note?: string): Promise<RoleRequest> {

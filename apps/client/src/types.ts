@@ -739,6 +739,13 @@ export interface RequestOffer {
 }
 
 /** A role you may request, from `GET /api/me/role-requests`. */
+/** An approval's reply. With two approvers (ADR 0320) the first gives nothing yet: `role` is null and the request stays pending. */
+export interface RoleApproval {
+  request: RoleRequest;
+  role: CustomRoleRef | null;
+  approvals?: { needed: number; given: number };
+}
+
 export interface RequestableRole {
   id: string;
   name: string;

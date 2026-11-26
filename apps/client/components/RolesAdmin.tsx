@@ -511,6 +511,8 @@ export function RequestRow({
   const second = awaitsSecond(q);
   const needsTwo = (q.approvals ?? 1) >= 2;
   const [hours, setHours] = useState(String(cap));
+  // A first approval made elsewhere can lower the cap after a reload.
+  useEffect(() => setHours(String(cap)), [cap]);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
