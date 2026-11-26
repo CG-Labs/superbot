@@ -16,6 +16,7 @@
 //! `PUT /api/license` (the console, the setup wizard, `botctl license install`) or the
 //! installer's `--license-file`.
 
+pub mod check;
 // botd only verifies; the signing half is for superbot-license, and tests.
 #[allow(dead_code)]
 pub mod token;
@@ -374,6 +375,12 @@ impl Licensing {
     /// Reads `LICENSE_KEY`, else `LICENSE_KEY_FILE`, else `DATA_DIR/license.key`. Never
     /// fails: a bad key is reported, and the server runs unlicensed.
     pub fn load(&self, get: impl Fn(&str) -> String) {
+        self.load_or(get, None)
+    }
+
+    /// As [`load`](Self::load), with `installed` read in place of `DATA_DIR/license.key`: a
+    /// key judged as if an admin had installed it (`botd license check --key-file`).
+    pub fn load_or(&self, get: impl Fn(&str) -> String, installed: Option<&str>) {
         let (inline, file) = (get("LICENSE_KEY"), get("LICENSE_KEY_FILE"));
         let (inline, file) = (inline.trim(), file.trim());
         let loaded = match (inline.is_empty(), file.is_empty()) {
@@ -384,7 +391,7 @@ impl Licensing {
             },
             (false, true) => self.loaded_from(Source::Env, Ok(inline.to_string())),
             (true, false) => self.loaded_from(Source::EnvFile, read_capped(Path::new(file))),
-            (true, true) => self.loaded_from(Source::File, read_capped(&self.path)),
+            (true, true) => self.loaded_from(Source::File, installed.map_or_else(|| read_capped(&self.path), |k| Ok(k.to_string()))),
         };
         *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = loaded;
     }
@@ -867,7 +874,7 @@ mod tests {
     /// and seats are counted in the local database, so licensing must never need a network.
     #[test]
     fn licensing_never_reaches_the_network() {
-        for (file, src) in [("license/mod.rs", include_str!("mod.rs")), ("license/token.rs", include_str!("token.rs"))] {
+        for (file, src) in [("license/mod.rs", include_str!("mod.rs")), ("license/token.rs", include_str!("token.rs")), ("license/check.rs", include_str!("check.rs"))] {
             let code = src.split("\n#[cfg(test)]\n").next().unwrap();
             for needle in ["reqwest", "hyper", "TcpStream", "UdpSocket", "ToSocketAddrs", "lookup_host", "http://", "https://"] {
                 assert!(!code.contains(needle), "{file} uses {needle}: licensing must work with no network (ADR 0128)");

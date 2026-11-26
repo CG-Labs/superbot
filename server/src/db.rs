@@ -5877,7 +5877,7 @@ impl Db {
         Self::seats_used(&self.c())
     }
 
-    fn seats_used(c: &Connection) -> u32 {
+    pub(crate) fn seats_used(c: &Connection) -> u32 {
         c.query_row("SELECT COUNT(*) FROM users WHERE status = 'active' AND kind = 'person' AND id != ?", [crate::users::OPERATOR], |r| r.get(0)).unwrap_or(0)
     }
 

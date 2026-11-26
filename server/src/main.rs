@@ -442,6 +442,9 @@ async fn main() {
     if args.first().is_some_and(|a| a == "machines") {
         std::process::exit(machines::settings_check::cli(&args[1..]));
     }
+    if args.first().is_some_and(|a| a == "license") {
+        std::process::exit(license::check::cli(&args[1..]));
+    }
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");
     let password = auth_password();
