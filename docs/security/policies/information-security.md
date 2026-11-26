@@ -46,7 +46,7 @@ What the service holds itself to. Risks are assessed against these, and the evid
 
 ## Management review
 
-Management and the security owner meet at least quarterly to review: the checklist's open items, the risk register, incidents and their reviews, vulnerability and access-review status, drills, vendor reviews, and exceptions. Minutes are kept in the register. Until there is an independent body, management names someone not responsible for running the service to review the programme yearly (an internal audit or an outside readiness assessment).
+Management and the security owner meet at least quarterly to review: the checklist's open items, the risk register, incidents and their reviews, vulnerability and access-review status, drills, vendor reviews, and exceptions. The [deficiency log](../soc2-evidence-plan.md#the-deficiency-log) gathers the exceptions the evidence bundles list for it. Minutes are kept in the register. Until there is an independent body, management names someone not responsible for running the service to review the programme yearly (an internal audit or an outside readiness assessment).
 
 ## Configuration baseline
 
