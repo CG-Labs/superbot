@@ -686,6 +686,22 @@ impl Status {
         self.following(false);
     }
 
+    /// The stream is still open but may deliver nothing: the token it was made with ran out
+    /// and no new subscription could be made. Not a loss: nothing broke, and no catch-up yet.
+    fn stalled(&self, why: &str) {
+        if self.following.load(Ordering::SeqCst) {
+            *self.last_loss.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
+            self.following(false);
+        }
+    }
+
+    /// A new subscription replaced the one kept past its token.
+    fn renewed(&self) {
+        if !self.following.load(Ordering::SeqCst) {
+            self.following(true);
+        }
+    }
+
     fn changed(&self) {
         self.last_change.store(crate::db::now(), Ordering::SeqCst);
         self.changes.fetch_add(1, Ordering::SeqCst);
@@ -733,6 +749,7 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                         // changes in between had no event.
                         let catch_up = catch_up || stream.expires.is_some_and(|at| Instant::now() >= at);
                         let ended = std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await;
+                        inner.events.renewed();
                         if catch_up {
                             log_info!("Vault: subscribed to change events with a new token; reading every cached secret again, as the old stream may have stopped early (ADR 0306).");
                             tx.send(Note::Resumed(None));
@@ -747,6 +764,11 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                         log_warn!("Vault: couldn't renew the subscription to change events ({e}); keeping the current one (ADR 0306).");
                         stream.due = Instant::now() + MIN_RESUBSCRIBE;
                         stream.late = true;
+                        // Vault may keep a stream open, and answer its pings, after its token ran
+                        // out while sending nothing on it (ADR 0318).
+                        if stream.expires.is_some_and(|at| Instant::now() >= at) {
+                            inner.events.stalled("the token the stream was made with ran out, and subscribing again failed");
+                        }
                     }
                 },
             }
@@ -1332,8 +1354,12 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 1);
         assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-1"));
+        // Its token ran out at 1 s: open and answering pings, but not counted as followed.
+        let w = x.watch_status().unwrap();
+        assert!(!w.following && w.lost == 0 && w.last_loss.as_deref().is_some_and(|l| l.contains("ran out")), "{w:?}");
         f.events.status.store(0, Ordering::SeqCst);
         wait_for(|| caught_up("EVENTS_LATE_TOKEN"));
+        assert!(x.watch_status().unwrap().following, "followed again with the new subscription");
         assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-2"));
         assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "the old stream never broke");
         redact::forget("events-late-1");
