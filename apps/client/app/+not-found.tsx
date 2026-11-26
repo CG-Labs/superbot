@@ -1,40 +1,31 @@
-import { Link, Stack } from 'expo-router';
-import { StyleSheet } from 'react-native';
-
-import { Text, View } from '@/components/Themed';
+import { Link, Stack } from "expo-router";
+import { StyleSheet, Text, View } from "react-native";
+import { RouteScreen, useGoBack } from "../components/Shell";
+import { kit, PageHeader } from "../components/ui";
+import { themedStyles } from "../src/theme";
 
 export default function NotFoundScreen() {
+  const styles = useStyles();
+  const back = useGoBack();
   return (
-    <>
-      <Stack.Screen options={{ title: 'Oops!' }} />
-      <View style={styles.container}>
-        <Text style={styles.title}>This screen doesn't exist.</Text>
-
+    <RouteScreen>
+      <Stack.Screen options={{ title: "Oops!" }} />
+      <PageHeader title="Not found" onBack={back} />
+      <View style={styles.center}>
+        <Text style={styles.title}>This screen doesn&apos;t exist.</Text>
         <Link href="/" style={styles.link}>
-          <Text style={styles.linkText}>Go to home screen!</Text>
+          Go to home screen!
         </Link>
       </View>
-    </>
+    </RouteScreen>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 20,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: 'bold',
-  },
-  link: {
-    marginTop: 15,
-    paddingVertical: 15,
-  },
-  linkText: {
-    fontSize: 14,
-    color: '#2e78b7',
-  },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    center: k.center,
+    title: { ...k.strong, fontSize: t.font.size.lg, lineHeight: t.font.lineHeight.lg },
+    link: k.link,
+  });
 });

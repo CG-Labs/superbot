@@ -1,8 +1,8 @@
 import React from "react";
-import { Redirect, router } from "expo-router";
-import { StyleSheet, Text, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { Redirect } from "expo-router";
+import { StyleSheet, View } from "react-native";
 import { AccessReview } from "../components/AccessReview";
+import { RouteNotice, RouteScreen, useGoBack } from "../components/Shell";
 import { kit, Spinner } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { useSuperBot } from "../src/SuperBotContext";
@@ -11,6 +11,7 @@ import { themedStyles } from "../src/theme";
 /** Admins only (ADR 0099). The server refuses the report to anyone else; this just says so. */
 export default function AccessReviewScreen() {
   const styles = useStyles();
+  const back = useGoBack();
   const { ready, api, me } = useSuperBot();
   if (!ready) {
     return (
@@ -20,30 +21,20 @@ export default function AccessReviewScreen() {
     );
   }
   if (!api) return <Redirect href="/" />;
-  const back = () => (router.canGoBack() ? router.back() : router.replace("/home"));
   return (
-    <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
+    <RouteScreen>
       {isAdmin(me) ? (
         <AccessReview api={api} onBack={back} />
       ) : (
-        <View style={styles.denied}>
-          <Text style={styles.text}>Only admins can review access.</Text>
-          <Text style={styles.link} onPress={back}>
-            Back to Bots
-          </Text>
-        </View>
+        <RouteNotice title="Access review" message="Only admins can review access." onBack={back} />
       )}
-    </SafeAreaView>
+    </RouteScreen>
   );
 }
 
 const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
-    root: k.root,
     loading: k.center,
-    denied: k.center,
-    text: k.text,
-    link: k.link,
   });
 });
