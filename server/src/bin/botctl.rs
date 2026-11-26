@@ -101,6 +101,18 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl role approve <request> [--for <n>h|<n>d] [--note "<text>"]
                                                    Give the role for the time asked, or less (--for)
   botctl role deny <request> [--note "<text>"]     Turn it down
+  botctl team                                      Your team, its members and your role in it
+  botctl team roles                                The custom roles your team's owners and admins may give
+                                                   in it (ADR 0311), and how many requests wait
+  botctl team role assign <role> <user> [--for <n>h|<n>d] [--reason "<text>"]
+                                                   As your team's owner or admin: give a plain member a role
+                                                   in the team; only its team permissions apply, only there
+  botctl team role unassign <user>                 Take away the role they hold in your team
+  botctl team requests [pending|approved|denied|cancelled|lapsed|all]
+                                                   Requests for roles in your team; pending ones by default
+  botctl team approve <request> [--for <n>h|<n>d] [--note "<text>"]
+                                                   Give it for the time asked, or less; never your own
+  botctl team deny <request> [--note "<text>"]     Turn it down
   botctl service-accounts                          Service accounts (ADR 0143): non-human callers for scripts
                                                    and integrations. Admins see all; anyone else the ones they
                                                    own (show, disable and token list|revoke too, ADR 0239)
@@ -1486,6 +1498,31 @@ fn sso_role_request(args: &[&str]) -> Result<(&'static str, String, Option<Strin
     })
 }
 
+/// `--for <n>h|<n>d`, 1 hour to 365 days: when that ends, in Unix ms from `now`.
+fn ends_after(v: &str, now: i64, usage: &str) -> Result<i64, String> {
+    let hour = 60 * 60_000;
+    let (n, unit) = match (v.strip_suffix('h'), v.strip_suffix('d')) {
+        (Some(n), _) => (n, hour),
+        (_, Some(n)) => (n, 24 * hour),
+        _ => ("", 0),
+    };
+    match n.parse::<i64>() {
+        Ok(n) if (1..=365 * 24).contains(&n) => Ok(now + n * unit),
+        _ => Err(format!("--for is hours or days, like 8h or 7d. {usage}")),
+    }
+}
+
+/// Every word in `rest` is one of the `allowed` flags, each followed by its value.
+fn known_flags(rest: &[&str], allowed: &[&str], usage: &str) -> Result<(), String> {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if !allowed.contains(a) || it.next().is_none() {
+            return Err(format!("Unexpected \"{a}\". {usage}"));
+        }
+    }
+    Ok(())
+}
+
 /// `botctl roles` and `botctl role ...`: custom roles (ADR 0123, 0132). The server checks
 /// every name and permission; this only shapes the request.
 fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
@@ -1501,18 +1538,7 @@ fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Opt
         }
         v.parse::<u32>().map(|n| json!(n)).map_err(|_| format!("--max-days is a number of days or none. {USAGE}"))
     };
-    let until = |v: &str| -> Result<i64, String> {
-        let hour = 60 * 60_000;
-        let (n, unit) = match (v.strip_suffix('h'), v.strip_suffix('d')) {
-            (Some(n), _) => (n, hour),
-            (_, Some(n)) => (n, 24 * hour),
-            _ => ("", 0),
-        };
-        match n.parse::<i64>() {
-            Ok(n) if (1..=365 * 24).contains(&n) => Ok(now + n * unit),
-            _ => Err(format!("--for is hours or days, like 8h or 7d. {USAGE}")),
-        }
-    };
+    let until = |v: &str| ends_after(v, now, USAGE);
     let perms = |v: &str| -> Value {
         if v == "none" {
             return json!([]);
@@ -1532,15 +1558,7 @@ fn role_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Opt
         Some(team) => format!("{}/teams/{}/users/{}", at(id), encode(team), encode(user)),
         None => format!("{}/users/{}", at(id), encode(user)),
     };
-    let known = |rest: &[&str], allowed: &[&str]| -> Result<(), String> {
-        let mut it = rest.iter();
-        while let Some(a) = it.next() {
-            if !allowed.contains(a) || it.next().is_none() {
-                return Err(format!("Unexpected \"{a}\". {USAGE}"));
-            }
-        }
-        Ok(())
-    };
+    let known = |rest: &[&str], allowed: &[&str]| known_flags(rest, allowed, USAGE);
     Ok(match args {
         [] | ["list"] => ("GET", "/api/roles".into(), None),
         ["show", id] => ("GET", at(id), None),
@@ -1655,6 +1673,92 @@ fn role_request_said(verb: &str, res: &Value) -> String {
         "deny" => format!("Denied {who}'s request for {name}{place}."),
         _ => format!("Withdrawn: your request for {name}{place}."),
     }
+}
+
+/// `botctl team ...` (ADR 0311): a team's owners and admins give and take custom roles in
+/// their own team and decide its requests for them, on the routes the Team screen uses
+/// (ADR 0254, 0263). The server checks who may; this only shapes the request.
+fn team_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    team_request_at(args, now_ms())
+}
+
+/// `team_request` with `now` (Unix ms) for `--for`.
+fn team_request_at(args: &[&str], now: i64) -> Result<(&'static str, String, Option<String>), String> {
+    const USAGE: &str = "Usage: botctl team | team roles | team role assign <role> <user> [--for <n>h|<n>d] [--reason TEXT] | team role unassign <user> | team requests [pending|approved|denied|cancelled|lapsed|all] | team approve <request> [--for <n>h|<n>d] [--note TEXT] | team deny <request> [--note TEXT]";
+    let holder = |user: &str| format!("/api/team/members/{}/custom-role", encode(user));
+    let request_at = |id: &str, verb: &str| format!("/api/team/role-requests/{}/{verb}", encode(id));
+    let word = |a: &&str| !a.starts_with("--");
+    Ok(match args {
+        [] | ["show"] | ["roles"] => ("GET", "/api/team".into(), None),
+        ["role", "assign", role, user, rest @ ..] if word(role) && word(user) => {
+            known_flags(rest, &["--for", "--reason"], USAGE)?;
+            let mut body = json!({ "role": role });
+            if let Some(v) = flag(rest, "--for") {
+                body["expiresAt"] = json!(ends_after(v, now, USAGE)?);
+            }
+            if let Some(v) = flag(rest, "--reason") {
+                body["reason"] = json!(v);
+            }
+            ("PUT", holder(user), Some(body.to_string()))
+        }
+        ["role", "unassign", user] if word(user) => ("DELETE", holder(user), None),
+        ["requests"] => ("GET", "/api/team/role-requests".into(), None),
+        ["requests", status] if word(status) => ("GET", format!("/api/team/role-requests?status={}", encode(status)), None),
+        ["approve", id, rest @ ..] if word(id) => {
+            known_flags(rest, &["--for", "--note"], USAGE)?;
+            let mut body = Map::new();
+            if let Some(v) = flag(rest, "--for") {
+                body.insert("hours".into(), json!((ends_after(v, now, USAGE)? - now) / (60 * 60_000)));
+            }
+            if let Some(v) = flag(rest, "--note") {
+                body.insert("note".into(), json!(v));
+            }
+            ("POST", request_at(id, "approve"), Some(Value::Object(body).to_string()))
+        }
+        ["deny", id, rest @ ..] if word(id) => {
+            known_flags(rest, &["--note"], USAGE)?;
+            let body = flag(rest, "--note").map_or_else(|| json!({}), |n| json!({ "note": n }));
+            ("POST", request_at(id, "deny"), Some(body.to_string()))
+        }
+        _ => return Err(USAGE.into()),
+    })
+}
+
+/// What `botctl team roles` prints: the custom roles the caller may give in their team, from
+/// `GET /api/team`'s `roleChoices`, which only its owners and admins get.
+fn team_roles_said(v: &Value) -> String {
+    let team = v["name"].as_str().unwrap_or_default();
+    let Some(choices) = v["roleChoices"].as_array() else {
+        return format!("Only {team}'s owners and admins, with write access, give roles in it. Ask one of them, or request one: botctl role request <role> --team --for <n>h --reason TEXT");
+    };
+    if choices.is_empty() {
+        return format!("No custom role adds anything in a team yet, so there is nothing to give in {team}. A server admin makes roles with users.manage, billing.manage or machines.manage.");
+    }
+    let mut out = format!("Roles you may give in {team}:");
+    for r in choices {
+        let applies = r["applies"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        let ends = r["maxDays"].as_i64().map(|d| format!(" (time-bound: give it --for at most {d} day{})", if d == 1 { "" } else { "s" })).unwrap_or_default();
+        out.push_str(&format!("\n  {}: {applies}{ends}", r["name"].as_str().unwrap_or_default()));
+    }
+    match v["roleRequests"].as_i64() {
+        Some(0) | None => out,
+        Some(1) => out + "\n1 request waits for a decision: botctl team requests",
+        Some(n) => out + &format!("\n{n} requests wait for a decision: botctl team requests"),
+    }
+}
+
+/// The server admins' `botctl role` commands refuse a team's owners and admins (403). In their
+/// own team, `botctl team` does the same on the routes they may use.
+fn team_hint(rest: &[&str], e: String) -> String {
+    let instead = match rest {
+        ["assign", ..] if rest.contains(&"--team") => "botctl team role assign <role> <user>",
+        ["unassign", ..] if rest.contains(&"--team") => "botctl team role unassign <user>",
+        ["requests", ..] => "botctl team requests",
+        ["approve", ..] => "botctl team approve <request>",
+        ["deny", ..] => "botctl team deny <request>",
+        _ => return e,
+    };
+    if e.ends_with("(HTTP 403)") { format!("{e}\nIn your own team, as one of its owners or admins: {instead}") } else { e }
 }
 
 /// `botctl service-accounts` and `botctl service-account ...` (ADR 0143). The server checks
@@ -2427,7 +2531,7 @@ fn run(args: &[String]) -> Result<String, String> {
         ["roles"] | ["role", ..] => {
             let rest = a.get(1..).unwrap_or_default();
             let (method, path, body) = role_request(rest)?;
-            let res = api(Cred::Operator, method, &path, body)?;
+            let res = api(Cred::Operator, method, &path, body).map_err(|e| team_hint(rest, e))?;
             match rest.first() {
                 Some(&("rm" | "delete")) => Ok("Deleted.".into()),
                 Some(&verb @ ("assign" | "unassign")) => Ok(role_assigned(verb, &serde_json::from_str(&res).map_err(|e| e.to_string())?)),
@@ -2645,6 +2749,17 @@ fn run(args: &[String]) -> Result<String, String> {
         [..] if region_request(&a).is_some() => {
             let (method, path, body) = region_request(&a).unwrap();
             op(method, &path, body)
+        }
+        ["team", rest @ ..] if !matches!(rest.first(), Some(&("region" | "residency"))) => {
+            let (method, path, body) = team_request(rest)?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            let said = |f: &dyn Fn(&Value) -> String| serde_json::from_str(&res).map(|v| f(&v)).map_err(|e| e.to_string());
+            match rest {
+                ["roles"] => said(&team_roles_said),
+                ["role", verb, ..] => said(&|v| role_assigned(verb, v)),
+                [verb @ ("approve" | "deny"), ..] => said(&|v| role_request_said(verb, v)),
+                _ => Ok(pretty(res)),
+            }
         }
         ["user", "add", email, rest @ ..] => {
             let name = rest.first().filter(|n| !n.starts_with("--"));
@@ -5078,6 +5193,86 @@ mod tests {
         let mut team = q.clone();
         team["team"] = json!({ "name": "Ops" });
         assert_eq!(role_request_said("withdraw", &team), "Withdrawn: your request for On-call in Ops.");
+    }
+
+    #[test]
+    fn team_commands_use_the_team_screens_routes() {
+        let at = |a: &[&str]| team_request_at(a, 1_000).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        for show in [&[][..], &["show"], &["roles"]] {
+            assert_eq!(at(show), Ok(("GET", "/api/team".into(), None)), "{show:?}");
+        }
+        assert_eq!(at(&["role", "assign", "Team helpdesk", "ada@example.com"]), Ok(("PUT", "/api/team/members/ada%40example.com/custom-role".into(), Some(json!({ "role": "Team helpdesk" })))));
+        assert_eq!(
+            at(&["role", "assign", "r1", "u1", "--for", "8h", "--reason", "Onboarding week"]),
+            Ok(("PUT", "/api/team/members/u1/custom-role".into(), Some(json!({ "role": "r1", "expiresAt": 1_000 + 8 * 3_600_000, "reason": "Onboarding week" }))))
+        );
+        assert_eq!(at(&["role", "assign", "r1", "u1", "--for", "2d"]).unwrap().2.unwrap()["expiresAt"], 1_000 + 2 * 86_400_000);
+        assert_eq!(at(&["role", "unassign", "u 1"]), Ok(("DELETE", "/api/team/members/u%201/custom-role".into(), None)));
+        assert_eq!(at(&["requests"]), Ok(("GET", "/api/team/role-requests".into(), None)));
+        assert_eq!(at(&["requests", "all"]), Ok(("GET", "/api/team/role-requests?status=all".into(), None)));
+        assert_eq!(at(&["approve", "rq1"]), Ok(("POST", "/api/team/role-requests/rq1/approve".into(), Some(json!({})))));
+        assert_eq!(at(&["approve", "rq1", "--for", "4h", "--note", "Shorter"]), Ok(("POST", "/api/team/role-requests/rq1/approve".into(), Some(json!({ "hours": 4, "note": "Shorter" })))));
+        assert_eq!(at(&["deny", "rq1"]), Ok(("POST", "/api/team/role-requests/rq1/deny".into(), Some(json!({})))));
+        assert_eq!(at(&["deny", "rq1", "--note", "Use the runbook"]), Ok(("POST", "/api/team/role-requests/rq1/deny".into(), Some(json!({ "note": "Use the runbook" })))));
+        for bad in [
+            &["role"][..],
+            &["role", "assign", "r1"],
+            &["role", "assign", "--for", "8h", "u1"],
+            &["role", "assign", "r1", "u1", "--team", "t1"],
+            &["role", "assign", "r1", "u1", "--for", "8"],
+            &["role", "assign", "r1", "u1", "--for", "0d"],
+            &["role", "assign", "r1", "u1", "--reason"],
+            &["role", "unassign", "r1", "u1"],
+            &["role", "unassign"],
+            &["requests", "--all"],
+            &["approve"],
+            &["approve", "rq1", "--hours", "4"],
+            &["deny", "rq1", "--for", "4h"],
+            &["invite", "x@example.com"],
+        ] {
+            let e = at(bad).unwrap_err();
+            assert!(e.contains("Usage: botctl team"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn team_roles_lists_what_an_owner_may_give() {
+        let v = json!({
+            "name": "Ops",
+            "roleChoices": [
+                { "id": "r1", "name": "Team helpdesk", "applies": ["users.manage"], "maxDays": null },
+                { "id": "r2", "name": "On-call", "applies": ["machines.manage"], "maxDays": 7 },
+            ],
+            "roleRequests": 2,
+        });
+        assert_eq!(
+            team_roles_said(&v),
+            "Roles you may give in Ops:\n  Team helpdesk: users.manage\n  On-call: machines.manage (time-bound: give it --for at most 7 days)\n2 requests wait for a decision: botctl team requests"
+        );
+        let one = json!({ "name": "Ops", "roleChoices": [{ "name": "Lead", "applies": ["users.manage", "billing.manage"] }], "roleRequests": 1 });
+        assert!(team_roles_said(&one).ends_with("Lead: users.manage, billing.manage\n1 request waits for a decision: botctl team requests"), "{}", team_roles_said(&one));
+        assert!(!team_roles_said(&json!({ "name": "Ops", "roleChoices": [{ "name": "Lead", "applies": [] }], "roleRequests": 0 })).contains("wait"));
+        assert!(team_roles_said(&json!({ "name": "Ops", "roleChoices": [] })).starts_with("No custom role adds anything in a team yet"));
+        assert!(team_roles_said(&json!({ "name": "Ops", "role": "member" })).starts_with("Only Ops's owners and admins"));
+    }
+
+    #[test]
+    fn a_refused_admin_role_command_points_team_owners_at_botctl_team() {
+        let refused = || "Forbidden (HTTP 403)".to_string();
+        for (rest, instead) in [
+            (&["assign", "r1", "u1", "--team", "t1"][..], "botctl team role assign <role> <user>"),
+            (&["unassign", "r1", "u1", "--team", "t1"], "botctl team role unassign <user>"),
+            (&["requests"], "botctl team requests"),
+            (&["requests", "all"], "botctl team requests"),
+            (&["approve", "rq1", "--for", "4h"], "botctl team approve <request>"),
+            (&["deny", "rq1"], "botctl team deny <request>"),
+        ] {
+            assert_eq!(team_hint(rest, refused()), format!("Forbidden (HTTP 403)\nIn your own team, as one of its owners or admins: {instead}"), "{rest:?}");
+        }
+        for rest in [&["assign", "r1", "u1"][..], &["unassign", "r1", "u1"], &["show", "r1"], &["request", "r1", "--team"], &["my-requests"], &["add", "X"]] {
+            assert_eq!(team_hint(rest, refused()), refused(), "{rest:?}");
+        }
+        assert_eq!(team_hint(&["approve", "rq1"], "Not found (HTTP 404)".into()), "Not found (HTTP 404)");
     }
 
     #[test]
