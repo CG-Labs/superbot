@@ -82,13 +82,19 @@ pub fn check(
     Ok(out)
 }
 
-struct Args<'a> {
-    home: Option<&'a str>,
-    env_file: Option<&'a str>,
-    set: Vec<(&'a str, &'a str)>,
+pub(crate) struct Args<'a> {
+    pub home: Option<&'a str>,
+    pub env_file: Option<&'a str>,
+    pub set: Vec<(&'a str, &'a str)>,
 }
 
 fn parse<'a>(rest: &[&'a str]) -> Result<Args<'a>, String> {
+    parse_with(rest, USAGE)
+}
+
+/// `--home`, `--env-file` and `--set`, as `botd machines check` and `botd settings check`
+/// (ADR 0310) take them, with `usage` after an error.
+pub(crate) fn parse_with<'a>(rest: &[&'a str], usage: &str) -> Result<Args<'a>, String> {
     let mut a = Args {
         home: None,
         env_file: None,
@@ -96,13 +102,13 @@ fn parse<'a>(rest: &[&'a str]) -> Result<Args<'a>, String> {
     };
     let mut it = rest.iter();
     while let Some(&flag) = it.next() {
-        let v = *it.next().ok_or(format!("{flag} needs a value\n{USAGE}"))?;
+        let v = *it.next().ok_or(format!("{flag} needs a value\n{usage}"))?;
         match flag {
             "--home" => a.home = Some(v),
             "--env-file" => a.env_file = Some(v),
             "--set" => {
                 let (k, val) = v.split_once('=').ok_or(format!(
-                    "--set takes NAME=VALUE, not \"{}\"\n{USAGE}",
+                    "--set takes NAME=VALUE, not \"{}\"\n{usage}",
                     crate::audit::clip(v, 40)
                 ))?;
                 if k.is_empty()
@@ -111,19 +117,86 @@ fn parse<'a>(rest: &[&'a str]) -> Result<Args<'a>, String> {
                         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
                 {
                     return Err(format!(
-                        "--set: \"{}\" isn't a setting's name\n{USAGE}",
+                        "--set: \"{}\" isn't a setting's name\n{usage}",
                         crate::audit::clip(k, 40)
                     ));
                 }
                 a.set.push((k, val));
             }
-            _ => return Err(format!("Unknown option {flag}\n{USAGE}")),
+            _ => return Err(format!("Unknown option {flag}\n{usage}")),
         }
     }
     if a.home.is_some() && a.env_file.is_some() {
-        return Err(format!("Use --home or --env-file, not both\n{USAGE}"));
+        return Err(format!("Use --home or --env-file, not both\n{usage}"));
     }
     Ok(a)
+}
+
+/// Reads the settings `a` names into the process environment, as botd's start reads them
+/// under systemd's EnvironmentFile, saying where they came from, and moves into the folder
+/// the installer's unit runs botd in. Run before anything else reads the environment.
+pub(crate) fn load(a: &Args) -> Result<(), String> {
+    let s = crate::support_check::Settings::load(a.home, a.env_file)?;
+    match s.source()["envFile"].as_str() {
+        Some(f) => println!("Settings: {f}, over botd's environment"),
+        None => println!("Settings: botd's environment"),
+    }
+    for (k, _) in &a.set {
+        println!("Settings: {k} as given with --set");
+    }
+    for (k, v) in s
+        .vars()
+        .into_iter()
+        .chain(a.set.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+    {
+        unsafe { std::env::set_var(k, v) };
+    }
+    if let Some(dir) = a
+        .home
+        .map(|h| Path::new(h).join("superbot"))
+        .filter(|d| d.is_dir())
+    {
+        let _ = std::env::set_current_dir(dir);
+    }
+    Ok(())
+}
+
+/// A setting as botd's start reads it: empty when unset.
+pub(crate) fn var(k: &str) -> String {
+    std::env::var(k)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default()
+}
+
+/// The folder this botd is in, where its start looks for the files shipped beside it.
+pub(crate) fn bin_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default()
+}
+
+/// `f` with the secrets botd's start reads settings with: the environment, then the
+/// secrets manager SECRETS_BACKEND names, checked as at start (ADR 0125).
+pub(crate) fn with_startup_store<T>(
+    f: impl FnOnce(&dyn SecretStore) -> Result<T, String>,
+) -> Result<T, String> {
+    let process = secrets::env::EnvStore::process();
+    let external = secrets::external::from_env(&var, &process)
+        .map_err(|e| format!("Secrets backend: {e}"))?;
+    if let Some(x) = &external {
+        x.check().map_err(|e| {
+            format!("Secrets backend: {e}. botd won't start without its secrets (ADR 0125).")
+        })?;
+    }
+    let shared = external.map(secrets::external::Shared);
+    let store = secrets::external::Layered(
+        std::iter::once(&process as &dyn SecretStore)
+            .chain(shared.as_ref().map(|s| s as &dyn SecretStore))
+            .collect(),
+    );
+    f(&store)
 }
 
 /// `botd machines check ...`: prints what botd would say of its machine settings and
@@ -142,64 +215,11 @@ pub fn cli(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let s = match crate::support_check::Settings::load(a.home, a.env_file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("botd machines: {e}");
-            return 1;
-        }
-    };
-    match s.source()["envFile"].as_str() {
-        Some(f) => println!("Settings: {f}, over botd's environment"),
-        None => println!("Settings: botd's environment"),
+    if let Err(e) = load(&a) {
+        eprintln!("botd machines: {e}");
+        return 1;
     }
-    for (k, _) in &a.set {
-        println!("Settings: {k} as given with --set");
-    }
-    // Everything below reads the process environment, as botd's start does under systemd's
-    // EnvironmentFile. This runs before botd starts anything else that reads it.
-    for (k, v) in s
-        .vars()
-        .into_iter()
-        .chain(a.set.iter().map(|(k, v)| (k.to_string(), v.to_string())))
-    {
-        unsafe { std::env::set_var(k, v) };
-    }
-    if let Some(dir) = a
-        .home
-        .map(|h| Path::new(h).join("superbot"))
-        .filter(|d| d.is_dir())
-    {
-        let _ = std::env::set_current_dir(dir);
-    }
-    let var = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_default()
-    };
-    let bin_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_default();
-    let process = secrets::env::EnvStore::process();
-    let r = secrets::external::from_env(&var, &process)
-        .map_err(|e| format!("Secrets backend: {e}"))
-        .and_then(|x| match x {
-            Some(x) => x.check().map(|_| Some(x)).map_err(|e| {
-                format!("Secrets backend: {e}. botd won't start without its secrets (ADR 0125).")
-            }),
-            None => Ok(None),
-        })
-        .and_then(|external| {
-            let shared = external.map(secrets::external::Shared);
-            let store = secrets::external::Layered(
-                std::iter::once(&process as &dyn SecretStore)
-                    .chain(shared.as_ref().map(|s| s as &dyn SecretStore))
-                    .collect(),
-            );
-            check(&var, &store, &bin_dir)
-        });
+    let r = with_startup_store(|store| check(&var, store, &bin_dir()));
     match r {
         Ok(lines) => {
             for l in lines {
