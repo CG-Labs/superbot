@@ -208,6 +208,10 @@ pub struct ExternalStore {
     startup: Mutex<HashMap<(Scope, String), Option<Zeroizing<String>>>>,
     /// Held while a refresh runs, so two can't pile their reads onto the backend.
     refreshing: Mutex<()>,
+    /// Held while a change the backend announced is applied (`changed`), and by a refresh
+    /// for its whole run, so the two never overlap: either could otherwise leave the other's
+    /// newer answer uncached (ADR 0306).
+    changing: Mutex<()>,
     /// Bumped as each refresh starts. A read that began before it doesn't cache its
     /// answer, so a key read before a rotation can't land over the refresh's (ADR 0291).
     epoch: AtomicU64,
@@ -224,6 +228,7 @@ impl ExternalStore {
             run_credentials: None,
             startup: Mutex::default(),
             refreshing: Mutex::new(()),
+            changing: Mutex::new(()),
             epoch: AtomicU64::new(0),
         }
     }
@@ -451,6 +456,7 @@ impl ExternalStore {
             None => None,
         };
         let _one = self.refreshing.try_lock().map_err(|_| RefreshError::Busy)?;
+        let _no_change = self.changing.lock().unwrap_or_else(|e| e.into_inner());
         // Before anything is read, so reads still in flight from before can't cache over ours.
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let take = |name: &str| wanted.as_ref().is_none_or(|w| w.contains(name));
@@ -514,12 +520,14 @@ impl ExternalStore {
     /// again at `index` too. Like a refresh, it moves the epoch before reading, so neither a
     /// read already in flight nor this one can cache over a newer answer; and again as it
     /// caches, so a read that began meanwhile, perhaps from a standby that hasn't seen the
-    /// change, can't either. None when the store doesn't read that name there (another folder's,
+    /// change, can't either. It waits for a refresh that is running, and a refresh waits for
+    /// it. None when the store doesn't read that name there (another folder's,
     /// user folders off).
     pub fn changed(&self, scope: &Scope, name: &str, index: Option<&str>) -> Option<Refreshed> {
         if !scope.holds(name) || (scope.user_id().is_some() && !self.user_folders) {
             return None;
         }
+        let _one = self.changing.lock().unwrap_or_else(|e| e.into_inner());
         let key = (scope.clone(), name.to_string());
         let started = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let old = self.values.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|(_, v)| v.clone());
@@ -1584,7 +1592,7 @@ pub(crate) mod tests {
         assert_eq!(slow.join().unwrap(), "ch-old-1");
         assert_eq!(x.get("CH_TOKEN").unwrap().unwrap().expose(), "ch-new-1");
 
-        // Nor can the change's own read over a refresh that began while it was reading.
+        // A refresh begun while the change is reading waits for it, then reads again itself.
         let (started, release) = f.pause_next();
         let change = {
             let x = Arc::clone(&x);
@@ -1592,11 +1600,17 @@ pub(crate) mod tests {
         };
         started.recv().unwrap();
         f.values.lock().unwrap().insert((Scope::Bots, "CH_TOKEN".into()), "ch-newer-1".into());
-        x.refresh(Some(&["CH_TOKEN".to_string()])).unwrap();
+        let refresh = {
+            let x = Arc::clone(&x);
+            std::thread::spawn(move || entry(&x.refresh(Some(&["CH_TOKEN".to_string()])).unwrap(), "bots", "CH_TOKEN").result)
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!refresh.is_finished(), "it waits for the change");
         release.send(()).unwrap();
-        assert_eq!(change.join().unwrap(), Change::Unchanged, "it read the value from before the refresh");
+        assert_eq!(change.join().unwrap(), Change::Unchanged, "it read the value from before");
+        assert_eq!(refresh.join().unwrap(), Change::Changed);
         let reads = f.reads.load(Ordering::SeqCst);
-        assert_eq!(x.get("CH_TOKEN").unwrap().unwrap().expose(), "ch-newer-1", "the refresh's answer stays cached");
+        assert_eq!(x.get("CH_TOKEN").unwrap().unwrap().expose(), "ch-newer-1", "the refresh's answer is cached");
         assert_eq!(f.reads.load(Ordering::SeqCst), reads);
 
         // Nor can a read that began while the change was reading, from a backend that hadn't
