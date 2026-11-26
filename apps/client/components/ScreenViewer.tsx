@@ -56,10 +56,13 @@ export function ScreenViewer({
     controlChangeRef.current?.(control);
   }, [control]);
 
+  /** The last link that worked, kept across failed refreshes and retries so a restarted screen is still noticed. */
+  const lastRef = useRef<{ botId: string; url: string | null }>({ botId, url: null });
+
   useEffect(() => {
     let alive = true;
-    // The last link that worked, kept across failed refreshes so a restarted screen is still noticed.
-    let last: string | null = null;
+    if (lastRef.current.botId !== botId) lastRef.current = { botId, url: null };
+    const last = lastRef.current;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setUrl(null);
     setError(null);
@@ -69,8 +72,8 @@ export function ScreenViewer({
         const next = await fetchRef.current(botId);
         if (!alive) return;
         // A new link means the screen restarted: back to view-only, like the web app.
-        if (last !== null && next !== last) setControl(false);
-        last = next;
+        if (last.url !== null && next !== last.url) setControl(false);
+        last.url = next;
         setUrl(next);
         setError(null);
       } catch (err) {

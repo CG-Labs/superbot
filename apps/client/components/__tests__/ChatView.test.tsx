@@ -116,7 +116,7 @@ describe("ChatView", () => {
 
     await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "  Ship it  "));
     await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
-    expect(sendText).toHaveBeenCalledWith("Ship it");
+    expect(sendText).toHaveBeenCalledWith("Ship it", undefined, "b");
     expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("");
   });
 
@@ -199,9 +199,40 @@ describe("ChatView", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(/Couldn't send your message\. Can't reach the server/);
 
     await act(async () => fireEvent.press(screen.getByRole("button", { name: "Retry" })));
-    expect(sendText).toHaveBeenNthCalledWith(2, "Ship it");
+    expect(sendText).toHaveBeenNthCalledWith(2, "Ship it", undefined, "b");
     expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("");
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps a failed message with its own Bot when you've moved to another", async () => {
+    let fail!: (err: Error) => void;
+    const sendText = jest
+      .fn()
+      .mockImplementationOnce(() => new Promise<void>((_, reject) => (fail = reject)))
+      .mockResolvedValueOnce(undefined);
+    mockCtx.sendText = sendText;
+    const ui = () => (
+      <ToastProvider>
+        <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />
+      </ToastProvider>
+    );
+    const view = await render(ui());
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Ship it"));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+
+    mockCtx.activeId = "a";
+    await view.rerender(ui());
+    await act(async () => fail(new TypeError("Network request failed")));
+    expect(screen.getByLabelText("Message Ada")).toHaveDisplayValue("");
+
+    mockCtx.activeId = "b";
+    await view.rerender(ui());
+    expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+
+    mockCtx.activeId = "a";
+    await view.rerender(ui());
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Retry" })));
+    expect(sendText).toHaveBeenNthCalledWith(2, "Ship it", undefined, "b");
   });
 
   it("names the header, the stop button and the chosen option for screen readers", async () => {

@@ -103,8 +103,16 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     }
   }, []);
 
+  /** Words from failed sends, kept per Bot so they only come back in that Bot's chat. */
+  const unsentRef = useRef<Record<string, string>>({});
+
   useEffect(() => {
     if (!activeId) return;
+    const unsent = unsentRef.current[activeId];
+    if (unsent) {
+      delete unsentRef.current[activeId];
+      setText((cur) => cur || unsent);
+    }
     void load(activeId);
   }, [activeId, load]);
 
@@ -145,15 +153,17 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
   const answer = (m: Message, option: number) =>
     void answerQuestion(m, option).catch((err) => toast.error(err, "Couldn't send your answer"));
 
-  const send = (body: string) =>
-    void sendText(body).catch((err) => {
+  const send = (body: string, id: string) =>
+    void sendText(body, undefined, id).catch((err) => {
       // Gives the words back unless something new was typed meanwhile.
-      setText((cur) => cur || body);
+      if (shownRef.current === id) setText((cur) => cur || body);
+      else unsentRef.current[id] = body;
       toast.error(err, "Couldn't send your message", {
         label: "Retry",
         onPress: () => {
-          setText((cur) => (cur === body ? "" : cur));
-          send(body);
+          if (shownRef.current === id) setText((cur) => (cur === body ? "" : cur));
+          else if (unsentRef.current[id] === body) delete unsentRef.current[id];
+          send(body, id);
         },
       });
     });
@@ -162,7 +172,7 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     const body = text.trim();
     if (!body) return;
     setText("");
-    send(body);
+    send(body, bot.id);
   };
 
   const stop = () => void stopBot(bot.id).catch((err) => toast.error(err, isQueued(bot) ? "Couldn't cancel it" : "Couldn't stop it"));

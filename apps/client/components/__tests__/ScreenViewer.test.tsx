@@ -149,6 +149,32 @@ describe("ScreenViewer", () => {
     }
   });
 
+  it("still drops control after Try again if the screen restarted", async () => {
+    const fetchUrl = jest
+      .fn()
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a")
+      .mockRejectedValueOnce(new Error("The screen is starting."))
+      .mockResolvedValueOnce("https://h/screen/6902/?token=b");
+    jest.useFakeTimers();
+    try {
+      await render(
+        <ScreenViewer botId="b1" botName="Ada" fetchUrl={fetchUrl} onClose={jest.fn()} initialControl refreshMs={1000} retryMs={60_000} />,
+      );
+      expect(await screen.findByTestId("screen-frame")).toHaveTextContent(/token=a/);
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.getByRole("button", { name: "Give back" })).toBeOnTheScreen();
+
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+      expect(fetchUrl).toHaveBeenCalledTimes(3);
+      expect(screen.getByTestId("screen-frame")).toHaveTextContent(/token=b/);
+      expect(screen.getByTestId("screen-shield")).toBeOnTheScreen();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("hands the screen back with Done during a handoff", async () => {
     const user = userEvent.setup();
     const onHandoffDone = jest.fn().mockResolvedValue(undefined);
