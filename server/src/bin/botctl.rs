@@ -2271,6 +2271,14 @@ fn saml_summary(v: &Value) -> String {
         }
         None => out += "  Authentication context:   not checked (the IdP's MFA isn't required)\n",
     }
+    let assurance = &v["assurance"];
+    match assurance["required"].as_array() {
+        Some(required) => {
+            let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+            out += &format!("  Identity assurance:       all of {}\n    Read from attribute {}\n", required.join(", "), assurance["attribute"].as_str().unwrap_or(""));
+        }
+        None => out += "  Identity assurance:       not checked (the IdP's identity vetting isn't required)\n",
+    }
     let age = |s: u64| match s {
         s if s % 86_400 == 0 => format!("{}d", s / 86_400),
         s if s % 3_600 == 0 => format!("{}h", s / 3_600),
@@ -5107,6 +5115,15 @@ mod tests {
         v["authnContext"] = json!({ "required": ["mfa", "urn:okta:loa:2fa:any"], "methodsAttribute": "amr", "requested": false });
         let out = saml_summary(&v);
         assert!(out.contains("  Authentication context:   one of mfa, urn:okta:loa:2fa:any\n    Also read from attribute amr\n    Not requested: the IdP's own policy decides\n"), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_the_identity_assurance_required() {
+        let mut v = json!({ "provider": "fed", "label": "Fed", "idp": null, "assurance": null });
+        assert!(saml_summary(&v).contains("  Identity assurance:       not checked (the IdP's identity vetting isn't required)\n"));
+        v["assurance"] = json!({ "required": ["https://refeds.org/assurance", "https://refeds.org/assurance/IAP/medium"], "attribute": "urn:oid:1.3.6.1.4.1.5923.1.1.1.11" });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Identity assurance:       all of https://refeds.org/assurance, https://refeds.org/assurance/IAP/medium\n    Read from attribute urn:oid:1.3.6.1.4.1.5923.1.1.1.11\n"), "{out}");
     }
 
     #[test]

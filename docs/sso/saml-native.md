@@ -40,6 +40,7 @@ Acme (corp): ready
     SOAP SLO URL:            https://superbot.example.com/api/auth/sso/corp/slo/soap
   IdP-initiated sign-in:    refused (start from SuperBot)
   Authentication context:   not checked (the IdP's MFA isn't required)
+  Identity assurance:       not checked (the IdP's identity vetting isn't required)
   Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)
     Research and Scholarship: set SP_DISPLAY_NAME, SP_INFORMATION_URL, SP_CONTACT_TECHNICAL
     Code of Conduct v2:       set SP_DISPLAY_NAME, SP_DESCRIPTION, SP_PRIVACY_URL
@@ -209,6 +210,8 @@ With [several IdPs of a federation](#several-idps-of-a-federation), the setting 
 | `SSO_<ID>_AUTHN_CONTEXT` | | Only people the IdP says signed in one of these ways get in, comma separated (exact): authentication context classes, or values of `AUTHN_METHODS_ATTRIBUTE` ([below](#require-mfa-at-the-idp)). |
 | `SSO_<ID>_AUTHN_METHODS_ATTRIBUTE` | | The assertion attribute listing how the person signed in, whose values count for `AUTHN_CONTEXT` too (Entra ID: `http://schemas.microsoft.com/claims/authnmethodsreferences`). Needs `AUTHN_CONTEXT`. |
 | `SSO_<ID>_REQUEST_AUTHN_CONTEXT` | `false` | `true`: AuthnRequests ask the IdP for the `AUTHN_CONTEXT` classes (`RequestedAuthnContext`, exact). Needs `AUTHN_CONTEXT`. |
+| `SSO_<ID>_ASSURANCE` | | Only people the IdP vouches for with every one of these identity assurance values get in, comma separated (exact), like `https://refeds.org/assurance/IAP/medium`; RAF's own `https://refeds.org/assurance` is added to RAF values ([below](#require-identity-assurance-refeds-raf)). |
+| `SSO_<ID>_ASSURANCE_ATTRIBUTE` | eduPersonAssurance (`urn:oid:1.3.6.1.4.1.5923.1.1.1.11`) | The assertion attribute the assurance values are read from. Needs `ASSURANCE`. |
 | `SSO_<ID>_FORCE_AUTHN` | `false` | `true`: every AuthnRequest asks the IdP to sign the person in again (`ForceAuthn`), and an answer from before the request is refused ([below](#sign-in-age-and-the-idps-session-limit)). |
 | `SSO_<ID>_MAX_AUTHN_AGE` | | A duration (`30m`, `12h`, `7d`; 5m to 365d): a sign-in at the IdP older than this is sent back once with `ForceAuthn`. Not with `FORCE_AUTHN`. |
 | `SSO_<ID>_IDP_SESSION_LIMIT` | `on` | Sessions end at the IdP's `SessionNotOnOrAfter`, if sooner than `SESSION_MAX_AGE`. `off` ignores it. |
@@ -505,7 +508,7 @@ SSO_UNI_SP_CONTACT_SECURITY="Security Team <security@example.edu>"
 SSO_UNI_SP_SIRTFI=v2
 ```
 
-- **What's published.** The name, description and links as `mdui:UIInfo` in English; the organization; each contact as a `ContactPerson`, the security one as the REFEDS security contact; Sirtfi as the `assurance-certification` entity attribute. With a display name, an `AttributeConsumingService` lists the attributes botd reads: the email and display name (your `EMAIL_ATTRIBUTE` and `NAME_ATTRIBUTE`, or eduPerson's `mail` and `displayName`), and the groups and authentication methods attributes if set. The email is marked required when `ALLOWED_DOMAINS` is set, and the groups with `REQUIRED_GROUPS`. A subject identifier is asked for as [above](#subject-identifiers-subject-id-and-pairwise-id). With none of these settings, the metadata is unchanged.
+- **What's published.** The name, description and links as `mdui:UIInfo` in English; the organization; each contact as a `ContactPerson`, the security one as the REFEDS security contact; Sirtfi as the `assurance-certification` entity attribute. With a display name, an `AttributeConsumingService` lists the attributes botd reads: the email and display name (your `EMAIL_ATTRIBUTE` and `NAME_ATTRIBUTE`, or eduPerson's `mail` and `displayName`), the groups and authentication methods attributes if set, and the assurance attribute with [`ASSURANCE`](#require-identity-assurance-refeds-raf). The email is marked required when `ALLOWED_DOMAINS` is set, the groups with `REQUIRED_GROUPS`, and the assurance attribute always. A subject identifier is asked for as [above](#subject-identifiers-subject-id-and-pairwise-id). With none of these settings, the metadata is unchanged.
 - **Contacts are public.** Federations publish them in their metadata. Use role addresses, and a security address that isn't publicly archived, as Sirtfi requires.
 - **Entity categories are the federation's to add.** Research and Scholarship and the Code of Conduct v2 are added by your federation after review; botd doesn't claim them. `botctl sso saml uni` shows the listing and, for each, "metadata ready, ask the federation to add it" or the settings still missing. R&S needs `SP_DISPLAY_NAME`, `SP_INFORMATION_URL`, `SP_CONTACT_TECHNICAL` and `RESPONSE_BINDING=post` (the default); CoCo v2 needs `SP_DISPLAY_NAME`, `SP_DESCRIPTION` and `SP_PRIVACY_URL`, and most federations also want an administrative contact and Sirtfi for it.
 - **Then register.** Give the federation `<SSO_PUBLIC_URL>/api/auth/sso/uni/metadata`, or the file it serves, through its registration process. Send it again after changing these settings or rolling over a key.
@@ -574,6 +577,24 @@ App tiles ([above](#idp-initiated-sign-in-app-tiles)) aren't held to it, because
 
 If the values are wrong, nobody gets in with this provider. Break-glass and one-time codes still work. Fix the setting from what the audit log says the IdP sent.
 
+## Require identity assurance (REFEDS RAF)
+
+MFA says how someone signed in. Identity assurance says how well their organization knows who they are: whether their identity was checked against an ID document, whether their identifier is unique and never reassigned. Research and education IdPs send it in the `eduPersonAssurance` attribute, with the values of the [REFEDS Assurance Framework](https://refeds.org/assurance) (RAF). Research services that hold sensitive data (NIH's, many research infrastructures') ask for both. SuperBot can refuse anyone the IdP doesn't vouch for with every value you name ([ADR 0328](../adr/0328-saml-required-identity-assurance.md)):
+
+```bash
+# A verified, unique identity (RAF's Cappuccino profile, spelled out), and MFA.
+SSO_UNI_ASSURANCE=https://refeds.org/assurance/IAP/medium,https://refeds.org/assurance/ID/unique
+SSO_UNI_AUTHN_CONTEXT=https://refeds.org/profile/mfa
+```
+
+- **All of them.** Unlike `AUTHN_CONTEXT`, where any one value lets someone in, each `ASSURANCE` value must be among what the IdP sent. Values are exact, comma separated, up to 16.
+- **RAF's own value is added.** A value under `https://refeds.org/assurance/` is a RAF claim only beside `https://refeds.org/assurance`, which a conforming IdP always sends, so botd requires that too. `botctl sso saml uni` shows the full list.
+- **Levels aren't inferred.** RAF has IdPs send every lower level with a higher one (`IAP/high` with `IAP/medium` and `IAP/low`), so requiring `IAP/medium` lets in anyone with `IAP/high` from a conforming IdP. An IdP that sends only `IAP/high` doesn't conform and is refused. To accept only RAF 2.0 claims, also list `https://refeds.org/assurance/version/2`. A profile works too: `https://refeds.org/assurance/profile/espresso`.
+- **Read from the signed assertion only**, from `eduPersonAssurance` (`urn:oid:1.3.6.1.4.1.5923.1.1.1.11`), or the attribute `SSO_<ID>_ASSURANCE_ATTRIBUTE` names. Nothing is read without `ASSURANCE`. Values of other frameworks (an IdP's own levels of assurance) work the same way.
+- **Checked on every sign-in**, after MFA and before the account is looked up, so just in time never makes an account for someone without it. A refusal is `assurance` in the audit log, with what the IdP sent (`assurance`) and what it lacked (`assuranceMissing`), and the person sees that their organization hasn't vouched for their identity at the level SuperBot requires. Every `auth.login` then records `assurance`.
+- **Federations release it when asked.** With `SP_DISPLAY_NAME` set ([below](#registering-superbot-with-a-federation)), SuperBot's metadata asks for the attribute, marked required. Many IdPs only release `eduPersonAssurance` to SPs that ask, or that are in Research and Scholarship.
+- **With several IdPs**, each person is held to the values their own IdP sent. Sessions people already have aren't ended.
+
 ## Sign-in age and the IdP's session limit
 
 The signed assertion says when the IdP signed the person in (`AuthnInstant`) and, from some IdPs, when its own session for them ends (`SessionNotOnOrAfter`). SuperBot uses both ([ADR 0225](../adr/0225-saml-session-lifetime-and-reauthentication.md)):
@@ -588,7 +609,7 @@ SSO_CORP_MAX_AUTHN_AGE=12h
 ```
 
 - **One retry, then a clear refusal.** The IdP's answer to a `ForceAuthn` request must show a sign-in after that request (within two minutes of clock difference). If it answers from its old session again, the sign-in is refused: `stale_authn` (or `idp_session_ended`) in the audit log, and the person sees that their organization's sign-in was too long ago. An assertion without `AuthnInstant` can't show it's recent, so it's refused when a recent sign-in is required.
-- **Checked last**, after the signature, required groups and MFA, and before the account is looked up, so just in time never makes an account from a stale sign-in. The sign-in asked again is audited as `auth.saml_reauthn` (`reason`, `authnInstant`, `authnSince`, `idpSessionEnds`). Every `auth.login` records `authnInstant`, `idpSessionEnds` when the IdP set one, and `forceAuthn` when SuperBot asked.
+- **Checked last**, after the signature, required groups, MFA and [identity assurance](#require-identity-assurance-refeds-raf), and before the account is looked up, so just in time never makes an account from a stale sign-in. The sign-in asked again is audited as `auth.saml_reauthn` (`reason`, `authnInstant`, `authnSince`, `idpSessionEnds`). Every `auth.login` records `authnInstant`, `idpSessionEnds` when the IdP set one, and `forceAuthn` when SuperBot asked.
 - **Several statements.** With more than one `AuthnStatement`, the latest `AuthnInstant` and the earliest `SessionNotOnOrAfter` count. Values outside the signed assertion are never read.
 - **App tiles** ([above](#idp-initiated-sign-in-app-tiles)) aren't held to it, because their response never signs anyone in. The sign-in they restart is.
 - **Sessions people already have aren't changed.** The settings apply from their next sign-in. `botctl sso saml corp` shows them.
@@ -629,6 +650,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `idp_metadata_expired` | The IdP's signed metadata in use has passed its `validUntil`, and no fresh copy loaded. From a file or an import, give botd a fresh signed copy; from a URL or MDQ, look for `sso.saml_metadata_refused` or an unreachable server in the log ([above](#signed-idp-metadata)). |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
 | `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |
+| `assurance` | `SSO_<ID>_ASSURANCE` is set and the IdP didn't send every value. `assurance` says what it sent and `assuranceMissing` what it lacked. None sent: the IdP doesn't release `eduPersonAssurance` to SuperBot (ask its operators, and set `SP_DISPLAY_NAME` so SuperBot's metadata asks for it), or sends it under another name (`ASSURANCE_ATTRIBUTE`). Some missing: the person's identity wasn't vetted to that level at their organization ([above](#require-identity-assurance-refeds-raf)). |
 | `stale_authn` | `FORCE_AUTHN` or `MAX_AUTHN_AGE` is set, and the IdP's answer to SuperBot's `ForceAuthn` request was from an older sign-in. `authnInstant` and `authnSince` say how old. The IdP ignores `ForceAuthn`: fix the app at the IdP ([above](#sign-in-age-and-the-idps-session-limit)). |
 | `idp_session_ended` | The IdP's `SessionNotOnOrAfter` had passed, and its answer to SuperBot's `ForceAuthn` request was in the same ended session. `idpSessionEnds` says when. Fix the IdP's session lifetime, or set `IDP_SESSION_LIMIT=off`. |
 | `user_disabled` | The person is disabled in SuperBot. |

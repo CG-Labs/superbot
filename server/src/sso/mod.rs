@@ -473,7 +473,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 55] = [
+const ONLY_FOR: [(&str, &[&str]); 57] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -513,6 +513,8 @@ const ONLY_FOR: [(&str, &[&str]); 55] = [
     ("AUTHN_CONTEXT", &["saml"]),
     ("AUTHN_METHODS_ATTRIBUTE", &["saml"]),
     ("REQUEST_AUTHN_CONTEXT", &["saml"]),
+    ("ASSURANCE", &["saml"]),
+    ("ASSURANCE_ATTRIBUTE", &["saml"]),
     ("FORCE_AUTHN", &["saml"]),
     ("MAX_AUTHN_AGE", &["saml"]),
     ("IDP_SESSION_LIMIT", &["saml"]),
@@ -533,7 +535,7 @@ const ONLY_FOR: [(&str, &[&str]); 55] = [
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 40] = [
+const SAML_NATIVE_ONLY: [&str; 42] = [
     "IDP_ENTITY_IDS",
     "IDP_ENTITY_CATEGORIES",
     "IDP_METADATA_URL",
@@ -558,6 +560,8 @@ const SAML_NATIVE_ONLY: [&str; 40] = [
     "AUTHN_CONTEXT",
     "AUTHN_METHODS_ATTRIBUTE",
     "REQUEST_AUTHN_CONTEXT",
+    "ASSURANCE",
+    "ASSURANCE_ATTRIBUTE",
     "FORCE_AUTHN",
     "MAX_AUTHN_AGE",
     "IDP_SESSION_LIMIT",
@@ -817,7 +821,8 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 None => saml_sp::Subject::NameId,
                 Some(v) => saml_sp::Subject::parse(&v).ok_or_else(|| format!("{} must be nameid, subject-id, or pairwise-id", key("SUBJECT")))?,
             };
-            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")?, groups: attribute("GROUPS_ATTRIBUTE")?, authn_methods: attribute("AUTHN_METHODS_ATTRIBUTE")?, subject };
+            let (assurance, assurance_attribute) = assurance(&key, list, attribute("ASSURANCE_ATTRIBUTE")?)?;
+            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")?, groups: attribute("GROUPS_ATTRIBUTE")?, authn_methods: attribute("AUTHN_METHODS_ATTRIBUTE")?, assurance: assurance_attribute, subject };
             let mut required_groups: Vec<String> = Vec::new();
             for g in list(&key("REQUIRED_GROUPS")) {
                 let g = saml_roles::group_name(&g).map_err(|e| format!("{}: {e}", key("REQUIRED_GROUPS")))?;
@@ -917,7 +922,7 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             let discovery = discovery_url(&key, var, several)?;
             let about = about(&key, var, &attributes, !allowed_domains.is_empty(), !required_groups.is_empty())?;
             (
-                Kind::SamlSp { entity_ids, every_idp, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, discovery, about },
+                Kind::SamlSp { entity_ids, every_idp, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, assurance, freshness, discovery, about },
                 saml::LABEL,
             )
         }
@@ -1057,6 +1062,20 @@ fn authn_context(key: &dyn Fn(&str) -> String, var: &Var, list: &List, attribute
     Ok(Some(saml_sp::AuthnContext { accepted, request }))
 }
 
+/// Native SAML: `ASSURANCE`, the identity assurance values the IdP must vouch for, all of them,
+/// and the attribute they're read from, `ASSURANCE_ATTRIBUTE` or eduPersonAssurance (ADR 0328).
+/// No attribute is read without a requirement.
+fn assurance(key: &dyn Fn(&str) -> String, list: &List, attribute: Option<String>) -> Result<(Vec<String>, Option<String>), String> {
+    let required = saml_sp::required_assurance(&list(&key("ASSURANCE"))).map_err(|e| format!("{}: {e}", key("ASSURANCE")))?;
+    if required.is_empty() {
+        return match attribute {
+            Some(_) => Err(format!("{} needs {}: the assurance values to require, like {}/IAP/medium", key("ASSURANCE_ATTRIBUTE"), key("ASSURANCE"), saml_sp::RAF)),
+            None => Ok((required, None)),
+        };
+    }
+    Ok((required, Some(attribute.unwrap_or_else(|| saml_sp::EDU_PERSON_ASSURANCE.into()))))
+}
+
 /// Native SAML: `FORCE_AUTHN`, `MAX_AUTHN_AGE` and `IDP_SESSION_LIMIT` (ADR 0225).
 fn freshness(key: &dyn Fn(&str) -> String, var: &Var) -> Result<saml_sp::Freshness, String> {
     let switch = |k: &str, yes: &str, no: &str, default: bool| match var(&key(k)).map(|v| v.to_ascii_lowercase()) {
@@ -1135,6 +1154,14 @@ fn claim_details(d: &mut Value, c: &Claims) {
     if let Some(s) = c.subject_from {
         d["subjectFrom"] = json!(s);
     }
+    if !c.assurance.is_empty() {
+        d["assurance"] = json!(assurance_seen(&c.assurance));
+    }
+}
+
+/// The assurance values an IdP sent, as the audit log keeps them.
+fn assurance_seen(v: &[String]) -> Vec<String> {
+    v.iter().take(saml_sp::MAX_ASSURANCE).map(|v| crate::audit::clip(v, 128)).collect()
 }
 
 /// The IdP's type (entra, google, oidc, apple, github, saml), beside the configured id.
@@ -1832,6 +1859,15 @@ async fn finish_saml(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, f
                 failed(a, source, id, "authn_context", Some(&claims), extra);
                 return ret.fail("sso_mfa_required");
             }
+        }
+    }
+    // And only people the IdP vouches for with every identity assurance value required (ADR 0328).
+    if let Kind::SamlSp { assurance, .. } = &p.kind {
+        let missing = saml_sp::assurance_missing(assurance, &claims.assurance);
+        if !missing.is_empty() {
+            a.limiter.fail(&ip, at);
+            failed(a, source, id, "assurance", Some(&claims), json!({ "assurance": assurance_seen(&claims.assurance), "assuranceMissing": missing }));
+            return ret.fail("sso_assurance_required");
         }
     }
     // Last before anyone is made just in time: a sign-in recent enough, in an IdP session that
@@ -2592,7 +2628,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_ids, sp_entity_id, source, attributes, required_groups, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, about, .. } = &p.kind else {
+    let Kind::SamlSp { entity_ids, sp_entity_id, source, attributes, required_groups, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, assurance, freshness, about, .. } = &p.kind else {
         return json!({});
     };
     let several = p.several_idps();
@@ -2672,6 +2708,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "forceAuthn": freshness.force_authn, "maxAuthnAgeSeconds": freshness.max_authn_age_ms.map(|ms| ms / 1000), "idpSessionLimit": freshness.idp_session_limit,
         "certificateWarnings": a.app.as_ref().map_or_else(Vec::new, |app| saml_expiry::warnings(app, p, now)),
     });
+    out["assurance"] = json!(attributes.assurance.as_ref().map(|attribute| json!({ "required": assurance, "attribute": attribute })));
     out["about"] = about_view(about, *response_binding);
     out
 }
@@ -3284,8 +3321,8 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, every_idp: None, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness, discovery: None, about }
-            if *freshness == saml_sp::Freshness::default() && about.display_name.is_none() && about.contacts.is_empty() && entity_ids == &[ADFS] && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, every_idp: None, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, assurance, freshness, discovery: None, about }
+            if *freshness == saml_sp::Freshness::default() && assurance.is_empty() && attributes.assurance.is_none() && about.display_name.is_none() && about.contacts.is_empty() && entity_ids == &[ADFS] && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
         assert!(p.not_ready().unwrap().contains("botctl sso saml corp import"), "not offered until its metadata is imported");
@@ -3523,6 +3560,39 @@ mod tests {
         assert!(e.contains("SSO_CORP_AUTHN_METHODS_ATTRIBUTE needs SSO_CORP_AUTHN_CONTEXT"), "{e}");
         assert!(saml(&[("SSO_ADFS_AUTHN_CONTEXT", MFA)]).is_err(), "native only: the broker decides how people sign in");
         assert!(entra(&[("SSO_ENTRA_AUTHN_CONTEXT", MFA)]).is_err(), "SAML only");
+    }
+
+    #[test]
+    fn reads_the_identity_assurance_required_and_refuses_unclear_settings() {
+        const MEDIUM: &str = "https://refeds.org/assurance/IAP/medium";
+        let required = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { assurance, attributes, .. } => (assurance.clone(), attributes.assurance.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(required(&native(&[]).unwrap()), (vec![], None), "nothing required or read by default");
+        let s = native(&[("SSO_CORP_ASSURANCE", "https://refeds.org/assurance/IAP/medium, https://refeds.org/assurance/ID/unique ,https://refeds.org/assurance/IAP/medium")]).unwrap();
+        assert_eq!(
+            required(&s),
+            (vec![saml_sp::RAF.to_string(), MEDIUM.into(), "https://refeds.org/assurance/ID/unique".into()], Some(saml_sp::EDU_PERSON_ASSURANCE.into())),
+            "RAF's conformance value first, then the admin's in order, each once, from eduPersonAssurance"
+        );
+        let s = native(&[("SSO_CORP_ASSURANCE", "urn:example:loa:2,https://refeds.org/assurance"), ("SSO_CORP_ASSURANCE_ATTRIBUTE", "assurance")]).unwrap();
+        assert_eq!(required(&s), (vec!["urn:example:loa:2".to_string(), saml_sp::RAF.into()], Some("assurance".into())), "other frameworks as they are, from the attribute named");
+        let s = native(&[("SSO_CORP_ASSURANCE", "https://refeds.org/assurance")]).unwrap();
+        assert_eq!(required(&s).0, [saml_sp::RAF], "conformance alone");
+        let many: &'static str = (0..saml_sp::MAX_ASSURANCE).map(|i| format!("{}/x{i}", saml_sp::RAF)).collect::<Vec<_>>().join(",").leak();
+        for (vars, why) in [
+            (vec![("SSO_CORP_ASSURANCE_ATTRIBUTE", "assurance")], "an attribute with nothing to require"),
+            (vec![("SSO_CORP_ASSURANCE", "IAP medium")], "not a URI"),
+            (vec![("SSO_CORP_ASSURANCE", many)], "too many, with RAF's own value added"),
+            (vec![("SSO_CORP_ASSURANCE", MEDIUM), ("SSO_CORP_ASSURANCE_ATTRIBUTE", "my assurance")], "not an attribute name"),
+        ] {
+            assert!(native(&vars).is_err(), "{why}");
+        }
+        let e = native(&[("SSO_CORP_ASSURANCE_ATTRIBUTE", "assurance")]).err().unwrap();
+        assert!(e.contains("SSO_CORP_ASSURANCE_ATTRIBUTE needs SSO_CORP_ASSURANCE"), "{e}");
+        assert!(saml(&[("SSO_ADFS_ASSURANCE", MEDIUM)]).is_err(), "native only");
+        assert!(entra(&[("SSO_ENTRA_ASSURANCE", MEDIUM)]).is_err(), "SAML only");
     }
 
     #[test]

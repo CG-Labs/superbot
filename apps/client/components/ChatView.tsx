@@ -15,7 +15,7 @@ import { showError } from "../src/dialogs";
 import { isOpenHandoff } from "../src/handoff";
 import { isQueued, workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { HARNESS_NAMES, hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { Message } from "../src/types";
 import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
@@ -62,13 +62,17 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
     canOnBot,
     me,
   } = useSuperBot();
+  const t = useTheme();
+  const styles = useStyles();
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
+  const [composing, setComposing] = useState(false);
   const listRef = useRef<FlatList>(null);
   const inputRef = useRef<TextInputInstance>(null);
 
   const bot = bots.find((b) => b.id === activeId);
   const canOperate = canOnBot(bot, "operate");
+  const avatarEdge = t.scheme === "light" ? t.c.borderStrong : undefined;
 
   useEffect(() => {
     if (!activeId) return;
@@ -87,7 +91,8 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
   if (!bot) {
     return (
       <View style={styles.empty}>
-        <Text style={styles.emptyText}>Pick a bot to start chatting</Text>
+        <Text style={styles.emptyTitle}>Pick a bot to start chatting</Text>
+        <Text style={styles.emptyHint}>Your Bots are in the list. Each one has its own computer to work on.</Text>
       </View>
     );
   }
@@ -95,14 +100,15 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
   const list = messages[bot.id] || [];
   const draft = drafts[bot.id];
   const handoff = handoffs[bot.id];
+  const hasText = text.trim().length > 0;
 
   const answer = (m: Message, option: number) => void answerQuestion(m, option).catch(showError);
 
   const onSend = () => {
-    const t = text.trim();
-    if (!t) return;
+    const body = text.trim();
+    if (!body) return;
     setText("");
-    void sendText(t);
+    void sendText(body);
   };
 
   const renderItem = ({ item, index }: { item: Message; index: number }) => {
@@ -113,10 +119,12 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
       <View>
         {gap ? <Text style={styles.ts}>{formatTime(item.at)}</Text> : null}
         {item.role === "routine" ? (
-          <Text style={styles.routine}>Routine · {item.text}</Text>
+          <View style={styles.routineRow}>
+            <Text style={styles.routine}>Routine · {item.text}</Text>
+          </View>
         ) : (
           <View style={[styles.row, isUser && styles.rowUser]}>
-            <View style={[styles.bubble, isUser && styles.bubbleUser, item.error && styles.bubbleError]}>
+            <View style={[isUser ? styles.bubbleUser : styles.reply, item.error && styles.bubbleError]}>
               {item.role === "peer" || item.role === "reply" ? (
                 <Text style={styles.from}>{peerLabel(item, bots)}</Text>
               ) : null}
@@ -129,7 +137,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
                 <Pressable
                   role="button"
                   aria-label={`${COPY_LABEL} message`}
-                  style={styles.copy}
+                  style={({ pressed }) => [styles.copy, pressed && styles.pressed]}
                   onPress={() => void copyText(item.text)}
                 >
                   <Text style={styles.copyText}>{COPY_LABEL}</Text>
@@ -142,7 +150,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
                     <Pressable
                       role="button"
                       aria-label="Open screen"
-                      style={styles.openScreen}
+                      style={({ pressed }) => [styles.openScreen, pressed && styles.pressed]}
                       onPress={() => onToggleScreen(true)}
                     >
                       <Text style={styles.openScreenText}>Open screen</Text>
@@ -153,7 +161,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
                       key={k}
                       role="button"
                       aria-label={opt}
-                      style={[styles.opt, item.question?.picked === k && styles.optOn]}
+                      style={({ pressed }) => [styles.opt, item.question?.picked === k && styles.optOn, pressed && styles.optPressed]}
                       disabled={!canOperate || item.question?.picked != null}
                       onPress={() => answer(item, k)}
                     >
@@ -180,17 +188,17 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
         ))}
       {draft ? (
         <View style={styles.row}>
-          <View style={styles.bubble}>
+          <View style={styles.reply}>
             <Markdown>{draft}</Markdown>
           </View>
         </View>
       ) : null}
       {bot.working ? (
         <View style={styles.working}>
-          <ActivityIndicator color={colors.blueDot} />
+          <ActivityIndicator color={t.c.accent} />
           <Text style={styles.workingText}>{workingLabel(bot)}…</Text>
           {canOperate ? (
-            <Pressable onPress={() => void stopBot(bot.id)}>
+            <Pressable style={({ pressed }) => [styles.stopBtn, pressed && styles.pressed]} onPress={() => void stopBot(bot.id)}>
               <Text style={styles.stop}>{isQueued(bot) ? "Cancel" : "Stop"}</Text>
             </Pressable>
           ) : null}
@@ -199,174 +207,315 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
     </View>
   );
 
+  const welcome =
+    !draft && !bot.working ? (
+      <View style={styles.welcome}>
+        <BotAvatar color={bot.color} shape={bot.shape} size={64} outline={avatarEdge} />
+        <Text style={styles.welcomeTitle}>Say hello to {bot.name}</Text>
+        <Text style={styles.welcomeHint}>
+          {canOperate ? `Ask ${bot.name} anything. It works on its own computer and tells you when it needs you.` : `${bot.name} hasn't said anything yet.`}
+        </Text>
+      </View>
+    ) : null;
+
   return (
     <View style={styles.chat}>
       <View style={styles.header}>
         {onBack ? (
-          <Pressable onPress={onBack} style={styles.backBtn}>
-            <Text style={styles.backText}>←</Text>
+          <Pressable onPress={onBack} style={({ pressed }) => [styles.backBtn, pressed && styles.pressed]} aria-label="Back to Bots">
+            <Text style={styles.backText}>‹</Text>
           </Pressable>
         ) : null}
-        <Pressable style={styles.pill} onPress={onOpenDetails}>
-          <BotAvatar color={bot.color} shape={bot.shape} size={30} />
-          <Text style={styles.pillName}>{bot.name}</Text>
-          <Text style={styles.harness}>{bot.harness}</Text>
+        <Pressable style={({ pressed }) => [styles.pill, pressed && styles.pressed]} onPress={onOpenDetails}>
+          <BotAvatar color={bot.color} shape={bot.shape} size={30} outline={avatarEdge} />
+          <Text style={styles.pillName} numberOfLines={1}>
+            {bot.name}
+          </Text>
+          <View style={styles.harnessChip}>
+            <Text style={styles.harness}>{HARNESS_NAMES[bot.harness] ?? bot.harness}</Text>
+          </View>
         </Pressable>
         {canOperate ? (
-        <Pressable
-          role="button"
-          aria-label={screenOpen ? "Hide screen" : "Show screen"}
-          aria-pressed={!!screenOpen}
-          style={[styles.screenBtn, screenOpen && styles.screenBtnOn]}
-          onPress={() => onToggleScreen()}
-        >
-          <Text style={styles.screenBtnText}>Screen</Text>
-        </Pressable>
+          <Pressable
+            role="button"
+            aria-label={screenOpen ? "Hide screen" : "Show screen"}
+            aria-pressed={!!screenOpen}
+            style={({ pressed }) => [styles.screenBtn, screenOpen && styles.screenBtnOn, pressed && styles.pressed]}
+            onPress={() => onToggleScreen()}
+          >
+            <Text style={[styles.screenBtnText, screenOpen && styles.screenBtnTextOn]}>Screen</Text>
+          </Pressable>
         ) : null}
       </View>
       {handoff ? (
-        <HandoffBanner botName={bot.name} handoff={handoff} onOpenScreen={() => onToggleScreen(true)} />
+        <View style={styles.column}>
+          <HandoffBanner botName={bot.name} handoff={handoff} onOpenScreen={() => onToggleScreen(true)} />
+        </View>
       ) : null}
       {loading ? (
-        <ActivityIndicator style={{ marginTop: 24 }} color={colors.textDim} />
+        <ActivityIndicator style={styles.loading} color={t.c.textMuted} />
       ) : (
         <FlatList
           ref={listRef}
           data={list}
           keyExtractor={(m) => String(m.id)}
           renderItem={renderItem}
-          contentContainerStyle={styles.messages}
+          style={styles.list}
+          contentContainerStyle={[styles.messages, !list.length && styles.messagesEmpty]}
+          ListEmptyComponent={welcome ?? undefined}
           ListFooterComponent={footer}
           onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
         />
       )}
-      {!canOnBot(bot, "manage") ? null : bot.tier?.managed && me?.role !== "admin" ? (
-        <PlanBar label={bot.tier.label} />
-      ) : (
-        <ModelBar
-          botId={bot.id}
-          harness={bot.harness}
-          model={bot.model}
-          effort={bot.effort}
-          tier={bot.tier?.managed ? bot.tier.name : undefined}
-        />
-      )}
-      {canOperate ? (
-      <View style={styles.composer}>
-        <TextInput
-          ref={inputRef}
-          aria-label={`Message ${bot.name}`}
-          style={styles.input}
-          placeholder={`Message ${bot.name}`}
-          placeholderTextColor={colors.textFaint}
-          value={text}
-          onChangeText={setText}
-          multiline
-          onSubmitEditing={Platform.OS === "web" ? onSend : undefined}
-        />
-        <Pressable style={styles.send} onPress={onSend}>
-          <Text style={styles.sendText}>Send</Text>
-        </Pressable>
+      <View style={styles.dock}>
+        <View style={styles.column}>
+          {!canOnBot(bot, "manage") ? null : bot.tier?.managed && me?.role !== "admin" ? (
+            <PlanBar label={bot.tier.label} />
+          ) : (
+            <ModelBar
+              botId={bot.id}
+              harness={bot.harness}
+              model={bot.model}
+              effort={bot.effort}
+              tier={bot.tier?.managed ? bot.tier.name : undefined}
+            />
+          )}
+          {canOperate ? (
+            <View style={[styles.composer, composing && styles.composerFocused]}>
+              <TextInput
+                ref={inputRef}
+                aria-label={`Message ${bot.name}`}
+                style={styles.input}
+                placeholder={`Message ${bot.name}`}
+                placeholderTextColor={t.c.textFaint}
+                value={text}
+                onChangeText={setText}
+                onFocus={() => setComposing(true)}
+                onBlur={() => setComposing(false)}
+                multiline
+                onSubmitEditing={Platform.OS === "web" ? onSend : undefined}
+              />
+              <Pressable
+                role="button"
+                aria-label="Send"
+                style={({ pressed }) => [styles.send, !hasText && styles.sendIdle, pressed && styles.pressed]}
+                onPress={onSend}
+              >
+                <Text style={[styles.sendText, !hasText && styles.sendTextIdle]}>↑</Text>
+              </Pressable>
+            </View>
+          ) : (
+            <Text style={styles.readOnly}>{canWrite ? "You can view this Bot but not run it" : "Read-only access"}</Text>
+          )}
+        </View>
       </View>
-      ) : (
-        <Text style={styles.readOnly}>{canWrite ? "You can view this Bot but not run it" : "Read-only access"}</Text>
-      )}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  chat: { flex: 1, backgroundColor: colors.bgMain },
-  empty: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: colors.bgMain },
-  emptyText: { color: colors.textDim },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    gap: 8,
-  },
-  backBtn: { padding: 8 },
-  backText: { color: colors.text, fontSize: 22 },
-  pill: { flexDirection: "row", alignItems: "center", gap: 8, flex: 1 },
-  pillName: { color: colors.text, fontSize: 16, fontWeight: "600" },
-  harness: { color: colors.textFaint, fontSize: 13 },
-  screenBtn: { backgroundColor: colors.bgBubble, borderRadius: 999, paddingHorizontal: 14, paddingVertical: 6 },
-  screenBtnOn: { backgroundColor: colors.bgActive, borderWidth: 1, borderColor: colors.blue },
-  screenBtnText: { color: colors.text, fontSize: 14 },
-  messages: { padding: 12, paddingBottom: 24 },
-  ts: { color: colors.textFaint, textAlign: "center", marginVertical: 10, fontSize: 13 },
-  routine: { color: colors.textFaint, textAlign: "center", marginVertical: 6, fontSize: 13 },
-  row: { flexDirection: "row", marginBottom: 8 },
-  rowUser: { justifyContent: "flex-end" },
-  bubble: {
-    maxWidth: "88%",
-    backgroundColor: colors.bgBubble,
-    borderRadius: 16,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-  },
-  bubbleUser: { backgroundColor: "#2a3344" },
-  bubbleError: { borderColor: colors.danger, borderWidth: 1 },
-  userText: { color: colors.text },
-  from: { color: colors.textFaint, fontSize: 13, marginBottom: 2 },
-  copy: { alignSelf: "flex-start", marginTop: 4 },
-  copyText: { color: colors.textFaint, fontSize: 12 },
-  question: { marginTop: 8, gap: 6 },
-  qTitle: { color: colors.text, fontWeight: "600", marginBottom: 4 },
-  opt: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 10,
-    padding: 10,
-  },
-  optOn: { borderColor: colors.blue },
-  openScreen: {
-    alignSelf: "flex-start",
-    backgroundColor: colors.blue,
-    borderRadius: 999,
-    paddingHorizontal: 14,
-    paddingVertical: 7,
-    marginBottom: 2,
-  },
-  openScreenText: { color: "#fff", fontWeight: "600" },
-  optText: { color: colors.text },
-  working: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    padding: 12,
-  },
-  workingText: { color: colors.textDim, flex: 1 },
-  stop: { color: colors.danger },
-  composer: {
-    flexDirection: "row",
-    alignItems: "flex-end",
-    gap: 8,
-    padding: 12,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-  },
-  input: {
-    flex: 1,
-    minHeight: 44,
-    maxHeight: 120,
-    backgroundColor: colors.bgBubble,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-  },
-  send: {
-    backgroundColor: colors.blue,
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  sendText: { color: "#fff", fontWeight: "600" },
-  readOnly: { color: colors.textFaint, textAlign: "center", padding: 16 },
-});
+const useStyles = themedStyles((t) =>
+  StyleSheet.create({
+    chat: { flex: 1, backgroundColor: t.c.bg },
+    empty: {
+      flex: 1,
+      alignItems: "center",
+      justifyContent: "center",
+      gap: t.space.sm,
+      padding: t.space.xxl,
+      backgroundColor: t.c.bg,
+    },
+    emptyTitle: { color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold },
+    emptyHint: { color: t.c.textMuted, ...type(t, "md"), textAlign: "center", maxWidth: 360 },
+    header: {
+      flexDirection: "row",
+      alignItems: "center",
+      paddingHorizontal: t.space.lg,
+      paddingVertical: t.space.sm,
+      minHeight: 56,
+      borderBottomWidth: hairline,
+      borderBottomColor: t.c.border,
+      gap: t.space.sm,
+    },
+    backBtn: {
+      width: 36,
+      height: 36,
+      borderRadius: t.radius.pill,
+      alignItems: "center",
+      justifyContent: "center",
+      marginLeft: -t.space.xs,
+    },
+    backText: { color: t.c.text, fontSize: 30, lineHeight: 32, marginTop: -3 },
+    pill: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: t.space.sm,
+      flexShrink: 1,
+      marginRight: "auto",
+      paddingVertical: t.space.xs,
+      paddingRight: t.space.sm,
+      borderRadius: t.radius.pill,
+    },
+    pillName: { color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold, flexShrink: 1 },
+    harnessChip: {
+      backgroundColor: t.c.raised,
+      borderColor: t.c.border,
+      borderWidth: hairline,
+      borderRadius: t.radius.pill,
+      paddingHorizontal: t.space.sm,
+      paddingVertical: t.space.xxs,
+    },
+    harness: { color: t.c.textMuted, ...type(t, "xs") },
+    screenBtn: {
+      borderRadius: t.radius.pill,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      backgroundColor: t.c.raised,
+      paddingHorizontal: t.space.lg,
+      paddingVertical: t.space.xs + 2,
+    },
+    screenBtnOn: { backgroundColor: t.c.accentSoft, borderColor: t.c.accentBorder },
+    screenBtnText: { color: t.c.text, ...type(t, "sm"), fontWeight: t.font.weight.medium },
+    screenBtnTextOn: { color: t.c.accentText },
+    pressed: { opacity: 0.6 },
+    column: { width: "100%", maxWidth: t.layout.chatColumn, alignSelf: "center" },
+    loading: { marginTop: t.space.xl },
+    list: { flex: 1 },
+    messages: {
+      width: "100%",
+      maxWidth: t.layout.chatColumn,
+      alignSelf: "center",
+      paddingHorizontal: t.space.lg,
+      paddingTop: t.space.lg,
+      paddingBottom: t.space.xl,
+    },
+    messagesEmpty: { flexGrow: 1, justifyContent: "center" },
+    welcome: { alignItems: "center", gap: t.space.sm, paddingVertical: t.space.xxxl },
+    welcomeTitle: { color: t.c.text, ...type(t, "xl"), fontWeight: t.font.weight.semibold, marginTop: t.space.sm },
+    welcomeHint: { color: t.c.textMuted, ...type(t, "md"), textAlign: "center", maxWidth: 380 },
+    ts: { color: t.c.textFaint, textAlign: "center", marginTop: t.space.md, marginBottom: t.space.lg, ...type(t, "xs") },
+    routineRow: { alignItems: "center", marginVertical: t.space.sm },
+    routine: {
+      color: t.c.textMuted,
+      ...type(t, "sm"),
+      backgroundColor: t.c.surface,
+      borderRadius: t.radius.pill,
+      paddingHorizontal: t.space.md,
+      paddingVertical: t.space.xs,
+      overflow: "hidden",
+    },
+    row: { flexDirection: "row", marginBottom: t.space.lg },
+    rowUser: { justifyContent: "flex-end" },
+    reply: { flex: 1, minWidth: 0 },
+    bubbleUser: {
+      maxWidth: "80%",
+      backgroundColor: t.c.userBubble,
+      borderRadius: t.radius.xl,
+      paddingHorizontal: t.space.lg,
+      paddingVertical: t.space.sm + 2,
+    },
+    bubbleError: {
+      borderColor: t.c.danger,
+      borderWidth: 1,
+      backgroundColor: t.c.dangerSoft,
+      borderRadius: t.radius.lg,
+      paddingHorizontal: t.space.md,
+      paddingVertical: t.space.sm,
+    },
+    userText: { color: t.c.text, ...type(t, "md") },
+    from: { color: t.c.textMuted, ...type(t, "sm"), fontWeight: t.font.weight.medium, marginBottom: t.space.xs },
+    copy: {
+      alignSelf: "flex-start",
+      marginTop: t.space.sm,
+      paddingHorizontal: t.space.sm,
+      paddingVertical: t.space.xxs,
+      marginLeft: -t.space.sm,
+      borderRadius: t.radius.pill,
+    },
+    copyText: { color: t.c.textFaint, ...type(t, "xs"), fontWeight: t.font.weight.medium },
+    question: {
+      marginTop: t.space.md,
+      gap: t.space.sm,
+      padding: t.space.md,
+      borderRadius: t.radius.lg,
+      backgroundColor: t.c.raised,
+      borderWidth: hairline,
+      borderColor: t.c.border,
+      boxShadow: t.shadow.card,
+    },
+    qTitle: { color: t.c.text, ...type(t, "md"), fontWeight: t.font.weight.semibold, marginBottom: t.space.xs },
+    opt: {
+      borderWidth: 1,
+      borderColor: t.c.border,
+      borderRadius: t.radius.md,
+      paddingHorizontal: t.space.md,
+      paddingVertical: t.space.sm + 2,
+      backgroundColor: t.c.bg,
+    },
+    optOn: { borderColor: t.c.accent, backgroundColor: t.c.accentSoft },
+    optPressed: { backgroundColor: t.c.hover },
+    openScreen: {
+      alignSelf: "flex-start",
+      backgroundColor: t.c.accent,
+      borderRadius: t.radius.pill,
+      paddingHorizontal: t.space.lg,
+      paddingVertical: t.space.sm,
+      marginBottom: t.space.xxs,
+    },
+    openScreenText: { color: t.c.onAccent, fontWeight: t.font.weight.semibold },
+    optText: { color: t.c.text, ...type(t, "md") },
+    working: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: t.space.md,
+      paddingVertical: t.space.sm,
+    },
+    workingText: { color: t.c.textMuted, flex: 1, ...type(t, "md") },
+    stopBtn: {
+      borderRadius: t.radius.pill,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      paddingHorizontal: t.space.md,
+      paddingVertical: t.space.xs,
+    },
+    stop: { color: t.c.danger, ...type(t, "sm"), fontWeight: t.font.weight.medium },
+    dock: { paddingHorizontal: t.space.md, paddingBottom: t.space.md, paddingTop: t.space.xs },
+    composer: {
+      flexDirection: "row",
+      alignItems: "flex-end",
+      gap: t.space.sm,
+      padding: t.space.sm,
+      paddingLeft: t.space.lg,
+      borderRadius: t.radius.xl + 2,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      backgroundColor: t.c.elevated,
+      boxShadow: t.shadow.card,
+    },
+    // The input drops the browser's outline, so focus shows on the whole composer instead.
+    composerFocused: {
+      borderColor: t.c.accent,
+      boxShadow: `${t.shadow.card}, 0 0 0 3px ${t.c.accentSoft}`,
+    },
+    input: {
+      flex: 1,
+      minHeight: 40,
+      maxHeight: 160,
+      paddingVertical: t.space.sm + 1,
+      color: t.c.text,
+      ...type(t, "md"),
+      ...(Platform.OS === "web" ? { outlineStyle: "none" as never } : null),
+    },
+    send: {
+      width: 38,
+      height: 38,
+      borderRadius: t.radius.pill,
+      backgroundColor: t.c.accent,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    sendIdle: { backgroundColor: t.c.selected },
+    sendText: { color: t.c.onAccent, fontSize: 20, lineHeight: 22, fontWeight: t.font.weight.bold },
+    sendTextIdle: { color: t.c.textFaint },
+    readOnly: { color: t.c.textFaint, textAlign: "center", padding: t.space.lg, ...type(t, "sm") },
+  }),
+);

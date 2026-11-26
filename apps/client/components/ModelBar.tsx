@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Picker } from "@react-native-picker/picker";
 import { Platform, StyleSheet, Text, TextInput, View } from "react-native";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles, type, useTheme } from "../src/theme";
 import type { ModelOption } from "../src/types";
 
 interface Props {
@@ -16,6 +16,7 @@ interface Props {
 
 /** On a managed plan the plan picks the model (ADR 0033): people see the plan, not models. */
 export function PlanBar({ label }: { label: string }) {
+  const styles = useStyles();
   return (
     <View style={styles.row}>
       <Text style={styles.plan} accessibilityLabel="Plan">
@@ -27,6 +28,20 @@ export function PlanBar({ label }: { label: string }) {
 
 export function ModelBar({ botId, harness, model, effort, tier }: Props) {
   const { fetchModels, patchBot } = useSuperBot();
+  const t = useTheme();
+  const styles = useStyles();
+  const webSelectStyle = {
+    flex: 1,
+    backgroundColor: t.c.raised,
+    color: t.c.textMuted,
+    borderRadius: t.radius.pill,
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: t.c.border,
+    padding: "5px 12px",
+    fontSize: t.font.size.sm,
+    fontFamily: t.font.sans,
+  } as const;
   const [models, setModels] = useState<ModelOption[]>([]);
 
   useEffect(() => {
@@ -71,7 +86,7 @@ export function ModelBar({ botId, harness, model, effort, tier }: Props) {
       onSubmitEditing={saveTyped}
       onBlur={saveTyped}
       placeholder="Default model"
-      placeholderTextColor={colors.textFaint}
+      placeholderTextColor={t.c.textFaint}
       autoCapitalize="none"
       autoCorrect={false}
       accessibilityLabel="Model"
@@ -122,11 +137,11 @@ export function ModelBar({ botId, harness, model, effort, tier }: Props) {
         <Picker
           selectedValue={model || ""}
           style={styles.picker}
-          dropdownIconColor={colors.text}
+          dropdownIconColor={t.c.text}
           onValueChange={(v) => void onModel(String(v))}
         >
           {options.map((m) => (
-            <Picker.Item key={m.id || "default"} label={m.label} value={m.id} color={colors.text} />
+            <Picker.Item key={m.id || "default"} label={m.label} value={m.id} color={t.c.text} />
           ))}
         </Picker>
       )}
@@ -134,12 +149,12 @@ export function ModelBar({ botId, harness, model, effort, tier }: Props) {
         <Picker
           selectedValue={effort || ""}
           style={styles.picker}
-          dropdownIconColor={colors.text}
+          dropdownIconColor={t.c.text}
           onValueChange={(v) => void onEffort(String(v))}
         >
-          <Picker.Item label="Default effort" value="" color={colors.text} />
+          <Picker.Item label="Default effort" value="" color={t.c.text} />
           {current.efforts.map((e) => (
-            <Picker.Item key={e} label={e} value={e} color={colors.text} />
+            <Picker.Item key={e} label={e} value={e} color={t.c.text} />
           ))}
         </Picker>
       ) : null}
@@ -147,26 +162,23 @@ export function ModelBar({ botId, harness, model, effort, tier }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  row: {
-    flexDirection: "row",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-  },
-  picker: { flex: 1, color: colors.text, backgroundColor: colors.bgBubble },
-  plan: { color: colors.textDim, fontSize: 13, paddingVertical: 4 },
-  input: { borderRadius: 8, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 8, paddingVertical: 6 },
-});
-
-const webSelectStyle = {
-  flex: 1,
-  backgroundColor: colors.bgBubble,
-  color: colors.text,
-  borderRadius: 8,
-  borderWidth: 1,
-  borderColor: colors.border,
-  padding: 8,
-} as const;
+const useStyles = themedStyles((t) =>
+  StyleSheet.create({
+    row: {
+      flexDirection: "row",
+      gap: t.space.sm,
+      paddingHorizontal: t.space.xs,
+      paddingBottom: t.space.sm,
+    },
+    picker: { flex: 1, color: t.c.text, backgroundColor: t.c.raised },
+    plan: { color: t.c.textMuted, ...type(t, "sm"), paddingVertical: t.space.xs, paddingHorizontal: t.space.sm },
+    input: {
+      borderRadius: t.radius.pill,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      paddingHorizontal: t.space.md,
+      paddingVertical: t.space.xs + 2,
+      ...type(t, "sm"),
+    },
+  }),
+);

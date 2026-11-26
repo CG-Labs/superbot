@@ -2,6 +2,7 @@ import React from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { ChatView, peerLabel } from "../ChatView";
 import { copyText } from "../../src/clipboard";
+import { themes } from "../../src/theme";
 import type { BotView, Message } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
@@ -48,6 +49,9 @@ describe("ChatView", () => {
   afterEach(() => {
     mockCtx.bots = [bot("a", "Ada"), bot("b", "Bob")];
     mockCtx.me = undefined;
+    mockCtx.activeId = "b";
+    mockCtx.messages = { b: list };
+    mockCtx.sendText = undefined;
   });
 
   it("shows a managed plan instead of a model picker, except to admins", async () => {
@@ -98,5 +102,44 @@ describe("ChatView", () => {
 
     await act(async () => fireEvent.press(screen.getAllByLabelText("Copy message")[2]));
     expect(copyText).toHaveBeenCalledWith("All green");
+  });
+
+  it("sends the trimmed message from the send button, and nothing when it's empty", async () => {
+    const sendText = jest.fn(async () => {});
+    mockCtx.sendText = sendText;
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+    expect(sendText).not.toHaveBeenCalled();
+
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "  Ship it  "));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+    expect(sendText).toHaveBeenCalledWith("Ship it");
+    expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("");
+  });
+
+  it("greets you in a Bot's empty chat", async () => {
+    mockCtx.messages = { b: [] };
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    expect(screen.getByText("Say hello to Bob")).toBeOnTheScreen();
+  });
+
+  it("asks you to pick a Bot when none is open", async () => {
+    mockCtx.activeId = null;
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    expect(screen.getByText("Pick a bot to start chatting")).toBeOnTheScreen();
+    expect(screen.queryByLabelText(/^Message /)).toBeNull();
+  });
+
+  it("shows keyboard focus on the message box", async () => {
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    const box = screen.getByLabelText("Message Bob");
+    const accent = { borderColor: themes.light.c.accent };
+    expect(box.parent).not.toHaveStyle(accent);
+
+    await act(async () => fireEvent(box, "focus"));
+    expect(box.parent).toHaveStyle(accent);
+
+    await act(async () => fireEvent(box, "blur"));
+    expect(box.parent).not.toHaveStyle(accent);
   });
 });

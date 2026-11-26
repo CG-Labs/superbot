@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Modal, StyleSheet, useWindowDimensions, View } from "react-native";
-import { Redirect, router, useLocalSearchParams } from "expo-router";
+import { Redirect, router, useIsFocused, useLocalSearchParams } from "expo-router";
+import { StatusBar } from "expo-status-bar";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApprovalsInbox } from "../components/ApprovalsInbox";
 import { BotDetailsPanel } from "../components/BotDetailsPanel";
@@ -16,14 +17,21 @@ import { botParam } from "../src/push";
 import { isStarter, starterText } from "../src/prompts";
 import { useSuperBot } from "../src/SuperBotContext";
 import { watchTeamLink } from "../src/team";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, useTheme } from "../src/theme";
 
 /** Open screen viewer. `takeOver` tracks whether the user has control; `n` remounts it, e.g. to take over from a handoff card. */
 type ScreenState = { takeOver: boolean; n: number } | null;
 
+const SCREEN_PANEL_MIN = 420;
+const SCREEN_PANEL_SHARE = 0.46;
+const CHAT_MIN = 360;
+
 export default function HomeScreen() {
   const { api, me, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion, sendText } = useSuperBot();
   const { width } = useWindowDimensions();
+  const t = useTheme();
+  const styles = useStyles();
+  const focused = useIsFocused();
   const wide = width >= 800;
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("list");
   const [createOpen, setCreateOpen] = useState(false);
@@ -113,11 +121,15 @@ export default function HomeScreen() {
         onClose={() => setScreen(null)}
       />
     ) : null;
+  // With the screen viewer open on a narrow desktop window, the sidebar gives way so chat keeps room.
+  const sidebarFits = width - t.layout.sidebar - Math.max(SCREEN_PANEL_MIN, width * SCREEN_PANEL_SHARE) >= CHAT_MIN;
+  const showSidebar = wide ? !viewer || sidebarFits : mobilePane === "list";
 
   return (
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
+      {focused ? <StatusBar style={t.scheme === "dark" ? "light" : "dark"} /> : null}
       <View style={styles.row}>
-        {wide || mobilePane === "list" ? (
+        {showSidebar ? (
           <Sidebar
             compact={!wide}
             onSelectBot={onSelectBot}
@@ -197,9 +209,11 @@ export default function HomeScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  row: { flex: 1, flexDirection: "row" },
-  screenPanel: { width: "46%", minWidth: 420, borderLeftWidth: 1, borderLeftColor: colors.border },
-  screenModal: { flex: 1, backgroundColor: "#111" },
-});
+const useStyles = themedStyles((t) =>
+  StyleSheet.create({
+    root: { flex: 1, backgroundColor: t.c.bg },
+    row: { flex: 1, flexDirection: "row" },
+    screenPanel: { width: `${SCREEN_PANEL_SHARE * 100}%`, minWidth: SCREEN_PANEL_MIN, borderLeftWidth: hairline, borderLeftColor: t.c.border },
+    screenModal: { flex: 1, backgroundColor: "#111" },
+  }),
+);

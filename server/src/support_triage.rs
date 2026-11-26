@@ -88,7 +88,8 @@ const CHAIN_CHECKED: &str = "audit.verified";
 /// The reason codes only SAML sign-in gives (runbook-saml.md's reasons table). Codes both
 /// runbooks have (`not_linked`, `idp_error`, `wrong_audience`, `unknown_state`) go to the
 /// sign-in one, and to the SAML one too when the failures were SAML sign-ins.
-pub const SAML_REASONS: [&str; 20] = [
+pub const SAML_REASONS: [&str; 21] = [
+    "assurance",
     "authn_context",
     "bad_encryption",
     "bad_signature",

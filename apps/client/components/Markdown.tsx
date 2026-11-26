@@ -1,7 +1,7 @@
 import React, { useMemo, type ReactNode } from "react";
 import { Linking, ScrollView, StyleSheet, Text, View } from "react-native";
 import { decodeEntities, parseMarkdown, safeHref, type Token, type Tokens } from "../src/markdown";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type Theme } from "../src/theme";
 
 /**
  * Renders a message's Markdown as native views, on iOS, Android and web alike. Raw HTML is shown as
@@ -9,24 +9,27 @@ import { colors } from "../src/theme";
  * link to the image rather than loading it, so a message can't make the app fetch a tracking pixel.
  */
 export function Markdown({ children }: { children: string }) {
+  const styles = useStyles();
   const tokens = useMemo(() => parseMarkdown(children), [children]);
-  return <View style={styles.root}>{blocks(tokens, "b")}</View>;
+  return <View style={styles.root}>{blocks(styles, tokens, "b")}</View>;
 }
+
+type Styles = ReturnType<typeof makeStyles>;
 
 function open(url: string) {
   void Linking.openURL(url).catch(() => {});
 }
 
-function blocks(tokens: Token[], key: string): ReactNode[] {
+function blocks(styles: Styles, tokens: Token[], key: string): ReactNode[] {
   const out: ReactNode[] = [];
   tokens.forEach((t, i) => {
-    const node = block(t as Tokens.Generic, `${key}.${i}`);
+    const node = block(styles, t as Tokens.Generic, `${key}.${i}`);
     if (node !== null) out.push(node);
   });
   return out;
 }
 
-function block(t: Tokens.Generic, key: string): ReactNode {
+function block(styles: Styles, t: Tokens.Generic, key: string): ReactNode {
   switch (t.type) {
     case "space":
     case "def":
@@ -36,13 +39,13 @@ function block(t: Tokens.Generic, key: string): ReactNode {
     case "text":
       return (
         <Text key={key} style={styles.body}>
-          {t.tokens ? inline(t.tokens, key) : decodeEntities(t.text)}
+          {t.tokens ? inline(styles, t.tokens, key) : decodeEntities(t.text)}
         </Text>
       );
     case "heading":
       return (
         <Text key={key} role="heading" style={[styles.body, styles.heading, headingSize(t.depth)]}>
-          {inline(t.tokens ?? [], key)}
+          {inline(styles, t.tokens ?? [], key)}
         </Text>
       );
     case "code":
@@ -56,13 +59,13 @@ function block(t: Tokens.Generic, key: string): ReactNode {
     case "blockquote":
       return (
         <View key={key} style={styles.quote}>
-          {blocks(t.tokens ?? [], key)}
+          {blocks(styles, t.tokens ?? [], key)}
         </View>
       );
     case "list":
-      return list(t as Tokens.List, key);
+      return list(styles, t as Tokens.List, key);
     case "table":
-      return table(t as Tokens.Table, key);
+      return table(styles, t as Tokens.Table, key);
     case "hr":
       return <View key={key} style={styles.hr} />;
     case "html":
@@ -80,7 +83,7 @@ function block(t: Tokens.Generic, key: string): ReactNode {
   }
 }
 
-function list(t: Tokens.List, key: string): ReactNode {
+function list(styles: Styles, t: Tokens.List, key: string): ReactNode {
   const start = typeof t.start === "number" ? t.start : 1;
   return (
     <View key={key} style={styles.list}>
@@ -89,7 +92,7 @@ function list(t: Tokens.List, key: string): ReactNode {
         return (
           <View key={`${key}.${i}`} style={styles.item}>
             <Text style={[styles.body, styles.marker]}>{marker}</Text>
-            <View style={styles.itemBody}>{blocks(item.tokens, `${key}.${i}`)}</View>
+            <View style={styles.itemBody}>{blocks(styles, item.tokens, `${key}.${i}`)}</View>
           </View>
         );
       })}
@@ -97,10 +100,10 @@ function list(t: Tokens.List, key: string): ReactNode {
   );
 }
 
-function table(t: Tokens.Table, key: string): ReactNode {
+function table(styles: Styles, t: Tokens.Table, key: string): ReactNode {
   const cell = (c: Tokens.TableCell, k: string, header: boolean) => (
     <View key={k} style={[styles.cell, header && styles.headerCell]}>
-      <Text style={[styles.body, header && styles.strong, { textAlign: c.align ?? "left" }]}>{inline(c.tokens, k)}</Text>
+      <Text style={[styles.body, header && styles.strong, { textAlign: c.align ?? "left" }]}>{inline(styles, c.tokens, k)}</Text>
     </View>
   );
   return (
@@ -119,31 +122,31 @@ function table(t: Tokens.Table, key: string): ReactNode {
   );
 }
 
-function inline(tokens: Token[], key: string): ReactNode[] {
+function inline(styles: Styles, tokens: Token[], key: string): ReactNode[] {
   return tokens.map((tok, i) => {
     const t = tok as Tokens.Generic;
     const k = `${key}.${i}`;
     switch (t.type) {
       case "text":
-        return t.tokens ? <React.Fragment key={k}>{inline(t.tokens, k)}</React.Fragment> : decodeEntities(t.text);
+        return t.tokens ? <React.Fragment key={k}>{inline(styles, t.tokens, k)}</React.Fragment> : decodeEntities(t.text);
       case "escape":
         return t.text;
       case "strong":
         return (
           <Text key={k} style={styles.strong}>
-            {inline(t.tokens ?? [], k)}
+            {inline(styles, t.tokens ?? [], k)}
           </Text>
         );
       case "em":
         return (
           <Text key={k} style={styles.em}>
-            {inline(t.tokens ?? [], k)}
+            {inline(styles, t.tokens ?? [], k)}
           </Text>
         );
       case "del":
         return (
           <Text key={k} style={styles.del}>
-            {inline(t.tokens ?? [], k)}
+            {inline(styles, t.tokens ?? [], k)}
           </Text>
         );
       case "codespan":
@@ -155,9 +158,9 @@ function inline(tokens: Token[], key: string): ReactNode[] {
       case "br":
         return "\n";
       case "link":
-        return link(t.href, inline(t.tokens ?? [], k), k);
+        return link(styles, t.href, inline(styles, t.tokens ?? [], k), k);
       case "image":
-        return link(t.href, decodeEntities(t.text) || "image", k);
+        return link(styles, t.href, decodeEntities(t.text) || "image", k);
       case "html":
         return t.text;
       default:
@@ -166,7 +169,7 @@ function inline(tokens: Token[], key: string): ReactNode[] {
   });
 }
 
-function link(href: string, label: ReactNode, key: string): ReactNode {
+function link(styles: Styles, href: string, label: ReactNode, key: string): ReactNode {
   const url = safeHref(href);
   if (!url) return <React.Fragment key={key}>{label}</React.Fragment>;
   return (
@@ -181,27 +184,31 @@ function headingSize(depth: number) {
   return { fontSize, lineHeight: Math.round(fontSize * 1.35) };
 }
 
-const styles = StyleSheet.create({
-  root: { gap: 8 },
-  body: { color: colors.text, fontSize: 15, lineHeight: 22 },
-  heading: { fontWeight: "700" },
-  strong: { fontWeight: "700" },
-  em: { fontStyle: "italic" },
-  del: { textDecorationLine: "line-through" },
-  link: { color: colors.blueDot, textDecorationLine: "underline" },
-  codeInline: { fontFamily: "monospace", backgroundColor: "#2a2a2a", borderRadius: 4, fontSize: 14 },
-  fence: { backgroundColor: "#111", borderRadius: 8 },
-  fenceInner: { padding: 8 },
-  codeBlock: { color: colors.text, fontFamily: "monospace", fontSize: 13, lineHeight: 19 },
-  quote: { borderLeftWidth: 3, borderLeftColor: colors.border, paddingLeft: 10, gap: 8 },
-  list: { gap: 4 },
-  item: { flexDirection: "row", gap: 6 },
-  marker: { minWidth: 18, color: colors.textDim },
-  itemBody: { flex: 1, gap: 4 },
-  hr: { height: StyleSheet.hairlineWidth, backgroundColor: colors.border, marginVertical: 4 },
-  tableScroll: { flexGrow: 0 },
-  table: { borderWidth: 1, borderColor: colors.border, borderRadius: 6 },
-  tr: { flexDirection: "row" },
-  cell: { width: 140, paddingHorizontal: 8, paddingVertical: 4, borderColor: colors.border, borderTopWidth: 1 },
-  headerCell: { borderTopWidth: 0, backgroundColor: colors.bgActive },
-});
+function makeStyles(t: Theme) {
+  return StyleSheet.create({
+    root: { gap: t.space.sm + 2 },
+    body: { color: t.c.text, fontSize: t.font.size.md, lineHeight: 23 },
+    heading: { fontWeight: t.font.weight.bold },
+    strong: { fontWeight: t.font.weight.bold },
+    em: { fontStyle: "italic" },
+    del: { textDecorationLine: "line-through" },
+    link: { color: t.c.accentText, textDecorationLine: "underline" },
+    codeInline: { fontFamily: t.font.mono, backgroundColor: t.c.codeBg, borderRadius: 4, fontSize: t.font.size.sm },
+    fence: { backgroundColor: t.c.codeBg, borderRadius: t.radius.md, borderWidth: hairline, borderColor: t.c.border },
+    fenceInner: { padding: t.space.md },
+    codeBlock: { color: t.c.text, fontFamily: t.font.mono, fontSize: t.font.size.sm, lineHeight: 19 },
+    quote: { borderLeftWidth: 3, borderLeftColor: t.c.borderStrong, paddingLeft: t.space.md, gap: t.space.sm },
+    list: { gap: t.space.xs },
+    item: { flexDirection: "row", gap: 6 },
+    marker: { minWidth: 18, color: t.c.textMuted },
+    itemBody: { flex: 1, gap: t.space.xs },
+    hr: { height: hairline, backgroundColor: t.c.border, marginVertical: t.space.xs },
+    tableScroll: { flexGrow: 0 },
+    table: { borderWidth: 1, borderColor: t.c.border, borderRadius: t.radius.sm, overflow: "hidden" },
+    tr: { flexDirection: "row" },
+    cell: { width: 140, paddingHorizontal: t.space.sm, paddingVertical: t.space.xs, borderColor: t.c.border, borderTopWidth: 1 },
+    headerCell: { borderTopWidth: 0, backgroundColor: t.c.surface },
+  });
+}
+
+const useStyles = themedStyles(makeStyles);

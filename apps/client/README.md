@@ -44,6 +44,7 @@ Point the login screen at `http://127.0.0.1:3000` (or your server) and enter `AU
 ## Features
 
 - **Chat** over SSE, choice cards, per-Bot model and effort.
+- **Light and dark:** the chat screen and the sidebar follow the device's setting, on the design tokens in `src/tokens.json` (`useTheme` and `themedStyles` in `src/theme.ts`); other screens are dark until they move over ([ADR 0335](../../docs/adr/0335-design-system-for-the-app-and-the-console.md)).
 - **Routines:** open a Bot's details (tap its name) to create, edit, pause, or delete routines. Presets cover common schedules; any 5-field cron works (server time zone). The server validates cron and shows its error inline.
 - **Screen:** the **Screen** button in the chat header opens the Bot's live screen (voxl). It's a side panel on wide windows and full screen on phones. It is view-only until you press **Take over**; **Give back** returns it. Web and Electron use an iframe, native apps use a WebView. The password never goes in the link (see [ADR 0008](../../docs/adr/0008-client-screen-auth.md)).
 - **Handoffs:** when a Bot runs `botctl handoff`, its sidebar row says "Needs you", a banner sits on top of its chat, and **Open screen** opens the screen with control. **Done** (in the card or the screen panel) hands it back to the Bot.
@@ -126,6 +127,7 @@ You cannot produce a signed `.ipa` on Linux/Windows locally; use **EAS Build** (
 | `npm run typecheck` | TypeScript |
 | `npm run lint` | ESLint |
 | `npm test` | Jest (`jest-expo`) unit and component tests |
+| `npm run tokens` | Write the design tokens (`src/tokens.json`) into `web/styles.css`; `tokens:check` verifies them (CI) |
 | `npm run build:web` | Static web bundle (CI) |
 | `npm run build:web:server` | Web bundle for the server's `/app/` path |
 | `npm run desktop` | Electron dev |
