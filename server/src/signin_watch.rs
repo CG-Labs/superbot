@@ -390,7 +390,7 @@ fn report(a: &Auth, source: &Source, d: Detection, method: &str, account: Option
             format!("Method: {method}. Counted by {} over the last {} minutes.", if d.scope == "ip" { "source IP" } else { "account" }, s.window_ms / MINUTE),
             "The source IP and every attempt are in the audit log (auth.suspicious_sign_in, auth.login_failed).".into(),
         ];
-        crate::notify::alert(app, crate::notify::Alert { event: ACTION.into(), title, lines, target_type: "user".into(), target_id: id.into(), link: None }, "audit");
+        crate::notify::alert(app, crate::notify::Alert { event: ACTION.into(), title, lines, target_type: "user".into(), target_id: id.into(), link: None, ..Default::default() }, "audit");
     }
 }
 

@@ -10,6 +10,11 @@ describe("pushLink", () => {
     expect(pushLink({ type: "routine", botId: "b1", url: "/home?bot=b1" })).toEqual({ pathname: "/home", params: { bot: "b1" } });
   });
 
+  it("opens Team for a request for a team role, whatever its url says", () => {
+    expect(pushLink({ type: "role_request", url: "/team" })).toEqual({ pathname: "/team" });
+    expect(pushLink({ type: "role_request", url: "https://example.com/phish" })).toEqual({ pathname: "/team" });
+  });
+
   it("opens home for a test or an id that doesn't look like one", () => {
     expect(pushLink({ type: "test", url: "/home" })).toEqual({ pathname: "/home" });
     expect(pushLink({ type: "approval", approvalId: "../../settings" })).toEqual({ pathname: "/home" });

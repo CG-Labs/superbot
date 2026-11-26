@@ -149,8 +149,9 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 22] = [
+const EXCEPTION_FILES: [&str; 23] = [
     "pull-requests.json",
+    "branch-protection.json",
     "vulnerability-alerts.json",
     "ci-drills.json",
     "operator-drills.json",

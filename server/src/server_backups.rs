@@ -373,7 +373,7 @@ fn ago(ms: i64) -> String {
 }
 
 fn alert(app: &AppState, action: &str, title: &str, lines: Vec<String>) {
-    let a = Alert { event: action.into(), title: title.into(), lines, target_type: "server".into(), target_id: "backups".into(), link: None };
+    let a = Alert { event: action.into(), title: title.into(), lines, target_type: "server".into(), target_id: "backups".into(), link: None, ..Default::default() };
     notify::alert(app, a, PAGE);
 }
 

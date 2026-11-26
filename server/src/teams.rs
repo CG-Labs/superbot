@@ -92,7 +92,7 @@ fn settings(app: &AppState) -> Settings {
     app.teams.get().copied().unwrap_or_default()
 }
 
-fn manages(role: &str) -> bool {
+pub(crate) fn manages(role: &str) -> bool {
     role == OWNER || role == ADMIN
 }
 

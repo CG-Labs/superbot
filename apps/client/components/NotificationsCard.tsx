@@ -272,12 +272,12 @@ export function NotificationsCard({ api, bot }: Props) {
         </View>
         <Chips
           options={[
-            { value: "on", label: "Also each Bot's owner and operators" },
+            { value: "on", label: "Also the people who can answer" },
             { value: "off", label: "Only these addresses" },
           ]}
           value={s.email.deciders ? "on" : "off"}
           onChange={(v) =>
-            void patch("deciders", v === "on" ? "Owners and operators get email too." : "Only the listed addresses get email.", { email: { deciders: v === "on" } })
+            void patch("deciders", v === "on" ? "Bot owners and operators, and team owners and admins for role requests, get email too." : "Only the listed addresses get email.", { email: { deciders: v === "on" } })
           }
           disabled={locked}
         />

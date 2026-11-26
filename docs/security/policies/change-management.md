@@ -27,7 +27,7 @@ How changes to SuperBot's code and to the managed service reach production: who 
 ## Reviews and segregation of duties
 
 - Every pull request is approved by someone other than its author before it merges. An automated reviewer's findings are answered, but don't count as the approval.
-- `main` is protected in GitHub so that this is enforced: a required approval, required status checks, no force pushes, no deletion, and administrators included. The engineering lead exports these settings quarterly as evidence (checklist CC8.1-1).
+- `main` is protected in GitHub so that this is enforced: a required approval, required status checks, no force pushes, no deletion, and administrators included. Each month's change-management bundle judges the protection against these settings and lists who can bypass it ([ADR 0303](../../adr/0303-branch-protection-judged-against-the-policy.md)); the engineering lead also exports them quarterly with an admin's view as evidence (checklist CC8.1-1).
 - Each month's [change-management bundle](../soc2-evidence-plan.md#the-change-management-bundle) lists every pull request merged into `main` with its approvers and checks, and every commit that reached it without one ([ADR 0148](../../adr/0148-change-management-evidence-from-github.md)). The engineering lead reviews its exceptions (merged without an approval by someone other than the author, without required checks passing, or straight to `main`) and records why each happened, as an emergency change or otherwise.
 - A change written by an agent is reviewed like anyone else's, by a person.
 - Whoever approves a production change is not the person who makes it, except in an emergency.
