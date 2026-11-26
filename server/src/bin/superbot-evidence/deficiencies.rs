@@ -766,6 +766,12 @@ mod tests {
         assert_eq!(c["openByOwner"]["Engineering lead"], json!(["CC3.4-1", "CC8.1-1", "CC8.1-2"]));
         assert_eq!(s["openChecklistRows"], 7);
 
+        let mut later = st.clone();
+        later.push(bundle("policy-register", p("2027-03-01", "2027-04-01"), "2027-04-02T09:00:00Z", &[("incidents.json", json!({ "exceptions": { "reviewOverdue": null } }))], None));
+        later.push(bundle("policy-register", p("2027-03-01", "2027-04-01"), "2027-04-03T09:00:00Z", &[("incidents.json", json!({ "exceptions": {} }))], None));
+        let l2 = log(&inputs(&later, None), &quarter(), 0).unwrap();
+        assert_eq!(find(&l2, "policy-register", "INC-4")["stillListed"], true, "a later bundle that couldn't judge it, or doesn't have the list, doesn't clear it");
+
         let none = log(&inputs(&st, None), &quarter(), 0).unwrap();
         assert_eq!(find(&none, "policy-register", "INC-1")["owners"], json!([]));
         assert!(none["checklist"].is_null() && none["summary"]["openChecklistRows"].is_null());
