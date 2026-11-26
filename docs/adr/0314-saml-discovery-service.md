@@ -54,3 +54,4 @@ The `return` URL carries the start's own parameters: `session`, and for apps `re
 - Admins give the federation updated SP metadata (or enter the `/discovery` URL at its registry) once, when they turn it on.
 - Sign-in reaches a third party before the IdP. If the service is down, people can't pick there. Removing the setting brings back botd's chooser with no other change.
 - The chooser stays as the fallback, and as the default.
+- `botctl offline-check` and the console's offline report list the service as a sign-in destination, so an air-gapped install learns that people must reach it.

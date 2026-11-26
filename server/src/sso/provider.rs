@@ -664,7 +664,7 @@ impl Provider {
             Kind::Entra { authority, .. } => vec![(key("AUTHORITY"), authority.clone(), "authority")],
             Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::Saml { issuer, .. } => vec![(key("ISSUER"), issuer.clone(), "issuer")],
             Kind::GitHub { web, api, .. } => vec![(key("URL"), web.clone(), "sign-in page"), (key("API_URL"), api.clone(), "API")],
-            Kind::SamlSp { entity_ids, source, response_binding, .. } => {
+            Kind::SamlSp { entity_ids, source, response_binding, discovery, .. } => {
                 let (mut out, from) = match source {
                     IdpSource::Url(url) => (vec![(key("IDP_METADATA_URL"), url.clone(), "metadata")], key("IDP_METADATA_URL")),
                     IdpSource::Mdq(_) => (entity_ids.iter().filter_map(|e| source.url_for(e)).map(|u| (key("IDP_MDQ_URL"), u, "MDQ metadata")).collect(), key("IDP_MDQ_URL")),
@@ -680,6 +680,9 @@ impl Provider {
                         out.extend(m.artifact_resolution.iter().map(|(_, u)| (from.clone(), u.clone(), "artifact resolution")));
                     }
                 }
+                // Last: the first is where the metadata comes from. The browser goes here
+                // before any IdP when no IdP is picked yet (ADR 0314).
+                out.extend(discovery.iter().map(|u| (key("DISCOVERY_URL"), u.clone(), "discovery service")));
                 out
             }
         }
