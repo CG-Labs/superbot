@@ -65,6 +65,6 @@ Hermes in the image is already outside botd's home (`/opt/hermes`). The installe
 ## Deferred
 
 - **The network**, as in ADR 0037: accounts share one network.
-- **Screens** with accounts on.
+- **Screens** with accounts on (done: [ADR 0342](0342-per-user-screens-on-one-server.md)).
 - **Per-Bot accounts** on the server: a Bot runs as its owner's account. Machines already have the Bots' own user (ADR 0043).
 - **Logins for Pi and Hermes** through `botctl user harness-login`: they use keys for now.

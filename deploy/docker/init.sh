@@ -30,7 +30,7 @@ Usage: init.sh [options]
   --harnesses LIST   Harness CLIs baked into the image, e.g. "claude codex pi" (add hermes for Hermes Agent);
                      needs --from-source
   --isolation        Run each user's Bots as their own Unix account (ISOLATION=users; new .env files have it)
-  --no-isolation     Run every Bot as botd's account (ISOLATION=off); Bots' screens need this
+  --no-isolation     Run every Bot as botd's account (ISOLATION=off)
   --from-source      Build the images from this checkout (docker-compose.build.yml) instead of pulling them
   --published        Pull the published images from ghcr.io (the default; clears --from-source)
   --rotate-master-key

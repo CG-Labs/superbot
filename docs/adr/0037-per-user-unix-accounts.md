@@ -69,7 +69,7 @@ After machine routing and before the harness starts, botd makes the owner's acco
 
 A run routed to its owner's own machine ([ADR 0036](0036-bots-on-the-users-machine.md)) skips all of this: that machine runs only their Bots, so no account is made here, any harness the machine has may run, and the job never goes through sudo. It takes the memory and facts from botd's copies in `DATA_DIR`. When it sends back changes, botd drops the now stale copies in the owner's folder here, so a later run here starts again from botd's.
 
-Only **Claude Code and Codex** run this way. Pi's approval gate and Hermes's managed config and daemon live in files botd writes in a folder the run could change; they're refused until that's reworked (done in [ADR 0058](0058-harness-os-user-by-default.md)). **Screens are off**: their X displays belong to botd's account.
+Only **Claude Code and Codex** run this way. Pi's approval gate and Hermes's managed config and daemon live in files botd writes in a folder the run could change; they're refused until that's reworked (done in [ADR 0058](0058-harness-os-user-by-default.md)). **Screens are off**: their X displays belong to botd's account (until [ADR 0342](0342-per-user-screens-on-one-server.md), which runs each as its run's account).
 
 ### Harness logins
 
@@ -113,7 +113,7 @@ A half-made setup is a startup error, not a silent fallback.
 
 - **The network.** Accounts share one network: a tool listening on `127.0.0.1` can be reached by other users' runs. Per-user network namespaces, or the machine agent, close this.
 - **Pi and Hermes** under accounts (done: [ADR 0058](0058-harness-os-user-by-default.md)).
-- **Per-user screens.**
+- **Per-user screens** (done: [ADR 0342](0342-per-user-screens-on-one-server.md)).
 - **Shared team Bots**: a Bot runs as its owner. A team account is a later decision.
 - **The client's personal-secrets screen.**
 - **A separate account for Bots on the user's machine** (#29): runs there use the agent's account for now ([ADR 0036](0036-bots-on-the-users-machine.md)).
