@@ -2798,7 +2798,7 @@ pub(crate) mod tests {
         // No display name: no service to name the requested attributes by.
         let unnamed = About { display_name: None, description: None, information_url: None, privacy_url: None, ..about };
         let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &unnamed);
-        assert!(!md.contains("UIInfo") && !md.contains("AttributeConsumingService") && md.contains("<md:ContactPerson"), "{md}");
+        assert!(!md.contains("UIInfo") && !md.contains("AttributeConsumingService") && md.contains("<md:ContactPerson"));
     }
 
     const MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
