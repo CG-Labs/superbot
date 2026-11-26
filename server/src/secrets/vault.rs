@@ -877,9 +877,9 @@ impl Inner {
         }
     }
 
-    async fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
+    async fn list(&self, scope: Scope, index: Option<&str>) -> Result<Vec<String>, Error> {
         let path = format!("{}/metadata/{}/{}/", self.cfg.mount, self.cfg.prefix, scope.folder('/'));
-        let Some(body) = self.get(&format!("{path}?list=true"), None).await? else { return Ok(Vec::new()) };
+        let Some(body) = self.get(&format!("{path}?list=true"), index).await? else { return Ok(Vec::new()) };
         let keys = body["data"]["keys"].as_array().ok_or_else(|| Error::Unavailable(format!("Vault: listing {path} gave no keys")))?;
         Ok(keys.iter().filter_map(Value::as_str).filter(|k| !k.ends_with('/')).map(String::from).collect())
     }
@@ -1048,7 +1048,12 @@ impl Provider for Vault {
     }
 
     fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
-        self.run(move |i| async move { i.list(scope).await })
+        self.run(move |i| async move { i.list(scope, None).await })
+    }
+
+    fn list_at(&self, scope: Scope, index: Option<&str>) -> Result<Vec<String>, Error> {
+        let index = index.map(str::to_string);
+        self.run(move |i| async move { i.list(scope, index.as_deref()).await })
     }
 
     fn read_at(&self, scope: Scope, name: &str, index: Option<&str>) -> Result<Option<Zeroizing<String>>, Error> {
@@ -1202,6 +1207,7 @@ pub(crate) mod tests {
             return e;
         }
         assert_eq!(q.get("list").map(String::as_str), Some("true"));
+        f.events.listed(&h);
         let folder = rest.trim_end_matches('/').to_string() + "/";
         let mut keys: Vec<String> = Vec::new();
         for k in f.kv.lock().unwrap().keys() {

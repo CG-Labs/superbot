@@ -129,6 +129,10 @@ pub trait Provider: Send + Sync {
     }
     /// Names in `scope`. Never values.
     fn list(&self, scope: Scope) -> Result<Vec<String>, Error>;
+    /// `list`, from a backend that has seen at least `index`, as `read_at`.
+    fn list_at(&self, scope: Scope, _index: Option<&str>) -> Result<Vec<String>, Error> {
+        self.list(scope)
+    }
     /// Starts telling `store` of changes as the backend announces them (`ExternalStore::changed`),
     /// if it is set to; whether it does. An error when it is set to but can't (ADR 0306).
     fn watch(&self, _store: std::sync::Weak<ExternalStore>) -> Result<bool, Error> {
@@ -286,10 +290,14 @@ impl ExternalStore {
     }
 
     fn list_from_backend(&self, scope: &Scope) -> Result<Vec<String>, Error> {
+        self.list_from_backend_at(scope, None)
+    }
+
+    fn list_from_backend_at(&self, scope: &Scope, index: Option<&str>) -> Result<Vec<String>, Error> {
         let target = Event::new(actor(), "secret.read").target("secret_folder", &scope.folder('/'));
         let mut details = self.details(scope, "list");
         let started = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
-        match self.provider.list(scope.clone()) {
+        match self.provider.list_at(scope.clone(), index) {
             Ok(names) => {
                 let mut names: Vec<String> = names.into_iter().filter(|n| scope.holds(n)).collect();
                 names.sort();
@@ -449,7 +457,7 @@ impl ExternalStore {
         let jobs: Vec<Job> = keys.into_iter().map(Job::Read).chain(folders.into_iter().map(Job::List)).collect();
         let done = parallel(&jobs, |job| match job {
             Job::Read((scope, name)) => Done::Read(self.fetch_at(scope, name, index)),
-            Job::List(scope) => Done::List(self.list_from_backend(scope)),
+            Job::List(scope) => Done::List(self.list_from_backend_at(scope, index)),
         });
 
         let mut entries = Vec::new();
@@ -483,8 +491,8 @@ impl ExternalStore {
 
     /// The backend announced a change to `name` in `scope` at `index` (ADR 0306): reads it
     /// again, from a backend that has seen the change. The answer replaces what was cached as
-    /// a read would (audited, redacted, fail closed on an error), and the folder's list is
-    /// dropped so a name that came or went shows at its next use. Like a refresh, it moves the
+    /// a read would (audited, redacted, fail closed on an error), and the folder is listed
+    /// again at `index` too. Like a refresh, it moves the
     /// epoch before reading, so neither a read already in flight nor this one can cache over
     /// a newer answer. None when the store doesn't read that name there (another folder's,
     /// user folders off).
@@ -498,7 +506,7 @@ impl ExternalStore {
         let at_startup = self.startup.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
         let got = self.provider.read_at(scope.clone(), name, index);
         let now = self.took(scope, name, started, got);
-        self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(scope);
+        let _ = self.list_from_backend_at(scope, index);
         Some(Refreshed::compared(name.to_string(), scope, old.as_ref(), at_startup.as_ref(), &now))
     }
 }

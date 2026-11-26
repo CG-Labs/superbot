@@ -746,6 +746,8 @@ pub(crate) mod tests {
         pub closes: AtomicUsize,
         /// The `X-Vault-Index` of each KV read that had one.
         pub indexes: Mutex<Vec<String>>,
+        /// The same, for each list.
+        pub list_indexes: Mutex<Vec<String>>,
     }
 
     impl Hub {
@@ -773,6 +775,12 @@ pub(crate) mod tests {
         pub(crate) fn saw(&self, h: &axum::http::HeaderMap) {
             if let Some(i) = h.get("x-vault-index").and_then(|v| v.to_str().ok()) {
                 self.indexes.lock().unwrap().push(i.to_string());
+            }
+        }
+
+        pub(crate) fn listed(&self, h: &axum::http::HeaderMap) {
+            if let Some(i) = h.get("x-vault-index").and_then(|v| v.to_str().ok()) {
+                self.list_indexes.lock().unwrap().push(i.to_string());
             }
         }
     }
@@ -1008,6 +1016,13 @@ pub(crate) mod tests {
         f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_ROTATED_TOKEN"));
         wait_for(|| get(&x, "EVENTS_ROTATED_TOKEN").as_deref() == Some("events-rotated-2"));
         assert!(f.events.indexes.lock().unwrap().contains(&"djE6c3RhbmQtaW4=".to_string()), "read at the event's index");
+        assert!(f.events.list_indexes.lock().unwrap().contains(&"djE6c3RhbmQtaW4=".to_string()), "and its folder listed at it");
+
+        // A new name shows in the folder at once, though its list was cached for an hour.
+        assert!(!x.names().unwrap().contains(&"EVENTS_ADDED_TOKEN".to_string()));
+        put(&f, "bots/EVENTS_ADDED_TOKEN", "events-added-1");
+        f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_ADDED_TOKEN"));
+        wait_for(|| x.names().unwrap().contains(&"EVENTS_ADDED_TOKEN".to_string()));
         assert_eq!(redact::text("events-rotated-2"), redact::MARK);
         let refreshed = audited("EVENTS_ROTATED_TOKEN").into_iter().find(|e| e.action == "secret.cache_refreshed").expect("audited");
         assert_eq!((refreshed.details["trigger"].as_str(), refreshed.details["event"].as_str()), (Some("vault-event"), Some("kv-v2/data-write")));
@@ -1036,7 +1051,7 @@ pub(crate) mod tests {
         wait_for(|| get(&x, "EVENTS_ROTATED_TOKEN").as_deref() == Some("events-rotated-3"));
         assert_eq!(f.reads.load(Ordering::SeqCst), reads + 1, "only the last event is for a name botd reads");
         wait_for(|| f.events.pongs.load(Ordering::SeqCst) > 0);
-        for v in ["events-rotated-1", "events-rotated-2", "events-rotated-3", "events-startup-1", "events-startup-2", "events-deleted-1"] {
+        for v in ["events-rotated-1", "events-rotated-2", "events-rotated-3", "events-startup-1", "events-startup-2", "events-deleted-1", "events-added-1"] {
             redact::forget(v);
         }
     }
