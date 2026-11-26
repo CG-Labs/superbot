@@ -45,6 +45,22 @@ The guide for each provider has its own table and the provider's error codes: [E
 - Two-factor: a lost authenticator needs a recovery code, or an admin to reset their factors (`DELETE /api/users/<user>/mfa`, or the console's user page).
 - Password sign-ins are rate limited after repeated failures: wait, and check `auth.suspicious_sign_in` and the sign-in alerts ([deploy guide](../../deploy/README.md#metrics-and-logs)) in case it isn't them.
 
+## Suspicious sign-ins
+
+botd watches failed sign-ins (passwords, sign-in codes, second factors) for guessing, audits each pattern it sees as `auth.suspicious_sign_in` with the `pattern`, and alerts ([ADR 0104](../adr/0104-suspicious-sign-in-alerts.md)). These aren't people locked out: they're someone else trying to get in. Severity 1 when a guess may have worked, 3 otherwise.
+
+| Alert | Pattern | Do |
+|---|---|---|
+| `SuperBotSignInAfterFailures` (a page) | `success_after_failures`: a sign-in worked from an IP, or to an account, that had just reached its failure limit | Ask the person, over a channel you trust, whether it was them. If not, or they can't be reached: disable them (`botctl user disable <user>`, which ends their sessions and stops their runs), then [Severity 1](escalation.md#security-incidents) |
+| `SuperBotAccountSignInFailures` | `account_failures`: one account reached `SIGNIN_ALERT_ACCOUNT_FAILURES` within `SIGNIN_ALERT_WINDOW`, from any IP | For a second factor, their password or code is known to someone else: have them change it. For the break-glass password, rotate `AUTH_PASSWORD` |
+| `SuperBotSignInBurstsRepeated` | `ip_failures`: three or more bursts in an hour, each from one IP past `SIGNIN_ALERT_IP_FAILURES` | The events name the IPs: block them at the proxy or firewall if they persist |
+| `SuperBotSignInFailuresHigh` | none: over 100 failed sign-ins in 15 minutes across the server | Guessing spread over many IPs. `superbot_signin_failures_total` by method, and `auth.login_failed` events, say where. A broken identity provider fails many people too: check the reasons above first |
+| `SuperBotSignInFromNewNetwork` | `new_ip`: someone covered by `SIGNIN_ALERT_NEW_IP` (admins by default) signed in from a network none of their kept sessions came from | Confirm with them. Travel and new offices are the usual answer |
+
+```sh
+botctl audit 50 --action auth.suspicious_sign_in
+```
+
 ## Escalate when
 
 - Many people fail with a reason not in these tables, or with no `auth.login_failed` event at all (the request never reached botd: the proxy, DNS or certificate).
