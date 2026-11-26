@@ -1,11 +1,11 @@
 {
   "superbotRegister": 1,
-  "notes": "Template (docs/security/policy-register.md). Copy it out of the repository, replace every <...> placeholder, the dates and the zero digests, and keep it private. Check it with: superbot-evidence register <register.json> --policies docs/security/policies",
+  "notes": "Template (docs/security/policy-register.md). Copy it out of the repository, replace every <...> placeholder, the dates and the zero digests, and keep it private. Check it with: superbot-evidence register <register.json> --policies docs/security/policies --training docs/security/training",
   "riskAppetite": 9,
   "people": [
     { "id": "person-1", "name": "<name>", "joined": "2026-12-01" },
     { "id": "person-2", "name": "<name>", "joined": "2026-12-01" },
-    { "id": "person-3", "name": "<name>", "joined": "2026-12-01" }
+    { "id": "person-3", "name": "<name>", "joined": "2026-12-01", "engineer": true }
   ],
   "roles": [
     { "role": "Management", "holder": "person-1", "deputy": "person-2", "from": "2026-12-01" },
@@ -33,7 +33,13 @@
     { "person": "person-1", "policy": "code-of-conduct", "at": "2026-12-01" }
   ],
   "training": [
-    { "person": "person-1", "course": "security-awareness", "at": "2026-12-01" }
+    { "person": "person-1", "course": "security-awareness", "at": "2026-12-01" },
+    { "person": "person-3", "course": "secure-development", "at": "2026-12-01" }
+  ],
+  "screenings": [
+    { "person": "person-1", "kind": "check", "at": "2026-12-01", "by": "person-2", "recordSha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+    { "person": "person-2", "kind": "check", "at": "2026-12-01", "by": "person-1", "recordSha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+    { "person": "person-3", "kind": "check", "at": "2026-12-01", "by": "person-1", "recordSha256": "0000000000000000000000000000000000000000000000000000000000000000" }
   ],
   "risks": [
     { "id": "R-01", "title": "A user reads another user's data", "owner": "Engineering lead", "likelihood": 2, "impact": 5, "treatment": "reduce", "controls": ["CC6.1-1", "CC6.8-2", "CC3.2-2"], "identified": "2026-12-01" },

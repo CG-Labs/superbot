@@ -4,7 +4,8 @@
 //! approvals, acknowledgements and training, the risk register and its reviews, management
 //! reviews, vendor assessments and reviews, and exceptions. For a period this checks it
 //! against the policies' cadences (a role without a holder, a policy unapproved, changed
-//! since approval or past its yearly review, an acknowledgement or training overdue, a risk
+//! since approval or past its yearly review, an acknowledgement or training overdue, a
+//! screening before access missing, late or recorded by someone who couldn't, a risk
 //! unreviewed or accepted without management, a quarter without a management review, a
 //! vendor unassessed or unreviewed or its assurance report stale, unreviewed or with
 //! findings untreated, an exception over a year or unreviewed, a server's
@@ -37,8 +38,9 @@ use std::path::Path;
 /// `incidents.json` (ADR 0223), 4 `access.json` (ADR 0231), 5 `vulnerabilities.json`
 /// (ADR 0241), 6 `production-changes.json` (ADR 0270), 7 vendors' assurance reports in
 /// `vendors.json` (ADR 0279), 8 the system description's approval in `policies.json`
-/// (ADR 0292).
-pub const FORMAT: u32 = 8;
+/// (ADR 0292), 9 screenings, secure-development training and the courses' texts in
+/// `people.json` (ADR 0312).
+pub const FORMAT: u32 = 9;
 pub const PREFIX: &str = "superbot-register-";
 /// The register's own format, in its `superbotRegister` field.
 pub const REGISTER_FORMAT: u64 = 1;
@@ -71,6 +73,20 @@ pub const CONCERN_HANDLERS: [&str; 3] = ["People lead", "Management", "Security 
 pub const CONCERN_OUTCOMES: [&str; 4] = ["substantiated", "not-substantiated", "withdrawn", "referred"];
 /// The training everyone takes at onboarding and yearly (information security policy).
 pub const AWARENESS: &str = "security-awareness";
+/// The training engineers take on joining engineering and yearly (information security
+/// policy, ADR 0312): whoever the register marks `engineer`, or holds or deputises the
+/// Engineering lead role.
+pub const SECURE_DEVELOPMENT: &str = "secure-development";
+/// The courses in docs/security/training/, each a file named for it.
+pub const COURSES: [&str; 2] = [AWARENESS, SECURE_DEVELOPMENT];
+pub const ENGINEERING_ROLE: &str = "Engineering lead";
+/// How someone was screened before access (ADR 0312): a background check done, or none
+/// because the law doesn't allow one for the role or it wouldn't be proportionate, which
+/// the people lead decides and records the reason for in their own file.
+pub const SCREENING_KINDS: [&str; 2] = ["check", "exempt"];
+/// The role whose holder or deputy records a screening (information security policy,
+/// "People"), never for themselves.
+pub const SCREENER: &str = "People lead";
 
 /// The incident response plan (CC7.3-1 to CC7.5-1, ADR 0223).
 pub const INCIDENT_RESPONSE: &str = "incident-response";
@@ -225,7 +241,9 @@ after the period are left out.
                            description's, whether the text approved is the text in
                            force, and whether its yearly review is overdue
   people.json              everyone with access in the period, by register id, with their
-                           acknowledgements and training, due, late or overdue
+                           screening before access, acknowledgements, awareness training
+                           and engineers' secure-development training, due, late or
+                           overdue, and the courses' texts in force
   risks.json               the open risks, scored, treated and reviewed, the full yearly
                            reviews, accepted risks and who accepted them, fraud risks
   management-reviews.json  the quarterly management reviews, who attended (by role), and
@@ -314,6 +332,8 @@ pub struct Register {
     #[serde(default)]
     pub training: Vec<Training>,
     #[serde(default)]
+    pub screenings: Vec<Screening>,
+    #[serde(default)]
     pub risks: Vec<Risk>,
     #[serde(default)]
     pub risk_reviews: Vec<RiskReview>,
@@ -360,6 +380,9 @@ pub struct Person {
     /// The day their access ended, not included.
     #[serde(default, deserialize_with = "opt_day")]
     pub left: Option<NaiveDate>,
+    /// They write or review the service's code, so take secure-development training.
+    #[serde(default)]
+    pub engineer: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -405,6 +428,24 @@ pub struct Training {
     pub course: String,
     #[serde(deserialize_with = "day")]
     pub at: NaiveDate,
+}
+
+/// A screening before access, by id only: the check's report, or why there was none,
+/// stays in the people lead's file, identified by its SHA-256. No outcome is recorded:
+/// someone who didn't pass isn't given access.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Screening {
+    pub person: String,
+    pub kind: String,
+    /// The day the check came back, or the exemption was decided.
+    #[serde(deserialize_with = "day")]
+    pub at: NaiveDate,
+    pub by: String,
+    pub record_sha256: String,
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted in the register, never put in evidence")]
+    pub notes: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -934,6 +975,35 @@ pub fn read_description(file: Option<&str>) -> Result<Policy, String> {
     Ok(Policy { id: SYSTEM_DESCRIPTION.into(), approver, sha256: Some(sha256) })
 }
 
+/// A training course as given with `--training`, and the SHA-256 of its text, so each
+/// month's bundle records which text the period's training was given from.
+#[derive(Clone, Debug)]
+pub struct Course {
+    pub id: String,
+    pub sha256: String,
+}
+
+/// The courses in a folder: `<course>.md` for each of `COURSES`, its header naming it
+/// (`| Course | security-awareness |`). A folder missing one, or a file naming another
+/// course, is refused, since the bundle would record the wrong text.
+pub fn read_courses(dir: &Path) -> Result<Vec<Course>, String> {
+    COURSES
+        .iter()
+        .map(|id| {
+            let f = dir.join(format!("{id}.md"));
+            let bytes = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+            let named = String::from_utf8_lossy(&bytes)
+                .lines()
+                .take_while(|l| !l.starts_with("## "))
+                .find_map(|l| l.strip_prefix("| Course |").map(|r| r.trim().trim_end_matches('|').trim().to_string()));
+            if named.as_deref() != Some(id) {
+                return Err(format!("{}: its header must name the course, `| Course | {id} |` (docs/security/training/)", f.display()));
+            }
+            Ok(Course { id: id.to_string(), sha256: sha256(&bytes) })
+        })
+        .collect()
+}
+
 pub fn plain_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
 }
@@ -1034,6 +1104,20 @@ pub fn parse(bytes: &[u8], policies: &[Policy]) -> Result<Register, String> {
         known(&what, &t.person, &mut bad);
         if !plain_id(&t.course) {
             bad.push(format!("{what}: course {:.64} isn't a plain id, such as {AWARENESS}", t.course));
+        }
+    }
+    for s in &r.screenings {
+        let what = format!("the screening of {:.64} on {}", s.person, s.at);
+        known(&what, &s.person, &mut bad);
+        known(&what, &s.by, &mut bad);
+        if !SCREENING_KINDS.contains(&s.kind.as_str()) {
+            bad.push(format!("{what}: kind is {}", SCREENING_KINDS.join(" or ")));
+        }
+        if s.by == s.person {
+            bad.push(format!("{what}: by is who recorded it, never the person screened"));
+        }
+        if !hex(&s.record_sha256, 64..=64) {
+            bad.push(format!("{what}: recordSha256 is the SHA-256 of the check's report or the exemption's reasons in the people lead's file, 64 lowercase hex digits"));
         }
     }
     for x in &r.risks {
@@ -1558,6 +1642,21 @@ fn ds(d: NaiveDate) -> String {
     d.to_string()
 }
 
+/// A yearly duty first due on `due`, done on the sorted days `done`: never done, first done
+/// late, or not done again within a year of `cut`, into those three lists.
+fn chase(who: &str, done: &[NaiveDate], due: NaiveDate, cut: NaiveDate, [missing, late, overdue]: [&mut Vec<Value>; 3]) {
+    let (Some(first), Some(last)) = (done.first(), done.last()) else {
+        missing.push(json!(format!("{who} (due {due})")));
+        return;
+    };
+    if *first > due {
+        late.push(json!(format!("{who} ({first}, due {due})")));
+    }
+    if age(cut, *last) > YEAR_DAYS {
+        overdue.push(json!(format!("{who} (last {last})")));
+    }
+}
+
 fn period_days(p: &Period) -> Vec<NaiveDate> {
     p.from.iter_days().take_while(|d| *d < p.to).collect()
 }
@@ -1570,6 +1669,8 @@ pub struct Check<'a> {
     pub policies: &'a [Policy],
     pub baselines: &'a [Baseline],
     pub sign_offs: &'a [SignOffs],
+    /// The training courses' texts in force, when `--training` gave them.
+    pub courses: &'a [Course],
 }
 
 impl Check<'_> {
@@ -1623,6 +1724,7 @@ impl Check<'_> {
             + r.policy_approvals.iter().filter(|x| x.approved_at >= c).count()
             + r.acknowledgements.iter().filter(|x| x.at >= c).count()
             + r.training.iter().filter(|x| x.at >= c).count()
+            + r.screenings.iter().filter(|x| x.at >= c).count()
             + r.risks.iter().filter(|x| x.identified >= c).count()
             + r.risk_reviews.iter().filter(|x| x.at >= c).count()
             + r.management_reviews.iter().filter(|x| x.at >= c).count()
@@ -1760,34 +1862,32 @@ impl Check<'_> {
         (v, rows)
     }
 
+    /// When `x` became an engineer, as of the period's last day: since joining when the
+    /// register marks them one, or since their assignment as holder or deputy of the
+    /// Engineering lead role began.
+    fn engineer_since(&self, x: &Person) -> Option<NaiveDate> {
+        let last = self.cut().pred_opt()?;
+        let by_role = self.assignments_on(ENGINEERING_ROLE, last).filter(|a| a.holder == x.id || a.deputy.as_deref() == Some(x.id.as_str())).map(|a| a.from).min();
+        [x.engineer.then_some(x.joined), by_role].into_iter().flatten().min().map(|d| d.max(x.joined))
+    }
+
     pub fn people(&self) -> (Value, Vec<&'static str>) {
         let (p, cut) = (self.p, self.cut());
         let (mut missing, mut late, mut overdue) = (Vec::new(), Vec::new(), Vec::new());
         let (mut t_missing, mut t_late, mut t_overdue) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut sd_missing, mut sd_late, mut sd_overdue) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut s_missing, mut s_late, mut s_wrong) = (Vec::new(), Vec::new(), Vec::new());
         let mut out = Vec::new();
         let at_end = |x: &Person| x.joined < cut && x.left.is_none_or(|l| l >= cut);
-        let training_from = self.first_approval("information-security");
+        let training_from = self.first_approval(INFORMATION_SECURITY);
         for x in self.r.people.iter().filter(|x| x.joined < cut && x.left.is_none_or(|l| l > p.from)) {
             let mut acks = serde_json::Map::new();
             for pol in ACKNOWLEDGED.iter().filter(|id| self.policies.iter().any(|q| q.id == **id)) {
                 let mut at: Vec<NaiveDate> = self.r.acknowledgements.iter().filter(|a| a.person == x.id && a.policy == *pol && a.at < cut).map(|a| a.at).collect();
                 at.sort_unstable();
                 let due = self.first_approval(pol).map(|f| plus(f.max(x.joined), GRACE_DAYS));
-                if at_end(x) {
-                    if let Some(due) = due.filter(|d| *d < cut) {
-                        match (at.first(), at.last()) {
-                            (None, _) => missing.push(json!(format!("{} {pol} (due {due})", x.id))),
-                            (Some(first), Some(last)) => {
-                                if *first > due {
-                                    late.push(json!(format!("{} {pol} ({first}, due {due})", x.id)));
-                                }
-                                if age(cut, *last) > YEAR_DAYS {
-                                    overdue.push(json!(format!("{} {pol} (last {last})", x.id)));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                if let Some(due) = due.filter(|d| at_end(x) && *d < cut) {
+                    chase(&format!("{} {pol}", x.id), &at, due, cut, [&mut missing, &mut late, &mut overdue]);
                 }
                 acks.insert(pol.to_string(), json!({ "count": at.len(), "first": at.first().copied().map(ds), "last": at.last().copied().map(ds), "due": due.map(ds) }));
             }
@@ -1796,37 +1896,65 @@ impl Check<'_> {
                 courses.entry(t.course.as_str()).or_default().push(t.at);
             }
             courses.values_mut().for_each(|v| v.sort_unstable());
+            let taken = |course: &str| courses.get(course).map_or(&[][..], Vec::as_slice);
             let due = training_from.map(|f| plus(f.max(x.joined), GRACE_DAYS));
-            if at_end(x) {
-                if let Some(due) = due.filter(|d| *d < cut) {
-                    match courses.get(AWARENESS) {
-                        None => t_missing.push(json!(format!("{} (due {due})", x.id))),
-                        Some(at) => {
-                            if at[0] > due {
-                                t_late.push(json!(format!("{} ({}, due {due})", x.id, at[0])));
-                            }
-                            if age(cut, *at.last().expect("not empty")) > YEAR_DAYS {
-                                t_overdue.push(json!(format!("{} (last {})", x.id, at.last().expect("not empty"))));
-                            }
-                        }
-                    }
+            if let Some(due) = due.filter(|d| at_end(x) && *d < cut) {
+                chase(&x.id, taken(AWARENESS), due, cut, [&mut t_missing, &mut t_late, &mut t_overdue]);
+            }
+            let engineer = self.engineer_since(x).filter(|_| at_end(x));
+            let sd_due = engineer.and_then(|since| training_from.map(|f| plus(f.max(since), GRACE_DAYS)));
+            if let Some(due) = sd_due.filter(|d| *d < cut) {
+                chase(&x.id, taken(SECURE_DEVELOPMENT), due, cut, [&mut sd_missing, &mut sd_late, &mut sd_overdue]);
+            }
+            let mut screened: Vec<&Screening> = self.r.screenings.iter().filter(|s| s.person == x.id && s.at < cut).collect();
+            screened.sort_by_key(|s| s.at);
+            for s in &screened {
+                if self.held(&s.by, &[SCREENER], s.at).is_none() {
+                    s_wrong.push(json!(format!("{} on {}: {} didn't hold {SCREENER}", x.id, s.at, s.by)));
                 }
             }
+            // Before access for anyone joining once the policy is approved; those already
+            // in scope then are screened, or exempted, within the grace period.
+            let s_due = training_from.map(|f| if x.joined >= f { x.joined } else { plus(f, GRACE_DAYS) });
+            if let Some(due) = s_due.filter(|d| at_end(x) && *d < cut) {
+                match screened.first() {
+                    None => s_missing.push(json!(format!("{} (due {due})", x.id))),
+                    Some(s) if s.at > due => s_late.push(json!(format!("{} ({}, due {due})", x.id, s.at))),
+                    Some(_) => {}
+                }
+            }
+            let screening = json!({
+                "count": screened.len(),
+                "first": screened.first().map(|s| json!({ "at": ds(s.at), "kind": s.kind, "by": s.by, "heldRole": self.held(&s.by, &[SCREENER], s.at), "recordSha256": s.record_sha256 })),
+                "due": s_due.map(ds),
+            });
             let training: Value = courses.iter().map(|(c, at)| (c.to_string(), json!({ "count": at.len(), "last": at.last().copied().map(ds) }))).collect::<serde_json::Map<_, _>>().into();
-            out.push(json!({ "id": x.id, "joined": ds(x.joined), "left": x.left.map(ds), "atEnd": at_end(x), "acknowledgements": acks, "training": training, "awarenessDue": due.map(ds) }));
+            out.push(json!({
+                "id": x.id, "joined": ds(x.joined), "left": x.left.map(ds), "atEnd": at_end(x), "engineer": engineer.is_some(),
+                "screening": screening, "acknowledgements": acks, "training": training, "awarenessDue": due.map(ds), "secureDevelopmentDue": sd_due.map(ds),
+            }));
         }
         let recent = |d: NaiveDate| d < cut && age(cut, d) <= YEAR_DAYS;
+        let trained = t_missing.is_empty() && t_overdue.is_empty();
         let mut rows = Vec::new();
-        if self.r.training.iter().any(|t| recent(t.at)) {
+        if self.r.training.iter().any(|t| t.course == AWARENESS && recent(t.at)) && trained && sd_missing.is_empty() && sd_overdue.is_empty() && s_missing.is_empty() {
             rows.push("CC1.4-1");
         }
-        if self.r.acknowledgements.iter().any(|a| recent(a.at)) {
+        if self.r.acknowledgements.iter().any(|a| recent(a.at)) && missing.is_empty() && overdue.is_empty() && trained {
             rows.push("CC2.2-1");
         }
         let v = json!({
-            "basis": format!("everyone with access at the period's end acknowledges {} and takes {AWARENESS} training within {GRACE_DAYS} days of joining or of the policy's first approval (training: the information security policy's), whichever is later, and again within each year; people are named by their register id only", ACKNOWLEDGED.join(" and ")),
-            "summary": { "people": out.len(), "atEnd": out.iter().filter(|x| x["atEnd"] == true).count(), "acknowledgements": self.r.acknowledgements.iter().filter(|a| a.at < cut).count(), "training": self.r.training.iter().filter(|t| t.at < cut).count() },
-            "exceptions": { "notAcknowledged": missing, "acknowledgedLate": late, "acknowledgementOverdue": overdue, "notTrained": t_missing, "trainedLate": t_late, "trainingOverdue": t_overdue },
+            "basis": format!("everyone with access at the period's end acknowledges {} and takes {AWARENESS} training within {GRACE_DAYS} days of joining or of the policy's first approval (training: the information security policy's), whichever is later, and again within each year; engineers (marked engineer, or holding or deputising {ENGINEERING_ROLE}) take {SECURE_DEVELOPMENT} training on the same terms from when they became one; everyone is screened before access (a background check, or exempt where the law or the role doesn't allow one), recorded by someone holding or deputising {SCREENER}, and those in scope before the policy's first approval within {GRACE_DAYS} days of it; CC1.4-1 is named only while nobody at the period's end is unscreened or owes training, and CC2.2-1 only while nobody owes an acknowledgement or awareness training; people are named by their register id only", ACKNOWLEDGED.join(" and ")),
+            "courseTextsRecorded": !self.courses.is_empty(),
+            "courses": self.courses.iter().map(|c| json!({ "course": c.id, "sha256": c.sha256 })).collect::<Vec<_>>(),
+            "summary": {
+                "people": out.len(), "atEnd": out.iter().filter(|x| x["atEnd"] == true).count(), "engineersAtEnd": out.iter().filter(|x| x["engineer"] == true).count(),
+                "acknowledgements": self.r.acknowledgements.iter().filter(|a| a.at < cut).count(), "training": self.r.training.iter().filter(|t| t.at < cut).count(), "screenings": self.r.screenings.iter().filter(|s| s.at < cut).count(),
+            },
+            "exceptions": {
+                "notAcknowledged": missing, "acknowledgedLate": late, "acknowledgementOverdue": overdue, "notTrained": t_missing, "trainedLate": t_late, "trainingOverdue": t_overdue,
+                "secureDevelopmentNotTrained": sd_missing, "secureDevelopmentLate": sd_late, "secureDevelopmentOverdue": sd_overdue, "notScreened": s_missing, "screenedLate": s_late, "screenerNotInRole": s_wrong,
+            },
             "people": out,
         });
         (v, rows)
@@ -2872,6 +3000,7 @@ pub fn build(c: &Check, src: &Source, now_ms: i64) -> Bundle {
             "register": src.file, "registerBytes": src.bytes, "registerSha256": src.sha256, "registerFormat": REGISTER_FORMAT,
             "policies": c.policies.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
             "policyTextsChecked": c.policies.iter().any(|p| p.sha256.is_some()),
+            "trainingTextsRecorded": !c.courses.is_empty(),
             "baselineChecks": c.baselines.len(),
             "accessReviewFiles": c.sign_offs.len(),
         },
@@ -2902,13 +3031,14 @@ pub fn summary(c: &Check) -> String {
 // The command
 
 pub const USAGE: &str = "  superbot-evidence register <register.json> [--policies <folder>] [--description <file>]
-                    [--baseline <file>]... [--access-review <system>=<file>]...
+                    [--training <folder>] [--baseline <file>]... [--access-review <system>=<file>]...
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>]";
 
 struct Args {
     register: String,
     policies: Option<String>,
     description: Option<String>,
+    training: Option<String>,
     baselines: Vec<String>,
     access_reviews: Vec<String>,
     from: Option<String>,
@@ -2917,7 +3047,7 @@ struct Args {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut a = Args { register: String::new(), policies: None, description: None, baselines: Vec::new(), access_reviews: Vec::new(), from: None, to: None, out: None };
+    let mut a = Args { register: String::new(), policies: None, description: None, training: None, baselines: Vec::new(), access_reviews: Vec::new(), from: None, to: None, out: None };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let value = |it: &mut std::slice::Iter<String>| it.next().filter(|v| !v.starts_with("--") && !v.is_empty()).cloned().ok_or(format!("{flag} needs a value"));
@@ -2932,6 +3062,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             "--policies" => &mut a.policies,
             "--description" => &mut a.description,
+            "--training" => &mut a.training,
             "--from" => &mut a.from,
             "--to" => &mut a.to,
             "-o" | "--out" => &mut a.out,
@@ -2996,13 +3127,14 @@ pub fn run(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<String
         }
         signed.push(s);
     }
-    let c = Check { r: &register, p, policies: &policies, baselines: &baselines, sign_offs: &signed };
+    let courses = a.training.as_deref().map(|dir| read_courses(Path::new(dir))).transpose()?.unwrap_or_default();
+    let c = Check { r: &register, p, policies: &policies, baselines: &baselines, sign_offs: &signed, courses: &courses };
     let src = Source { file: Path::new(&a.register).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), bytes: bytes.len(), sha256: sha256(&bytes) };
     let b = build(&c, &src, now.timestamp_millis());
     let file = a.out.clone().unwrap_or_else(|| format!("{}.tar", b.name));
     crate::save_private(&file, &b.tar)?;
     Ok(format!(
-        "Saved {file} ({} KB) from the register {} (SHA-256 {}) for {} to {} (not included){}:{}\nManifest SHA-256: {}\nBundle SHA-256: {}\nKeep it in the evidence store, with the register as it is now; to check it:\n  tar -xf {} && (cd {} && sha256sum -c SHA256SUMS)",
+        "Saved {file} ({} KB) from the register {} (SHA-256 {}) for {} to {} (not included){}{}:{}\nManifest SHA-256: {}\nBundle SHA-256: {}\nKeep it in the evidence store, with the register as it is now; to check it:\n  tar -xf {} && (cd {} && sha256sum -c SHA256SUMS)",
         b.tar.len().div_ceil(1024),
         src.file,
         src.sha256,
@@ -3014,6 +3146,7 @@ pub fn run(args: &[String], now: chrono::DateTime<chrono::Utc>) -> Result<String
             (false, true) => ", against the system description given, without the policy files (--policies), so their approved texts weren't compared",
             (false, false) => ", without the policy files (--policies) or the system description (--description), so approved texts weren't compared",
         },
+        if courses.is_empty() { "; the training courses' texts weren't recorded (--training)" } else { "; with the training courses' texts in force" },
         summary(&c),
         b.manifest_sha256,
         b.sha256,
@@ -3047,6 +3180,13 @@ mod tests {
             }
             training.push(json!({ "person": who, "course": AWARENESS, "at": "2027-01-20" }));
         }
+        for who in ["p-eng", "p-ops"] {
+            training.push(json!({ "person": who, "course": SECURE_DEVELOPMENT, "at": "2027-01-25" }));
+        }
+        let screenings: Vec<Value> = ["p-mgmt", "p-sec", "p-eng", "p-ops"]
+            .iter()
+            .map(|who| json!({ "person": who, "kind": if *who == "p-ops" { "exempt" } else { "check" }, "at": "2027-01-15", "by": if *who == "p-mgmt" { "p-sec" } else { "p-mgmt" }, "recordSha256": ZERO, "notes": "Dan's agency did it" }))
+            .collect();
         let role = |r: &str, h: &str, dep: &str| json!({ "role": r, "holder": h, "deputy": dep, "from": "2027-01-01" });
         json!({
             "superbotRegister": 1,
@@ -3064,6 +3204,7 @@ mod tests {
             "policyApprovals": approvals,
             "acknowledgements": acks,
             "training": training,
+            "screenings": screenings,
             "risks": [
                 { "id": "R-01", "title": "Cross-user data leak between machines", "owner": "Security owner", "likelihood": 2, "impact": 5, "treatment": "reduce", "controls": ["CC6.3-1"], "identified": "2027-01-05" },
                 { "id": "R-02", "title": "Signup abuse for free compute", "owner": "Security owner", "likelihood": 3, "impact": 2, "treatment": "reduce", "controls": ["CC3.3-1"], "fraud": true, "identified": "2027-01-05" },
@@ -3157,7 +3298,7 @@ mod tests {
 
     fn check(v: &Value, f: &dyn Fn(&Check)) {
         let r = parse(&serde_json::to_vec(v).unwrap(), &builtin_policies()).unwrap();
-        f(&Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[] });
+        f(&Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] });
     }
 
     fn exceptions(v: &Value) -> usize {
@@ -3214,7 +3355,7 @@ mod tests {
         let mut texts = builtin_policies();
         texts.iter_mut().for_each(|p| p.sha256 = Some(ZERO.into()));
         texts[2].sha256 = Some("1".repeat(64));
-        let c = Check { r: &r, p: period(), policies: &texts, baselines: &[], sign_offs: &[] };
+        let c = Check { r: &r, p: period(), policies: &texts, baselines: &[], sign_offs: &[], courses: &[] };
         let (pol, rows) = c.policies();
         let ex = &pol["exceptions"];
         assert_eq!(ex["notApproved"], json!(["acceptable-use"]));
@@ -3258,7 +3399,7 @@ mod tests {
         let r = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap();
         let mut texts = builtin_policies();
         texts.iter_mut().for_each(|p| p.sha256 = Some(if p.id == SYSTEM_DESCRIPTION { "1".repeat(64) } else { ZERO.into() }));
-        let c = Check { r: &r, p: period(), policies: &texts, baselines: &[], sign_offs: &[] };
+        let c = Check { r: &r, p: period(), policies: &texts, baselines: &[], sign_offs: &[], courses: &[] };
         let (pol, rows) = c.policies();
         let ex = &pol["exceptions"];
         assert_eq!(ex["changedSinceApproval"], json!([SYSTEM_DESCRIPTION]));
@@ -3319,6 +3460,128 @@ mod tests {
     }
 
     #[test]
+    fn screenings_before_access_missing_late_or_recorded_by_someone_who_couldnt() {
+        let mut v = good();
+        let people = v["people"].as_array_mut().unwrap();
+        people.push(json!({ "id": "p-new", "joined": "2027-03-10" }));
+        people.push(json!({ "id": "p-late", "joined": "2027-03-03" }));
+        people.push(json!({ "id": "p-pre", "joined": "2027-03-20" }));
+        people.push(json!({ "id": "p-gone", "joined": "2026-01-01", "left": "2027-03-05" }));
+        let screenings = v["screenings"].as_array_mut().unwrap();
+        screenings.retain(|s| s["person"] != "p-ops");
+        screenings.push(json!({ "person": "p-late", "kind": "check", "at": "2027-03-04", "by": "p-mgmt", "recordSha256": ZERO }));
+        screenings.push(json!({ "person": "p-pre", "kind": "check", "at": "2027-03-18", "by": "p-sec", "recordSha256": ZERO }));
+        screenings.push(json!({ "person": "p-eng", "kind": "check", "at": "2027-02-01", "by": "p-ops", "recordSha256": ZERO }));
+        check(&v, &|c| {
+            let (pe, rows) = c.people();
+            let ex = &pe["exceptions"];
+            assert_eq!(ex["notScreened"], json!(["p-ops (due 2027-02-04)", "p-new (due 2027-03-10)"]), "before access once the policy is approved, within 30 days of it for those already in");
+            assert_eq!(ex["screenedLate"], json!(["p-late (2027-03-04, due 2027-03-03)"]));
+            assert_eq!(ex["screenerNotInRole"], json!(["p-eng on 2027-02-01: p-ops didn't hold People lead"]), "a deputy counts (p-sec for p-pre), anyone else doesn't");
+            let pre = pe["people"].as_array().unwrap().iter().find(|x| x["id"] == "p-pre").unwrap();
+            assert_eq!((pre["screening"]["first"]["heldRole"].as_str(), pre["screening"]["due"].as_str()), (Some("People lead (deputy)"), Some("2027-03-20")), "{pre}");
+            let gone = pe["people"].as_array().unwrap().iter().find(|x| x["id"] == "p-gone").unwrap();
+            assert_eq!((gone["atEnd"].as_bool(), gone["screening"]["count"].as_u64()), (Some(false), Some(0)), "a leaver is listed, not chased");
+            assert!(!rows.contains(&"CC1.4-1"), "someone with access unscreened: {rows:?}");
+            assert!(rows.contains(&"CC2.2-1"), "screening is CC1.4's, not CC2.2's: {rows:?}");
+            assert!(!pe.to_string().contains("agency"), "no notes: {pe}");
+        });
+        let mut later = good();
+        later["policyApprovals"].as_array_mut().unwrap().iter_mut().for_each(|a| a["approvedAt"] = json!("2027-03-20"));
+        later["screenings"] = json!([]);
+        later["acknowledgements"] = json!([]);
+        later["training"] = json!([]);
+        check(&later, &|c| assert_eq!(c.people().0["exceptions"]["notScreened"], json!([]), "nobody is due before the policy is approved, and then 30 days after"));
+    }
+
+    #[test]
+    fn engineers_take_secure_development_training_from_when_they_became_one() {
+        let mut v = good();
+        v["people"].as_array_mut().unwrap().push(json!({ "id": "p-dev", "joined": "2026-06-01", "engineer": true }));
+        v["people"].as_array_mut().unwrap().push(json!({ "id": "p-lead", "joined": "2026-06-01" }));
+        v["people"][3]["engineer"] = json!(true);
+        v["roles"][2]["until"] = json!("2027-03-10");
+        v["roles"].as_array_mut().unwrap().push(json!({ "role": "Engineering lead", "holder": "p-lead", "deputy": "p-ops", "from": "2027-03-10" }));
+        let training = v["training"].as_array_mut().unwrap();
+        training.retain(|t| !(t["person"] == "p-ops" && t["course"] == SECURE_DEVELOPMENT));
+        training.push(json!({ "person": "p-ops", "course": SECURE_DEVELOPMENT, "at": "2026-02-15" }));
+        training.push(json!({ "person": "p-dev", "course": SECURE_DEVELOPMENT, "at": "2027-02-20" }));
+        for who in ["p-dev", "p-lead"] {
+            training.push(json!({ "person": who, "course": AWARENESS, "at": "2027-01-20" }));
+        }
+        for who in ["p-dev", "p-lead"] {
+            for pol in ACKNOWLEDGED {
+                v["acknowledgements"].as_array_mut().unwrap().push(json!({ "person": who, "policy": pol, "at": "2027-01-10" }));
+            }
+            v["screenings"].as_array_mut().unwrap().push(json!({ "person": who, "kind": "check", "at": "2027-01-15", "by": "p-mgmt", "recordSha256": ZERO }));
+        }
+        check(&v, &|c| {
+            let (pe, rows) = c.people();
+            let ex = &pe["exceptions"];
+            assert_eq!(ex["secureDevelopmentLate"], json!(["p-dev (2027-02-20, due 2027-02-04)"]), "marked engineer: due from joining or the policy");
+            assert_eq!(ex["secureDevelopmentOverdue"], json!(["p-ops (last 2026-02-15)"]), "marked engineer, and deputising: due from joining, the earlier");
+            assert_eq!(ex["secureDevelopmentNotTrained"], json!([]), "p-lead became one on 2027-03-10, so isn't due until 2027-04-09");
+            let person = |id: &str| pe["people"].as_array().unwrap().iter().find(|x| x["id"] == id).unwrap().clone();
+            assert_eq!((person("p-lead")["engineer"].as_bool(), person("p-lead")["secureDevelopmentDue"].as_str()), (Some(true), Some("2027-04-09")));
+            assert_eq!((person("p-eng")["engineer"].as_bool(), person("p-eng")["secureDevelopmentDue"].clone()), (Some(false), Value::Null), "no longer the Engineering lead at the period's end");
+            assert_eq!((person("p-mgmt")["engineer"].as_bool(), pe["summary"]["engineersAtEnd"].as_u64()), (Some(false), Some(3)));
+            assert!(!rows.contains(&"CC1.4-1"), "an engineer overdue: {rows:?}");
+            assert!(rows.contains(&"CC2.2-1"), "{rows:?}");
+        });
+    }
+
+    #[test]
+    fn people_json_names_its_rows_only_while_everyone_holds_up() {
+        let rows = |v: &Value| {
+            let r = parse(&serde_json::to_vec(v).unwrap(), &builtin_policies()).unwrap();
+            Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] }.people().1
+        };
+        assert_eq!(rows(&good()), ["CC1.4-1", "CC2.2-1"]);
+        let mut v = good();
+        v["training"].as_array_mut().unwrap().retain(|t| t["person"] != "p-sec");
+        assert_eq!(rows(&v), Vec::<&str>::new(), "someone owes awareness training: neither row");
+        let mut v = good();
+        v["acknowledgements"].as_array_mut().unwrap().retain(|a| !(a["person"] == "p-sec" && a["policy"] == "code-of-conduct"));
+        assert_eq!(rows(&v), ["CC1.4-1"], "someone owes an acknowledgement: not CC2.2-1");
+        let mut v = good();
+        v["training"].as_array_mut().unwrap().retain(|t| t["person"] != "p-eng" || t["course"] != SECURE_DEVELOPMENT);
+        assert_eq!(rows(&v), ["CC2.2-1"], "the Engineering lead owes secure-development training: not CC1.4-1");
+        let mut v = good();
+        v["training"].as_array_mut().unwrap().retain(|t| t["person"] != "p-ops" || t["course"] != SECURE_DEVELOPMENT);
+        assert_eq!(rows(&v), ["CC2.2-1"], "so does its deputy");
+        let mut v = good();
+        v["training"].as_array_mut().unwrap().iter_mut().for_each(|t| t["course"] = json!(SECURE_DEVELOPMENT));
+        assert!(!rows(&v).contains(&"CC1.4-1"), "only awareness training counts for everyone");
+        let mut v = good();
+        v["screenings"][0]["at"] = json!("2027-03-15");
+        assert_eq!(rows(&v), ["CC1.4-1", "CC2.2-1"], "a late screening is flagged, but it was done");
+    }
+
+    #[test]
+    fn the_courses_are_read_from_their_folder_and_recorded() {
+        let real = read_courses(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/training")).unwrap();
+        assert_eq!(real.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), COURSES);
+        assert!(real.iter().all(|c| hex(&c.sha256, 64..=64)));
+        let r = parse(&serde_json::to_vec(&good()).unwrap(), &builtin_policies()).unwrap();
+        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &real };
+        let pe = c.people().0;
+        assert_eq!((pe["courseTextsRecorded"].as_bool(), pe["courses"][1]["course"].as_str(), pe["courses"][1]["sha256"].as_str()), (Some(true), Some(SECURE_DEVELOPMENT), Some(real[1].sha256.as_str())));
+        check(&good(), &|c| assert_eq!((c.people().0["courseTextsRecorded"].as_bool(), c.people().0["courses"].clone()), (Some(false), json!([]))));
+
+        let dir = std::env::temp_dir().join(format!("superbot-register-courses-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("security-awareness.md"), "# A\n\n| Field | Value |\n| Course | security-awareness |\n").unwrap();
+        assert!(read_courses(&dir).unwrap_err().contains("secure-development.md"), "a course missing");
+        std::fs::write(dir.join("secure-development.md"), "# B\n\n| Course | security-awareness |\n").unwrap();
+        assert!(read_courses(&dir).unwrap_err().contains("| Course | secure-development |"), "a file naming another course");
+        std::fs::write(dir.join("secure-development.md"), "# B\n\n## Body\n\n| Course | secure-development |\n").unwrap();
+        assert!(read_courses(&dir).is_err(), "the course is named in the header, not the body");
+        std::fs::write(dir.join("secure-development.md"), "# B\n\n| Course | secure-development |\n").unwrap();
+        assert_eq!(read_courses(&dir).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn risks_unreviewed_accepted_without_management_and_no_fraud() {
         let mut v = good();
         v["risks"][0]["identified"] = json!("2025-12-01");
@@ -3370,13 +3633,13 @@ mod tests {
         let mut v = good();
         v["managementReviews"] = json!([{ "at": "2027-01-20", "attendees": ["p-eng"] }]);
         let r = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap();
-        let c = Check { r: &r, p: q, policies: &builtin_policies(), baselines: &[], sign_offs: &[] };
+        let c = Check { r: &r, p: q, policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] };
         let (m, rows) = c.management_reviews();
         assert_eq!(m["exceptions"]["quarterWithoutReview"], json!(["2026-Q4"]));
         assert_eq!(m["exceptions"]["withoutManagementOrSecurityOwner"], json!(["2027-01-20"]));
         assert_eq!(m["exceptions"]["noMinutes"], json!(["2027-01-20"]));
         assert_eq!(rows, ["CC1.2-1"], "within a quarter of the end");
-        let late = Check { r: &r, p: Period { from: d("2027-05-01"), to: d("2027-06-01") }, policies: &builtin_policies(), baselines: &[], sign_offs: &[] };
+        let late = Check { r: &r, p: Period { from: d("2027-05-01"), to: d("2027-06-01") }, policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] };
         assert!(late.management_reviews().1.is_empty(), "the last review is over a quarter old");
     }
 
@@ -3559,7 +3822,7 @@ mod tests {
         let b2 = baseline("b.json", &json_check("2027-04-01T00:00:05Z", &[]), &period()).unwrap();
         assert_eq!(b2.checked_on, d("2027-04-01"), "the month's evidence bundle, made on the 1st");
         let bs = [b1, b2];
-        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &bs, sign_offs: &[] };
+        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &bs, sign_offs: &[], courses: &[] };
         let (x, rows) = c.exceptions();
         let ex = &x["exceptions"];
         assert_eq!(ex["overAYear"], json!(["EX-02 (approved 2026-10-01, ends 2027-12-01)"]));
@@ -3628,7 +3891,7 @@ mod tests {
         older["acknowledgements"].as_array_mut().unwrap().retain(|a| a["policy"] != CODE_OF_CONDUCT);
         let set: Vec<Policy> = builtin_policies().into_iter().filter(|p| p.id != CODE_OF_CONDUCT).collect();
         let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
-        let c = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[] };
+        let c = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[], courses: &[] };
         let (x, rows) = c.conduct();
         assert_eq!((x["codeOfConduct"]["inPolicySet"].as_bool(), rows.len()), (Some(false), 0), "a policy folder from before the code of conduct");
         assert_eq!(exceptions(&c.people().0), 0, "nobody is chased for a policy not in the set");
@@ -3729,7 +3992,7 @@ mod tests {
         let mut older = good();
         older["policyApprovals"].as_array_mut().unwrap().retain(|a| a["policy"] != INCIDENT_RESPONSE);
         let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
-        let c = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[] };
+        let c = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[], courses: &[] };
         let (x, rows) = c.incidents();
         assert_eq!((x["incidentResponsePlan"]["inPolicySet"].as_bool(), rows.len(), exceptions(&x)), (Some(false), 0, 0), "a policy folder without the plan");
     }
@@ -3794,8 +4057,14 @@ mod tests {
         v["conductConcerns"].as_array_mut().unwrap().push(json!({ "id": "CC-02", "received": "2027-03-05", "triaged": "2027-03-01", "handledBy": "p-mgmt", "closed": "2027-03-10" }));
         v["conductConcerns"].as_array_mut().unwrap().push(json!({ "id": "CC-03", "received": "2027-03-05", "handledBy": "p-who", "closed": "2027-03-06", "outcome": "dismissed" }));
         v["conductConcerns"].as_array_mut().unwrap().push(json!({ "id": "CC-01", "received": "2027-03-05" }));
+        v["screenings"][1] = json!({ "person": "p-sec", "kind": "passed", "at": "2027-01-15", "by": "p-sec", "recordSha256": "abc" });
+        v["screenings"][2]["by"] = json!("p-hr");
         let e = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap_err();
         for want in [
+            "the screening of p-sec on 2027-01-15: kind is check or exempt",
+            "the screening of p-sec on 2027-01-15: by is who recorded it, never the person screened",
+            "the screening of p-sec on 2027-01-15: recordSha256 is the SHA-256",
+            "the screening of p-eng on 2027-01-15 names p-hr, who isn't in people",
             "person id alice@example.com isn't plain",
             "person id p-sec is used twice",
             "names p-nobody, who isn't in people",
@@ -3885,9 +4154,9 @@ mod tests {
         v["people"].as_array_mut().unwrap().push(json!({ "id": "p-gone", "joined": "2026-01-01", "left": "2027-03-20" }));
         v["access"].as_array_mut().unwrap().push(json!({ "person": "p-gone", "system": "github", "level": "user", "granted": "2026-06-01", "removed": "2027-04-01" }));
         let r = parse(&serde_json::to_vec(&v).unwrap(), &builtin_policies()).unwrap();
-        let march = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[] }.access().0;
+        let march = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] }.access().0;
         assert_eq!(march["exceptions"]["leaverNotRemoved"], json!(["p-gone on github (user): left 2027-03-20, not removed"]));
-        let april = Check { r: &r, p: Period { from: d("2027-04-01"), to: d("2027-05-01") }, policies: &builtin_policies(), baselines: &[], sign_offs: &[] }.access().0;
+        let april = Check { r: &r, p: Period { from: d("2027-04-01"), to: d("2027-05-01") }, policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] }.access().0;
         assert_eq!(april["exceptions"]["leaverRemovedLate"], json!(["p-gone on github (user): left 2027-03-20, removed 2027-04-01"]), "{}", april["exceptions"]);
         assert_eq!(april["exceptions"]["leaverNotRemoved"], json!([]));
     }
@@ -3955,7 +4224,7 @@ mod tests {
     #[test]
     fn superbot_reviews_are_matched_to_botds_sign_offs() {
         let r = parse(&serde_json::to_vec(&good()).unwrap(), &builtin_policies()).unwrap();
-        let run = |files: &[SignOffs]| Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: files }.access().0;
+        let run = |files: &[SignOffs]| Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: files, courses: &[] }.access().0;
         let signed = sign_offs("botd-eu", "/evidence/access-review.json", &access_review(&[(SIGNED, "2027-03-16T14:00:00Z")], 0)).unwrap();
         assert_eq!((signed.file.as_str(), signed.signed.len(), signed.truncated, signed.period.clone()), ("access-review.json", 1, false, Some(("2027-03-01".into(), "2027-04-01".into()))));
         let a = run(std::slice::from_ref(&signed));
@@ -4114,7 +4383,7 @@ mod tests {
         month_apart["vulnerabilities"].as_array_mut().unwrap().push(json!({ "id": "V-12", "source": "pentest", "penTest": "PT-01", "received": "2026-12-20", "assessed": "2026-12-21", "severity": "high", "owner": "Engineering lead", "accepted": "2027-03-01", "acceptedBy": "p-sec" }));
         let retests = |v: &Value, from: &str, to: &str| {
             let r = parse(&serde_json::to_vec(v).unwrap(), &builtin_policies()).unwrap();
-            let x = Check { r: &r, p: Period { from: d(from), to: d(to) }, policies: &builtin_policies(), baselines: &[], sign_offs: &[] }.vulnerabilities().0;
+            let x = Check { r: &r, p: Period { from: d(from), to: d(to) }, policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] }.vulnerabilities().0;
             (x["exceptions"]["retestLate"].clone(), x["exceptions"]["retestOverdue"].clone(), x["penTests"][0]["retestDue"].clone())
         };
         let none = (json!([]), json!([]));
@@ -4240,7 +4509,7 @@ mod tests {
         let mut older = good();
         older["policyApprovals"].as_array_mut().unwrap().retain(|a| a["policy"] != CHANGE_MANAGEMENT);
         let r = parse(&serde_json::to_vec(&older).unwrap(), &set).unwrap();
-        let (x, rows) = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[] }.production_changes();
+        let (x, rows) = Check { r: &r, p: period(), policies: &set, baselines: &[], sign_offs: &[], courses: &[] }.production_changes();
         assert_eq!((x["changeManagementPolicy"]["inPolicySet"].as_bool(), rows.len()), (Some(false), 0), "a policy folder without the change management policy");
     }
 
@@ -4293,7 +4562,7 @@ mod tests {
         }
         april["managementReviews"] = json!([{ "at": "2027-03-20", "attendees": ["p-mgmt", "p-sec"], "minutesSha256": ZERO }, { "at": "2027-04-10", "attendees": ["p-mgmt", "p-sec"], "minutesSha256": ZERO }]);
         let r = parse(&serde_json::to_vec(&april).unwrap(), &builtin_policies()).unwrap();
-        let listed = |p: Period| Check { r: &r, p, policies: &builtin_policies(), baselines: &[], sign_offs: &[] }.production_changes().0["exceptions"]["notInManagementReview"].clone();
+        let listed = |p: Period| Check { r: &r, p, policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] }.production_changes().0["exceptions"]["notInManagementReview"].clone();
         assert_eq!(listed(period()), json!([]), "the next review is after the period");
         assert_eq!(listed(Period { from: d("2027-04-01"), to: d("2027-05-01") }), json!(["CHG-02 (made 2027-03-29, not listed by the management review on 2027-04-10)"]), "flagged in the period of the review that missed it");
     }
@@ -4391,7 +4660,7 @@ mod tests {
         v["managementReviews"] = json!([]);
         let bytes = serde_json::to_vec(&v).unwrap();
         let r = parse(&bytes, &builtin_policies()).unwrap();
-        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[] };
+        let c = Check { r: &r, p: period(), policies: &builtin_policies(), baselines: &[], sign_offs: &[], courses: &[] };
         let src = Source { file: "register.json".into(), bytes: bytes.len(), sha256: sha256(&bytes) };
         let now = period().end_ms() + 3_600_000;
         let b = build(&c, &src, now);
@@ -4399,7 +4668,7 @@ mod tests {
         assert!(![crate::changes::PREFIX, crate::vulns::PREFIX, crate::drills::PREFIX, "superbot-evidence-"].iter().any(|p| b.name.starts_with(p)));
         let entries = crate::coverage::untar(&b.tar).unwrap();
         let all: String = entries.iter().map(|(_, x)| String::from_utf8_lossy(x).into_owned()).collect();
-        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse", "on-call login", "code host's organisation", "Mallory", "Initrode", "Oscar"] {
+        for never in ["Alice", "Example", "Cross-user", "secret reasoning", "Signup abuse", "on-call login", "code host's organisation", "Mallory", "Initrode", "Oscar", "agency"] {
             assert!(!all.contains(never), "{never:?} is in the bundle");
         }
         let manifest: Value = serde_json::from_slice(&entries.iter().find(|(n, _)| n.ends_with("/manifest.json")).unwrap().1).unwrap();
@@ -4417,15 +4686,16 @@ mod tests {
     #[test]
     fn options() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let a = parse_args(&s(&["r.json", "--policies", "docs", "--description", "d.md", "--baseline", "a.json", "--baseline", "b.json", "--access-review", "botd-1=c.json", "--from", "2027-03-01", "--to", "2027-04-01", "-o", "x.tar"])).unwrap();
-        assert_eq!((a.register.as_str(), a.policies.as_deref(), a.description.as_deref(), a.baselines.len(), a.access_reviews.len(), a.out.as_deref()), ("r.json", Some("docs"), Some("d.md"), 2, 1, Some("x.tar")));
-        for bad in [&[][..], &["--policies", "d"], &["r.json", "s.json"], &["r.json", "--from"], &["r.json", "-o", "a", "-o", "b"], &["r.json", "--token", "x"], &["r.json", "--baseline"], &["r.json", "--access-review"], &["r.json", "--description"], &["r.json", "--description", "a", "--description", "b"]] {
+        let a = parse_args(&s(&["r.json", "--policies", "docs", "--description", "d.md", "--training", "t", "--baseline", "a.json", "--baseline", "b.json", "--access-review", "botd-1=c.json", "--from", "2027-03-01", "--to", "2027-04-01", "-o", "x.tar"])).unwrap();
+        assert_eq!((a.register.as_str(), a.policies.as_deref(), a.description.as_deref(), a.training.as_deref(), a.baselines.len(), a.access_reviews.len(), a.out.as_deref()), ("r.json", Some("docs"), Some("d.md"), Some("t"), 2, 1, Some("x.tar")));
+        for bad in [&[][..], &["--policies", "d"], &["r.json", "s.json"], &["r.json", "--from"], &["r.json", "-o", "a", "-o", "b"], &["r.json", "--token", "x"], &["r.json", "--baseline"], &["r.json", "--access-review"], &["r.json", "--description"], &["r.json", "--description", "a", "--description", "b"], &["r.json", "--training"], &["r.json", "--training", "a", "--training", "b"]] {
             assert!(parse_args(&s(bad)).is_err(), "{bad:?}");
         }
     }
 
     /// The policy files' headers name an approver this tool knows, and the template in the
-    /// security pack reads, names every role and policy, and names no real person.
+    /// security pack reads, names every role and policy, screens and trains, and names no
+    /// real person.
     #[test]
     fn the_real_policies_and_the_template() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/policies");
@@ -4440,6 +4710,9 @@ mod tests {
         assert_eq!(r.policy_approvals.iter().map(|a| a.policy.as_str()).collect::<BTreeSet<_>>(), POLICIES.iter().chain([&SYSTEM_DESCRIPTION]).copied().collect::<BTreeSet<_>>());
         assert!(r.people.iter().all(|p| p.name.as_deref().is_none_or(|n| n.starts_with('<'))), "placeholders only");
         assert!(r.risks.iter().any(|x| x.fraud), "the template has a fraud risk to start from");
+        assert!(r.people.iter().all(|p| r.screenings.iter().any(|s| s.person == p.id)), "the template screens everyone");
+        assert!(r.people.iter().any(|p| p.engineer) && r.training.iter().any(|t| t.course == SECURE_DEVELOPMENT), "the template has an engineer and their secure-development training");
+        assert!(r.training.iter().all(|t| COURSES.contains(&t.course.as_str())), "the template's courses are the training folder's");
         assert_eq!(r.systems.iter().map(|s| s.kind.as_str()).collect::<BTreeSet<_>>(), SYSTEM_KINDS.iter().copied().collect::<BTreeSet<_>>(), "the template has a system of each kind");
         assert!(!r.access.is_empty() && !r.access_reviews.is_empty());
         assert!(r.changes.iter().any(|x| x.approved_by.as_deref().is_some_and(|by| by != x.made_by)), "the template has a change approved by someone else");
