@@ -67,8 +67,9 @@ The service has an external penetration test at least yearly, the first within a
 
 ## People
 
-- **Before access:** background checks where the law allows, proportionate to the role, and acknowledgement of this policy, the [acceptable use policy](acceptable-use.md) and the [code of conduct](code-of-conduct.md).
-- **Training:** security awareness at onboarding and yearly; incident response roles take part in the yearly tabletop; engineers get secure-development training yearly. The people lead keeps completion records.
+- **Before access:** background checks where the law allows, proportionate to the role, and acknowledgement of this policy, the [acceptable use policy](acceptable-use.md) and the [code of conduct](code-of-conduct.md). The people lead records each check, or why one was exempt, before the person gets access.
+- **Training:** the [security awareness](../training/security-awareness.md) course at onboarding and yearly; incident response roles take part in the yearly tabletop; engineers take the [secure development](../training/secure-development.md) course yearly. The people lead keeps completion records.
+- **Records:** checks, acknowledgements and training are kept in the [policy register](../policy-register.md#hiring-checks-and-training), which flags anyone missing one, late or overdue.
 - **Leaving:** access removed as the [access control policy](access-control.md#removing-access) says.
 - **Accountability:** security duties are part of each role's description and of performance reviews. Breaking a policy, on purpose or through repeated negligence, leads to disciplinary action up to ending the engagement, under the provider's disciplinary process.
 

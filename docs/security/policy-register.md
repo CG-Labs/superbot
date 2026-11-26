@@ -11,6 +11,7 @@ The records the [policy set](policies/README.md) calls for that people keep, in 
 ```sh
 superbot-evidence register register.json --policies docs/security/policies \
   --description docs/security/soc2-system-description.md \
+  --training docs/security/training \
   --baseline baseline-<server>.json --access-review <server>=access-review-<server>.json \
   --from 2027-03-01 --to 2027-04-01
 ```
@@ -26,11 +27,12 @@ One JSON object. Dates are `YYYY-MM-DD` (UTC days); a record dated on or after t
 | `superbotRegister` | The format, `1`. |
 | `notes` | Free text for the register's keeper; never in the bundle. |
 | `riskAppetite` | The highest risk score (likelihood times impact, 1 to 25) the risk owner may accept; above it, or with none set, only Management may. |
-| `people` | Everyone with access to production systems or customer data: `id`, `name` (never in the bundle), `joined`, and `left` when they go. |
+| `people` | Everyone with access to production systems or customer data: `id`, `name` (never in the bundle), `joined`, `left` when they go, and `engineer` (`true` for anyone who writes, reviews, builds or deploys the service's code, so owes secure-development training; the Engineering lead and their deputy always do). |
 | `roles` | Assignments of the policies' roles (Management, Security owner, Engineering lead, Operator, People lead, Privacy lead): `role`, `holder`, `deputy`, `from`, and `until` when it ends. End the old assignment with `until` when a role changes hands, since a role's assignments mustn't overlap; each role needs a holder and a deputy, not the same person, every day. |
 | `policyApprovals` | `policy` (its file name, such as `access-control`, or `soc2-system-description` for the [system description](soc2-system-description.md)), `sha256` (`sha256sum` of the file as approved), `commit`, `approvedBy`, `approvedAt`. Each policy, and the system description, needs one within a year. |
 | `acknowledgements` | `person`, `policy`, `at`. Everyone acknowledges the information security, acceptable use and code of conduct policies within 30 days of joining (or of the policy's first approval) and yearly. |
-| `training` | `person`, `course`, `at`. Everyone takes `security-awareness` on the same terms. |
+| `training` | `person`, `course` (a [course](training/README.md)'s id), `at`. Everyone takes `security-awareness` on the same terms; engineers take `secure-development` within 30 days of becoming one (or of the policy's first approval) and yearly. See [hiring checks and training](#hiring-checks-and-training). |
+| `screenings` | Background checks before access: `person`, `kind` (`check`, or `exempt` where the law or the role rules one out), `at`, `by` (the people lead or their deputy, never the person screened), `recordSha256` (the SHA-256 of the check's report or the exemption's reasons, kept in the people lead's file), `notes`. See [hiring checks and training](#hiring-checks-and-training). |
 | `risks` | `id`, `title` (never in the bundle), `owner` (a role), `likelihood` and `impact` (1 to 5), `treatment` (`reduce`, `accept`, `transfer` or `avoid`), `controls` (readiness checklist row ids, such as `CC6.1-1`; a reduced risk needs one), `fraud`, `identified`, `reviewed` (dates), `closed`, `notes`; for an accepted risk, `acceptedBy` (the owner role's holder, or Management; only Management above the appetite), `acceptedAt` and `acceptedUntil`, its next review. An accepted risk without a dated acceptance is reported. Each open risk is reviewed yearly, and at least one is a fraud risk. |
 | `riskReviews` | Full reviews of the register: `at`, `by`. One a year. |
 | `managementReviews` | `at`, `attendees`, `minutesSha256` (the minutes' SHA-256; the minutes go in the store), `emergencyChanges` (the ids of the emergency changes it went through). One a quarter, with Management and the security owner. |
@@ -47,6 +49,24 @@ One JSON object. Dates are `YYYY-MM-DD` (UTC days); a record dated on or after t
 | `vulnerabilities` | Vulnerabilities found outside the CI scans: `id`, `source` (`report`, `pentest`, `vendor` or `internal`), `penTest` (for `pentest`), `incident`, `received`, `acknowledged` (for `report`); `assessed`, `severity` and `owner` (together); `fixed`, or `accepted` and `acceptedBy` (together), `notes`. See [vulnerabilities and penetration tests](#vulnerabilities-and-penetration-tests). |
 | `penTests` | External penetration tests: `id`, `vendor`, `reported`, `reportSha256` (the tester's report's SHA-256), `retested` and `retestSha256` (together), `notes`. One a year. |
 | `changes` | Changes to production systems under the [change management policy](policies/change-management.md#production-changes): `id`, `system`, `kind` (`standard` by default, or `emergency`), `recorded` and `recordSha256` (the change record's SHA-256), `approved` and `approvedBy` (together), `made`, `madeBy`, `incident` (for `emergency`), `interrupts` and `startsAt` (together), `announcedAt`, `verified`; for `emergency`, `reviewed` and `reviewedBy` (together), `code`, `pullRequest` and `followedUp` (together); `notes`. See [production changes](#production-changes). |
+
+## Hiring checks and training
+
+The information security policy's [People](policies/information-security.md#people) section asks for a background check before access, acknowledgement of three policies, and training; the people lead keeps the records ([ADR 0312](../adr/0312-hiring-checks-and-training-in-the-register.md)).
+
+```json
+"people": [{ "id": "p-042", "name": "<name>", "joined": "2027-02-01", "engineer": true }],
+"screenings": [{ "person": "p-042", "kind": "check", "at": "2027-01-25", "by": "p-007", "recordSha256": "<sha256 of the report>" }],
+"training": [
+  { "person": "p-042", "course": "security-awareness", "at": "2027-02-10" },
+  { "person": "p-042", "course": "secure-development", "at": "2027-02-17" }
+]
+```
+
+- **Screening.** Due by the day a person joins, or within 30 days of the information security policy's first approval for anyone who joined before it. Missing, late, or recorded by someone who didn't hold (or deputise) People lead that day, it is reported in `people.json` as `notScreened`, `screenedLate` or `screenerNotInRole`. Record an exemption the same way, with `kind` `exempt` and the reasons' digest: the bundle shows the kind, never the reasons.
+- **Training.** `security-awareness` is due within 30 days of joining (or of the policy's first approval) and yearly, for everyone. `secure-development` is due on the same terms for engineers, counted from when they became one: joining, if marked `engineer`, or the start of their assignment as Engineering lead or deputy. Missing, late and overdue are reported for each course.
+- **The courses' texts.** `--training` is the [training folder](training/README.md) at the commit in force. Each course file's header must name its id (`| Course | security-awareness |`); `people.json` records each one's SHA-256 under `courses`, so the bundle shows which text was in force that month. Without `--training`, `courseTextsRecorded` is false and the check says so.
+- **Rows.** `people.json` names CC1.4-1 only while everyone at the period's end is screened and current on the training they owe, and CC2.2-1 only while everyone has acknowledged the policies and taken awareness training. Anyone missing one leaves the row out; a late record is flagged but still counts.
 
 ## Conduct concerns
 
