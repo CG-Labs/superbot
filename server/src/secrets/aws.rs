@@ -633,6 +633,56 @@ impl Drop for Credentials {
     }
 }
 
+/// The largest identity document botd sends on: AWS's are about 2 KB.
+const MAX_PKCS7: usize = 16 * 1024;
+
+/// The instance's identity document, signed by AWS, from IMDSv2 at
+/// `AWS_EC2_METADATA_SERVICE_ENDPOINT`: what Vault's `aws` method takes for its `ec2` type
+/// (ADR 0298). Not a credential: any process on the instance can fetch it.
+pub struct InstanceIdentity {
+    endpoint: String,
+    /// Link-local, so never through a proxy.
+    local: reqwest::Client,
+}
+
+impl InstanceIdentity {
+    /// `needed_by` names what wants it in errors.
+    pub fn from_env(var: &dyn Fn(&str) -> String, needed_by: &str) -> Result<InstanceIdentity, String> {
+        if var("AWS_EC2_METADATA_DISABLED").trim().eq_ignore_ascii_case("true") {
+            return Err(format!("{needed_by} reads the instance's identity document from the instance metadata service, but AWS_EC2_METADATA_DISABLED is true"));
+        }
+        Ok(InstanceIdentity { endpoint: metadata_setting(&var("AWS_EC2_METADATA_SERVICE_ENDPOINT"))?, local: http::client("AWS instance identity", None, true)? })
+    }
+
+    /// The PKCS#7 signature of the identity document, base64 with its line breaks taken
+    /// out, as Vault wants it. IMDSv2 only: a session token first.
+    pub async fn pkcs7(&self) -> Result<String, Error> {
+        const LABEL: &str = "AWS (for Vault)";
+        let what = "the instance identity document";
+        let token = fetch_ok(LABEL, self.local.put(format!("{}/latest/api/token", self.endpoint)).header("x-aws-ec2-metadata-token-ttl-seconds", "60"), what).await?;
+        let text = fetch_ok(LABEL, self.local.get(format!("{}/latest/dynamic/instance-identity/pkcs7", self.endpoint)).header("x-aws-ec2-metadata-token", token.as_str()), what).await?;
+        let pkcs7: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        if pkcs7.is_empty() || pkcs7.len() > MAX_PKCS7 || !pkcs7.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)) {
+            return Err(Error::Unavailable(format!("{LABEL}: {what} isn't a PKCS#7 signature")));
+        }
+        Ok(pkcs7)
+    }
+
+    /// Where it comes from, for startup lines.
+    pub fn describe(&self) -> String {
+        if self.endpoint == IMDS { "IMDSv2".to_string() } else { format!("IMDSv2 at {}", self.endpoint) }
+    }
+}
+
+/// What reading the instance's identity document reaches, for `botd offline check`: the
+/// instance metadata service when it is set (its default is link-local).
+pub fn instance_identity_reach(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String, &'static str)>, String> {
+    Ok(match var("AWS_EC2_METADATA_SERVICE_ENDPOINT").trim() {
+        "" => Vec::new(),
+        raw => vec![("AWS_EC2_METADATA_SERVICE_ENDPOINT", metadata_setting(raw)?, "the instance metadata service")],
+    })
+}
+
 struct Inner {
     region: String,
     endpoint: String,
