@@ -3205,6 +3205,7 @@ async fn every_idp_of_a_federation_in_a_category_signs_in_found_by_search() {
         (format!("SSO_{up}_LABEL"), "Uni Federation".into()),
         (format!("SSO_{up}_IDP_ENTITY_IDS"), "all".into()),
         (format!("SSO_{up}_IDP_ENTITY_CATEGORIES"), rs.into()),
+        (format!("SSO_{up}_IDP_INITIATED"), "restart".into()),
         (format!("SSO_{up}_IDP_AGGREGATE_URL"), format!("http://127.0.0.1:{md_port}/federation.xml")),
         (format!("SSO_{up}_METADATA_SIGNING_CERT_FILE"), anchor.to_string_lossy().into_owned()),
     ]);
@@ -3215,6 +3216,14 @@ async fn every_idp_of_a_federation_in_a_category_signs_in_found_by_search() {
         let path = format!("/api/auth/sso/{}/start?session=cookie&q={}", sp.id, url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>());
         async move { crate::tests::call_with(sp.port, "GET", &path, "", "", "").await }
     };
+
+    // Straight after a restart nothing is read yet: B's tile waits for the aggregate, then
+    // restarts at B rather than failing as an unknown IdP.
+    let mut tile = sp.unsolicited();
+    from_b(&mut tile);
+    let (code, to, _) = sp.post(Some(&tile.posted()), None, "").await;
+    let start_b = format!("http://127.0.0.1:{}/api/auth/sso/{}/start?idp={}", sp.port, sp.id, url::form_urlencoded::byte_serialize(IDP_B.as_bytes()).collect::<String>());
+    assert_eq!((code, to.as_str()), (303, start_b.as_str()));
 
     // The chooser is a search box, a plain form back here: thousands of IdPs don't fit a list.
     let (code, head, page) = chooser("").await;

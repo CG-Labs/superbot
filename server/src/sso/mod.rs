@@ -598,7 +598,9 @@ fn every_idp(key: &dyn Fn(&str) -> String, list: &List, every: bool) -> Result<O
     }
     let mut categories: Vec<String> = Vec::new();
     for c in set {
-        let c = saml::entity_id(&c).ok_or_else(|| format!("{}: {c} is not an entity category (a URI, like http://refeds.org/category/research-and-scholarship)", key("IDP_ENTITY_CATEGORIES")))?;
+        let c = saml::entity_id(&c)
+            .filter(|c| c.len() <= saml_sp::MAX_CATEGORY)
+            .ok_or_else(|| format!("{}: {c} is not an entity category (a URI of at most {} characters, like http://refeds.org/category/research-and-scholarship)", key("IDP_ENTITY_CATEGORIES"), saml_sp::MAX_CATEGORY))?;
         if !categories.contains(&c) {
             categories.push(c);
         }
@@ -1768,6 +1770,8 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     if a.limiter.blocked(&ip, at).is_some() {
         return see("/login?error=sso_too_many");
     }
+    // With every IdP of a federation, who's one may not be known yet since a restart.
+    p.every_idp_read(a.sso.refresh_gap).await;
     let idp = match unsolicited_idp(p, &msg) {
         Ok(idp) => idp,
         Err(claimed) => {
@@ -1959,6 +1963,7 @@ pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> O
     let p = a.sso.provider(s.idp_provider.as_deref()?)?;
     let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { return None };
     let login = app.db.saml_session(&s.id)?;
+    let _ = tokio::time::timeout(Duration::from_secs(3), p.every_idp_read(a.sso.refresh_gap)).await;
     let entity = session_idp(p, s)?;
     // Cached metadata, even if stale, and a short fetch otherwise: clients wait 5 s for this answer.
     let idp = match p.idp_loaded_for(&entity) {
@@ -2222,6 +2227,7 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
     let Some(app) = a.app.as_ref() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
     let Some(p) = a.sso.provider(id).filter(|p| p.saml_sp()) else { return not_found("SAML provider").into_response() };
     let Kind::SamlSp { sp_entity_id, encryption, .. } = &p.kind else { return not_found("SAML provider").into_response() };
+    p.every_idp_read(a.sso.refresh_gap).await;
     let Some(entity) = logout_idp(p, incoming) else { return slo_failed(a, source, id, "unknown_idp", json!({})) };
     // From a URL, the metadata may not be loaded since a restart: logouts can't wait for a sign-in.
     let Ok(idp) = idp_metadata(a, p, &entity).await else { return slo_failed(a, source, id, "not_ready", json!({})) };
@@ -2289,6 +2295,7 @@ pub async fn slo_soap(Extension(a): Extension<Arc<Auth>>, Extension(source): Ext
     let Some(p) = a.sso.provider(id).filter(|p| p.saml_sp()) else { return not_found("SAML provider").into_response() };
     let Kind::SamlSp { sp_entity_id, encryption, .. } = &p.kind else { return not_found("SAML provider").into_response() };
     let Ok(xml) = std::str::from_utf8(&body) else { return soap_failed(a, &source, id, "bad_message", json!({})) };
+    p.every_idp_read(a.sso.refresh_gap).await;
     let Some(entity) = logout_idp(p, &saml_slo::Incoming::Soap(xml)) else { return soap_failed(a, &source, id, "unknown_idp", json!({})) };
     let Ok(idp) = idp_metadata(a, p, &entity).await else { return soap_failed(a, &source, id, "not_ready", json!({})) };
     let key = match sp_key(app, p) {
@@ -3653,6 +3660,8 @@ mod tests {
         assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all,https://a.example/idp"), agg, signer]).contains("alone"));
         assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "https://a.example/idp,https://b.example/idp"), cats, agg, signer]).contains("only for SSO_CORP_IDP_ENTITY_IDS=all"));
         assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_IDP_ENTITY_CATEGORIES", "research"), agg, signer]).contains("not an entity category"));
+        let long: &'static str = Box::leak(format!("urn:{}", "c".repeat(saml_sp::MAX_CATEGORY)).into_boxed_str());
+        assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_IDP_ENTITY_CATEGORIES", long), agg, signer]).contains("at most 256 characters"), "longer than metadata's are read");
         let nine: &'static str = Box::leak((0..9).map(|i| format!("urn:example:c{i}")).collect::<Vec<_>>().join(",").into_boxed_str());
         assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_IDP_ENTITY_CATEGORIES", nine), agg, signer]).contains("at most 8"));
         assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_JIT_ROLE", "member"), agg, signer]).contains("anyone any SAML IdP of the federation signs in"));

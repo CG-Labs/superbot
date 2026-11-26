@@ -384,7 +384,7 @@ pub const ASSURANCE_CERTIFICATION: &str = "urn:oasis:names:tc:SAML:attribute:ass
 pub const HIDE_FROM_DISCOVERY: &str = "http://refeds.org/category/hide-from-discovery";
 /// The most categories read from one entity, and the longest.
 const MAX_CATEGORIES: usize = 64;
-const MAX_CATEGORY: usize = 256;
+pub const MAX_CATEGORY: usize = 256;
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// Where the IdP takes logout messages: requests at `location`, our responses at `response`,
