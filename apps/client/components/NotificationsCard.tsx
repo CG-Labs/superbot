@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { FORMAT_LABELS, MAX_DELAY_SECONDS, MAX_THROTTLE_SECONDS, parseRecipients, parseSeconds, secondsLabel, testSummary, webhookUrlProblem } from "../src/notifications";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 import type { BotNotificationsPatch, BotNotificationsView, NotificationsPatch, NotificationsView, NotifyDetail, NotifyFormat } from "../src/types";
 import { Chips } from "./Chips";
+import { kit, Spinner, usePlaceholder } from "./ui";
 
 export type NotificationsApi = Pick<SuperBotApi, "notifications" | "patchNotifications" | "testNotifications" | "botNotifications" | "patchBotNotifications">;
 
@@ -31,6 +32,8 @@ function message(e: unknown): string {
  * server's SMTP settings and a webhook (Slack-compatible or signed JSON). Admins only.
  */
 export function NotificationsCard({ api, bot }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const botId = bot?.id;
   const [view, setView] = useState<NotificationsView | undefined>(undefined);
   const [botView, setBotView] = useState<BotNotificationsView | undefined>(undefined);
@@ -91,7 +94,7 @@ export function NotificationsCard({ api, bot }: Props) {
     return (
       <View style={styles.card} accessibilityLabel="Notifications">
         <Text style={styles.cardTitle}>Notifications</Text>
-        {error ? <Text style={styles.error}>{error}</Text> : <ActivityIndicator color={colors.textDim} />}
+        {error ? <Text style={styles.error}>{error}</Text> : <Spinner />}
       </View>
     );
   }
@@ -122,7 +125,7 @@ export function NotificationsCard({ api, bot }: Props) {
           <TextInput
             style={[styles.input, styles.mono]}
             placeholder={hook.set ? "Replace the URL" : "https://hooks.slack.com/services/…"}
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={placeholder}
             value={url}
             onChangeText={setUrl}
             autoCapitalize="none"
@@ -142,7 +145,7 @@ export function NotificationsCard({ api, bot }: Props) {
               <Text style={styles.primaryText}>{busy === "url" ? "Saving…" : "Save URL"}</Text>
             </Pressable>
             {hook.set ? (
-              <Pressable style={[styles.btn, locked && styles.busy]} disabled={locked} onPress={() => save(null)} accessibilityRole="button" accessibilityLabel="Remove webhook URL">
+              <Pressable style={[styles.btn, styles.dangerBtn, locked && styles.busy]} disabled={locked} onPress={() => save(null)} accessibilityRole="button" accessibilityLabel="Remove webhook URL">
                 <Text style={styles.dangerText}>Remove URL</Text>
               </Pressable>
             ) : null}
@@ -249,7 +252,7 @@ export function NotificationsCard({ api, bot }: Props) {
         <TextInput
           style={styles.input}
           placeholder="ops@example.com, oncall@example.com"
-          placeholderTextColor={colors.textFaint}
+          placeholderTextColor={placeholder}
           value={to}
           onChangeText={setTo}
           autoCapitalize="none"
@@ -346,33 +349,29 @@ export function NotificationsCard({ api, bot }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  field: { gap: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: colors.border },
-  label: { color: colors.text, fontWeight: "500" },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  warn: { color: colors.warning },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 13 },
-  mono: { fontFamily: "monospace" },
-  input: {
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-  },
-  seconds: { width: 80 },
-  row: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 8 },
-  self: { alignSelf: "flex-start" },
-  btn: { borderRadius: 999, borderWidth: 1, borderColor: colors.border, paddingVertical: 8, paddingHorizontal: 16 },
-  btnText: { color: colors.text, fontSize: 15 },
-  dangerText: { color: colors.danger, fontSize: 15 },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  primaryText: { color: "#111", fontSize: 15 },
-  busy: { opacity: 0.6 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    card: k.card,
+    cardTitle: k.cardTitle,
+    field: k.field,
+    label: k.label,
+    good: k.good,
+    error: k.error,
+    warn: k.warn,
+    dim: k.dim,
+    faint: k.faint,
+    mono: { fontFamily: t.font.mono },
+    input: k.input,
+    seconds: { width: 80 },
+    row: k.actions,
+    self: { alignSelf: "flex-start" },
+    btn: k.btn,
+    btnText: k.btnText,
+    dangerBtn: k.danger,
+    dangerText: { ...k.btnText, ...k.dangerText },
+    primaryBtn: { ...k.btn, ...k.primary },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    busy: k.disabled,
+  });
 });

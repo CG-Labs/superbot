@@ -15,7 +15,7 @@ import { promptsFor } from "../src/prompts";
 import { cronLabel } from "../src/routines";
 import { workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors, HARNESS_NAMES } from "../src/theme";
+import { colors, HARNESS_NAMES, ThemeScope } from "../src/theme";
 import type { Routine } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
@@ -40,7 +40,16 @@ interface Props {
 /** "new" or the routine being edited, or "prompts"; null shows the details. */
 type Editing = "new" | "prompts" | Routine | null;
 
-export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudit, onUsePrompt }: Props) {
+/** Still dark-only (ADR 0335), so the shared chips inside it are held to dark too. */
+export function BotDetailsPanel(props: Props) {
+  return (
+    <ThemeScope scheme="dark">
+      <DetailsPanel {...props} />
+    </ThemeScope>
+  );
+}
+
+function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudit, onUsePrompt }: Props) {
   const {
     bots,
     activeId,
