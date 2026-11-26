@@ -3549,6 +3549,186 @@ mod tests {
         assert_eq!(Held { messages: 1, sessions: 1, ..Held::default() }.of_bots(), Held { messages: 1, ..Held::default() });
     }
 
+    fn audit_move(from: Option<&str>, to: Option<&str>, n: usize) -> ChatMove {
+        ChatMove { audit_events: n, ..mv(from, to, 0, [0, 0, 0]) }
+    }
+
+    /// An event `user` made, from `ip`, about `about` (a person) if given.
+    fn acted(db: &Db, user: &str, ip: &str, about: Option<&str>) -> i64 {
+        use crate::audit::{Actor, ActorKind, Source, Who};
+        let actor = Actor { kind: ActorKind::User, id: Some(user.into()), name: Some(format!("{user} name")), email: Some(format!("{user}@example.com")), ..Default::default() };
+        let who = Who { actor, source: Source { ip: Some(ip.into()), user_agent: Some("agent/1".into()) } };
+        let e = who.event("bot.updated").details(serde_json::json!({ "note": format!("by {user}") }));
+        db.try_record(&match about {
+            Some(p) => e.target("user", p),
+            None => e,
+        })
+        .unwrap()
+    }
+
+    /// `(actor_id, ip, details, salt is set)` of event `id` as `table` holds it.
+    fn audit_row(db: &Db, table: &str, id: i64) -> (Option<String>, Option<String>, String, bool) {
+        db.c().query_row(&format!("SELECT actor_id, ip, details, chain_salt IS NOT NULL FROM {table} WHERE id = ?1"), [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+    }
+
+    fn file_holds(path: &Path, what: &str) -> bool {
+        std::fs::read(path).unwrap().windows(what.len()).any(|w| w == what.as_bytes())
+    }
+
+    #[test]
+    fn a_pinned_persons_audit_details_are_kept_in_their_store_and_move_with_the_pin() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let before = acted(&db, &ada, "192.0.2.77", None);
+        assert_eq!(audit_row(&db, "main.audit_events", before).0.as_deref(), Some(ada.as_str()));
+
+        // Pinned, their events' details wait in botd's log until the next pass moves them.
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: None, held: Held { audit_events: 1, ..Held::default() } }]);
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(None, Some("gb-lon"), 1)]);
+        assert_eq!(audit_row(&db, "main.audit_events", before), (None, None, r#"{"inChatStore":"gb-lon"}"#.to_string(), false), "the row keeps only its seal");
+        assert_eq!(audit_row(&db, "chats_0.audit_details", before), (Some(ada.clone()), Some("192.0.2.77".into()), format!(r#"{{"note":"by {ada}"}}"#), true));
+
+        // New ones go straight there; an unpinned person's stay in botd's log.
+        let after = acted(&db, &ada, "192.0.2.77", None);
+        let theirs = acted(&db, &cy, "192.0.2.9", Some(&ada));
+        assert_eq!((count(&db, "chats_0", AUDIT), audit_row(&db, "main.audit_events", after).0), (2, None));
+        assert_eq!(audit_row(&db, "main.audit_events", theirs).0.as_deref(), Some(cy.as_str()), "the person who acted decides");
+
+        // Reads see each event whole, and the chain still verifies.
+        let read = db.audit_events(&crate::audit::Filter::default(), 100, true);
+        let e = read.iter().find(|e| e.id == after).unwrap();
+        assert_eq!((e.actor_id.as_deref(), e.actor_name.clone(), e.ip.as_deref()), (Some(ada.as_str()), Some(format!("{ada} name")), Some("192.0.2.77")));
+        assert_eq!(e.details["note"], format!("by {ada}"));
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok && r.erased == 0, "{r:?}");
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), held: Held { audit_events: 2, ..Held::default() } }]);
+        assert!(!file_holds(&d.dir.path().join("app.sqlite"), "192.0.2.77"), "no copy left in botd's file");
+
+        // Pinned elsewhere, they move store to store, and the rows say where.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        db.pin_residency(PinOn::User, &ada, "de-fra-2", "DPA-2", None).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("gb-lon"), Some("de-fra-2"), 2)]);
+        assert_eq!(audit_row(&db, "main.audit_events", before).2, r#"{"inChatStore":"de-fra-2"}"#);
+        assert_eq!((count(&db, "chats_0", AUDIT), count(&db, "chats_1", AUDIT)), (0, 2));
+
+        // Unpinned, they go back into their rows, and the move is recorded for the store's earlier backups.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("de-fra-2"), None, 2)]);
+        assert_eq!(audit_row(&db, "main.audit_events", before), (Some(ada.clone()), Some("192.0.2.77".into()), format!(r#"{{"note":"by {ada}"}}"#), true));
+        assert_eq!((count(&db, "main", AUDIT), count(&db, "chats_1", AUDIT)), (0, 0));
+        let fra = db.chat_stores().into_iter().find(|s| s.region == "de-fra-2").unwrap();
+        assert_eq!(db.moves_out_to_clear(&fra).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+        assert!(db.place_chats().unwrap().is_empty(), "nothing left to move");
+    }
+
+    #[test]
+    fn audit_details_in_a_store_survive_a_restart_and_a_pass_cut_off_after_its_copy() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let id = acted(&db, &ada, "192.0.2.77", None);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!((count(&db, "main", AUDIT), count(&db, "chats_0", AUDIT)), (1, 1), "in both places");
+        let read = |db: &Db| db.audit_events(&crate::audit::Filter::default(), 100, true).into_iter().find(|e| e.id == id).unwrap().ip;
+        assert_eq!(read(&db).as_deref(), Some("192.0.2.77"));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+        drop(db);
+        let db = d.up();
+        assert_eq!(read(&db).as_deref(), Some("192.0.2.77"));
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(None, Some("gb-lon"), 1)]);
+        assert_eq!((count(&db, "main", AUDIT), count(&db, "chats_0", AUDIT)), (0, 1));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+    }
+
+    #[test]
+    fn botds_log_refuses_changes_to_an_events_details_except_an_erasure_or_a_move() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let id = acted(&db, &ada, "192.0.2.77", None);
+        assert!(db.c().execute("UPDATE main.audit_events SET ip = 'x' WHERE id = ?1", [id]).is_err(), "still append-only");
+        assert!(db.c().execute("UPDATE audit_events SET ip = 'x' WHERE id = ?1", [id]).is_err(), "the view isn't written");
+        db.c().execute_batch(&format!("INSERT INTO main.settings (key, value) VALUES ('{}', '1')", super::super::AUDIT_MOVING)).unwrap();
+        assert!(db.c().execute("UPDATE main.audit_events SET action = 'x' WHERE id = ?1", [id]).is_err(), "a move keeps the fixed columns");
+        assert!(db.c().execute("UPDATE main.audit_events SET chain_digest = 'x' WHERE id = ?1", [id]).is_err(), "and the seal");
+    }
+
+    #[test]
+    fn an_erasure_rewrites_audit_details_where_they_are_kept() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        for u in [&ada, &cy] {
+            db.pin_residency(PinOn::User, u, "gb-lon", "DPA-1", None).unwrap();
+        }
+        let own = acted(&db, &ada, "192.0.2.77", None);
+        let about = acted(&db, &cy, "192.0.2.9", Some(&ada));
+        db.erase_user(&ada, "erased-01", None, &[]).unwrap();
+        assert_eq!(audit_row(&db, "chats_0.audit_details", own), (Some("erased-01".into()), None, r#"{"note":"by erased-01"}"#.to_string(), false));
+        let target: Option<String> = db.c().query_row("SELECT target_id FROM chats_0.audit_details WHERE id = ?1", [about], |r| r.get(0)).unwrap();
+        assert_eq!(target.as_deref(), Some("erased-01"));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok, "the erasure names them");
+
+        // Their pin went with the erasure: their own events come home, already rewritten.
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("gb-lon"), None, 1)]);
+        assert_eq!(audit_row(&db, "main.audit_events", own).0.as_deref(), Some("erased-01"));
+        assert_eq!(count(&db, "chats_0", AUDIT), 1, "Cy's event about them stays with Cy");
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok, "{r:?}");
+    }
+
+    #[test]
+    fn retention_deletes_audit_details_where_they_are_kept() {
+        let d = Dirs::new();
+        let db = d.db();
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", super::super::audit_delete_trigger())).unwrap();
+        db.attach_chat_stores(&d.both(), &[], None).unwrap();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let actor = crate::audit::Actor { kind: crate::audit::ActorKind::User, id: Some(ada.clone()), ..Default::default() };
+        let at = |t: i64| db.record_at(&crate::audit::Event::new(actor.clone(), "bot.updated"), t).unwrap();
+        let (old, young) = (at(now() - 40 * 86_400_000), at(now()));
+        assert_eq!(count(&db, "chats_0", AUDIT), 2);
+        db.set_audit_retention(Some(30));
+        let (n, anchor) = db.prune_audit(None).unwrap();
+        assert_eq!((n, anchor.map(|a| a.id)), (1, Some(old)));
+        let left: Vec<i64> = db.c().prepare("SELECT id FROM chats_0.audit_details").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(left, [young]);
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+    }
+
+    #[test]
+    fn a_forgotten_store_names_the_events_whose_details_only_it_held() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let id = acted(&db, &ada, "192.0.2.77", None);
+        drop(db);
+        remove_store_files(&d.lon.join("chats.sqlite"));
+        let db = d.db();
+        db.attach_chat_stores(&[("de-fra-2".into(), d.fra.clone())], &["gb-lon".into()], None).unwrap();
+        assert_eq!(audit_row(&db, "audit_events", id), (None, None, r#"{"inChatStore":"gb-lon"}"#.to_string(), false));
+        let named: String = db.c().query_row("SELECT details FROM audit_events WHERE action = 'audit.erased' AND target_type = 'chat_store'", [], |r| r.get(0)).unwrap();
+        assert_eq!(named, format!(r#"{{"rows":[[{id},{id}]]}}"#));
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok, "{r:?}");
+    }
+
+    #[test]
+    fn describing_what_a_place_holds_names_audit_details() {
+        assert_eq!(Held { usage_records: 1, audit_events: 2, ..Held::default() }.describe(), "1 model usage record and 2 audit events' details");
+        assert_eq!(Held { audit_events: 1, ..Held::default() }.describe(), "1 audit event's details");
+        assert_eq!(Held { sessions: 1, audit_events: 2, ..Held::default() }.audit(), Held { audit_events: 2, ..Held::default() });
+        assert_eq!(Held { audit_events: 2, ..Held::default() }.of_bots(), Held::default());
+    }
+
     #[test]
     fn a_store_moves_to_another_folder_while_botd_runs_and_every_connection_follows_it() {
         let d = Dirs::new();
