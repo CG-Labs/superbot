@@ -465,6 +465,11 @@ async fn main() {
     let process_env = secrets::env::EnvStore::process();
     let external = secrets::external::from_env(&|k| env(k, ""), &process_env).unwrap_or_else(|e| exit(format!("Secrets backend: {e}")));
     let external_names = external.as_ref().map(|x| x.check().unwrap_or_else(|e| exit(format!("Secrets backend: {e}. botd won't start without its secrets (ADR 0125)."))));
+    if let Some(x) = &external
+        && let Err(e) = x.watch()
+    {
+        exit(format!("Secrets backend: {e}. VAULT_EVENTS=1 asks botd to follow Vault's change events, so it won't start without them (ADR 0306)."));
+    }
     let external_shared = external.clone().map(secrets::external::Startup);
     let startup_store = secrets::external::Layered(std::iter::once(&process_env as &dyn secrets::SecretStore).chain(external_shared.as_ref().map(|s| s as &dyn secrets::SecretStore)).collect());
     offline_check::record_start(&startup_store.0);

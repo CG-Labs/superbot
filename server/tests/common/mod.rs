@@ -527,7 +527,6 @@ pub fn start_with(harness: &str, hook: Option<&str>, env: &[(&str, &str)]) -> Bo
     for d in ["data", "workspace", "home", "proof"] {
         std::fs::create_dir_all(dir.join(d)).unwrap();
     }
-    let port = free_port();
     // botd runs the `botctl` next to it.
     let botd = if let Some(hook) = hook {
         let bin = dir.join("bin");
@@ -564,7 +563,6 @@ pub fn start_with(harness: &str, hook: Option<&str>, env: &[(&str, &str)]) -> Bo
         fake_login(harness, &home, m.port, &mut cmd);
         Some(m)
     };
-    let log = std::fs::File::create(dir.join("botd.log")).unwrap();
     // Its own session, so `stop` can find what its runs leave behind.
     // SAFETY: setsid is async-signal-safe.
     unsafe {
@@ -573,23 +571,48 @@ pub fn start_with(harness: &str, hook: Option<&str>, env: &[(&str, &str)]) -> Bo
             Ok(())
         });
     }
-    let child = cmd
-        .env("HOST", "127.0.0.1")
-        .env("PORT", port.to_string())
+    cmd.env("HOST", "127.0.0.1")
         .env("AUTH_PASSWORD", PASSWORD)
         .env("SUPERBOT_MASTER_KEY", "ab".repeat(32))
         .env("DATA_DIR", dir.join("data"))
         .env("WORKSPACE_DIR", dir.join("workspace"))
         .env("DEFAULT_HARNESS", harness)
         .env("SCREENS", "off")
-        .env("TESTING_MODE", "on")
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .spawn()
-        .expect("start botd");
-    let b = Botd { child, port, dir, model };
-    wait_for("botd to start", Duration::from_secs(30), || (http(&b, "GET", "/healthz", "").0 == 200).then_some(()));
-    b
+        .env("TESTING_MODE", "on");
+    // `free_port` lets the port go before botd binds it, so something else (the fake
+    // model, a harness, another test) can take it first; botd then exits on its bind.
+    let mut port = free_port();
+    for attempt in 1.. {
+        let log = std::fs::File::create(dir.join("botd.log")).unwrap();
+        let mut child = cmd.env("PORT", port.to_string()).stdout(log.try_clone().unwrap()).stderr(log).spawn().expect("start botd");
+        let start = Instant::now();
+        let taken = loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                break read(&dir.join("botd.log")).contains("AddrInUse");
+            }
+            if http_port(port, "/healthz") == 200 || start.elapsed() > Duration::from_secs(30) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if taken && attempt < 5 {
+            port = free_port();
+            continue;
+        }
+        let b = Botd { child, port, dir, model };
+        wait_for("botd to start", Duration::from_secs(1), || (http(&b, "GET", "/healthz", "").0 == 200).then_some(()));
+        return b;
+    }
+    unreachable!()
+}
+
+fn http_port(port: u16, path: &str) -> u16 {
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else { return 0 };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = s.write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes());
+    let mut res = String::new();
+    let _ = s.read_to_string(&mut res);
+    res.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
 }
 
 /// Points `harness` at the fake model through its own custom-endpoint setting, with a
