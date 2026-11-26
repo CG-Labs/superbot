@@ -139,6 +139,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Markdown unless --json; the last 90 days by default
   botctl regions                                   The data regions offered, who and what is in each, the
                                                    hosts and backup store in each, and residency warnings
+  botctl regions move-store <region> <folder>      Move a region's chat store and its backups to an empty
+                                                   folder in the same region while botd runs (ADR 0309);
+                                                   then set REGION_DATA_DIRS as it says before botd restarts
   botctl tiers                                     Every tier, its routes and limits, and the default
   botctl tiers move-bots <tier> [--user <user>] [--dry-run]
                                                    Move a managed tier's Bots (or one user's) that run on
@@ -1149,6 +1152,7 @@ fn region_request(args: &[&str]) -> Option<(&'static str, String, Option<String>
     let pick = |r: &str| json!({ "region": if r == "default" { Value::Null } else { json!(r) } }).to_string();
     Some(match args {
         ["regions"] => ("GET", "/api/regions".into(), None),
+        ["regions", "move-store", region, folder] => ("POST", format!("/api/regions/{}/chat-store/move", encode(region)), Some(json!({ "folder": folder }).to_string())),
         ["user", "region", key] => ("GET", format!("/api/users/{}/region", encode(key)), None),
         ["user", "region", key, r] => ("PUT", format!("/api/users/{}/region", encode(key)), Some(pick(r))),
         ["team", "region", id] => ("GET", format!("/api/teams/{}/region", encode(id)), None),
@@ -4479,6 +4483,11 @@ mod tests {
     fn region_commands() {
         let body = |r: Value| Some(json!({ "region": r }).to_string());
         assert_eq!(region_request(&["regions"]), Some(("GET", "/api/regions".into(), None)));
+        assert_eq!(
+            region_request(&["regions", "move-store", "gb-lon", "/mnt/lon-2"]),
+            Some(("POST", "/api/regions/gb-lon/chat-store/move".into(), Some(json!({ "folder": "/mnt/lon-2" }).to_string())))
+        );
+        assert_eq!(region_request(&["regions", "move-store", "gb-lon"]), None);
         assert_eq!(region_request(&["user", "region", "ada@example.com"]), Some(("GET", "/api/users/ada%40example.com/region".into(), None)));
         assert_eq!(region_request(&["user", "region", "u1", "gb-lon"]), Some(("PUT", "/api/users/u1/region".into(), body(json!("gb-lon")))));
         assert_eq!(region_request(&["user", "region", "u1", "default"]), Some(("PUT", "/api/users/u1/region".into(), body(Value::Null))));

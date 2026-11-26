@@ -35,7 +35,7 @@
 //! and the next pass deletes the one in the wrong place.
 
 use super::{Db, now};
-use crate::database_encryption::{self, Format};
+use crate::database_encryption::{self, DbKey, Format};
 use crate::secrets::sealed::{self, Cipher, StoreApprovals};
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use serde::Serialize;
@@ -148,6 +148,10 @@ pub const USAGE: &str = "token_usage";
 /// store is gone, as the only copy left (ADR 0293, ADR 0299, ADR 0304).
 const KEPT_WHEN_GONE: [&str; 4] = [SECRETS, SECOND_FACTOR, RECOVERY_CODE, USAGE];
 
+/// The table a move puts in the file it leaves, naming the copy, before botd switches to the
+/// copy (ADR 0309): a file that has it and that botd's record has left is stale.
+const MOVED_TO: &str = "chat_store_moved_to";
+
 fn kept(table: &str) -> Option<&'static Kept> {
     KEPT.iter().find(|k| k.name == table)
 }
@@ -256,6 +260,9 @@ pub struct ChatStore {
 #[derive(Debug, Default)]
 pub(super) struct ChatStores {
     stores: Vec<ChatStore>,
+    /// Where each store's file is now, in the order of `stores`: where startup attached it,
+    /// or where a move took it while botd runs (ADR 0309).
+    paths: std::sync::RwLock<Vec<PathBuf>>,
     /// Each kept table's columns, quoted, in the order botd's own table has them.
     cols: Vec<String>,
     /// A checkpoint after rows left a place was blocked by a reader, so their zeroed pages
@@ -523,6 +530,96 @@ fn not_a_store(path: &Path, e: &rusqlite::Error) -> String {
     }
 }
 
+/// What moving a store while botd runs did (ADR 0309).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreMoved {
+    pub region: String,
+    pub store_id: String,
+    /// The store's file before and after.
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// The copy's size.
+    pub bytes: u64,
+}
+
+/// The folder a store recorded at `was` was moved to while botd ran (ADR 0309), when the
+/// settings name `path` instead and the store is at `was`. None: it wasn't moved.
+pub fn moved_to(was: &str, path: &Path) -> Result<Option<PathBuf>, String> {
+    let was = Path::new(was);
+    if was == path || database_encryption::format(was)? == Format::Missing {
+        return Ok(None);
+    }
+    Ok(was.parent().map(Path::to_path_buf))
+}
+
+/// Copies `store`'s file at `from` to `to` under `key`, with nothing writing to it: the copy
+/// is checked whole and to be `store`, made a single file, synced and renamed into place.
+/// Its size.
+fn copy_store(store: &ChatStore, from: &Path, to: &Path, key: Option<&DbKey>) -> Result<u64, String> {
+    let io = |p: &Path, err: std::io::Error| format!("{}: {err}", p.display());
+    if database_encryption::format(to)? != Format::Missing {
+        return Err(format!("{} already exists", to.display()));
+    }
+    let partial = to.with_file_name(".moving-chats.sqlite");
+    remove_store_files(&partial);
+    let r = (|| {
+        database_encryption::backup(from, &partial, key).map_err(|err| format!("copying {}: {err}", from.display()))?;
+        let db = |err: rusqlite::Error| format!("checking the copy: {err}");
+        let dst = database_encryption::open_with(&partial, key).map_err(db)?;
+        let check: String = dst.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db)?;
+        if check != "ok" {
+            return Err(format!("the copy failed its integrity check ({check})"));
+        }
+        let own: (String, String) = dst.query_row("SELECT id, region FROM chat_store LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
+        if own != (store.id.clone(), store.region.clone()) {
+            return Err(format!("the copy is store {} of {}, not {}'s store {}", own.0, own.1, store.region, store.id));
+        }
+        dst.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(())).map_err(db)?;
+        drop(dst);
+        let f = std::fs::File::open(&partial).map_err(|err| io(&partial, err))?;
+        f.sync_all().map_err(|err| io(&partial, err))?;
+        let bytes = f.metadata().map_err(|err| io(&partial, err))?.len();
+        std::fs::rename(&partial, to).map_err(|err| io(to, err))?;
+        if let Some(dir) = to.parent() {
+            std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|err| io(dir, err))?;
+        }
+        Ok(bytes)
+    })();
+    if r.is_err() {
+        remove_store_files(&partial);
+        remove_store_files(to);
+    }
+    r
+}
+
+/// Attaches `store`'s file at `path` to `c` in place of the file attached as its schema, keyed
+/// with `key` (SQLCipher's raw key; None: plain), and checks it is that store. The views
+/// across places name the schema, so they read the new file from then on.
+fn reattach(c: &Connection, store: &ChatStore, path: &Path, key: Option<&str>) -> Result<(), String> {
+    let e = |err: rusqlite::Error| format!("attaching {}: {err}", path.display());
+    let p = path.to_str().ok_or_else(|| format!("{}: path is not UTF-8", path.display()))?;
+    c.flush_prepared_statement_cache();
+    let attached: bool = c.query_row("SELECT COUNT(*) > 0 FROM pragma_database_list WHERE name = ?1", [&store.schema], |r| r.get(0)).map_err(e)?;
+    if attached {
+        c.execute(&format!("DETACH DATABASE {}", store.schema), []).map_err(e)?;
+    }
+    c.execute(&format!("ATTACH DATABASE ?1 AS {} KEY ?2", store.schema), params![p, key.unwrap_or("")]).map_err(|err| not_a_store(path, &err))?;
+    let own: Option<String> = c.query_row(&format!("SELECT id FROM {}.chat_store LIMIT 1", store.schema), [], |r| r.get(0)).optional().map_err(|err| not_a_store(path, &err))?;
+    if own.as_deref() != Some(store.id.as_str()) {
+        let _ = c.execute(&format!("DETACH DATABASE {}", store.schema), []);
+        return Err(format!("{} isn't {}'s store {}", path.display(), store.region, store.id));
+    }
+    c.query_row(&format!("PRAGMA {}.journal_mode = WAL", store.schema), [], |_| Ok(())).map_err(e)
+}
+
+/// Deletes a store's file at `path` and the files SQLite keeps beside it.
+pub fn remove_store_files(path: &Path) {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for f in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(path.with_file_name(format!("{name}{f}")));
+    }
+}
+
 /// The places chats are kept, by schema: botd's own first.
 fn schemas(stores: &[ChatStore]) -> impl Iterator<Item = &str> {
     std::iter::once("main").chain(stores.iter().map(|s| s.schema.as_str()))
@@ -664,9 +761,11 @@ impl Db {
         self.5.get().map_or(&[], |s| s.stores.as_slice())
     }
 
-    /// The regions' chat stores attached now (ADR 0215).
+    /// The regions' chat stores attached now (ADR 0215), each where its file is now (ADR 0309).
     pub fn chat_stores(&self) -> Vec<ChatStore> {
-        self.chat_stores_set().to_vec()
+        let Some(set) = self.5.get() else { return Vec::new() };
+        let paths = set.paths.read().unwrap_or_else(|e| e.into_inner());
+        set.stores.iter().zip(paths.iter()).map(|(s, p)| ChatStore { path: p.clone(), ..s.clone() }).collect()
     }
 
     /// Checks botd's record of chat stores against `dirs` (each region's `chats.sqlite`) and
@@ -738,8 +837,19 @@ impl Db {
             let shown = path.display().to_string();
             let schema = format!("chats_{i}");
             let rec = recorded.iter().find(|(r, _, _)| r == region);
+            let moved_away = |id: &str, moved: &Path| {
+                format!(
+                    "{region}'s chat store (store {id}) was moved to {} while botd ran, but REGION_DATA_DIRS still names {}. Set it to {region}={} (ADR 0309).",
+                    moved.display(),
+                    dir.display(),
+                    moved.display()
+                )
+            };
             let missing = database_encryption::format(&path)? == Format::Missing;
             if let (true, Some((_, id, was))) = (missing, rec) {
+                if let Some(moved) = moved_to(was, &path)? {
+                    return Err(moved_away(id, &moved));
+                }
                 return Err(format!(
                     "{region}'s chat store (store {id}, last at {was}) isn't at {shown}. Is its volume mounted? botd won't start an empty store in its place: \
                      restore it from its folder's backups/ or its bucket with `botd chat-store restore {region} newest` (ADR 0215, ADR 0256)."
@@ -751,6 +861,17 @@ impl Db {
                 let mut s = c.prepare(&format!("SELECT name FROM {schema}.sqlite_master WHERE type = 'table'")).map_err(|err| not_a_store(&path, &err))?;
                 s.query_map([], |r| r.get(0)).map_err(|err| not_a_store(&path, &err))?.collect::<rusqlite::Result<_>>().map_err(|err| not_a_store(&path, &err))?
             };
+            if tables.iter().any(|t| t == MOVED_TO) {
+                // A move stopped after marking this file: once the record names the copy, botd
+                // may have written there, so this file is stale. Otherwise the move never switched.
+                let to: Option<String> = c.query_row(&format!("SELECT path FROM {schema}.{MOVED_TO} LIMIT 1"), [], |r| r.get(0)).optional().map_err(e)?;
+                match (to, rec) {
+                    (Some(to), Some((_, id, was))) if to == *was && to != path_str => {
+                        return Err(moved_away(id, Path::new(&to).parent().unwrap_or(Path::new("/"))));
+                    }
+                    _ => c.execute_batch(&format!("DROP TABLE {schema}.{MOVED_TO}")).map_err(e)?,
+                }
+            }
             let own: Option<(String, String)> = if tables.iter().any(|t| t == "chat_store") {
                 c.query_row(&format!("SELECT id, region FROM {schema}.chat_store LIMIT 1"), [], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(e)?
             } else {
@@ -800,8 +921,72 @@ impl Db {
                 create_view(&c, &stores, k, cols).map_err(e)?;
             }
         }
-        let _ = self.5.set(ChatStores { stores, cols, unflushed: Default::default() });
+        let paths = std::sync::RwLock::new(stores.iter().map(|s| s.path.clone()).collect());
+        let _ = self.5.set(ChatStores { stores, paths, cols, unflushed: Default::default() });
         Ok(out)
+    }
+
+    /// Moves `region`'s store to `to` (its new `chats.sqlite`, not there yet) while botd runs
+    /// (ADR 0309). botd's connection and the users' secrets' (`secrets`) are held throughout,
+    /// so nothing writes to the store meanwhile: it is copied under botd's database key
+    /// (`key`), the copy checked whole and to be this store, renamed into place and attached
+    /// in the old file's place on both connections, and botd's record of where it is
+    /// updated. Any failure leaves the old file attached and deletes the copy. The old file
+    /// is left for the caller to delete.
+    pub fn move_chat_store(&self, region: &str, to: &Path, key: Option<&DbKey>, secrets: Option<&sealed::UserSecrets>) -> Result<StoreMoved, String> {
+        let set = self.5.get().ok_or("no chat stores are attached")?;
+        let i = set.stores.iter().position(|s| s.region == region).ok_or_else(|| format!("{region} has no chat store (REGION_DATA_DIRS, ADR 0215)"))?;
+        let store = &set.stores[i];
+        let from = set.paths.read().unwrap_or_else(|e| e.into_inner())[i].clone();
+        if from == to {
+            return Err(format!("{region}'s chat store is already at {}", to.display()));
+        }
+        let to_str = to.to_str().ok_or_else(|| format!("{}: path is not UTF-8", to.display()))?;
+        let c = self.c();
+        let moved = |other: Option<(&Connection, &[ChatStore])>| -> Result<u64, String> {
+            let other = other.filter(|(_, stores)| stores.iter().any(|s| s.schema == store.schema)).map(|(c, _)| c);
+            let bytes = copy_store(store, &from, to, key)?;
+            let s = &store.schema;
+            let unmark = || {
+                let _ = c.execute_batch(&format!("DROP TABLE IF EXISTS {s}.{MOVED_TO}"));
+            };
+            let mark = c
+                .execute_batch(&format!("CREATE TABLE IF NOT EXISTS {s}.{MOVED_TO} (path TEXT NOT NULL); DELETE FROM {s}.{MOVED_TO}"))
+                .and_then(|()| c.execute(&format!("INSERT INTO {s}.{MOVED_TO} (path) VALUES (?1)"), [to_str]));
+            if let Err(err) = mark {
+                unmark();
+                remove_store_files(to);
+                return Err(format!("marking {} as moved: {err}", from.display()));
+            }
+            let raw = key.map(DbKey::raw);
+            let back = |c: &Connection| {
+                if let Err(err) = reattach(c, store, &from, raw) {
+                    crate::obs::log::log_warn!("Regional chat stores: {region}'s store couldn't be attached again at {} after a move failed: {err}. Restart botd (ADR 0309).", from.display());
+                }
+            };
+            let done = reattach(&c, store, to, raw)
+                .and_then(|()| other.map_or(Ok(()), |o| reattach(o, store, to, raw).inspect_err(|_| back(o))))
+                .and_then(|()| {
+                    c.execute("UPDATE main.chat_stores SET path = ?2 WHERE region = ?1", params![region, to_str]).map(|_| ()).map_err(|err| format!("recording where the store is: {err}")).inspect_err(|_| {
+                        if let Some(o) = other {
+                            back(o);
+                        }
+                    })
+                });
+            if let Err(err) = done {
+                back(&c);
+                unmark();
+                remove_store_files(to);
+                return Err(err);
+            }
+            Ok(bytes)
+        };
+        let bytes = match secrets {
+            Some(s) => s.holding(|o, stores| moved(Some((o, stores))))?,
+            None => moved(None)?,
+        };
+        set.paths.write().unwrap_or_else(|e| e.into_inner())[i] = to.to_path_buf();
+        Ok(StoreMoved { region: region.to_string(), store_id: store.id.clone(), from, to: to.to_path_buf(), bytes })
     }
 
     /// The schema a new row of `bot_id`'s goes to.
@@ -1270,8 +1455,9 @@ impl Db {
 
     /// Every store and what it holds.
     pub fn chat_store_counts(&self) -> Vec<(ChatStore, Held)> {
+        let stores = self.chat_stores();
         let c = self.c();
-        self.chat_stores_set().iter().map(|s| (s.clone(), held_in(&c, &s.schema, ALL, ALL).unwrap_or_default())).collect()
+        stores.into_iter().map(|s| (held_in(&c, &s.schema, ALL, ALL).unwrap_or_default(), s)).map(|(n, s)| (s, n)).collect()
     }
 
     /// Redacts known secrets from the stores' chats and approval subjects, as startup does
@@ -3064,5 +3250,152 @@ mod tests {
         assert_eq!(Held { sessions: 2, saml_sessions: 1, push_devices: 1, ..Held::default() }.describe(), "2 sign-in sessions, 1 SAML sign-in and 1 push device");
         assert_eq!(Held { messages: 1, sessions: 1, ..Held::default() }.sign_ins(), Held { sessions: 1, ..Held::default() });
         assert_eq!(Held { messages: 1, sessions: 1, ..Held::default() }.of_bots(), Held { messages: 1, ..Held::default() });
+    }
+
+    #[test]
+    fn a_store_moves_to_another_folder_while_botd_runs_and_every_connection_follows_it() {
+        let d = Dirs::new();
+        let db = d.up();
+        let s = own_secrets(&d, &db);
+        let ada = user(&db, "ada");
+        let bot = bot_of(&db, &ada);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let first = db.add_message(&bot, "user", "before the move", None, false, None);
+        db.place_chats().unwrap();
+        assert!(!s.put(&ada, "OPENAI_API_KEY", "sk-0309-before").unwrap());
+        let (old, new) = (d.lon.join("chats.sqlite"), d.dir.path().join("lon-2").join("chats.sqlite"));
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+
+        let m = db.move_chat_store("gb-lon", &new, None, Some(&s)).unwrap();
+        assert_eq!((m.region.as_str(), m.from.as_path(), m.to.as_path()), ("gb-lon", old.as_path(), new.as_path()));
+        assert!(m.bytes > 0 && !new.with_file_name(".moving-chats.sqlite").exists());
+        assert_eq!(db.chat_stores().iter().find(|s| s.region == "gb-lon").unwrap().path, new);
+        let recorded: String = db.c().query_row("SELECT path FROM main.chat_stores WHERE region = 'gb-lon'", [], |r| r.get(0)).unwrap();
+        assert_eq!(recorded, new.to_str().unwrap());
+
+        // Reads see the copy; new rows and secrets go to it, never to the old file.
+        assert_eq!(db.messages(&bot, 10).iter().map(|m| m.id).collect::<Vec<_>>(), vec![first.id]);
+        assert_eq!(secret(&s, &ada, "OPENAI_API_KEY").as_deref(), Some("sk-0309-before"));
+        let after = db.add_message(&bot, "user", "after the move", None, false, None);
+        assert!(after.id > first.id);
+        assert!(!s.put(&ada, "GITHUB_TOKEN", "ghp-0309-after").unwrap());
+        assert_eq!((rows_in(&new), rows_in(&old)), (2, 1));
+        let secrets_in = |p: &Path| Connection::open(p).unwrap().query_row("SELECT COUNT(*) FROM user_secrets", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!((secrets_in(&new), secrets_in(&old)), (2, 1));
+
+        // Moves by pin still reach it.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        db.place_chats().unwrap();
+        assert_eq!((rows_in(&new), count(&db, "main", "messages")), (0, 2));
+        assert_eq!(secret(&s, &ada, "GITHUB_TOKEN").as_deref(), Some("ghp-0309-after"));
+    }
+
+    #[test]
+    fn a_move_that_fails_leaves_the_store_attached_where_it_was() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let bot = bot_of(&db, &ada);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        db.add_message(&bot, "user", "stays put", None, false, None);
+        db.place_chats().unwrap();
+        let old = d.lon.join("chats.sqlite");
+
+        let gone = d.dir.path().join("not-made").join("chats.sqlite");
+        assert!(db.move_chat_store("gb-lon", &gone, None, None).unwrap_err().contains("copying"));
+        let taken = d.fra.join("chats.sqlite");
+        assert!(db.move_chat_store("gb-lon", &taken, None, None).unwrap_err().contains("already exists"));
+        assert!(db.move_chat_store("gb-lon", &old, None, None).unwrap_err().contains("already at"));
+        assert!(db.move_chat_store("us-east", &gone, None, None).unwrap_err().contains("has no chat store"));
+
+        assert_eq!(db.chat_stores().iter().find(|s| s.region == "gb-lon").unwrap().path, old);
+        db.add_message(&bot, "user", "still here", None, false, None);
+        assert_eq!(rows_in(&old), 2);
+        assert_eq!(db.messages(&bot, 10).len(), 2);
+    }
+
+    #[test]
+    fn botd_wont_start_while_the_settings_name_the_folder_a_store_moved_out_of() {
+        let d = Dirs::new();
+        let new_dir = d.dir.path().join("lon-2");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        {
+            let db = d.up();
+            let ada = user(&db, "ada");
+            db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+            db.add_message(&bot_of(&db, &ada), "user", "moved", None, false, None);
+            db.place_chats().unwrap();
+            db.move_chat_store("gb-lon", &new_dir.join("chats.sqlite"), None, None).unwrap();
+        }
+        remove_store_files(&d.lon.join("chats.sqlite"));
+
+        let e = d.db().attach_chat_stores(&d.both(), &[], None).unwrap_err();
+        assert!(e.contains(&format!("was moved to {} while botd ran", new_dir.display())) && e.contains(&format!("Set it to gb-lon={}", new_dir.display())), "{e}");
+        let db = d.db();
+        db.attach_chat_stores(&[("gb-lon".into(), new_dir.clone()), ("de-fra-2".into(), d.fra.clone())], &[], None).unwrap();
+        assert_eq!(rows_in(&new_dir.join("chats.sqlite")), 1);
+        assert_eq!(db.c().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn botd_wont_start_on_the_file_a_move_left_when_it_stopped_before_deleting_it() {
+        let d = Dirs::new();
+        let new_dir = d.dir.path().join("lon-2");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        {
+            let db = d.up();
+            let ada = user(&db, "ada");
+            db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+            db.place_chats().unwrap();
+            db.move_chat_store("gb-lon", &new_dir.join("chats.sqlite"), None, None).unwrap();
+            db.add_message(&bot_of(&db, &ada), "user", "after the move", None, false, None);
+        }
+        assert_eq!(rows_in(&d.lon.join("chats.sqlite")), 0);
+
+        let e = d.db().attach_chat_stores(&d.both(), &[], None).unwrap_err();
+        assert!(e.contains(&format!("was moved to {} while botd ran", new_dir.display())) && e.contains(&format!("Set it to gb-lon={}", new_dir.display())), "{e}");
+        let db = d.db();
+        db.attach_chat_stores(&[("gb-lon".into(), new_dir.clone()), ("de-fra-2".into(), d.fra.clone())], &[], None).unwrap();
+        assert_eq!(db.c().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_mark_left_by_a_move_that_never_switched_is_dropped_at_startup() {
+        let d = Dirs::new();
+        let copy = d.dir.path().join("lon-2").join("chats.sqlite");
+        d.up();
+        let old = d.lon.join("chats.sqlite");
+        rusqlite::Connection::open(&old)
+            .unwrap()
+            .execute_batch(&format!("CREATE TABLE {MOVED_TO} (path TEXT NOT NULL); INSERT INTO {MOVED_TO} (path) VALUES ('{}')", copy.display()))
+            .unwrap();
+
+        d.db().attach_chat_stores(&d.both(), &[], None).unwrap();
+        let left: i64 = rusqlite::Connection::open(&old).unwrap().query_row(&format!("SELECT COUNT(*) FROM sqlite_master WHERE name = '{MOVED_TO}'"), [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_moved_store_stays_under_botds_database_key() {
+        use crate::database_encryption::{DbKey, format, opens};
+        use crate::secrets::key::MasterKey;
+        let dir = super::Scratch::new();
+        let key = DbKey::derive(&MasterKey::generate());
+        let (lon, lon2) = (dir.path().join("lon"), dir.path().join("lon-2"));
+        std::fs::create_dir_all(&lon).unwrap();
+        std::fs::create_dir_all(&lon2).unwrap();
+        let db = Db::open_keyed(&dir.path().join("app.sqlite"), &key);
+        db.attach_chat_stores(&[("gb-lon".to_string(), lon.clone())], &[], Some(key.raw())).unwrap();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let bot = bot_of(&db, &ada);
+        db.add_message(&bot, "user", "secret chat", None, false, None);
+        let to = lon2.join("chats.sqlite");
+        db.move_chat_store("gb-lon", &to, Some(&key), None).unwrap();
+        let m = db.add_message(&bot, "user", "secret after", None, false, None);
+        assert_eq!(db.message(m.id).unwrap().text, "secret after");
+        assert_eq!(format(&to).unwrap(), Format::Encrypted);
+        assert!(opens(&to, &key));
+        assert!(!std::fs::read(&to).unwrap().windows(11).any(|w| w == b"secret chat"));
     }
 }
