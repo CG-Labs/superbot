@@ -470,7 +470,7 @@ async fn main() {
     if let Some(x) = &external
         && let Err(e) = x.watch()
     {
-        exit(format!("Secrets backend: {e}. VAULT_EVENTS=1 asks botd to follow Vault's change events, so it won't start without them (ADR 0306)."));
+        exit(format!("Secrets backend: {e}. VAULT_EVENTS or GCP_SECRET_MANAGER_EVENTS asks botd to follow the store's change events, so it won't start without them (ADR 0306, ADR 0325)."));
     }
     let external_shared = external.clone().map(secrets::external::Startup);
     let startup_store = secrets::external::Layered(std::iter::once(&process_env as &dyn secrets::SecretStore).chain(external_shared.as_ref().map(|s| s as &dyn secrets::SecretStore)).collect());
