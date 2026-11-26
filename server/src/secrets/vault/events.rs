@@ -267,16 +267,19 @@ enum Note {
 const MAX_PENDING: usize = 1024;
 
 /// Changes waiting for the thread that applies them. A name changed again before it is read
-/// waits once, at its latest index, so a busy name can't hold up the rest or pile up reads;
-/// past `MAX_PENDING` names, they are dropped for one read of everything cached.
+/// waits once, so a busy name can't hold up the rest or pile up reads; past `MAX_PENDING`
+/// names, they are dropped for one read of everything cached. Each is read at the newest
+/// index seen so far: Vault sends events in order, so it covers every change before it, and
+/// no read or list asks for less than one already applied.
 #[derive(Default)]
 struct Pending {
     order: VecDeque<(Scope, String)>,
-    latest: HashMap<(Scope, String), (String, Option<String>)>,
+    /// The latest event type for each name waiting.
+    latest: HashMap<(Scope, String), String>,
     all: bool,
-    /// The index of the newest change made way for a read of everything: Vault sends events
-    /// in order, so it covers those before it.
-    floor: Option<String>,
+    newest: Option<String>,
+    /// The read of everything stands for dropped changes, so it asks for `newest` too.
+    floor: bool,
     sender_gone: bool,
     receiver_gone: bool,
 }
@@ -309,21 +312,26 @@ impl Tx {
         match note {
             Note::Resumed(index) => {
                 p.all = true;
-                p.floor = index.or(p.floor.take());
+                if index.is_some() {
+                    p.newest = index;
+                    p.floor = true;
+                }
             }
             Note::Changed { scope, name, event, index } => {
+                if index.is_some() {
+                    p.newest = index;
+                }
                 let key = (scope, name);
                 if let Some(waiting) = p.latest.get_mut(&key) {
-                    *waiting = (event, index);
+                    *waiting = event;
                 } else if p.order.len() >= MAX_PENDING {
-                    let newest = index.or_else(|| p.order.iter().rev().find_map(|k| p.latest.get(k).and_then(|(_, i)| i.clone())));
                     p.order.clear();
                     p.latest.clear();
                     p.all = true;
-                    p.floor = newest.or(p.floor.take());
+                    p.floor = true;
                 } else {
                     p.order.push_back(key.clone());
-                    p.latest.insert(key, (event, index));
+                    p.latest.insert(key, event);
                 }
             }
         }
@@ -350,11 +358,12 @@ impl Rx {
         let mut p = self.0.lock();
         loop {
             if std::mem::take(&mut p.all) {
-                return Some(Note::Resumed(p.floor.take()));
+                let index = if std::mem::take(&mut p.floor) { p.newest.clone() } else { None };
+                return Some(Note::Resumed(index));
             }
             if let Some(key) = p.order.pop_front() {
-                let (event, index) = p.latest.remove(&key).unwrap_or_default();
-                return Some(Note::Changed { scope: key.0, name: key.1, event, index });
+                let event = p.latest.remove(&key).unwrap_or_default();
+                return Some(Note::Changed { scope: key.0, name: key.1, event, index: p.newest.clone() });
             }
             if p.sender_gone {
                 return None;
@@ -928,8 +937,8 @@ pub(crate) mod tests {
         tx.send(changed("A_TOKEN", "1"));
         tx.send(changed("B_TOKEN", "2"));
         tx.send(changed("A_TOKEN", "3"));
-        assert_eq!(rx.recv(), Some(changed("A_TOKEN", "3")), "once, at its latest index, in its first place");
-        assert_eq!(rx.recv(), Some(changed("B_TOKEN", "2")));
+        assert_eq!(rx.recv(), Some(changed("A_TOKEN", "3")), "once, in its first place, at the newest index");
+        assert_eq!(rx.recv(), Some(changed("B_TOKEN", "3")), "never at less than one already applied");
 
         for i in 0..MAX_PENDING {
             tx.send(changed(&format!("N{i}_TOKEN"), "4"));
