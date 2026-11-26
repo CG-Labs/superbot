@@ -47,7 +47,7 @@ use axum::response::{Html, IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
-pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
+pub use provider::{ClaimMap, ENTRA_AUTHORITY, EveryIdp, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
 use saml_sp::{AesCbc, Binding, Encryption, IdpInitiated, KeyUse, Refused, RequestBinding, ResponseBinding, Sp, SpKey, SpSigning};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -465,7 +465,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 41] = [
+const ONLY_FOR: [(&str, &[&str]); 42] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -482,6 +482,7 @@ const ONLY_FOR: [(&str, &[&str]); 41] = [
     ("IDP_ALIAS", &["saml"]),
     ("IDP_ENTITY_ID", &["saml"]),
     ("IDP_ENTITY_IDS", &["saml"]),
+    ("IDP_ENTITY_CATEGORIES", &["saml"]),
     ("IDP_METADATA_URL", &["saml"]),
     ("IDP_METADATA_FILE", &["saml"]),
     ("IDP_MDQ_URL", &["saml"]),
@@ -511,8 +512,9 @@ const ONLY_FOR: [(&str, &[&str]); 41] = [
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 26] = [
+const SAML_NATIVE_ONLY: [&str; 27] = [
     "IDP_ENTITY_IDS",
+    "IDP_ENTITY_CATEGORIES",
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
     "IDP_MDQ_URL",
@@ -541,10 +543,18 @@ const SAML_NATIVE_ONLY: [&str; 26] = [
 ];
 
 /// Native SAML's IdP: `IDP_ENTITY_ID`, or several of a federation's in `IDP_ENTITY_IDS` (ADR
-/// 0282). Each is checked as an entity ID, and listed once.
+/// 0282). Each is checked as an entity ID, and listed once. `IDP_ENTITY_IDS=all` is every IdP
+/// of the federation (ADR 0308): an empty list.
 fn entity_ids(key: &dyn Fn(&str) -> String, var: &Var, list: &List) -> Result<Vec<String>, String> {
     let check = |k: &str, e: &str| saml::entity_id(e).ok_or_else(|| format!("{}: {e} is not an entity ID (a URI, like http://www.okta.com/exk1abc)", key(k)));
     let several = list(&key("IDP_ENTITY_IDS"));
+    if several.iter().any(|e| e.eq_ignore_ascii_case(EVERY_IDP)) {
+        return match (var(&key("IDP_ENTITY_ID")), several.len()) {
+            (Some(_), _) => Err(format!("Set {} for one IdP or {} for several, not both", key("IDP_ENTITY_ID"), key("IDP_ENTITY_IDS"))),
+            (None, 1) => Ok(Vec::new()),
+            (None, _) => Err(format!("{}: {EVERY_IDP} is every IdP of the federation, alone: don't list others with it", key("IDP_ENTITY_IDS"))),
+        };
+    }
     match (var(&key("IDP_ENTITY_ID")), several.is_empty()) {
         (Some(_), false) => Err(format!("Set {} for one IdP or {} for several, not both", key("IDP_ENTITY_ID"), key("IDP_ENTITY_IDS"))),
         (Some(e), true) => Ok(vec![check("IDP_ENTITY_ID", &e)?]),
@@ -569,6 +579,34 @@ fn entity_ids(key: &dyn Fn(&str) -> String, var: &Var, list: &List) -> Result<Ve
             }
         }
     }
+}
+
+/// `SSO_<ID>_IDP_ENTITY_IDS` for every IdP of a federation's aggregate (ADR 0308).
+const EVERY_IDP: &str = "all";
+/// The most `SSO_<ID>_IDP_ENTITY_CATEGORIES`.
+const MAX_ENTITY_CATEGORIES: usize = 8;
+
+/// With every IdP of a federation (ADR 0308): `IDP_ENTITY_CATEGORIES`, the categories each
+/// must have, URIs once each. Refused without it.
+fn every_idp(key: &dyn Fn(&str) -> String, list: &List, every: bool) -> Result<Option<EveryIdp>, String> {
+    let set = list(&key("IDP_ENTITY_CATEGORIES"));
+    if !every {
+        return match set.is_empty() {
+            true => Ok(None),
+            false => Err(format!("{} is only for {}={EVERY_IDP}: it picks which of the federation's IdPs sign in", key("IDP_ENTITY_CATEGORIES"), key("IDP_ENTITY_IDS"))),
+        };
+    }
+    let mut categories: Vec<String> = Vec::new();
+    for c in set {
+        let c = saml::entity_id(&c).ok_or_else(|| format!("{}: {c} is not an entity category (a URI, like http://refeds.org/category/research-and-scholarship)", key("IDP_ENTITY_CATEGORIES")))?;
+        if !categories.contains(&c) {
+            categories.push(c);
+        }
+    }
+    if categories.len() > MAX_ENTITY_CATEGORIES {
+        return Err(format!("{} lists {} categories: at most {MAX_ENTITY_CATEGORIES}", key("IDP_ENTITY_CATEGORIES"), categories.len()));
+    }
+    Ok(Some(EveryIdp { categories }))
 }
 
 /// Claims people or their admins can change, so they can't be the subject.
@@ -670,8 +708,9 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 return Err(format!("{} is only for the SAML bridge (with {}). Native SAML reads the IdP's metadata instead", key(k), key("ISSUER")));
             }
             let entity_ids = entity_ids(&key, var, list)?;
-            let several = entity_ids.len() > 1;
-            let idps = entity_ids.join(", ");
+            let every_idp = every_idp(&key, list, entity_ids.is_empty())?;
+            let several = entity_ids.len() > 1 || every_idp.is_some();
+            let idps = if every_idp.is_some() { "any SAML IdP of the federation".to_string() } else { format!("SAML IdP {}", entity_ids.join(", ")) };
             let aggregate = var(&key("IDP_AGGREGATE_URL"));
             if aggregate.is_some() && ["IDP_METADATA_URL", "IDP_METADATA_FILE", "IDP_MDQ_URL"].iter().any(|k| var(&key(k)).is_some()) {
                 return Err(format!("{} fetches the IdPs' metadata: remove {}, {} and {}", key("IDP_AGGREGATE_URL"), key("IDP_METADATA_URL"), key("IDP_METADATA_FILE"), key("IDP_MDQ_URL")));
@@ -700,6 +739,10 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 }
                 (None, None, None) => IdpSource::Saved,
             };
+            // Only an aggregate says who the federation's IdPs are: MDQ answers for one at a time.
+            if every_idp.is_some() && !matches!(source, IdpSource::Aggregate(_)) {
+                return Err(format!("{}={EVERY_IDP} needs {}: only the federation's signed aggregate lists every IdP", key("IDP_ENTITY_IDS"), key("IDP_AGGREGATE_URL")));
+            }
             if several && !matches!(source, IdpSource::Mdq(_) | IdpSource::Aggregate(_)) {
                 return Err(format!("{} needs {} or {}: botd fetches each IdP's metadata from the federation's MDQ server or its aggregate", key("IDP_ENTITY_IDS"), key("IDP_MDQ_URL"), key("IDP_AGGREGATE_URL")));
             }
@@ -727,7 +770,7 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             }
             let allowed_domains = domains("ALLOWED_DOMAINS")?;
             if jit_role.is_some() && allowed_domains.is_empty() {
-                return Err(format!("{} without {} would let anyone SAML IdP {idps} signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
+                return Err(format!("{} without {} would let anyone {idps} signs in get an account: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
             }
             // Every IdP names its own groups: one's "staff" isn't another's. Only a value scoped
             // to an IdP's own domain says whose it is (ADR 0287).
@@ -812,7 +855,7 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             let authn_context = authn_context(&key, var, list, &attributes)?;
             let freshness = freshness(&key, var)?;
             (
-                Kind::SamlSp { entity_ids, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness },
+                Kind::SamlSp { entity_ids, every_idp, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness },
                 saml::LABEL,
             )
         }
@@ -1102,11 +1145,15 @@ pub async fn start(
     if a.limiter.blocked(&ip, at).is_some() {
         return no_store(ret.fail("sso_too_many"));
     }
-    // Several IdPs (ADR 0282): the chooser first, then only one of them.
+    // Several IdPs (ADR 0282): the chooser first, then only one of them. With every IdP of a
+    // federation (ADR 0308), the aggregate says whether it's one, below.
     let idp = match (p.several_idps(), q.get("idp")) {
         (false, _) => p.idps().first().cloned().unwrap_or_default(),
-        (true, None) => return no_store(chooser(p, &q)),
-        (true, Some(e)) if p.idps().contains(e) => e.clone(),
+        (true, None) => {
+            p.every_idp_read(sso.refresh_gap).await;
+            return no_store(chooser(p, &q));
+        }
+        (true, Some(e)) if p.every_idp().is_some() || p.lists(e) => e.clone(),
         (true, Some(e)) => {
             failed(&a, &source, &id, "unknown_idp", None, json!({ "entityId": crate::audit::clip(e, 256) }));
             return no_store(ret.fail("sso_failed"));
@@ -1116,6 +1163,10 @@ pub async fn start(
     audit_metadata_refusal(&a, p);
     let endpoint = match endpoint {
         Ok(e) => e,
+        Err(jwt::Invalid("unknown_idp")) => {
+            failed(&a, &source, &id, "unknown_idp", None, json!({ "entityId": crate::audit::clip(&idp, 256) }));
+            return no_store(ret.fail("sso_failed"));
+        }
         Err(e) => {
             crate::obs::log::log_warn!("SSO {id}: discovery failed: {e}");
             return no_store(ret.fail("sso_failed"));
@@ -1164,22 +1215,41 @@ pub async fn start(
 /// Native SAML with several IdPs (ADR 0282): the page that asks which to sign in at, each
 /// link this same start with `idp` added, by the name the IdP's metadata gives (else its
 /// entity ID). IdPs whose metadata isn't loaded yet are listed by entity ID.
+///
+/// With every IdP of a federation (ADR 0308), thousands, the page is a search box instead: the
+/// IdPs matching every word of `q` in their name, entity ID or email domains, at most
+/// `CHOOSER_MATCHES` of them, never those the federation hides from discovery.
 fn chooser(p: &Provider, q: &HashMap<String, String>) -> Response {
-    let mut choices: Vec<(String, String)> = p
-        .idps()
-        .iter()
-        .map(|e| {
-            let name = p.idp_loaded_for(e).and_then(|m| m.name.clone()).unwrap_or_else(|| e.clone());
-            let mut query = url::form_urlencoded::Serializer::new(String::new());
-            query.extend_pairs(q.iter().filter(|(k, _)| k.as_str() != "idp"));
-            query.append_pair("idp", e);
-            (name, format!("/api/auth/sso/{}/start?{}", p.id, query.finish()))
-        })
-        .collect();
+    let action = format!("/api/auth/sso/{}/start", p.id);
+    let carry: Vec<(String, String)> = q.iter().filter(|(k, _)| !["idp", "q"].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let link = |e: &str| {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.extend_pairs(carry.iter());
+        query.append_pair("idp", e);
+        format!("{action}?{}", query.finish())
+    };
+    let every = p.every_idp().is_some();
+    let typed: String = q.get("q").map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(100).collect()).unwrap_or_default();
+    let words: Vec<String> = typed.split_whitespace().map(str::to_lowercase).collect();
+    let mut choices: Vec<(String, String)> = Vec::new();
+    for e in p.listed_idps() {
+        let m = p.idp_loaded_for(&e);
+        if every && !m.as_ref().is_some_and(|m| !m.hidden() && !words.is_empty() && saml_sp::chooser_match(m, &words)) {
+            continue;
+        }
+        let name = m.and_then(|m| m.name.clone()).unwrap_or_else(|| e.clone());
+        choices.push((name, link(&e)));
+    }
     choices.sort_by_cached_key(|(name, _)| name.to_lowercase());
-    let csp = HeaderValue::from_str(&saml_sp::chooser_csp()).expect("ASCII");
-    ([(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")), (header::CONTENT_SECURITY_POLICY, csp)], saml_sp::chooser_page(&p.label, &choices)).into_response()
+    let more = if every { choices.len().saturating_sub(CHOOSER_MATCHES) } else { 0 };
+    choices.truncate(choices.len() - more);
+    let search = every.then(|| saml_sp::ChooserSearch { action: &action, carry: &carry, query: &typed, more });
+    let csp = HeaderValue::from_str(&saml_sp::chooser_csp(every)).expect("ASCII");
+    ([(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")), (header::CONTENT_SECURITY_POLICY, csp)], saml_sp::chooser_page(&p.label, &choices, search.as_ref())).into_response()
 }
+
+/// The most IdPs the chooser shows for one search, with every IdP of a federation.
+const CHOOSER_MATCHES: usize = 50;
 
 /// Native SAML: the browser off to the IdP with an AuthnRequest whose ID is `request_id` and
 /// whose RelayState is `state`, signed when the provider signs them, with `binder` set as a web
@@ -1710,7 +1780,7 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
             return see("/login?error=sso_failed");
         }
     };
-    let checked = match check_saml(a, app, p, idp, &msg, None, at).await {
+    let checked = match check_saml(a, app, p, &idp, &msg, None, at).await {
         Ok(c) => c,
         // It answers a request: a sign-in that expired, or another browser's.
         Err((Refused("in_response_to_mismatch", _), _)) => return expired(),
@@ -1734,7 +1804,7 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     }
     // The IdP answered the sign-in this browser was just sent to start with another unsolicited
     // response: it ignores our AuthnRequests, and restarting again would go round forever.
-    let marker = restart_marker(p, idp);
+    let marker = restart_marker(p, &idp);
     if read_cookie(headers, SAML_RESTART) == Some(marker.as_str()) {
         failed(a, source, id, "idp_initiated_loop", Some(&checked.claims), json!({ "idpInitiated": true }));
         return see("/login?error=sso_failed");
@@ -1746,7 +1816,7 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
     // With several IdPs, straight to the one that signed it, not the chooser.
     let mut start = format!("{}/api/auth/sso/{id}/start", a.sso.public_url);
     if p.several_idps() {
-        start = with_query(&start, &[("idp", idp)]);
+        start = with_query(&start, &[("idp", idp.as_str())]);
     }
     let mut res = see(&start);
     res.headers_mut().insert(header::SET_COOKIE, saml_restart_cookie(&marker, RESTART_TTL_S));
@@ -1757,15 +1827,15 @@ async fn unsolicited(a: &Auth, app: &AppState, source: &Source, headers: &Header
 /// (ADR 0290) the one its Issuer names (an artifact's SourceID), if that's one of them.
 /// `check_saml` then checks it was signed by that IdP, so the claim is never trusted. Err
 /// holds the entity ID it named, if one could be read.
-fn unsolicited_idp<'a>(p: &'a Provider, msg: &Message) -> Result<&'a str, Option<String>> {
+fn unsolicited_idp(p: &Provider, msg: &Message) -> Result<String, Option<String>> {
     if !p.several_idps() {
-        return p.idps().first().map(String::as_str).ok_or(None);
+        return p.idps().first().cloned().ok_or(None);
     }
     match msg.binding {
-        ResponseBinding::Artifact => saml_artifact::claimed_source(msg.value, p.idps()).ok_or(None),
+        ResponseBinding::Artifact => saml_artifact::claimed_source(msg.value, &p.listed_idps()).map(String::from).ok_or(None),
         ResponseBinding::Post => {
             let claimed = saml_sp::claimed_issuer(msg.value).ok_or(None)?;
-            p.idps().iter().find(|e| **e == claimed).map(String::as_str).ok_or(Some(claimed))
+            if p.lists(&claimed) { Ok(claimed) } else { Err(Some(claimed)) }
         }
     }
 }
@@ -1891,9 +1961,9 @@ pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> O
     let login = app.db.saml_session(&s.id)?;
     let entity = session_idp(p, s)?;
     // Cached metadata, even if stale, and a short fetch otherwise: clients wait 5 s for this answer.
-    let idp = match p.idp_loaded_for(entity) {
+    let idp = match p.idp_loaded_for(&entity) {
         Some(m) => m,
-        None => tokio::time::timeout(Duration::from_secs(3), idp_metadata(a, p, entity)).await.ok()?.ok()?,
+        None => tokio::time::timeout(Duration::from_secs(3), idp_metadata(a, p, &entity)).await.ok()?.ok()?,
     };
     let browser = s.kind == "cookie";
     let slo = match (&idp.slo, &idp.slo_soap) {
@@ -1941,8 +2011,8 @@ pub async fn logout_request(a: &Arc<Auth>, app: &AppState, s: &db::Session) -> O
 
 /// The IdP that signed session `s` in: the provider's one, or with several (ADR 0282) the one
 /// its identity is under.
-fn session_idp<'a>(p: &'a Provider, s: &db::Session) -> Option<&'a str> {
-    if p.several_idps() { p.idp_of(s.idp_subject.as_deref()?) } else { p.idps().first().map(String::as_str) }
+fn session_idp(p: &Provider, s: &db::Session) -> Option<String> {
+    if p.several_idps() { p.idp_of(s.idp_subject.as_deref()?) } else { p.idps().first().cloned() }
 }
 
 /// `GET /api/auth/sso/{id}/logout?h=`: the page that posts our signed LogoutRequest to an IdP
@@ -2003,7 +2073,7 @@ pub fn sessions_ended(a: &Auth, app: &AppState, sessions: &[db::Session], reason
     for s in sessions.iter().filter(|s| s.method == "sso" && s.unexpired_at(at, a.sessions.idle_ms, a.sessions.max_ms)) {
         let Some(p) = s.idp_provider.as_deref().and_then(|id| a.sso.provider(id)) else { continue };
         let Kind::SamlSp { sp_entity_id, .. } = &p.kind else { continue };
-        let Some(idp) = session_idp(p, s).and_then(|e| p.idp_loaded_for(e)) else { continue };
+        let Some(idp) = session_idp(p, s).and_then(|e| p.idp_loaded_for(&e)) else { continue };
         let Some(soap) = idp.slo_soap.clone() else { continue };
         // Without a SessionIndex the request would name only the person, ending IdP sessions
         // on devices nobody revoked.
@@ -2154,7 +2224,7 @@ async fn slo(a: &Auth, source: &Source, id: &str, incoming: &saml_slo::Incoming<
     let Kind::SamlSp { sp_entity_id, encryption, .. } = &p.kind else { return not_found("SAML provider").into_response() };
     let Some(entity) = logout_idp(p, incoming) else { return slo_failed(a, source, id, "unknown_idp", json!({})) };
     // From a URL, the metadata may not be loaded since a restart: logouts can't wait for a sign-in.
-    let Ok(idp) = idp_metadata(a, p, entity).await else { return slo_failed(a, source, id, "not_ready", json!({})) };
+    let Ok(idp) = idp_metadata(a, p, &entity).await else { return slo_failed(a, source, id, "not_ready", json!({})) };
     let Some(idp_slo) = idp.slo.clone() else { return slo_failed(a, source, id, "no_slo", json!({})) };
     let key = match sp_key(app, p) {
         Ok(k) => k,
@@ -2220,7 +2290,7 @@ pub async fn slo_soap(Extension(a): Extension<Arc<Auth>>, Extension(source): Ext
     let Kind::SamlSp { sp_entity_id, encryption, .. } = &p.kind else { return not_found("SAML provider").into_response() };
     let Ok(xml) = std::str::from_utf8(&body) else { return soap_failed(a, &source, id, "bad_message", json!({})) };
     let Some(entity) = logout_idp(p, &saml_slo::Incoming::Soap(xml)) else { return soap_failed(a, &source, id, "unknown_idp", json!({})) };
-    let Ok(idp) = idp_metadata(a, p, entity).await else { return soap_failed(a, &source, id, "not_ready", json!({})) };
+    let Ok(idp) = idp_metadata(a, p, &entity).await else { return soap_failed(a, &source, id, "not_ready", json!({})) };
     let key = match sp_key(app, p) {
         Ok(k) => k,
         Err(e) => {
@@ -2257,12 +2327,12 @@ pub async fn slo_soap(Extension(a): Extension<Arc<Auth>>, Extension(source): Ext
 /// The IdP a logout message is checked against: the provider's one, or with several (ADR
 /// 0282) the one its Issuer names, if that's one of them. `receive` then checks the message
 /// was signed by it.
-fn logout_idp<'a>(p: &'a Provider, incoming: &saml_slo::Incoming) -> Option<&'a str> {
+fn logout_idp(p: &Provider, incoming: &saml_slo::Incoming) -> Option<String> {
     if !p.several_idps() {
-        return p.idps().first().map(String::as_str);
+        return p.idps().first().cloned();
     }
     let issuer = saml_slo::claimed_issuer(incoming)?;
-    p.idps().iter().find(|e| **e == issuer).map(String::as_str)
+    p.lists(&issuer).then_some(issuer)
 }
 
 fn slo_actor(provider: &str, subject: Option<String>) -> Actor {
@@ -2330,7 +2400,7 @@ fn metadata_refused(p: &Provider, entity: &str, e: &saml_sp::MetadataRefused) ->
         _ => "",
     };
     let (entity_id, kept) = match entity {
-        "" => (Value::Null, p.idps().iter().any(|e| p.idp_loaded_for(e).is_some())),
+        "" => (Value::Null, p.listed_idps().iter().any(|e| p.idp_loaded_for(e).is_some())),
         _ => (json!(entity), p.idp_loaded_for(entity).is_some()),
     };
     let details = json!({ "provider": p.id, "entityId": entity_id, "source": source, "reason": e.reason, "error": crate::audit::clip(&e.message, 256), "kept": kept });
@@ -2348,20 +2418,22 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     let Kind::SamlSp { entity_ids, sp_entity_id, source, attributes, required_groups, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, .. } = &p.kind else {
         return json!({});
     };
-    let several = entity_ids.len() > 1;
+    let several = p.several_idps();
     let now = db::now();
     // Each certificate says whether it's ending (ADR 0198).
     let cert = |c: &xmldsig::Cert| {
         json!({ "sha256": c.sha256, "subject": c.subject, "notAfter": c.not_after * 1000, "expiry": saml_expiry::state(c.not_after, now).as_str(), "daysLeft": saml_expiry::days_left(c.not_after, now) })
     };
-    let loaded: Vec<Arc<saml_sp::IdpMetadata>> = entity_ids.iter().filter_map(|e| p.idp_loaded_for(e)).collect();
+    let loaded: Vec<Arc<saml_sp::IdpMetadata>> = p.listed_idps().iter().filter_map(|e| p.idp_loaded_for(e)).collect();
     let view = |m: &saml_sp::IdpMetadata| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
         json!({ "entityId": m.entity_id, "name": m.name, "scopes": m.scopes, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age(&m.entity_id).map(|d| d.as_secs()), "validUntil": m.valid_until, "expired": !m.valid_at(now) })
     };
     let idp = if several { None } else { loaded.first().map(|m| view(m)) };
-    // Several IdPs (ADR 0282): each, loaded or not, in the order they're configured.
+    // Several IdPs (ADR 0282): each, loaded or not, in the order they're configured. Every IdP
+    // of a federation (ADR 0308) is too many to show: how many, and what they must be.
     let idps: Vec<Value> = entity_ids.iter().map(|e| loaded.iter().find(|m| m.entity_id == *e).map_or_else(|| json!({ "entityId": e }), |m| view(m))).collect();
+    let every_idp = p.every_idp().map(|e| json!({ "categories": e.categories, "idps": loaded.len(), "hidden": loaded.iter().filter(|m| m.hidden()).count() }));
     let key = a.app.as_ref().map(|app| sp_key(app, p));
     // botd's own keys show their rollover too (ADR 0181).
     let rollover = |v: &mut Value, u: KeyUse| {
@@ -2401,7 +2473,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     let back_channel = loaded.iter().any(|m| m.slo_soap.is_some()) && matches!(key, Some(Ok(_)));
     let from = match source {
         IdpSource::Mdq(base) if several => Some(base.clone()),
-        IdpSource::Url(_) | IdpSource::Mdq(_) | IdpSource::Aggregate(_) => source.url_for(&entity_ids[0]),
+        IdpSource::Url(_) | IdpSource::Mdq(_) | IdpSource::Aggregate(_) => source.url_for(entity_ids.first().map_or("", String::as_str)),
         IdpSource::File(f) => Some(f.clone()),
         IdpSource::Saved => None,
     };
@@ -2413,7 +2485,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "encryptedAssertions": encryption.as_str(), "aesCbc": aes_cbc.as_str(), "spEncryptionKey": enc_key,
         "signedMetadata": metadata_trust.as_ref().map_or("off", |t| if t.require { "require" } else { "allow" }),
         "metadataSigningCertificates": metadata_trust.as_ref().map(|t| t.certs.iter().map(cert).collect::<Vec<_>>()),
-        "idpEntityId": (!several).then(|| &entity_ids[0]), "idpEntityIds": entity_ids, "source": source.name(), "from": from, "idp": idp, "idps": idps,
+        "idpEntityId": (!several).then(|| &entity_ids[0]), "idpEntityIds": entity_ids, "source": source.name(), "from": from, "idp": idp, "idps": idps, "everyIdp": every_idp,
         "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
         "groupsAttribute": attributes.groups, "requiredGroups": required_groups,
         "roleMappings": a.app.as_ref().map(|app| app.db.saml_role_mappings_of(&p.id).len()),
@@ -2427,6 +2499,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
 /// `GET /api/sso/{id}/saml`: what to enter at the IdP, and the IdP metadata in use.
 pub async fn saml_status(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>) -> Res {
     let p = saml_provider(&a, &id)?;
+    p.every_idp_read(a.sso.refresh_gap).await;
     if matches!(&p.kind, Kind::SamlSp { source, .. } if source.fetched()) {
         for entity in p.idps() {
             if let Err(e) = idp_metadata(&a, p, entity).await {
@@ -2444,10 +2517,10 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
     let Kind::SamlSp { entity_ids, source, sign_requests, request_binding, response_binding, metadata_trust, .. } = &p.kind else {
         return Err(bad("not a native SAML provider"));
     };
-    let entity_id = &entity_ids[0];
     if let Some(var) = source.setting() {
         return Err(ApiError(StatusCode::CONFLICT, format!("SSO_{}_{var} sets this provider's IdP metadata. Change it there, or remove it to import here.", id.to_ascii_uppercase())));
     }
+    let entity_id = &entity_ids[0];
     let xml = v["xml"].as_str().unwrap_or("");
     let m = match saml_sp::load_idp_metadata(xml, entity_id, *sign_requests, *request_binding, *response_binding, metadata_trust.as_ref(), db::now()) {
         Ok(m) => m,
@@ -2603,6 +2676,7 @@ pub async fn link_identity(
         bad(if known.is_empty() { "SSO is off: set SSO_PROVIDERS".to_string() } else { format!("provider must be one of: {}", known.join(", ")) })
     })?;
     let subject = p.subject(v["subject"].as_str().unwrap_or("")).map_err(bad)?;
+    p.every_idp_read(a.sso.refresh_gap).await;
     let tenant = v["tenant"].as_str().filter(|t| !t.trim().is_empty());
     let (issuer, tenant) = match v["idp"].as_str().filter(|i| !i.trim().is_empty()) {
         Some(_) if tenant.is_some() => return Err(bad("Give a tenant or an idp, not both")),
@@ -3013,7 +3087,7 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, every_idp: None, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness }
             if *freshness == saml_sp::Freshness::default() && entity_ids == &[ADFS] && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
@@ -3475,8 +3549,8 @@ mod tests {
         assert!(p.issuer_for(None).unwrap_err().contains("--idp"));
         assert_eq!(p.issuer_at(B).unwrap(), B);
         assert!(p.issuer_at("https://idp.other.example").is_err());
-        assert_eq!(p.idp_of(&format!("{B}|alice")), Some(B));
-        assert_eq!(p.idp_of(&format!("{A}|staff|alice")), Some(A), "the NameID may hold |");
+        assert_eq!(p.idp_of(&format!("{B}|alice")).as_deref(), Some(B));
+        assert_eq!(p.idp_of(&format!("{A}|staff|alice")).as_deref(), Some(A), "the NameID may hold |");
         assert_eq!(p.idp_of("https://idp.other.example|bob"), None);
         let one = native(&[]).unwrap();
         assert_eq!((one.providers[0].idps(), one.providers[0].several_idps()), (&[ADFS.to_string()][..], false));
