@@ -9,7 +9,7 @@ Bot runs fail or time out on one harness (Hermes Agent, Claude Code, Codex, Pi) 
 3. **What the runs say.** botd logs every finished run with its harness and result:
 
    ```sh
-   journalctl -u superbot -o cat | jq -c 'select(.msg == "run.finished" and .result != "done")' | tail -20
+   journalctl -u superbot -o cat | jq -Rc 'fromjson? | select(.msg == "run.finished" and .result != "done")' | tail -20
    ```
 
    Or make a support bundle: `logs.jsonl` has the recent `run.finished` lines and `health.json` the last 15 minutes' runs by result. The Bot's chat shows the harness's own error text to its owner.

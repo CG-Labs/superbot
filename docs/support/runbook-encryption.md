@@ -44,7 +44,7 @@ Then delete the plain copy, as in the next section.
 | `machines` | Incus machines' off-host backups | `MACHINE_BACKUP_AGE_RECIPIENTS` |
 | `chat_stores` | Regional chat stores' off-host copies | `REGION_DATA_AGE_RECIPIENTS` |
 
-Make a key on a machine the customer controls (`age-keygen`), or on the server with `--backup-age-generate` and copy it off at once; the server keeps only the public key ([encryption](../ops/backup-restore.md#encryption)). Without the identity, encrypted archives can't be restored, so check the customer holds it before you call this done. Archives already written stay plain: once a new encrypted one exists and is copied off, delete the plain ones from the store too, or record that the customer keeps them. `SUPERBOT_BACKUP_ENCRYPTION=required` then refuses plain backups from now on.
+Make a key on a machine the customer controls (`age-keygen`), or on the server with `--backup-age-generate`: then copy the identity file off at once, check the copy, and delete it on the server (`shred -u <identity-file>`), so the server keeps only the public key ([encryption](../ops/backup-restore.md#encryption)). Without the identity, encrypted archives can't be restored, so check the customer holds it before you call this done. Archives already written stay plain: once a new encrypted one exists and is copied off, delete the plain ones from the store too, or record that the customer keeps them. `SUPERBOT_BACKUP_ENCRYPTION=required` then refuses plain backups from now on.
 
 ## botd won't start for the key
 

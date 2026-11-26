@@ -10,11 +10,11 @@ The metrics and settings are in the deploy guide's [metrics and logs](../../depl
 2. **What botd logged.** Every response has an `X-Request-Id`, the same as its log line. With `LOG_FORMAT=json`:
 
    ```sh
-   journalctl -u superbot -o cat | jq -c 'select(.msg == "http.request" and .status >= 500)' | tail -20
-   journalctl -u superbot -o cat | jq -c 'select(.msg == "server.panic")' | tail -5
+   journalctl -u superbot -o cat | jq -Rc 'fromjson? | select(.msg == "http.request" and .status >= 500)' | tail -20
+   journalctl -u superbot -o cat | jq -Rc 'fromjson? | select(.msg == "server.panic")' | tail -5
    ```
 
-   (Compose: `docker compose logs --tail 2000 botd`.) With an error tracker (`ERROR_REPORT_DSN`), each 5xx and panic is there too, with the route template and request id but never the panic's message, which stays in botd's log. A support bundle has the recent log lines in `logs.jsonl` and the last 15 minutes' metrics in `health.json`.
+   `fromjson?` skips the plain-text lines Rust's panic hook writes next to the JSON. (Compose: `docker compose logs --tail 2000 botd`.) With an error tracker (`ERROR_REPORT_DSN`), each 5xx and panic is there too, with the route template and request id but never the panic's message, which stays in botd's log. A support bundle has the recent log lines in `logs.jsonl` and the last 15 minutes' metrics in `health.json`.
 3. **Did anything change?** An upgrade (most often), a setting, the database's disk, the host's memory, the proxy in front of botd, a provider botd calls for that route (Stripe for `billing_webhook`, the identity provider for `auth`, Incus or Linode for `machines`).
 
 ## Requests failing
