@@ -1506,3 +1506,91 @@ async fn an_admin_moves_a_regions_chat_store_to_another_folder_while_botd_runs()
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(!regions["residency"]["warnings"].to_string().contains("was moved to"), "{regions}");
 }
+
+#[tokio::test]
+async fn the_audit_export_holds_back_a_pinned_persons_audit_details_from_sinks_outside_their_region() {
+    use crate::audit_chain_http_tests::{collector, export_to, until};
+    use crate::audit_line::{Bound, check};
+    use crate::machines::chat_stores::{self, Settings};
+    use crate::machines::s3_standin::{self, StandIn};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false, new_derived_keys: false }).unwrap();
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    let actor = crate::audit::Actor { kind: crate::audit::ActorKind::User, id: Some(ada.clone()), name: Some("Ada".into()), ..Default::default() };
+    let who = crate::audit::Who { actor, source: crate::audit::Source { ip: Some("192.0.2.91".into()), user_agent: None } };
+    let hers = app.db.try_record(&who.event("bot.updated").details(json!({ "name": "Ada's Bot" }))).unwrap();
+    let theirs = app.db.try_record(&crate::audit::Event::new(crate::audit::Actor::system("test"), "test.unpinned").details(json!({ "n": 1 }))).unwrap();
+
+    // London's SIEM is in her region; the US one and the archive are said to be elsewhere; the SOC's region isn't stated.
+    let ((lon_url, in_lon), (us_url, in_us), (soc_url, in_soc)) = (collector(0).await, collector(0).await, collector(0).await);
+    let bucket = StandIn::start().await;
+    let export = format!("london={lon_url},us={us_url},soc={soc_url},s3://backups/audit/prod");
+    export_to(
+        &app,
+        &[
+            ("AUDIT_EXPORT", &export),
+            ("AUDIT_EXPORT_DATA_REGION", "us-east-1"),
+            ("AUDIT_EXPORT_DATA_REGION_LONDON", "gb-lon"),
+            ("AUDIT_EXPORT_DATA_REGION_SOC", "off"),
+            ("AUDIT_EXPORT_S3_ENDPOINT", bucket.url.as_str()),
+            ("AUDIT_EXPORT_S3_ACCESS_KEY_ID", s3_standin::ACCESS_KEY),
+            ("AUDIT_EXPORT_S3_SECRET_ACCESS_KEY", s3_standin::SECRET),
+            ("AUDIT_EXPORT_S3_BATCH_SECONDS", "0"),
+            ("AUDIT_EXPORT_S3_LOCK", "off"),
+        ],
+    );
+    let xs = app.audit_export.get().unwrap().clone();
+    until("every sink caught up", || xs.sinks.iter().all(|x| x.delivered() >= theirs)).await;
+    let line = |got: &crate::audit_chain_http_tests::Collected, id: i64| got.lock().unwrap().1.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["id"] == id).unwrap();
+    let archived = || -> Vec<Value> {
+        let w = bucket.w();
+        w.objects.iter().flat_map(|(_, b)| String::from_utf8_lossy(b).lines().map(|l| serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect()
+    };
+
+    // In her region, and where no region is stated, her event goes whole.
+    for got in [&in_lon, &in_soc] {
+        let v = line(got, hers);
+        assert_eq!((v["ip"].as_str(), v["actorId"].as_str(), v["details"]["name"].as_str()), (Some("192.0.2.91"), Some(ada.as_str()), Some("Ada's Bot")), "{v}");
+        assert_eq!(check(&v), Ok(Bound::All));
+    }
+    // Elsewhere, only its sealed row goes: the line still gives its hash, as an erased event's does.
+    let whole = line(&in_lon, hers);
+    let archive_line = archived().into_iter().find(|v| v["id"] == hers).unwrap();
+    for v in [line(&in_us, hers), archive_line] {
+        assert_eq!(v["details"], json!({ "inChatStore": "gb-lon" }), "{v}");
+        for f in crate::audit_line::ERASABLE_FIELDS.iter().filter(|f| **f != "details") {
+            assert!(v[*f].is_null(), "{f} in {v}");
+        }
+        assert!(v["chainSalt"].is_null() && v["chainHash"] == whole["chainHash"] && v["chainDigest"] == whole["chainDigest"], "{v}");
+        assert_eq!(check(&v), Ok(Bound::Fixed));
+    }
+    let body = in_us.lock().unwrap().1.join("\n");
+    assert!(!body.contains("192.0.2.91") && !body.contains(&ada), "nothing of hers reaches the US sink");
+    assert_eq!(line(&in_us, theirs)["details"], json!({ "n": 1 }), "events kept in botd's log go whole");
+    let (_, siem) = call_json(port, "GET", "/api/audit/siem", &admin, "").await;
+    let us = siem["sinks"].as_array().unwrap().iter().find(|s| s["name"] == "us").unwrap().clone();
+    assert_eq!(us["dataRegion"].as_str(), Some("us-east-1"), "{siem}");
+    assert!(us["heldBack"].as_u64().unwrap() >= 2, "her event and the pin's: {us}");
+
+    // The archive still checks against the log.
+    let (_, v) = call_json(port, "GET", "/api/audit/verify?archive=on", &admin, "").await;
+    assert_eq!(v["archive"]["ok"].as_bool(), Some(true), "{v}");
+    assert!(v["archive"]["heldBack"].as_u64().unwrap() >= 2, "{v}");
+
+    // Her report names what each sink gets, and the one with no stated region as not covered.
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    let gets: Vec<(&str, &str)> = r["auditExport"].as_array().unwrap().iter().map(|s| (s["name"].as_str().unwrap_or("archive"), s["details"].as_str().unwrap())).collect();
+    assert_eq!(gets, [("london", "whole"), ("us", "heldBack"), ("soc", "whole"), ("archive", "heldBack")], "{r}");
+    let lines: Vec<&str> = r["notCovered"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|l| l.contains("audit export")).collect();
+    assert_eq!(lines, ["Their audit events, sent whole by the audit export to soc (webhook, in no stated region), which the operator doesn't state is in the region (AUDIT_EXPORT_DATA_REGION, ADR 0316, ADR 0330)."], "{r}");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("## Audit export") && md.contains("- **us (webhook, in us-east-1):** only their events' sealed rows, their details held back\n"), "{md}");
+    assert!(md.contains("- **london (webhook, in gb-lon):** their events whole\n"), "{md}");
+}

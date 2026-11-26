@@ -323,7 +323,7 @@ impl ControlPlane {
 }
 
 /// Lowercase letters, digits, and inner dashes, as Linode plans, regions, and tags are.
-fn slug(s: &str, max: usize) -> bool {
+pub(crate) fn slug(s: &str, max: usize) -> bool {
     !s.is_empty()
         && s.len() <= max
         && s.bytes()

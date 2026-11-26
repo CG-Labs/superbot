@@ -107,6 +107,9 @@ pub struct Checked {
     pub bound: u64,
     pub bound_fixed: u64,
     pub unbound: u64,
+    /// Matched events the archive holds only the sealed row of, their details kept in another
+    /// region's chat store when they were sent (ADR 0330).
+    pub held_back: u64,
     /// Events after this one were sent with their digest, so must have it.
     pub digests_after: Option<i64>,
     pub gone: u64,
@@ -223,11 +226,21 @@ pub struct Row {
 /// row with the same hash. A line without its digest and salt isn't bound to its contents
 /// on its own: the salted digest that binds them stays here.
 fn differing(archived: &Value, row: &Row) -> Option<&'static str> {
-    let fields = FIXED_FIELDS.iter().chain(if row.erased { [].iter() } else { ERASABLE_FIELDS.iter() }).chain(["chainPrev"].iter());
+    let fixed_only = row.erased || held_back(archived);
+    let fields = FIXED_FIELDS.iter().chain(if fixed_only { [].iter() } else { ERASABLE_FIELDS.iter() }).chain(["chainPrev"].iter());
     fields.copied().find(|f| {
         let (a, h) = (archived.get(*f).unwrap_or(&Value::Null), row.event.get(*f).unwrap_or(&Value::Null));
         if *f == "details" { !redacted_from(a, h) } else { a != h }
     })
+}
+
+/// Whether an archived event is only its sealed row, as the export sends it to a sink outside
+/// the region whose chat store keeps its details (ADR 0330): every field an erasure may
+/// rewrite empty but `details`, which names the store.
+fn held_back(archived: &Value) -> bool {
+    let d = &archived["details"];
+    d.as_object().is_some_and(|o| o.len() == 1 && o.get("inChatStore").is_some_and(Value::is_string))
+        && ERASABLE_FIELDS.iter().filter(|f| **f != "details").all(|f| archived.get(*f).is_none_or(Value::is_null))
 }
 
 /// Whether `archived` is `here` as the export wrote it: equal, except that each
@@ -484,7 +497,12 @@ impl<'a> Walker<'a> {
         let differs = match (local.hashes.get(&e.id), anchor) {
             (Some(Some(h)), _) if *h == e.hash => {
                 match local.rows.get(&e.id).and_then(|r| differing(&e.raw, r)) {
-                    None => self.rep.matched += 1,
+                    None => {
+                        self.rep.matched += 1;
+                        if held_back(&e.raw) {
+                            self.rep.held_back += 1;
+                        }
+                    }
                     Some(field) => {
                         self.rep.altered += 1;
                         self.problem(Some(key), Some(e.id), "contents", format!("event {}'s {field} in {key} differs from this server's, under the same hash: the archive's copy was changed", e.id));
@@ -1136,6 +1154,25 @@ mod tests {
             assert_eq!(differing(&archived(forged.clone()), &row(here.clone())), Some("details"), "{forged}");
         }
         assert!(!redacted_text("ab[redacted]ba", "aba"), "the ends can't overlap");
+    }
+
+    #[test]
+    fn an_event_sent_as_its_sealed_row_is_held_to_its_fixed_fields_only() {
+        let row = Row { event: json!({ "id": 2, "action": "bot.updated", "actorId": "u1", "ip": "192.0.2.9", "details": { "name": "Ada's Bot" }, "chainPrev": "p" }), erased: false };
+        let sealed = json!({ "id": 2, "action": "bot.updated", "actorId": null, "ip": null, "details": { "inChatStore": "gb-lon" }, "chainPrev": "p" });
+        assert!(held_back(&sealed));
+        assert_eq!(differing(&sealed, &row), None, "its details are kept in a store elsewhere");
+        let mut other = sealed.clone();
+        other["action"] = json!("bot.deleted");
+        assert_eq!(differing(&other, &row), Some("action"), "what no erasure may change still must match");
+        for not_sealed in [
+            json!({ "actorId": "u1", "details": { "inChatStore": "gb-lon" } }),
+            json!({ "details": { "inChatStore": "gb-lon", "name": "x" } }),
+            json!({ "details": { "inChatStore": 3 } }),
+            json!({ "details": { "name": "Ada's Bot" } }),
+        ] {
+            assert!(!held_back(&not_sealed), "{not_sealed}");
+        }
     }
 
     #[test]

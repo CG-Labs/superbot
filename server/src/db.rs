@@ -9846,6 +9846,11 @@ impl Db {
         self.select_audit_events(f, limit, oldest_first, true)
     }
 
+    /// [`chats::audit_kept_in`] on botd's connection (ADR 0330).
+    pub fn audit_kept_in(&self, from: i64, to: i64) -> rusqlite::Result<std::collections::BTreeMap<i64, String>> {
+        chats::audit_kept_in(&self.c(), from, to)
+    }
+
     fn select_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool, strict: bool) -> rusqlite::Result<Vec<AuditEvent>> {
         use rusqlite::types::Value as V;
         let mut sql = String::from("SELECT * FROM audit_events WHERE 1 = 1");
