@@ -5,11 +5,13 @@ on:
     paths:
       - "apps/client/**"
       - "web/index.html"
+      - "web/styles.css"
       - ".github/workflows/client.yml"
   pull_request:
     paths:
       - "apps/client/**"
       - "web/index.html"
+      - "web/styles.css"
       - ".github/workflows/client.yml"
 
 permissions:
@@ -34,4 +36,6 @@ jobs:
       - run: npm test
       - run: npm run brand:test
       - run: npm run brand:check
+      - run: npm run tokens:test
+      - run: npm run tokens:check
       - run: npm run build:web

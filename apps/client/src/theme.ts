@@ -1,13 +1,98 @@
+import React, { createContext, useContext } from "react";
+import { Platform, StyleSheet, useColorScheme, type TextStyle } from "react-native";
+import tokens from "./tokens.json";
+
+export type Scheme = "light" | "dark";
+export type Palette = typeof tokens.color.light;
+type Weight = NonNullable<TextStyle["fontWeight"]>;
+
+export interface Theme {
+  scheme: Scheme;
+  c: Palette;
+  space: typeof tokens.space;
+  radius: typeof tokens.radius;
+  font: {
+    size: typeof tokens.font.size;
+    lineHeight: typeof tokens.font.lineHeight;
+    weight: Record<keyof typeof tokens.font.weight, Weight>;
+    /** The web font stack; native apps use the system font. */
+    sans: string;
+    mono: string;
+  };
+  shadow: typeof tokens.shadow.light;
+  motion: typeof tokens.motion;
+  layout: typeof tokens.layout;
+}
+
+const mono = Platform.select({ ios: "Menlo", android: "monospace", default: tokens.font.mono });
+
+function theme(scheme: Scheme): Theme {
+  return {
+    scheme,
+    c: tokens.color[scheme],
+    space: tokens.space,
+    radius: tokens.radius,
+    font: {
+      size: tokens.font.size,
+      lineHeight: tokens.font.lineHeight,
+      weight: tokens.font.weight as Record<keyof typeof tokens.font.weight, Weight>,
+      sans: tokens.font.sans,
+      mono,
+    },
+    shadow: tokens.shadow[scheme],
+    motion: tokens.motion,
+    layout: tokens.layout,
+  };
+}
+
+export const themes: Record<Scheme, Theme> = { light: theme("light"), dark: theme("dark") };
+
+const ForcedScheme = createContext<Scheme | null>(null);
+
+/**
+ * Holds everything inside it to one scheme. Screens not yet on the design system (ADR 0335) are
+ * dark-only, so they wrap the themed parts they show in a dark scope until they move over.
+ */
+export function ThemeScope({ scheme, children }: { scheme: Scheme; children: React.ReactNode }) {
+  return React.createElement(ForcedScheme.Provider, { value: scheme }, children);
+}
+
+/** The theme for the device's light or dark setting, unless a `ThemeScope` holds it to one. */
+export function useTheme(): Theme {
+  const forced = useContext(ForcedScheme);
+  const system = useColorScheme();
+  return themes[forced ?? (system === "dark" ? "dark" : "light")];
+}
+
+/** A hook giving `factory`'s styles for the current theme, made once per scheme. */
+export function themedStyles<T>(factory: (t: Theme) => T): () => T {
+  const made: Partial<Record<Scheme, T>> = {};
+  return function useThemedStyles() {
+    const t = useTheme();
+    return (made[t.scheme] ??= factory(t));
+  };
+}
+
+/** Text styles of the type scale, by size name. */
+export function type(t: Theme, size: keyof typeof tokens.font.size): TextStyle {
+  return { fontSize: t.font.size[size], lineHeight: t.font.lineHeight[size] };
+}
+
+export const hairline = StyleSheet.hairlineWidth;
+
+const dark = tokens.color.dark;
+
+/** Dark-only colours for screens not yet on the design system; their neutrals come from the dark palette. */
 export const colors = {
-  bgSidebar: "#0d0d0d",
-  bgMain: "#171717",
-  bgBubble: "#212121",
-  bgHover: "#1c1c1c",
-  bgActive: "#262626",
-  border: "#2a2a2a",
-  text: "#ececec",
-  textDim: "#9a9a9a",
-  textFaint: "#6b6b6b",
+  bgSidebar: dark.surface,
+  bgMain: dark.bg,
+  bgBubble: dark.raised,
+  bgHover: dark.hover,
+  bgActive: dark.selected,
+  border: dark.border,
+  text: dark.text,
+  textDim: dark.textMuted,
+  textFaint: dark.textFaint,
   blue: "#2f72e4",
   blueDot: "#4b8df8",
   danger: "#e5484d",
