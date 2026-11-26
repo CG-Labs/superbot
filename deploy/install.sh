@@ -1894,7 +1894,8 @@ rollback_license_key_file() {
   local env_file=$1 home data_dir file lic
   home=$(user_home)
   file=$(env_value "$env_file" LICENSE_KEY_FILE)
-  [[ -n "$file" ]] || return 1
+  # With LICENSE_KEY too, botd refuses both as ambiguous: judged over the .env as it is.
+  [[ -n "$file" && -z "$(env_value "$env_file" LICENSE_KEY)" ]] || return 1
   [[ "$file" == /* ]] || file="$home/superbot/$file"
   data_dir=$(realpath -m -- "$(env_data_dir "$env_file" "$home")")
   file=$(realpath -m -- "$file")

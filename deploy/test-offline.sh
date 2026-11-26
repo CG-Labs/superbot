@@ -1564,6 +1564,14 @@ grep -Fq "wouldn't run Bots with the license in LICENSE_KEY_FILE ($KF) from befo
 out=$(lrollback "LICENSE_FILE=$T/lkey " "; install_license") || fail "a rollback with --license-file over LICENSE_KEY_FILE failed: $out"
 grep -Fq "Kept the key in --license-file, which LICENSE_KEY_FILE names, as $KF" <<<"$out" || fail "--license-file wasn't written where LICENSE_KEY_FILE points: $out"
 [[ $(rows) == before && $(cat "$KF") == renewed && ! -e "$RH/superbot/data/license.key" ]] || fail "--license-file didn't replace the backup's LICENSE_KEY_FILE alone"
+rb_host "LICENSE_KEY=inline"$'\n'"LICENSE_KEY_FILE=$KF"$'\n'
+mkdir -p "${KF%/*}" && echo oldkf >"$KF"
+rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "the backup before an upgrade failed"
+rb_upgraded
+lbotd "$RB/bundle/bin" "$RH/superbot/data" && echo inline >"$RB/bundle/bin/accepts"
+touch "$RB/active"
+out=$(lrollback "LICENSE_FILE=$T/lkey ") || true
+grep -qx "LICENSE_KEY_FILE=$KF" "$RB/bundle/bin/env" || fail "LICENSE_KEY_FILE was dropped though LICENSE_KEY is set too, which botd refuses: $out"
 
 lrb_host "" old
 out=$(lrollback) || fail "a rollback whose older release takes only the license from before failed: $out"
