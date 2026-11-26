@@ -56,7 +56,8 @@ pub enum Kind {
     /// group-to-role mappings apply (ADR 0160). `idp_initiated` says what an unsolicited
     /// response does (ADR 0175), at whichever listed IdP signed it (ADR 0290). With `authn_context`, only people the IdP says signed in one
     /// of those ways get in, read from the assertion and `attributes.authn_methods` (ADR 0190).
-    /// `freshness` says how recently they must have signed in at the IdP, and whether its
+    /// With `assurance`, only people the IdP vouches for with every one of those identity
+    /// assurance values, read from `attributes.assurance` (ADR 0328). `freshness` says how recently they must have signed in at the IdP, and whether its
     /// session limit ends ours (ADR 0225). Responses come over `response_binding` only: posted,
     /// or as an artifact botd resolves over SOAP (ADR 0268). `entity_ids` is one IdP, or
     /// several of a federation's from its MDQ server (ADR 0282), one chosen at each sign-in;
@@ -83,6 +84,7 @@ pub enum Kind {
         metadata_trust: Option<MetadataTrust>,
         idp_initiated: IdpInitiated,
         authn_context: Option<AuthnContext>,
+        assurance: Vec<String>,
         freshness: Freshness,
         discovery: Option<String>,
         about: About,
@@ -416,6 +418,9 @@ pub struct Claims {
     /// Native SAML: the subject identifier attribute the subject is, `subject-id` or
     /// `pairwise-id` (ADR 0319), for the audit log. None: the NameID, or not SAML.
     pub subject_from: Option<&'static str>,
+    /// Native SAML: the identity assurance values the IdP vouched for (ADR 0328), read only when
+    /// the provider requires some. Empty otherwise.
+    pub assurance: Vec<String>,
 }
 
 impl Claims {
@@ -1399,7 +1404,7 @@ impl Provider {
                     _ => false,
                 };
                 let email = t.str("email").filter(|_| edov).map(|e| e.trim().to_string()).filter(|e| !e.is_empty() && e.len() <= 254);
-                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email, name, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
+                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email, name, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None, assurance: vec![] })
             }
             // Identities are stored under the configured issuer, so a link made with
             // `botctl user link` and a sign-in name the same one.
@@ -1419,7 +1424,7 @@ impl Provider {
                 if !hosted_domains.is_empty() && !t.str("hd").and_then(domain).is_some_and(|d| hosted_domains.contains(&d)) {
                     return Err(Invalid("wrong_domain"));
                 }
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email: Some(email), name, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email: Some(email), name, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None, assurance: vec![] })
             }
             Kind::Oidc { issuer, map, allowed_domains } => {
                 if !same_issuer(issuer, &meta.issuer) || iss != meta.issuer {
@@ -1427,7 +1432,7 @@ impl Provider {
                 }
                 let subject = subject_of(t, &map.subject)?;
                 let email = email_within(t, &map.email, allowed_domains)?;
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None, assurance: vec![] })
             }
             // The broker checked the SAML assertion; its signed token says which IdP it used.
             Kind::Saml { issuer, entity_id, alias, map, allowed_domains } => {
@@ -1439,7 +1444,7 @@ impl Provider {
                 }
                 let subject = saml::subject(&subject_of(t, &map.subject)?);
                 let email = email_within(t, &map.email, allowed_domains)?;
-                Ok(Claims { issuer: entity_id.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
+                Ok(Claims { issuer: entity_id.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None, assurance: vec![] })
             }
             // Apple's token never has the name: it is posted once, beside it (`apple::posted_name`).
             Kind::Apple { issuer, allowed_domains, .. } => {
@@ -1455,7 +1460,7 @@ impl Provider {
                         return Err(Invalid("wrong_domain"));
                     }
                 }
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: None, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: None, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None, assurance: vec![] })
             }
             Kind::GitHub { .. } | Kind::SamlSp { .. } => Err(Invalid("not_configured")),
         }

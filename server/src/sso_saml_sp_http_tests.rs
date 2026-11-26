@@ -2036,6 +2036,98 @@ async fn a_required_authn_context_keeps_out_sign_ins_without_it_before_just_in_t
     refused(Box::new(|_| {})).await;
 }
 
+// How well the IdP knows people (ADR 0328)
+
+const EPA: &str = "urn:oid:1.3.6.1.4.1.5923.1.1.1.11";
+const RAF: &str = "https://refeds.org/assurance";
+const IAP_LOW: &str = "https://refeds.org/assurance/IAP/low";
+const IAP_MEDIUM: &str = "https://refeds.org/assurance/IAP/medium";
+const ID_UNIQUE: &str = "https://refeds.org/assurance/ID/unique";
+
+#[tokio::test]
+async fn required_identity_assurance_keeps_out_people_the_idp_doesnt_vouch_for_before_just_in_time() {
+    let sp = serve_with(
+        &[("ASSURANCE", &format!("{IAP_MEDIUM},{ID_UNIQUE}")), ("AUTHN_CONTEXT", MFA), ("ALLOWED_DOMAINS", "example.com"), ("JIT_ROLE", "member"), ("SP_DISPLAY_NAME", "SuperBot")],
+        |a| a.limiter = users::Limiter::new(1000, 60_000),
+    )
+    .await;
+    let v = sp.view().await;
+    assert_eq!(v["assurance"], json!({ "required": [RAF, IAP_MEDIUM, ID_UNIQUE], "attribute": EPA }), "RAF's conformance value too");
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    assert!(md.contains(&format!(r#"<md:RequestedAttribute FriendlyName="eduPersonAssurance" Name="{EPA}" NameFormat="urn:oasis:names:tc:SAML:2.0:attrname-format:uri" isRequired="true"/>"#)), "{md}");
+
+    let mfa = |r: &mut Response| r.authn_contexts = vec![MFA.into()];
+    let refused = async |values: Vec<&str>| {
+        let (code, to, head) = sp
+            .sign_in(move |r| {
+                mfa(r);
+                if !values.is_empty() {
+                    r.multi_attributes = vec![(EPA.into(), values.iter().map(|v| v.to_string()).collect())];
+                }
+            })
+            .await;
+        assert_eq!((code, to.as_str()), (303, "/login?error=sso_assurance_required"));
+        assert_eq!(signed_in_as(sp.port, &head).await, None);
+        let f = sp.last_failure().await;
+        assert_eq!((f["reason"].as_str(), f["subject"].as_str()), (Some("assurance"), Some(STORED)));
+        f
+    };
+    let f = refused(vec![]).await;
+    assert_eq!((&f["assurance"], &f["assuranceMissing"]), (&json!([]), &json!([RAF, IAP_MEDIUM, ID_UNIQUE])), "none sent, all missing");
+    let f = refused(vec![RAF, IAP_LOW, ID_UNIQUE]).await;
+    assert_eq!((&f["assurance"], &f["assuranceMissing"]), (&json!([RAF, IAP_LOW, ID_UNIQUE]), &json!([IAP_MEDIUM])), "says what the IdP sent and what it lacked");
+    let f = refused(vec![IAP_LOW, IAP_MEDIUM, ID_UNIQUE]).await;
+    assert_eq!(f["assuranceMissing"], json!([RAF]), "not a RAF claim without RAF's own value");
+    // Another attribute's values don't count.
+    let (_, to, _) = sp.sign_in(|r| {
+        mfa(r);
+        r.multi_attributes = vec![("eduPersonAssurance".into(), vec![RAF.into(), IAP_MEDIUM.into(), ID_UNIQUE.into()])];
+    })
+    .await;
+    assert_eq!(to, "/login?error=sso_assurance_required");
+    // Changed after signing: never read.
+    let (request, relay, cookie) = sp.start().await;
+    let mut r = Response::new(&sp.acs(), &sp.entity(), &request, db::now());
+    mfa(&mut r);
+    r.multi_attributes = vec![(EPA.into(), vec![RAF.into(), IAP_LOW.into(), ID_UNIQUE.into()])];
+    let forged = r.xml_with(|a| a.replace(IAP_LOW, IAP_MEDIUM));
+    let (_, to, _) = sp.post(Some(&STANDARD.encode(forged)), Some(&relay), &cookie).await;
+    assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_failed", Some("bad_signature")));
+    // MFA is still checked first, and its own refusal says so.
+    let (_, to, _) = sp.sign_in(|r| r.multi_attributes = vec![(EPA.into(), vec![RAF.into(), IAP_MEDIUM.into(), ID_UNIQUE.into()])]).await;
+    assert_eq!((to.as_str(), sp.last_failure().await["reason"].as_str()), ("/login?error=sso_mfa_required", Some("authn_context")));
+    assert!(sp.app.db.identity(IDP, STORED).is_none(), "no account made");
+
+    // Vouched for with all of it, and more: in, just in time, and recorded.
+    let all = vec![RAF.to_string(), IAP_LOW.into(), IAP_MEDIUM.into(), ID_UNIQUE.into(), "https://refeds.org/assurance/ATP/ePA-1m".into()];
+    let (code, _, head) = sp
+        .sign_in({
+            let all = all.clone();
+            move |r| {
+                mfa(r);
+                r.multi_attributes = vec![(EPA.into(), all)];
+            }
+        })
+        .await;
+    assert_eq!(code, 200, "{head}");
+    let uid = signed_in_as(sp.port, &head).await.expect("just in time, once the requirement is met");
+    assert_eq!(sp.app.db.user(&uid).unwrap().role, Role::Member);
+    let login = &sp.audit("auth.login").await[0]["details"];
+    assert_eq!((&login["assurance"], &login["authnContext"]), (&json!(all), &json!(MFA)));
+    // Checked on every sign-in, not only the first.
+    refused(vec![RAF, IAP_LOW]).await;
+}
+
+#[tokio::test]
+async fn sign_ins_without_required_assurance_read_none_and_record_none() {
+    let sp = serve(&[]).await;
+    sp.link();
+    assert_eq!(sp.view().await["assurance"], Value::Null);
+    let (code, _, _) = sp.sign_in(|r| r.multi_attributes = vec![(EPA.into(), vec![RAF.into()])]).await;
+    assert_eq!(code, 200);
+    assert_eq!(sp.audit("auth.login").await[0]["details"]["assurance"], Value::Null, "not read unless required");
+}
+
 #[tokio::test]
 async fn a_requested_authn_context_is_asked_for_and_an_idp_that_cant_meet_it_says_so() {
     let sp = serve_with(&[("AUTHN_CONTEXT", MFA), ("REQUEST_AUTHN_CONTEXT", "true"), ("SIGN_REQUESTS", "true")], |a| a.limiter = users::Limiter::new(1000, 60_000)).await;
