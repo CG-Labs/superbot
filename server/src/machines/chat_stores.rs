@@ -475,15 +475,21 @@ pub struct Cleared {
     pub held: Held,
 }
 
-/// Rewrites the backup at `path` without the rows of `whose`, under the same key: copied
-/// beside it, cleared, checked and renamed over it, so a crash leaves the old file or the
-/// new one, never half of either. Left as it is when it holds none of them. What it took out.
-fn clear_backup(path: &Path, whose: &crate::db::Whose, key: Option<&DbKey>) -> Result<Held, String> {
+/// Rewrites the backup at `path` without the rows of `whose`, and without the audit events'
+/// details the store doesn't hold any more (`audit_held`, ADR 0321), under the same key:
+/// copied beside it, cleared, checked and renamed over it, so a crash leaves the old file or
+/// the new one, never half of either. Left as it is when it holds none of them. What it took out.
+fn clear_backup(path: &Path, whose: &crate::db::Whose, audit_held: &str, key: Option<&DbKey>) -> Result<Held, String> {
     let db = |e: rusqlite::Error| format!("clearing {}: {e}", path.display());
     fn io(p: &Path) -> impl Fn(std::io::Error) -> String + '_ {
         move |e| format!("{}: {e}", p.display())
     }
-    let held = crate::db::held_in_copy(&database_encryption::open_read_only(path, key).map_err(db)?, whose).map_err(db)?;
+    let held = {
+        let c = database_encryption::open_read_only(path, key).map_err(db)?;
+        let mut held = crate::db::held_in_copy(&c, whose).map_err(db)?;
+        held.audit_events = crate::db::audit_left_in_copy(&c, audit_held).map_err(db)?.audit_events;
+        held
+    };
     if held.total() == 0 {
         return Ok(held);
     }
@@ -496,7 +502,7 @@ fn clear_backup(path: &Path, whose: &crate::db::Whose, key: Option<&DbKey>) -> R
         // VACUUM's working copy would otherwise go to the host's temp folder, outside the region.
         c.execute_batch("PRAGMA temp_store = MEMORY").map_err(db)?;
         c.query_row("PRAGMA journal_mode = MEMORY", [], |_| Ok(())).map_err(db)?;
-        let dropped = crate::db::drop_from_copy(&c, whose).map_err(db)?;
+        let dropped = crate::db::drop_from_copy(&c, whose, audit_held).map_err(db)?;
         let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db)?;
         if check != "ok" {
             return Err(format!("clearing {}: the rewritten copy failed its integrity check ({check})", path.display()));
@@ -588,13 +594,20 @@ pub fn clear_backups(db: &Db) -> Vec<(String, Result<Clearing, String>)> {
             }
         };
         let whose = moves.whose();
+        let audit_held = match db.audit_ids_in(&store) {
+            Ok(h) => h,
+            Err(e) => {
+                out.push((store.region.clone(), Err(format!("{}'s chat store: {e}", store.region))));
+                continue;
+            }
+        };
         let mut done = Cleared { bots: whose.bots.len(), users: whose.users.len(), ..Cleared::default() };
         let (listed, mut failed) = match backups_to_clear(&store) {
             Ok(b) => (b, Vec::new()),
             Err(e) => (Vec::new(), vec![e]),
         };
         for (_, path) in listed {
-            match clear_backup(&path, &whose, key) {
+            match clear_backup(&path, &whose, &audit_held, key) {
                 Ok(h) if h.total() > 0 => {
                     done.backups += 1;
                     done.held.add(h);
@@ -1176,6 +1189,57 @@ mod tests {
         let f = crate::audit::Filter { actions: vec![CLEARED.into()], ..Default::default() };
         let cleared: Vec<Value> = db.audit_events(&f, 10, true).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
         assert_eq!((cleared[0]["details"]["users"].as_i64(), cleared[0]["details"]["facts"].as_i64()), (Some(1), Some(1)), "{cleared:?}");
+    }
+
+    /// An event `user` made from `ip`, about `about` if given.
+    fn acted(db: &Db, user: &str, ip: &str, about: Option<&str>) -> i64 {
+        use crate::audit::{Actor, ActorKind, Source, Who};
+        let actor = Actor { kind: ActorKind::User, id: Some(user.into()), ..Default::default() };
+        let e = Who { actor, source: Source { ip: Some(ip.into()), user_agent: None } }.event("user.updated");
+        db.try_record(&match about {
+            Some(p) => e.target("user", p),
+            None => e,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn backups_are_cleared_of_audit_details_that_followed_another_of_their_people_out_and_keep_those_still_in_the_store() {
+        let Two { t: _t, db, lon } = two();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (bea, _) = pinned_bot(&db, "bea", "gb-lon");
+        let cy = db.create_user(None, Some("cy@example.com"), "cy", crate::rbac::Role::Admin).unwrap().id;
+        let (hers, about_ada, about_bea) = ("198.51.100.210", "198.51.100.211", "198.51.100.212");
+        acted(&db, &ada, hers, None);
+        acted(&db, &cy, about_ada, Some(&ada));
+        acted(&db, &cy, about_bea, Some(&bea));
+        db.place_chats().unwrap();
+        backup_pass(&db, 7, now());
+        let dir = lon.join("backups");
+        let backed_up = |ip: &str| files_in(&dir).iter().any(|f| holds(&dir.join(f), ip));
+        assert!(backed_up(hers) && backed_up(about_ada) && backed_up(about_bea));
+
+        // Cy pinned to London too: the events about Ada and Bea are Cy's now, and stay. Ada
+        // unpinned: her own event leaves, and only it leaves the backups, though they kept
+        // Cy's event about her for her.
+        db.pin_residency(crate::db::PinOn::User, &cy, "gb-lon", "DPA-1", None).unwrap();
+        db.place_chats().unwrap();
+        db.unpin_residency(crate::db::PinOn::User, &ada).unwrap();
+        db.place_chats().unwrap();
+        let r = clear_pass(&db, now());
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].1.as_ref().unwrap().held.audit_events, 1, "{r:?}");
+        assert!(!backed_up(hers) && backed_up(about_ada) && backed_up(about_bea));
+
+        // Cy pinned to Frankfurt: both leave London, and its backups, though they kept them for Ada and Bea.
+        db.unpin_residency(crate::db::PinOn::User, &cy).unwrap();
+        db.pin_residency(crate::db::PinOn::User, &cy, "de-fra-2", "DPA-2", None).unwrap();
+        let moves = db.place_chats().unwrap();
+        assert_eq!(moves.iter().map(|m| (m.from.as_deref(), m.to.as_deref(), m.audit_events)).collect::<Vec<_>>(), vec![(Some("gb-lon"), Some("de-fra-2"), 2)]);
+        let r = clear_pass(&db, now());
+        assert_eq!(r[0].1.as_ref().unwrap().held.audit_events, 2, "{r:?}");
+        assert!(!backed_up(about_ada) && !backed_up(about_bea));
+        assert!(clear_pass(&db, now()).is_empty(), "nothing left to clear");
     }
 
     #[test]
