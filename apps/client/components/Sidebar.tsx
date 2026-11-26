@@ -4,7 +4,7 @@ import { isAdmin } from "../src/admin";
 import { workingLabel } from "../src/runQueue";
 import { canSeeServiceAccounts } from "../src/serviceAccounts";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type, useTheme } from "../src/theme";
 import { BotAvatar } from "./BotAvatar";
 
 interface Props {
@@ -49,240 +49,276 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
     canWrite,
   } = useSuperBot();
 
+  const t = useTheme();
+  const styles = useStyles();
+  const edge = t.scheme === "light" ? t.c.borderStrong : undefined;
   const primary = bots.find((b) => b.primary);
   const q = filter.toLowerCase();
   const list = bots
     .filter((b) => !b.primary && b.hidden === showHidden)
-  .filter((b) => !q || b.name.toLowerCase().includes(q) || (b.preview || "").toLowerCase().includes(q));
+    .filter((b) => !q || b.name.toLowerCase().includes(q) || (b.preview || "").toLowerCase().includes(q));
+
+  const nav = (
+    label: string,
+    onPress: () => void,
+    opts: { role?: "button" | "link"; a11yLabel?: string; hint?: string; strong?: boolean; trailing?: React.ReactNode } = {},
+  ) => (
+    <Pressable
+      style={({ pressed }) => [styles.navRow, pressed && styles.navPressed]}
+      onPress={onPress}
+      accessibilityRole={opts.role ?? "button"}
+      accessibilityLabel={opts.a11yLabel}
+      accessibilityHint={opts.hint}
+    >
+      <Text style={opts.strong ? styles.navStrong : styles.navText}>{label}</Text>
+      {opts.trailing}
+    </Pressable>
+  );
 
   return (
     <View style={[styles.sidebar, compact && styles.sidebarCompact]}>
       <View style={styles.topRow}>
+        <Text style={styles.brand} accessibilityRole="header">
+          SuperBot
+        </Text>
         {canWrite ? (
-          <Pressable style={styles.iconBtn} onPress={onNewBot}>
+          <Pressable style={({ pressed }) => [styles.iconBtn, pressed && styles.navPressed]} onPress={onNewBot} accessibilityRole="button" accessibilityLabel="New Bot">
             <Text style={styles.iconText}>+</Text>
           </Pressable>
         ) : null}
-        <Pressable style={styles.iconBtn} onPress={onLogout}>
+        <Pressable style={({ pressed }) => [styles.iconBtn, pressed && styles.navPressed]} onPress={onLogout} accessibilityRole="button" accessibilityLabel="Sign out">
           <Text style={styles.iconText}>⎋</Text>
         </Pressable>
       </View>
       <TextInput
         style={styles.search}
         placeholder="Search bots"
-        placeholderTextColor={colors.textFaint}
+        placeholderTextColor={t.c.textFaint}
         value={filter}
         onChangeText={setFilter}
+        accessibilityLabel="Search bots"
       />
-      {primary ? (
-        <Pressable
-          style={[styles.primary, activeId === primary.id && styles.active]}
-          onPress={() => onSelectBot(primary.id)}
-        >
-          <BotAvatar color={primary.color} shape={primary.shape} size={72} />
-          <Text style={styles.primaryName}>{primary.name}</Text>
-          {handoffs[primary.id] ? <Text style={styles.needsYou}>Needs you</Text> : null}
-          {primary.unread && activeId !== primary.id ? <View style={styles.dot} /> : null}
-        </Pressable>
-      ) : null}
-      <ScrollView style={styles.list} contentContainerStyle={{ gap: 2 }}>
-        {list.map((b) => (
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollInner}>
+        {primary ? (
           <Pressable
-            key={b.id}
-            style={[styles.row, activeId === b.id && styles.active]}
-            onPress={() => onSelectBot(b.id)}
+            style={({ pressed }) => [styles.primary, activeId === primary.id && styles.primaryActive, pressed && styles.navPressed]}
+            onPress={() => onSelectBot(primary.id)}
           >
-            <BotAvatar color={b.color} shape={b.shape} size={44} />
+            <BotAvatar color={primary.color} shape={primary.shape} size={56} outline={edge} />
             <View style={styles.meta}>
-              <Text style={styles.name} numberOfLines={1}>
-                {b.name}
+              <Text style={styles.primaryName} numberOfLines={1}>
+                {primary.name}
               </Text>
-              {handoffs[b.id] ? (
-                <Text style={styles.needsYou} numberOfLines={1}>
-                  Needs you on its screen
-                </Text>
-              ) : (
-                <Text style={styles.preview} numberOfLines={1}>
-                  {b.working ? `${workingLabel(b)}…` : b.preview || ""}
-                </Text>
-              )}
+              {handoffs[primary.id] ? <Text style={styles.needsYou}>Needs you</Text> : null}
             </View>
-            {b.unread && activeId !== b.id ? <View style={styles.dot} /> : null}
+            {primary.unread && activeId !== primary.id ? <View style={styles.dot} /> : null}
           </Pressable>
-        ))}
-        {!list.length ? (
-          <Text style={styles.empty}>{showHidden ? "No hidden bots" : "No bots yet"}</Text>
+        ) : null}
+        <View style={styles.list}>
+          {list.map((b) => (
+            <Pressable
+              key={b.id}
+              style={({ pressed }) => [styles.row, activeId === b.id && styles.active, pressed && styles.navPressed]}
+              onPress={() => onSelectBot(b.id)}
+            >
+              <BotAvatar color={b.color} shape={b.shape} size={40} outline={edge} />
+              <View style={styles.meta}>
+                <Text style={[styles.name, b.unread && activeId !== b.id && styles.nameUnread]} numberOfLines={1}>
+                  {b.name}
+                </Text>
+                {handoffs[b.id] ? (
+                  <Text style={styles.needsYou} numberOfLines={1}>
+                    Needs you on its screen
+                  </Text>
+                ) : (
+                  <Text style={styles.preview} numberOfLines={1}>
+                    {b.working ? `${workingLabel(b)}…` : b.preview || ""}
+                  </Text>
+                )}
+              </View>
+              {b.unread && activeId !== b.id ? <View style={styles.dot} /> : null}
+            </Pressable>
+          ))}
+          {!list.length ? (
+            <Text style={styles.empty}>{showHidden ? "No hidden bots" : "No bots yet"}</Text>
+          ) : null}
+        </View>
+        <View style={styles.divider} />
+        {nav(showHidden ? "Back to bots" : "Hidden bots", () => setShowHidden(!showHidden))}
+        {nav("Approvals", onOpenApprovals, {
+          strong: approvals.length > 0,
+          trailing: approvals.length ? (
+            <View style={styles.badge}>
+              <Text style={styles.badgeText}>{approvals.length}</Text>
+            </View>
+          ) : null,
+        })}
+        {onOpenPlan ? nav("Plan", onOpenPlan) : null}
+        {onOpenSecrets ? nav("Your secrets", onOpenSecrets) : null}
+        {onOpenTeam ? nav("Team", onOpenTeam) : null}
+        {onOpenSettings ? nav("Settings", onOpenSettings) : null}
+        {isAdmin(me) ? (
+          <>
+            <Text style={styles.section}>Admin</Text>
+            {onOpenSetup
+              ? nav("Finish server setup ↗", onOpenSetup, {
+                  role: "link",
+                  a11yLabel: "Finish server setup",
+                  hint: "Opens the setup wizard in the server's admin console",
+                  strong: true,
+                })
+              : null}
+            {onOpenUsers ? nav("Users", onOpenUsers) : null}
+            {onOpenRoles ? nav("Roles", onOpenRoles) : null}
+            {onOpenServiceAccounts ? nav("Service accounts", onOpenServiceAccounts) : null}
+            {onOpenAudit ? nav("Audit log", onOpenAudit) : null}
+            {onOpenAccessReview ? nav("Access review", onOpenAccessReview) : null}
+            {onOpenConsole
+              ? nav("Admin console ↗", onOpenConsole, {
+                  role: "link",
+                  a11yLabel: "Admin console",
+                  hint: "Opens the server's admin console in the browser",
+                })
+              : null}
+          </>
+        ) : onOpenServiceAccounts && canSeeServiceAccounts(me) ? (
+          nav("Your service accounts", onOpenServiceAccounts)
         ) : null}
       </ScrollView>
-      <Pressable style={styles.hiddenBtn} onPress={() => setShowHidden(!showHidden)}>
-        <Text style={styles.hiddenText}>{showHidden ? "Back to bots" : "Hidden bots"}</Text>
-      </Pressable>
-      <Pressable style={styles.approvalsBtn} onPress={onOpenApprovals}>
-        <Text style={approvals.length ? styles.approvalsWaiting : styles.hiddenText}>Approvals</Text>
-        {approvals.length ? (
-          <View style={styles.badge}>
-            <Text style={styles.badgeText}>{approvals.length}</Text>
-          </View>
-        ) : null}
-      </Pressable>
-      {onOpenPlan ? (
-        <Pressable style={styles.approvalsBtn} onPress={onOpenPlan} accessibilityRole="button">
-          <Text style={styles.hiddenText}>Plan</Text>
-        </Pressable>
-      ) : null}
-      {onOpenSecrets ? (
-        <Pressable style={styles.approvalsBtn} onPress={onOpenSecrets} accessibilityRole="button">
-          <Text style={styles.hiddenText}>Your secrets</Text>
-        </Pressable>
-      ) : null}
-      {onOpenTeam ? (
-        <Pressable style={styles.approvalsBtn} onPress={onOpenTeam} accessibilityRole="button">
-          <Text style={styles.hiddenText}>Team</Text>
-        </Pressable>
-      ) : null}
-      {onOpenSettings ? (
-        <Pressable style={styles.approvalsBtn} onPress={onOpenSettings} accessibilityRole="button">
-          <Text style={styles.hiddenText}>Settings</Text>
-        </Pressable>
-      ) : null}
-      {isAdmin(me) ? (
-        <>
-          {onOpenSetup ? (
-            <Pressable
-              style={styles.approvalsBtn}
-              onPress={onOpenSetup}
-              accessibilityRole="link"
-              accessibilityLabel="Finish server setup"
-              accessibilityHint="Opens the setup wizard in the server's admin console"
-            >
-              <Text style={styles.approvalsWaiting}>Finish server setup ↗</Text>
-            </Pressable>
-          ) : null}
-          {onOpenUsers ? (
-            <Pressable style={styles.approvalsBtn} onPress={onOpenUsers} accessibilityRole="button">
-              <Text style={styles.hiddenText}>Users</Text>
-            </Pressable>
-          ) : null}
-          {onOpenRoles ? (
-            <Pressable style={styles.approvalsBtn} onPress={onOpenRoles} accessibilityRole="button">
-              <Text style={styles.hiddenText}>Roles</Text>
-            </Pressable>
-          ) : null}
-          {onOpenServiceAccounts ? (
-            <Pressable style={styles.approvalsBtn} onPress={onOpenServiceAccounts} accessibilityRole="button">
-              <Text style={styles.hiddenText}>Service accounts</Text>
-            </Pressable>
-          ) : null}
-          {onOpenAudit ? (
-            <Pressable style={styles.approvalsBtn} onPress={onOpenAudit} accessibilityRole="button">
-              <Text style={styles.hiddenText}>Audit log</Text>
-            </Pressable>
-          ) : null}
-          {onOpenAccessReview ? (
-            <Pressable style={styles.approvalsBtn} onPress={onOpenAccessReview} accessibilityRole="button">
-              <Text style={styles.hiddenText}>Access review</Text>
-            </Pressable>
-          ) : null}
-          {onOpenConsole ? (
-            <Pressable
-              style={styles.approvalsBtn}
-              onPress={onOpenConsole}
-              accessibilityRole="link"
-              accessibilityLabel="Admin console"
-              accessibilityHint="Opens the server's admin console in the browser"
-            >
-              <Text style={styles.hiddenText}>Admin console ↗</Text>
-            </Pressable>
-          ) : null}
-        </>
-      ) : onOpenServiceAccounts && canSeeServiceAccounts(me) ? (
-        <Pressable style={styles.approvalsBtn} onPress={onOpenServiceAccounts} accessibilityRole="button">
-          <Text style={styles.hiddenText}>Your service accounts</Text>
-        </Pressable>
-      ) : null}
       <View style={styles.meRow}>
         <View style={styles.meAvatar}>
           <Text style={styles.meInitial}>{(me.name || "?")[0]?.toUpperCase()}</Text>
         </View>
-        <Text style={styles.meName}>{me.name || "You"}</Text>
+        <Text style={styles.meName} numberOfLines={1}>
+          {me.name || "You"}
+        </Text>
       </View>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  sidebar: {
-    width: 320,
-    maxWidth: "100%",
-    backgroundColor: colors.bgSidebar,
-    borderRightWidth: 1,
-    borderRightColor: colors.border,
-    padding: 12,
-    flex: 1,
-  },
-  sidebarCompact: { width: "100%", borderRightWidth: 0 },
-  topRow: { flexDirection: "row", justifyContent: "flex-end", gap: 8 },
-  iconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: colors.bgHover,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  iconText: { color: colors.text, fontSize: 22, lineHeight: 24 },
-  search: {
-    marginTop: 10,
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-  },
-  primary: {
-    alignItems: "center",
-    marginVertical: 16,
-    padding: 8,
-    borderRadius: 14,
-  },
-  primaryName: { color: colors.text, marginTop: 8, fontSize: 15 },
-  list: { flex: 1 },
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    padding: 10,
-    borderRadius: 14,
-  },
-  active: { backgroundColor: colors.bgActive },
-  meta: { flex: 1, minWidth: 0 },
-  name: { color: "#f0f0f0", fontSize: 16 },
-  preview: { color: colors.textDim, fontSize: 14 },
-  needsYou: { color: colors.blueDot, fontSize: 14, fontWeight: "600" },
-  dot: {
-    width: 9,
-    height: 9,
-    borderRadius: 5,
-    backgroundColor: colors.blueDot,
-  },
-  empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
-  hiddenBtn: { paddingVertical: 10 },
-  hiddenText: { color: colors.textDim },
-  approvalsBtn: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 },
-  approvalsWaiting: { color: colors.text },
-  badge: { backgroundColor: colors.danger, borderRadius: 999, minWidth: 22, paddingHorizontal: 7, alignItems: "center" },
-  badgeText: { color: "#fff", fontSize: 13, lineHeight: 22 },
-  meRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingTop: 8 },
-  meAvatar: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: colors.bgActive,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  meInitial: { color: colors.text, fontWeight: "600" },
-  meName: { color: colors.textDim },
-});
+const useStyles = themedStyles((t) =>
+  StyleSheet.create({
+    sidebar: {
+      width: t.layout.sidebar,
+      maxWidth: "100%",
+      backgroundColor: t.c.surface,
+      borderRightWidth: hairline,
+      borderRightColor: t.c.border,
+      paddingHorizontal: t.space.md,
+      paddingTop: t.space.md,
+      flex: 1,
+    },
+    sidebarCompact: { width: "100%", borderRightWidth: 0, backgroundColor: t.c.bg },
+    topRow: { flexDirection: "row", alignItems: "center", gap: t.space.xs, paddingLeft: t.space.sm },
+    brand: { flex: 1, color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold, letterSpacing: -0.2 },
+    iconBtn: {
+      width: 36,
+      height: 36,
+      borderRadius: t.radius.pill,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    iconText: { color: t.c.textMuted, fontSize: 20, lineHeight: 22 },
+    search: {
+      marginTop: t.space.md,
+      marginBottom: t.space.sm,
+      backgroundColor: t.c.raised,
+      borderRadius: t.radius.pill,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      paddingHorizontal: t.space.lg,
+      paddingVertical: t.space.sm,
+      color: t.c.text,
+      ...type(t, "md"),
+    },
+    scroll: { flex: 1, marginHorizontal: -t.space.xs },
+    scrollInner: { paddingHorizontal: t.space.xs, paddingBottom: t.space.lg },
+    primary: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: t.space.md,
+      marginTop: t.space.sm,
+      marginBottom: t.space.md,
+      padding: t.space.md,
+      borderRadius: t.radius.lg,
+      backgroundColor: t.c.raised,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      boxShadow: t.shadow.card,
+    },
+    primaryActive: { borderColor: t.c.accentBorder },
+    primaryName: { color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold },
+    list: { gap: t.space.xxs },
+    row: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: t.space.md,
+      paddingHorizontal: t.space.sm,
+      paddingVertical: t.space.sm,
+      borderRadius: t.radius.md,
+    },
+    active: { backgroundColor: t.c.selected },
+    meta: { flex: 1, minWidth: 0 },
+    name: { color: t.c.text, ...type(t, "md"), fontWeight: t.font.weight.medium },
+    nameUnread: { fontWeight: t.font.weight.bold },
+    preview: { color: t.c.textMuted, ...type(t, "sm") },
+    needsYou: { color: t.c.accentText, ...type(t, "sm"), fontWeight: t.font.weight.semibold },
+    dot: {
+      width: 8,
+      height: 8,
+      borderRadius: 4,
+      backgroundColor: t.c.accent,
+    },
+    empty: { color: t.c.textFaint, padding: t.space.md, textAlign: "center", ...type(t, "sm") },
+    divider: { height: hairline, backgroundColor: t.c.border, marginVertical: t.space.md, marginHorizontal: t.space.sm },
+    section: {
+      color: t.c.textFaint,
+      ...type(t, "xs"),
+      fontWeight: t.font.weight.semibold,
+      textTransform: "uppercase",
+      letterSpacing: 0.6,
+      paddingHorizontal: t.space.sm,
+      marginTop: t.space.md,
+      marginBottom: t.space.xs,
+    },
+    navRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingHorizontal: t.space.sm,
+      paddingVertical: t.space.sm,
+      borderRadius: t.radius.sm,
+    },
+    navPressed: { backgroundColor: t.c.hover },
+    navText: { color: t.c.textMuted, ...type(t, "md") },
+    navStrong: { color: t.c.text, ...type(t, "md"), fontWeight: t.font.weight.medium },
+    badge: {
+      backgroundColor: t.c.accent,
+      borderRadius: t.radius.pill,
+      minWidth: 22,
+      paddingHorizontal: 7,
+      alignItems: "center",
+    },
+    badgeText: { color: t.c.onAccent, ...type(t, "xs"), lineHeight: 20, fontWeight: t.font.weight.semibold },
+    meRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: t.space.md,
+      paddingVertical: t.space.md,
+      paddingHorizontal: t.space.sm,
+      borderTopWidth: hairline,
+      borderTopColor: t.c.border,
+    },
+    meAvatar: {
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      backgroundColor: t.c.accentSoft,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    meInitial: { color: t.c.accentText, fontWeight: t.font.weight.semibold },
+    meName: { flex: 1, color: t.c.text, ...type(t, "md"), fontWeight: t.font.weight.medium },
+  }),
+);

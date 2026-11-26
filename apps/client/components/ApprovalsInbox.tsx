@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { focusFirst } from "../src/notifications";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { colors, ThemeScope, themedStyles, type } from "../src/theme";
 import type { Approval, ApprovalScope } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 
@@ -33,6 +33,7 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
   const bot = bots.find((b) => b.id === a.botId);
   // Answering lets the Bot act, so it takes operator access to that Bot (ADR 0017).
   const canDecide = can("approve") && canOnBot(bot, "operate");
+  const styles = useCardStyles();
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -78,15 +79,15 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {canDecide ? (
       <View style={styles.actions}>
-        <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(false)} accessibilityRole="button">
+        <Pressable style={({ pressed }) => [styles.btn, pressed && styles.pressed]} disabled={busy} onPress={() => void decide(false)} accessibilityRole="button">
           <Text style={styles.btnText}>Deny</Text>
         </Pressable>
         {canRun ? (
-          <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(true, "run")} accessibilityRole="button" accessibilityHint={forRun ?? undefined}>
+          <Pressable style={({ pressed }) => [styles.btn, pressed && styles.pressed]} disabled={busy} onPress={() => void decide(true, "run")} accessibilityRole="button" accessibilityHint={forRun ?? undefined}>
             <Text style={styles.btnText}>Approve for this run</Text>
           </Pressable>
         ) : null}
-        <Pressable style={[styles.btn, styles.primary]} disabled={busy} onPress={() => void decide(true)} accessibilityRole="button">
+        <Pressable style={({ pressed }) => [styles.btn, styles.primary, pressed && styles.pressed]} disabled={busy} onPress={() => void decide(true)} accessibilityRole="button">
           <Text style={[styles.btnText, styles.primaryText]}>Approve</Text>
         </Pressable>
       </View>
@@ -117,7 +118,11 @@ export function ApprovalsInbox({ visible, onClose, onOpenPolicy, focusId }: Prop
           ) : null}
           <ScrollView contentContainerStyle={{ gap: 12 }}>
             {list.length ? (
-              list.map((a) => <ApprovalCard key={a.id} approval={a} />)
+              <ThemeScope scheme="dark">
+                {list.map((a) => (
+                  <ApprovalCard key={a.id} approval={a} />
+                ))}
+              </ThemeScope>
             ) : (
               <Text style={styles.empty}>Nothing is waiting for you.</Text>
             )}
@@ -155,34 +160,55 @@ const styles = StyleSheet.create({
   titleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   title: { color: colors.text, fontSize: 20, fontWeight: "600" },
   close: { color: colors.textDim, fontSize: 22 },
-  card: {
-    backgroundColor: colors.bgBubble,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: "#3a2f1d",
-    padding: 14,
-    gap: 8,
-  },
-  head: { flexDirection: "row", alignItems: "center", gap: 8 },
-  who: { color: colors.text, fontWeight: "500" },
-  reason: { color: colors.warning, fontSize: 16 },
-  subject: {
-    color: colors.text,
-    backgroundColor: "#151515",
-    borderRadius: 10,
-    padding: 10,
-    fontFamily: "monospace",
-    fontSize: 13,
-  },
   row: { flexDirection: "row", alignItems: "center", gap: 10 },
-  actions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 10 },
-  btn: { paddingVertical: 8, paddingHorizontal: 18, borderRadius: 999, borderWidth: 1, borderColor: "#3a3a3a" },
-  btnText: { color: colors.text, fontSize: 15 },
-  primary: { backgroundColor: "#f2f2f2", borderColor: "#f2f2f2" },
-  primaryText: { color: "#111" },
   dim: { color: colors.textDim },
   link: { color: colors.blueDot },
   faint: { color: colors.textFaint, fontSize: 13 },
-  error: { color: colors.danger },
   empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
 });
+
+const useCardStyles = themedStyles((t) =>
+  StyleSheet.create({
+    card: {
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: 0,
+      backgroundColor: t.c.raised,
+      borderRadius: t.radius.lg,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      borderLeftWidth: 3,
+      borderLeftColor: t.c.warning,
+      padding: t.space.lg,
+      gap: t.space.sm,
+      boxShadow: t.shadow.card,
+    },
+    head: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
+    who: { color: t.c.text, fontWeight: t.font.weight.semibold },
+    reason: { color: t.c.warning, ...type(t, "md"), fontWeight: t.font.weight.medium },
+    subject: {
+      color: t.c.text,
+      backgroundColor: t.c.codeBg,
+      borderRadius: t.radius.md,
+      padding: t.space.md,
+      fontFamily: t.font.mono,
+      fontSize: t.font.size.sm,
+    },
+    row: { flexDirection: "row", alignItems: "center", gap: t.space.md },
+    actions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: t.space.sm },
+    btn: {
+      paddingVertical: t.space.sm,
+      paddingHorizontal: t.space.lg + 2,
+      borderRadius: t.radius.pill,
+      borderWidth: 1,
+      borderColor: t.c.borderStrong,
+    },
+    btnText: { color: t.c.text, ...type(t, "md") },
+    primary: { backgroundColor: t.c.accent, borderColor: t.c.accent },
+    primaryText: { color: t.c.onAccent, fontWeight: t.font.weight.semibold },
+    pressed: { opacity: 0.7 },
+    dim: { color: t.c.textMuted },
+    faint: { color: t.c.textFaint, ...type(t, "sm") },
+    error: { color: t.c.danger },
+  }),
+);

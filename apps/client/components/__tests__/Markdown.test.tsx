@@ -1,7 +1,10 @@
 import React from "react";
 import { Linking } from "react-native";
 import { fireEvent, render, screen } from "@testing-library/react-native";
+import { themes } from "../../src/theme";
 import { Markdown } from "../Markdown";
+
+const mono = { fontFamily: themes.light.font.mono };
 
 describe("Markdown", () => {
   let open: jest.SpyInstance;
@@ -16,19 +19,19 @@ describe("Markdown", () => {
     expect(screen.getByText("bold")).toHaveStyle({ fontWeight: "700" });
     expect(screen.getByText("italic")).toHaveStyle({ fontStyle: "italic" });
     expect(screen.getByText("gone")).toHaveStyle({ textDecorationLine: "line-through" });
-    expect(screen.getByText("npm test")).toHaveStyle({ fontFamily: "monospace" });
+    expect(screen.getByText("npm test")).toHaveStyle(mono);
     expect(screen.getByText(/npm test & more next line$/)).toBeOnTheScreen();
   });
 
   it("keeps character references in inline code as written", async () => {
     await render(<Markdown>{"Use `&lt;div&gt;` for &lt;div&gt;"}</Markdown>);
-    expect(screen.getByText("&lt;div&gt;")).toHaveStyle({ fontFamily: "monospace" });
+    expect(screen.getByText("&lt;div&gt;")).toHaveStyle(mono);
     expect(screen.getByText(/for <div>$/)).toBeOnTheScreen();
   });
 
   it("renders fenced code verbatim", async () => {
     await render(<Markdown>{"```ts\nconst a = 1 < 2 && **b**;\n```"}</Markdown>);
-    expect(screen.getByText("const a = 1 < 2 && **b**;")).toHaveStyle({ fontFamily: "monospace" });
+    expect(screen.getByText("const a = 1 < 2 && **b**;")).toHaveStyle(mono);
   });
 
   it("renders bulleted, numbered, nested and task lists", async () => {

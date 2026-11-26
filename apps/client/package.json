@@ -67,7 +67,10 @@
     "test": "jest",
     "brand": "node scripts/brand.mjs",
     "brand:check": "node scripts/brand.mjs --check",
-    "brand:test": "node --test scripts/brand.test.mjs"
+    "brand:test": "node --test scripts/brand.test.mjs",
+    "tokens": "node scripts/tokens.mjs",
+    "tokens:check": "node scripts/tokens.mjs --check",
+    "tokens:test": "node --test scripts/tokens.test.mjs"
   },
   "build": {
     "appId": "com.cglabs.superbot",
