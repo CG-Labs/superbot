@@ -93,11 +93,11 @@ botd doesn't wait for the next check to say the score fell ([ADR 0307](../adr/03
 
 - **the band fell**: healthy to watch or at risk, or watch to at risk;
 - **a signal went at risk** that wasn't the day before, with what botd saw and the signal's section of this page;
-- **the score fell 10 points or more below the last [health check](health-check.md)'s**, on the day it crossed.
+- **the score fell 10 points or more below the last [health check](health-check.md)'s**, on the day it crossed (a day recorded before the check doesn't count: it can't have told of a fall from it).
 
 The notice goes to the global email list and webhook of [approval notifications](../../deploy/README.md#approval-notifications), where botd's other alerts go, with a link to the console's Support tab. Each is recorded as `support.health_score_fell` (both days' scores and bands, the signals newly at risk, the check's score), so `botctl audit --action support.health_score_fell` lists them. Recovery isn't told. Alerts need the [history](#history): with `HEALTH_SCORE_HISTORY_DAYS=0` there's nothing to compare with. A customer's admin who gets one forwards it to their TAM, and the TAM calls before the next check-in ([TAM programme](tam.md#cadence)).
 
-For Prometheus, `/metrics` shows the newest recorded day: `superbot_health_score`, `superbot_health_score_band{band}` (1 for its band), `superbot_health_signal_at_risk{signal}` and `superbot_health_score_recorded_timestamp_seconds`. [`superbot-health-score.rules.yml`](../../deploy/prometheus/superbot-health-score.rules.yml) turns them into tickets, never pages: the band at risk, a signal at risk, a fall of 10 points or more below the week's highest score, and no new record for 36 hours. A Provider that scrapes its customers' servers routes these to each customer's TAM.
+For Prometheus, `/metrics` shows the newest recorded day: `superbot_health_score`, `superbot_health_score_band{band}` (1 for its band), `superbot_health_signal_at_risk{signal}` and `superbot_health_score_recorded_timestamp_seconds` (0 while botd records but has no day it can read, so a history that never records is alerted on too). [`superbot-health-score.rules.yml`](../../deploy/prometheus/superbot-health-score.rules.yml) turns them into tickets, never pages: the band at risk, a signal at risk, a fall of 10 points or more below the week's highest score, and no new record for 36 hours. A Provider that scrapes its customers' servers routes these to each customer's TAM.
 
 ## What it isn't
 

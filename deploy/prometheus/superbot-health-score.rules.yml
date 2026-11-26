@@ -43,7 +43,8 @@ groups:
           description: "The 30-day health score is {{ $value }} points below its highest in the last 7 days. botctl health-score history shows which signals got worse; raise it at the next check-in, sooner for a signal at risk."
 
       # botd records the score within the first hours of each UTC day: none for 36 hours means
-      # recording stopped (a full disk, a broken database), and the other rules see old news.
+      # recording stopped or never worked (a full disk, a broken database; botd shows 0 while it
+      # has no day it can read), and the other rules see old news.
       - alert: SuperBotHealthScoreNotRecorded
         expr: time() - max by (job, instance) (superbot_health_score_recorded_timestamp_seconds{job="superbot"}) > 36 * 3600
         for: 1h

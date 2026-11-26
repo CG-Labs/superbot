@@ -108,3 +108,17 @@ tests:
             exp_annotations:
               summary: botd hasn't recorded the health score for over a day
               description: "The newest recorded health score is more than 36 hours old. botd's log says why (Health score history: couldn't record today's score); check the disk, and run botd support check."
+
+  # HEALTH_SCORE_HISTORY_DAYS=0: botd writes none of the series, and nothing fires. (While it
+  # records, botd writes a timestamp of 0 when it has no day it can read, as above.)
+  - interval: 1m
+    input_series:
+      - series: 'superbot_build_info{job="superbot",instance="a:8080",version="0.1.0"}'
+        values: '1x3000'
+    alert_rule_test:
+      - eval_time: 49h
+        alertname: SuperBotHealthScoreNotRecorded
+        exp_alerts: []
+      - eval_time: 49h
+        alertname: SuperBotHealthScoreAtRisk
+        exp_alerts: []

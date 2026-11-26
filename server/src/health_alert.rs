@@ -43,7 +43,7 @@ pub struct Fall {
     /// botd saw.
     pub at_risk: Vec<(&'static str, &'static str, String)>,
     /// The last health check's score, when the score is now `FALL_POINTS` below it and
-    /// wasn't the day before.
+    /// wasn't on a day recorded since the check.
     pub below_check: Option<u32>,
 }
 
@@ -63,8 +63,9 @@ fn statuses(d: &HealthScoreDay) -> BTreeMap<String, String> {
 }
 
 /// How `today` (a health score report, recorded on `day`) compares with `before`, the day
-/// recorded before it. None when nothing got worse in a way the playbook acts on.
-pub fn fall(before: &HealthScoreDay, today: &Value, day: &str, last_check: Option<u32>) -> Option<Fall> {
+/// recorded before it, and with the last health check's score and time. None when nothing
+/// got worse in a way the playbook acts on.
+pub fn fall(before: &HealthScoreDay, today: &Value, day: &str, last_check: Option<(u32, i64)>) -> Option<Fall> {
     let score = today["score"].as_u64().and_then(|s| u32::try_from(s).ok());
     let band = today["band"].as_str().unwrap_or("unknown").to_string();
     let band_fell = matches!((rank(&before.band), rank(&band)), (Some(a), Some(b)) if b > a);
@@ -78,7 +79,8 @@ pub fn fall(before: &HealthScoreDay, today: &Value, day: &str, last_check: Optio
         })
         .collect::<Vec<_>>();
     let below = |s: Option<u32>, c: u32| s.is_some_and(|s| s + FALL_POINTS <= c);
-    let below_check = last_check.filter(|c| below(score, *c) && !below(before.score, *c));
+    // A day recorded before the check can't have told of a fall measured from it.
+    let below_check = last_check.filter(|&(c, at)| below(score, c) && !(before.at >= at && below(before.score, c))).map(|(c, _)| c);
     (band_fell || !at_risk.is_empty() || below_check.is_some()).then(|| Fall {
         from_day: before.day.clone(),
         day: day.to_string(),
@@ -131,10 +133,11 @@ impl Fall {
     }
 }
 
-/// The score the last monthly health check recorded, if any.
-pub fn last_check(app: &App) -> Option<u32> {
+/// The score the last monthly health check recorded, and when, if any.
+pub fn last_check(app: &App) -> Option<(u32, i64)> {
     let f = Filter { actions: vec![crate::health_check::CHECKED.into()], ..Default::default() };
-    app.db.audit_events(&f, 1, false).into_iter().next().and_then(|e| e.details["score"].as_u64()).and_then(|s| u32::try_from(s).ok())
+    let e = app.db.audit_events(&f, 1, false).into_iter().next()?;
+    Some((u32::try_from(e.details["score"].as_u64()?).ok()?, e.at))
 }
 
 /// Called once today's score is recorded: records what fell since `before`, the day
@@ -145,14 +148,16 @@ pub fn watch(app: &App, before: Option<&HealthScoreDay>, today: &Value, day: &st
     Some(f.alert())
 }
 
-/// The gauges `/metrics` shows from the newest recorded day, while botd records them.
+/// The gauges `/metrics` shows from the newest recorded day, while botd records them. With
+/// no day it can read, the timestamp is 0, so a history that never records is alerted on.
 pub fn render(app: &App, out: &mut String) {
     if !crate::health_history::recording() {
         return;
     }
-    let Some(d) = app.db.health_scores_newest(1).ok().and_then(|v| v.into_iter().next()) else { return };
-    metrics::family(out, "superbot_health_score_recorded_timestamp_seconds", "gauge", "When botd recorded the newest day's health score (ADR 0157).");
-    metrics::sample(out, "superbot_health_score_recorded_timestamp_seconds", &[], d.at as f64 / 1000.0);
+    let newest = app.db.health_scores_newest(1).ok().and_then(|v| v.into_iter().next());
+    metrics::family(out, "superbot_health_score_recorded_timestamp_seconds", "gauge", "When botd recorded the newest day's health score (ADR 0157); 0 when it has none it can read.");
+    metrics::sample(out, "superbot_health_score_recorded_timestamp_seconds", &[], newest.as_ref().map_or(0.0, |d| d.at as f64 / 1000.0));
+    let Some(d) = newest else { return };
     if let Some(s) = d.score {
         metrics::family(out, "superbot_health_score", "gauge", "The newest recorded 30-day customer health score, 0 to 100 (ADR 0144).");
         metrics::sample(out, "superbot_health_score", &[], f64::from(s));
@@ -190,7 +195,7 @@ mod tests {
     fn nothing_worse_is_no_fall() {
         let before = day(Some(85), "healthy", &OK);
         assert_eq!(fall(&before, &report(Some(85), "healthy", &[("adoption", "ok", ""), ("backups", "ok", "")]), "2026-11-26", None), None);
-        assert_eq!(fall(&before, &report(Some(81), "healthy", &[("adoption", "watch", "")]), "2026-11-26", Some(85)), None, "4 points, still healthy");
+        assert_eq!(fall(&before, &report(Some(81), "healthy", &[("adoption", "watch", "")]), "2026-11-26", Some((85, 0))), None, "4 points, still healthy");
         let risky = day(Some(60), "watch", &[("backups", "risk")]);
         assert_eq!(fall(&risky, &report(Some(55), "watch", &[("backups", "risk", "")]), "2026-11-26", None), None, "at risk yesterday too: told then");
         assert_eq!(fall(&day(Some(40), "at_risk", &OK), &report(Some(70), "watch", &[]), "2026-11-26", None), None, "better");
@@ -232,19 +237,21 @@ mod tests {
     #[test]
     fn a_fall_below_the_last_check_is_told_on_the_day_it_crosses() {
         let today = report(Some(72), "watch", &[]);
-        let f = fall(&day(Some(78), "watch", &[]), &today, "2026-11-26", Some(82)).unwrap();
+        let f = fall(&day(Some(78), "watch", &[]), &today, "2026-11-26", Some((82, 0))).unwrap();
         assert_eq!((f.below_check, f.band_fell), (Some(82), false));
         assert!(f.alert().lines.contains(&"10 points or more below the last health check's 82.".to_string()));
-        assert_eq!(fall(&day(Some(71), "watch", &[]), &today, "2026-11-26", Some(82)), None, "already 10 below yesterday");
-        assert_eq!(fall(&day(Some(78), "watch", &[]), &today, "2026-11-26", Some(81)), None, "9 below");
+        assert_eq!(fall(&day(Some(71), "watch", &[]), &today, "2026-11-26", Some((82, 0))), None, "already 10 below yesterday, after the check");
+        assert_eq!(fall(&day(Some(78), "watch", &[]), &today, "2026-11-26", Some((81, 0))), None, "9 below");
         assert_eq!(fall(&day(Some(78), "watch", &[]), &today, "2026-11-26", None), None, "no check yet");
-        assert_eq!(fall(&day(None, "unknown", &[]), &today, "2026-11-26", Some(90)).unwrap().below_check, Some(90), "from unknown");
-        assert_eq!(fall(&day(Some(78), "watch", &[]), &report(None, "unknown", &[]), "2026-11-26", Some(90)), None, "unknown isn't a fall");
+        assert_eq!(fall(&day(None, "unknown", &[]), &today, "2026-11-26", Some((90, 0))).unwrap().below_check, Some(90), "from unknown");
+        assert_eq!(fall(&day(Some(78), "watch", &[]), &report(None, "unknown", &[]), "2026-11-26", Some((90, 0))), None, "unknown isn't a fall");
+        let recovered = fall(&day(Some(68), "watch", &[]), &report(Some(68), "watch", &[]), "2026-11-26", Some((100, 1))).unwrap();
+        assert_eq!(recovered.below_check, Some(100), "yesterday was recorded before a check that saw it recover, so it told nothing");
     }
 
     #[test]
     fn the_audit_details_hold_codes_scores_and_dates_only() {
-        let f = fall(&day(Some(85), "healthy", &OK), &report(Some(40), "at_risk", &[("backups", "risk", "Server backups are past their RPO.")]), "2026-11-26", Some(88)).unwrap();
+        let f = fall(&day(Some(85), "healthy", &OK), &report(Some(40), "at_risk", &[("backups", "risk", "Server backups are past their RPO.")]), "2026-11-26", Some((88, 0))).unwrap();
         assert_eq!(
             f.audit_details(),
             json!({
@@ -260,7 +267,13 @@ mod tests {
         let app = crate::runner::test_app();
         let mut out = String::new();
         render(&app, &mut out);
-        assert!(out.is_empty(), "nothing recorded yet: {out}");
+        assert_eq!(out.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>(), ["superbot_health_score_recorded_timestamp_seconds 0"], "nothing recorded yet");
+        app.db.execute_raw("ALTER TABLE health_scores RENAME TO health_scores_gone").unwrap();
+        out.clear();
+        render(&app, &mut out);
+        assert!(out.contains("superbot_health_score_recorded_timestamp_seconds 0\n"), "unreadable: {out}");
+        app.db.execute_raw("ALTER TABLE health_scores_gone RENAME TO health_scores").unwrap();
+        out.clear();
         let today = report(Some(70), "watch", &[("backups", "risk", "")]);
         assert!(watch(&app, None, &today, "2026-11-26").is_none(), "nothing to compare with");
         let before = day(Some(90), "healthy", &[("backups", "ok")]);
