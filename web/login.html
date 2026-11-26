@@ -3,74 +3,215 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
   <title>Sign in · SuperBot</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2264%22%20height%3D%2264%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214.08%22%20fill%3D%22%23171717%22%2F%3E%3Csvg%20x%3D%223%22%20y%3D%223%22%20width%3D%2258%22%20height%3D%2258%22%20viewBox%3D%220%200%20100%20100%22%3E%0A%20%20%3Cpath%20fill%3D%22%234b8df8%22%20d%3D%22M50%208%20L52.8%2015.2%20L60%2018%20L52.8%2020.8%20L50%2028%20L47.2%2020.8%20L40%2018%20L47.2%2015.2%20Z%22%2F%3E%0A%20%20%3Crect%20x%3D%2247%22%20y%3D%2224%22%20width%3D%226%22%20height%3D%2210%22%20fill%3D%22%234b8df8%22%2F%3E%0A%20%20%3Crect%20x%3D%2214%22%20y%3D%2232%22%20width%3D%2272%22%20height%3D%2260%22%20rx%3D%2218%22%20fill%3D%22%232f72e4%22%2F%3E%0A%20%20%3Crect%20x%3D%2224%22%20y%3D%2245%22%20width%3D%2252%22%20height%3D%2232%22%20rx%3D%2216%22%20fill%3D%22%23171717%22%2F%3E%0A%20%20%3Crect%20x%3D%2236%22%20y%3D%2253%22%20width%3D%228%22%20height%3D%2216%22%20rx%3D%224%22%20fill%3D%22%23ececec%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2253%22%20width%3D%228%22%20height%3D%2216%22%20rx%3D%224%22%20fill%3D%22%23ececec%22%2F%3E%0A%3C%2Fsvg%3E%3C%2Fsvg%3E" /><!-- brand:favicon -->
   <style>
+/* tokens:start: made from apps/client/src/tokens.json by `npm run tokens`; edit that file, not this block */
+:root {
+  color-scheme: light dark;
+  --c-bg: #faf9f7;
+  --c-surface: #f3f1ed;
+  --c-raised: #ffffff;
+  --c-elevated: #ffffff;
+  --c-hover: #ebe8e3;
+  --c-selected: #e6e2dc;
+  --c-user-bubble: #efece7;
+  --c-border: #e5e1db;
+  --c-border-strong: #d3cec6;
+  --c-text: #1f1e1c;
+  --c-text-muted: #5f5c57;
+  --c-text-faint: #87837c;
+  --c-accent: #2563eb;
+  --c-accent-text: #1d4fd8;
+  --c-accent-soft: #e8effd;
+  --c-accent-border: #b9cdf8;
+  --c-on-accent: #ffffff;
+  --c-danger: #c03035;
+  --c-danger-soft: #fbeaea;
+  --c-warning: #9a5a0e;
+  --c-warning-soft: #fbf1e1;
+  --c-success: #1f7543;
+  --c-success-soft: #e5f4ea;
+  --c-code-bg: #f0ede8;
+  --c-overlay: rgba(31, 30, 28, 0.32);
+  --c-shadow: #1f1e1c;
+  --shadow-card: 0px 1px 2px rgba(31, 30, 28, 0.04), 0px 4px 16px rgba(31, 30, 28, 0.06);
+  --shadow-pop: 0px 8px 32px rgba(31, 30, 28, 0.12);
+  --space-xxs: 2px;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-xxl: 32px;
+  --space-xxxl: 48px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius-pill: 999px;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
+  --fs-xxl: 28px;
+  --lh-xs: 16px;
+  --lh-sm: 18px;
+  --lh-md: 22px;
+  --lh-lg: 24px;
+  --lh-xl: 28px;
+  --lh-xxl: 34px;
+  --motion-fast: 120ms;
+  --motion-base: 200ms;
+  --motion-slow: 320ms;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c-bg: #1b1a19;
+    --c-surface: #151413;
+    --c-raised: #252422;
+    --c-elevated: #2a2927;
+    --c-hover: #242321;
+    --c-selected: #2e2d2a;
+    --c-user-bubble: #2e2c2a;
+    --c-border: #32302d;
+    --c-border-strong: #46433f;
+    --c-text: #eceae6;
+    --c-text-muted: #aaa59d;
+    --c-text-faint: #8a857e;
+    --c-accent: #5b93f5;
+    --c-accent-text: #7aa7f7;
+    --c-accent-soft: #1d2a40;
+    --c-accent-border: #34507f;
+    --c-on-accent: #0b1220;
+    --c-danger: #f06a6e;
+    --c-danger-soft: #3a1d1e;
+    --c-warning: #e9a23b;
+    --c-warning-soft: #33281a;
+    --c-success: #4cc06a;
+    --c-success-soft: #1a2e21;
+    --c-code-bg: #121110;
+    --c-overlay: rgba(0, 0, 0, 0.6);
+    --c-shadow: #000000;
+    --shadow-card: 0px 1px 2px rgba(0, 0, 0, 0.3), 0px 4px 16px rgba(0, 0, 0, 0.24);
+    --shadow-pop: 0px 8px 32px rgba(0, 0, 0, 0.45);
+  }
+}
+/* tokens:end */
+
+    /* The sign-in frame of the app (docs/adr/0336-sign-in-on-the-design-system.md), on the same tokens (docs/adr/0341-console-sign-in-and-setup-on-the-design-system.md). */
     * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; }
+    html, body { margin: 0; }
     body {
-      background: #171717; color: #ececec; display: grid; place-items: center;
-      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", sans-serif;
+      min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: var(--space-xl);
+      background: var(--c-bg); color: var(--c-text);
+      font: var(--fs-md)/var(--lh-md) var(--font-sans);
       -webkit-font-smoothing: antialiased;
     }
-    form { width: min(360px, 92vw); display: flex; flex-direction: column; gap: 14px; }
-    h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; text-align: center; }
-    p { margin: 0; color: #9a9a9a; font-size: 14px; text-align: center; }
-    input {
-      padding: 12px 14px; border-radius: 12px; border: 1px solid #2a2a2a;
-      background: #1c1c1c; color: #ececec; font: inherit; outline: none;
-    }
-    input:focus { border-color: #4b8df8; }
-    button {
-      padding: 12px; border-radius: 12px; border: 0; background: #ececec; color: #171717;
-      font: inherit; font-weight: 600; cursor: pointer;
-    }
-    button:disabled { opacity: .6; cursor: default; }
-    .error { color: #e5484d; font-size: 14px; text-align: center; min-height: 21px; }
-    #sso { display: flex; flex-direction: column; gap: 10px; }
-    #sso a {
-      padding: 12px; border-radius: 12px; border: 1px solid #2a2a2a; background: #1c1c1c; color: #ececec;
-      font-weight: 600; text-align: center; text-decoration: none;
-    }
-    #sso a:hover { border-color: #4b8df8; }
-    #sso a[data-type="apple"] { background: #fff; border-color: #fff; color: #000; }
-    .or { display: none; align-items: center; gap: 10px; color: #6b6b6b; font-size: 13px; }
-    .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid #2a2a2a; }
     [hidden] { display: none !important; }
-    #mfa, #saved { display: flex; flex-direction: column; gap: 14px; }
-    #qr { width: 200px; height: 200px; align-self: center; border-radius: 12px; background: #fff; padding: 8px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; word-break: break-all; user-select: all; text-align: center; color: #ececec; }
-    #codes { margin: 0; padding: 12px; list-style: none; columns: 2; border: 1px solid #2a2a2a; border-radius: 12px; }
-    a.link, button.link { color: #4b8df8; background: none; padding: 0; font-weight: 400; font-size: 14px; text-align: center; text-decoration: none; }
+    .card {
+      width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: var(--space-lg);
+      padding: var(--space-xxl); border-radius: var(--radius-xl);
+      background: var(--c-raised); border: 1px solid var(--c-border); box-shadow: var(--shadow-card);
+    }
+    .head { display: flex; flex-direction: column; align-items: center; gap: var(--space-sm); margin-bottom: var(--space-sm); }
+    .mark { width: 56px; height: 56px; border-radius: var(--radius-lg); margin-bottom: var(--space-sm); }
+    h1 { margin: 0; font-size: var(--fs-xxl); line-height: var(--lh-xxl); font-weight: 600; letter-spacing: -0.01em; text-align: center; }
+    p, .hint { margin: 0; color: var(--c-text-muted); font-size: var(--fs-md); line-height: var(--lh-md); text-align: center; }
+    label.hint { font-size: var(--fs-sm); line-height: var(--lh-sm); font-weight: 500; text-align: left; }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    input {
+      width: 100%; padding: var(--space-md) 14px; border-radius: var(--radius-md); border: 1px solid var(--c-border);
+      background: var(--c-bg); color: var(--c-text); font: inherit; outline: none;
+      transition: border-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease;
+    }
+    input::placeholder { color: var(--c-text-faint); }
+    input:hover { border-color: var(--c-border-strong); }
+    input:focus { border-color: var(--c-accent); box-shadow: 0 0 0 3px var(--c-accent-soft); }
+    button, #sso a {
+      min-height: 48px; display: flex; align-items: center; justify-content: center; padding: 0 var(--space-xl);
+      border-radius: var(--radius-pill); font: inherit; font-weight: 600; text-align: center; text-decoration: none; cursor: pointer;
+      transition: background var(--motion-fast) ease, border-color var(--motion-fast) ease, opacity var(--motion-fast) ease;
+    }
+    button:focus-visible, #sso a:focus-visible, a.link:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 2px; }
+    #go { border: 0; background: var(--c-accent); color: var(--c-on-accent); }
+    #go:hover { filter: brightness(1.08); }
+    button:disabled, #go:disabled { opacity: .55; cursor: default; filter: none; }
+    #sso { display: flex; flex-direction: column; gap: 10px; }
+    #sso:empty { display: none; }
+    #sso a { border: 1px solid var(--c-border-strong); background: var(--c-raised); color: var(--c-text); }
+    #sso a:hover { background: var(--c-hover); }
+    /* Apple allows its button only in black or white (docs/adr/0336-sign-in-on-the-design-system.md). */
+    #sso a[data-type="apple"] { background: #000; border-color: #000; color: #fff; }
+    .or { display: none; align-items: center; gap: var(--space-md); color: var(--c-text-faint); font-size: var(--fs-sm); line-height: var(--lh-sm); }
+    .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--c-border-strong); }
+    .notice {
+      margin: 0; padding: var(--space-md) 14px; border-radius: var(--radius-md); border: 1px solid var(--c-danger);
+      background: var(--c-danger-soft); color: var(--c-danger); font-size: var(--fs-sm); line-height: var(--lh-sm); text-align: left;
+    }
+    .notice:empty { display: none; }
+    #mfa, #saved, #setup { display: flex; flex-direction: column; gap: var(--space-md); }
+    /* Authenticator apps need dark modules on light to scan, in both schemes. */
+    #qr { width: 200px; height: 200px; align-self: center; border-radius: var(--radius-md); background: #fff; padding: var(--space-sm); }
+    .mono {
+      font-family: var(--font-mono); font-size: var(--fs-sm); line-height: var(--lh-sm); word-break: break-all; user-select: all;
+      color: var(--c-text); background: var(--c-code-bg); border: 1px solid var(--c-border); border-radius: var(--radius-md);
+    }
+    #key { padding: var(--space-md); text-align: center; }
+    #codes { margin: 0; padding: var(--space-md) var(--space-lg); list-style: none; columns: 2; text-align: center; }
+    a.link, button.link {
+      min-height: 0; align-self: center; padding: var(--space-xs) var(--space-md); border: 0; border-radius: var(--radius-pill);
+      background: none; color: var(--c-accent-text); font-size: var(--fs-sm); font-weight: 500; cursor: pointer;
+    }
+    a.link:hover, button.link:hover { background: var(--c-hover); }
+    @media (prefers-color-scheme: dark) {
+      #sso a[data-type="apple"] { background: #fff; border-color: #fff; color: #000; }
+    }
+    /* A phone's whole screen is the card. */
+    @media (max-width: 520px) {
+      body { padding: var(--space-lg); place-items: start center; }
+      .card { padding: var(--space-sm); border: 0; border-radius: 0; background: none; box-shadow: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; }
+    }
   </style>
 </head>
 <body>
-  <form id="form" autocomplete="on">
-    <h1>SuperBot</h1>
+  <form id="form" class="card" autocomplete="on">
+    <div class="head">
+      <img class="mark" alt="" src="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2264%22%20height%3D%2264%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214.08%22%20fill%3D%22%23171717%22%2F%3E%3Csvg%20x%3D%223%22%20y%3D%223%22%20width%3D%2258%22%20height%3D%2258%22%20viewBox%3D%220%200%20100%20100%22%3E%0A%20%20%3Cpath%20fill%3D%22%234b8df8%22%20d%3D%22M50%208%20L52.8%2015.2%20L60%2018%20L52.8%2020.8%20L50%2028%20L47.2%2020.8%20L40%2018%20L47.2%2015.2%20Z%22%2F%3E%0A%20%20%3Crect%20x%3D%2247%22%20y%3D%2224%22%20width%3D%226%22%20height%3D%2210%22%20fill%3D%22%234b8df8%22%2F%3E%0A%20%20%3Crect%20x%3D%2214%22%20y%3D%2232%22%20width%3D%2272%22%20height%3D%2260%22%20rx%3D%2218%22%20fill%3D%22%232f72e4%22%2F%3E%0A%20%20%3Crect%20x%3D%2224%22%20y%3D%2245%22%20width%3D%2252%22%20height%3D%2232%22%20rx%3D%2216%22%20fill%3D%22%23171717%22%2F%3E%0A%20%20%3Crect%20x%3D%2236%22%20y%3D%2253%22%20width%3D%228%22%20height%3D%2216%22%20rx%3D%224%22%20fill%3D%22%23ececec%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2253%22%20width%3D%228%22%20height%3D%2216%22%20rx%3D%224%22%20fill%3D%22%23ececec%22%2F%3E%0A%3C%2Fsvg%3E%3C%2Fsvg%3E" /><!-- brand:mark -->
+      <h1 id="title">Welcome to SuperBot</h1>
+      <p id="mfa-say" hidden></p>
+    </div>
     <div id="sso"></div>
     <div class="or" id="or">or</div>
-    <div id="first">
-      <p>Enter your sign-in code, or the server password.</p>
+    <div class="field" id="first">
+      <label class="hint" for="secret">Enter your sign-in code, or the server password.</label>
+      <input id="secret" type="password" autocomplete="current-password" placeholder="Sign-in code or password" autofocus required />
     </div>
-    <input id="secret" type="password" autocomplete="current-password" placeholder="Sign-in code or password" autofocus required />
     <!-- Two-factor authentication (docs/adr/0094-totp-second-factor.md). -->
     <div id="mfa" hidden>
-      <p id="mfa-say"></p>
       <img id="qr" alt="QR code to add SuperBot to an authenticator app" hidden />
       <div id="setup" hidden>
         <p>Or enter this key in the app:</p>
         <div class="mono" id="key"></div>
         <a class="link" id="otpauth">Open in an authenticator app on this device</a>
       </div>
-      <input id="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6-digit code" />
-      <input id="recovery" autocomplete="off" placeholder="Recovery code" hidden />
+      <input id="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6-digit code" aria-label="6-digit code" />
+      <input id="recovery" autocomplete="off" placeholder="Recovery code" aria-label="Recovery code" hidden />
       <button class="link" id="use-recovery" type="button">Use a recovery code</button>
     </div>
     <div id="saved" hidden>
-      <p>Two-factor authentication is on. Save these recovery codes somewhere safe. Each works once if you lose your authenticator app. They won't be shown again.</p>
+      <p>Save these recovery codes somewhere safe. Each works once if you lose your authenticator app. They won't be shown again.</p>
       <ul class="mono" id="codes"></ul>
     </div>
+    <div class="notice" id="error" role="alert"></div>
     <button id="go" type="submit">Sign in</button>
-    <div class="error" id="error" role="alert"></div>
   </form>
   <script>
     const form = document.getElementById("form");
@@ -137,7 +278,8 @@
       enrolling = data.mfa === "enroll";
       $("first").hidden = secret.hidden = true;
       secret.required = false;
-      $("mfa").hidden = false;
+      $("title").textContent = enrolling ? "Set up two-factor authentication" : "Two-factor authentication";
+      $("mfa").hidden = $("mfa-say").hidden = false;
       $("mfa-say").textContent = data.error;
       $("use-recovery").hidden = enrolling;
       if (enrolling && data.secret) {
@@ -161,8 +303,9 @@
     }
 
     function showRecoveryCodes(codes) {
-      $("mfa").hidden = true;
+      $("mfa").hidden = $("mfa-say").hidden = true;
       $("saved").hidden = false;
+      $("title").textContent = "Two-factor authentication is on";
       $("codes").replaceChildren(...codes.map((c) => Object.assign(document.createElement("li"), { textContent: c })));
       go.textContent = "I saved them. Continue";
     }
@@ -203,9 +346,9 @@
         }
         // A spent or expired challenge: start again.
         if (challenge) setTimeout(() => location.reload(), 2500);
-        error.textContent = data.error || "Sign in failed.";
+        error.textContent = data.error || "Sign-in failed. Check your code or password, then try again.";
       } catch {
-        error.textContent = "Can't reach the server.";
+        error.textContent = "Can't reach the SuperBot server. Check your connection, then try again.";
       } finally {
         go.disabled = false;
       }

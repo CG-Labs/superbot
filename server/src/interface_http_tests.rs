@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const CONSOLE_JS: &str = include_str!("../../web/app.js");
 const CONSOLE_HTML: &str = include_str!("../../web/index.html");
+const LOGIN_HTML: &str = include_str!("../../web/login.html");
 const CLIENT_API: &str = include_str!("../../apps/client/src/api.ts");
 
 async fn location(port: u16, path: &str, auth: &str, extra: &str) -> (u16, Option<String>, String) {
@@ -338,9 +339,14 @@ async fn sign_in_health_and_the_public_site_stay_open() {
     for path in ["/console/", "/app/"] {
         assert_eq!(location(port, path, "", "").await.1.as_deref(), Some("/login"), "{path}");
     }
-    let (code, _, body) = location(port, "/login", "", "").await;
+    let (code, head, body) = call_with(port, "GET", "/login", "", "", "").await;
     assert!(code == 200 && body.contains("Sign-in code or password"), "{code}");
     assert!(body.contains("me?.landing"), "the sign-in page follows the server's landing");
+    // Its styles are its own, with the design tokens inside (ADR 0341): /console/styles.css is admins' only.
+    assert_eq!(body, LOGIN_HTML);
+    assert!(body.contains("/* tokens:start") && !body.contains(r#"rel="stylesheet""#));
+    assert_eq!(header(&head, "content-type").as_deref(), Some("text/html; charset=utf-8"));
+    assert_eq!(header(&head, "cache-control").as_deref(), Some("no-cache"));
     for path in ["/healthz", "/", "/get-started"] {
         assert_eq!(location(port, path, "", "").await.0, 200, "{path}");
     }

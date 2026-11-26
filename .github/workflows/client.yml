@@ -5,12 +5,16 @@ on:
     paths:
       - "apps/client/**"
       - "web/index.html"
+      - "web/login.html"
+      - "web/app.js"
       - "web/styles.css"
       - ".github/workflows/client.yml"
   pull_request:
     paths:
       - "apps/client/**"
       - "web/index.html"
+      - "web/login.html"
+      - "web/app.js"
       - "web/styles.css"
       - ".github/workflows/client.yml"
 

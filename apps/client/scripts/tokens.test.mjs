@@ -4,10 +4,19 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { css, withTokens } from "./tokens.mjs";
+import { css, hasTokens, targets, withTokens } from "./tokens.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tokens = JSON.parse(fs.readFileSync(path.join(root, "src/tokens.json"), "utf8"));
+
+test("the console's style sheet and the sign-in page's own styles both carry the block", () => {
+  assert.deepEqual(targets, ["styles.css", "login.html"]);
+  const login = fs.readFileSync(path.resolve(root, "../../web/login.html"), "utf8");
+  assert.ok(hasTokens(login));
+  const style = login.slice(login.indexOf("<style>"), login.indexOf("</style>"));
+  assert.ok(style.includes(css(tokens)), "the block sits inside <style> and is current");
+  assert.ok(!hasTokens("<style>body {}</style>"));
+});
 
 test("every colour is a property in light and in dark", () => {
   const block = css(tokens);
