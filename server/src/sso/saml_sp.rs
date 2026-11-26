@@ -37,6 +37,9 @@
 //! - **How they signed in** (ADR 0190): every `AuthnContextClassRef` of the verified
 //!   assertion's `AuthnStatement`s, and every value of the authentication methods attribute
 //!   when the provider names one. The caller holds them to `SSO_<ID>_AUTHN_CONTEXT`.
+//! - **How well the IdP knows them** (ADR 0328), only when the provider requires identity
+//!   assurance: every value of the assurance attribute (eduPersonAssurance) of the verified
+//!   assertion. The caller holds them to `SSO_<ID>_ASSURANCE`, all of it.
 //! - **When they signed in, and for how long** (ADR 0225): the latest `AuthnInstant` and the
 //!   earliest `SessionNotOnOrAfter` of the verified assertion's `AuthnStatement`s; a malformed
 //!   one is refused. The caller holds the first to `FORCE_AUTHN` and `MAX_AUTHN_AGE`
@@ -101,14 +104,54 @@ pub const MAX_GROUP_LEN: usize = 256;
 /// Which assertion attributes hold the email and name. None: the usual names above.
 /// `groups` has no default: groups are read only from the attribute an admin names (ADR 0160).
 /// Nor has `authn_methods`, the attribute that lists how the person signed in (ADR 0190).
-/// `subject` says what names the person: the NameID, or a subject identifier attribute (ADR 0319).
+/// `assurance` is set only when identity assurance is required (ADR 0328): eduPersonAssurance
+/// unless another is named. `subject` says what names the person: the NameID, or a subject
+/// identifier attribute (ADR 0319).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attributes {
     pub email: Option<String>,
     pub name: Option<String>,
     pub groups: Option<String>,
     pub authn_methods: Option<String>,
+    pub assurance: Option<String>,
     pub subject: Subject,
+}
+
+/// eduPersonAssurance, which the REFEDS Assurance Framework's values are released in (ADR 0328).
+pub const EDU_PERSON_ASSURANCE: &str = "urn:oid:1.3.6.1.4.1.5923.1.1.1.11";
+/// The value an IdP conforming to the REFEDS Assurance Framework sends beside its other values,
+/// and the namespace they are in.
+pub const RAF: &str = "https://refeds.org/assurance";
+/// The most assurance values a provider requires, and the most read from one assertion: RAF
+/// has a dozen, and IdPs may add their own frameworks'.
+pub const MAX_ASSURANCE: usize = 16;
+pub const MAX_ASSURANCE_READ: usize = 32;
+
+/// `SSO_<ID>_ASSURANCE` as an admin lists it, checked and completed (ADR 0328): each value an
+/// authentication-context-like URI, once, at most `MAX_ASSURANCE`. A RAF value without RAF's own
+/// conformance value isn't a RAF claim, so that is required first whenever one is listed.
+pub fn required_assurance(listed: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in listed {
+        let v = authn_context_value(v).map_err(|_| format!("{v:?} is not an assurance value: a URI like https://refeds.org/assurance/IAP/medium"))?;
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    if out.iter().any(|v| v.starts_with(&format!("{RAF}/"))) && !out.iter().any(|v| v == RAF) {
+        out.insert(0, RAF.to_string());
+    }
+    if out.len() > MAX_ASSURANCE {
+        return Err(format!("at most {MAX_ASSURANCE} values"));
+    }
+    Ok(out)
+}
+
+/// The values of `required` the IdP didn't send, in the admin's order. Exact matches only: RAF
+/// has IdPs send every lower level with a higher one, so `IAP/medium` is never met by `IAP/high`
+/// alone, and a near miss is another claim.
+pub fn assurance_missing<'a>(required: &'a [String], sent: &[String]) -> Vec<&'a str> {
+    required.iter().filter(|r| !sent.contains(r)).map(String::as_str).collect()
 }
 
 /// What a native provider knows people by (`SSO_<ID>_SUBJECT`, ADR 0319). NameId: the NameID,
@@ -1439,12 +1482,12 @@ fn groups(assertion: Node, name: &str) -> Groups {
     Groups::Listed(out)
 }
 
-/// Plain-text values, trimmed, each once, in order: at most `MAX_AUTHN_CONTEXTS`, none empty or
-/// longer than `MAX_AUTHN_CONTEXT_LEN`. Leaving one out only ever refuses a sign-in.
-fn authn_values<'a, 'i: 'a>(nodes: impl Iterator<Item = Node<'a, 'i>>) -> Vec<String> {
+/// Plain-text values, trimmed, each once, in order: at most `max`, none empty or longer than
+/// `MAX_AUTHN_CONTEXT_LEN`. Leaving one out only ever refuses a sign-in.
+fn authn_values<'a, 'i: 'a>(nodes: impl Iterator<Item = Node<'a, 'i>>, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for v in nodes.filter_map(text_of).map(str::trim).filter(|v| !v.is_empty() && v.len() <= MAX_AUTHN_CONTEXT_LEN) {
-        if out.len() == MAX_AUTHN_CONTEXTS {
+        if out.len() == max {
             break;
         }
         if !out.iter().any(|o| o == v) {
@@ -1452,6 +1495,13 @@ fn authn_values<'a, 'i: 'a>(nodes: impl Iterator<Item = Node<'a, 'i>>) -> Vec<St
         }
     }
     out
+}
+
+/// Every value of every `name` attribute in the (verified) assertion's attribute statements, as
+/// `authn_values` reads them.
+fn attribute_values(assertion: Node, name: &str, max: usize) -> Vec<String> {
+    let attrs = assertion.children().filter(|c| is(*c, ASSERTION, "AttributeStatement")).flat_map(|s| s.children().filter(|c| is(*c, ASSERTION, "Attribute")));
+    authn_values(attrs.filter(|a| a.attribute("Name") == Some(name)).flat_map(|a| a.children().filter(|c| is(*c, ASSERTION, "AttributeValue"))), max)
 }
 
 /// How the (verified) assertion says the person signed in (ADR 0190): the class of each
@@ -1466,14 +1516,8 @@ fn read_authn(assertion: Node, methods: Option<&str>) -> Authn {
         .filter_map(|s| only(s, ASSERTION, "AuthnContext"))
         .filter(|c| !declared(*c))
         .filter_map(|c| only(c, ASSERTION, "AuthnContextClassRef"));
-    let methods: Vec<String> = match methods {
-        Some(name) => {
-            let attrs = assertion.children().filter(|c| is(*c, ASSERTION, "AttributeStatement")).flat_map(|s| s.children().filter(|c| is(*c, ASSERTION, "Attribute")));
-            authn_values(attrs.filter(|a| a.attribute("Name") == Some(name)).flat_map(|a| a.children().filter(|c| is(*c, ASSERTION, "AttributeValue"))))
-        }
-        None => Vec::new(),
-    };
-    Authn { classes: authn_values(classes), methods }
+    let methods = methods.map_or_else(Vec::new, |name| attribute_values(assertion, name, MAX_AUTHN_CONTEXTS));
+    Authn { classes: authn_values(classes, MAX_AUTHN_CONTEXTS), methods }
 }
 
 /// Every `ID`-like attribute at or under `n`.
@@ -1810,7 +1854,8 @@ pub fn check_response_xml(xml: &str, e: &Expect) -> Result<Checked, Refused> {
     let email = pick(&e.attributes.email, &EMAIL_ATTRIBUTES).filter(|m| m.len() <= 254 && crate::users::valid_email(m)).map(String::from);
     let name = pick(&e.attributes.name, &NAME_ATTRIBUTES).map(|n| crate::audit::clip(n, 100));
     let how = read_authn(assertion, e.attributes.authn_methods.as_deref());
-    let claims = Claims { issuer: e.idp.entity_id.clone(), subject, tenant: None, email, name, username: None, authn_context: how.class().map(String::from), encryption, response_binding: None, subject_from };
+    let assurance = e.attributes.assurance.as_deref().map_or_else(Vec::new, |n| attribute_values(assertion, n, MAX_ASSURANCE_READ));
+    let claims = Claims { issuer: e.idp.entity_id.clone(), subject, tenant: None, email, name, username: None, authn_context: how.class().map(String::from), encryption, response_binding: None, subject_from, assurance };
     let session_index = kept(authn, "SessionIndex");
     let login = SamlLogin { name_id: nid.value, format: nid.format, name_qualifier: nid.name_qualifier, sp_name_qualifier: nid.sp_name_qualifier, session_index };
     let groups = e.attributes.groups.as_deref().map_or(Groups::NotRead, |n| groups(assertion, n));
@@ -2553,7 +2598,7 @@ pub(crate) mod tests {
         no_attrs.attributes.clear();
         assert_eq!(check(&no_attrs.xml()).unwrap().claims.email, None);
         let idp = idp();
-        let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None, authn_methods: None, subject: Subject::NameId };
+        let mapped = Attributes { email: Some("work_mail".into()), name: None, groups: None, authn_methods: None, assurance: None, subject: Subject::NameId };
         let mut custom = base();
         custom.attributes = vec![("email".into(), "personal@evil.example".into()), ("work_mail".into(), "ada@example.com".into())];
         let c = check_response(&STANDARD.encode(custom.xml()), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &mapped, now_ms: NOW, decrypt: &[], require_encrypted: false, aes_cbc: AesCbc::Off }).unwrap();
@@ -2884,6 +2929,52 @@ pub(crate) mod tests {
         assert_eq!(check(&added).unwrap_err().0, "bad_signature");
         let outside = base().xml().replace("</samlp:Response>", &format!("<saml:AuthnStatement><saml:AuthnContext><saml:AuthnContextClassRef>{MFA}</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement></samlp:Response>"));
         assert_eq!(check(&outside).unwrap().authn.classes, s(&[PASSWORD_PROTECTED]));
+    }
+
+    fn assurance_of(r: &Response, attribute: Option<&str>) -> Vec<String> {
+        let idp = idp();
+        let attributes = Attributes { assurance: attribute.map(String::from), ..Attributes::default() };
+        check_response(&r.posted(), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false, aes_cbc: AesCbc::Off }).unwrap().claims.assurance
+    }
+
+    #[test]
+    fn identity_assurance_comes_only_from_the_signed_assertion_when_required() {
+        const MEDIUM: &str = "https://refeds.org/assurance/IAP/medium";
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut raf = base();
+        raf.multi_attributes = vec![(EDU_PERSON_ASSURANCE.into(), s(&[RAF, "https://refeds.org/assurance/IAP/low", &format!(" {MEDIUM}\n")])), ("urn:example:other".into(), s(&["https://refeds.org/assurance/IAP/high"]))];
+        assert!(assurance_of(&raf, None).is_empty(), "not read unless required");
+        assert_eq!(assurance_of(&raf, Some(EDU_PERSON_ASSURANCE)), s(&[RAF, "https://refeds.org/assurance/IAP/low", MEDIUM]), "every value of that attribute only, trimmed");
+        // Duplicates once, odd values left out, and a cap.
+        let mut odd = base();
+        odd.multi_attributes = vec![(EDU_PERSON_ASSURANCE.into(), vec![RAF.into(), "x".repeat(MAX_AUTHN_CONTEXT_LEN + 1), format!("<b>{MEDIUM}</b>"), RAF.into(), String::new()])];
+        assert_eq!(assurance_of(&odd, Some(EDU_PERSON_ASSURANCE)), s(&[RAF]));
+        let mut many = base();
+        many.multi_attributes = vec![(EDU_PERSON_ASSURANCE.into(), (0..MAX_ASSURANCE_READ).map(|i| format!("urn:a{i}")).chain([MEDIUM.into()]).collect())];
+        let read = assurance_of(&many, Some(EDU_PERSON_ASSURANCE));
+        assert_eq!((read.len(), read.contains(&MEDIUM.to_string())), (MAX_ASSURANCE_READ, false), "past the limit nothing more is read");
+        // Added after signing, or outside the signed assertion: never read.
+        let added = raf.xml_with(|a| a.replace("IAP/low", "IAP/high"));
+        assert_eq!(check(&added).unwrap_err().0, "bad_signature");
+        let outside = base().xml().replace("</samlp:Response>", &format!(r#"<saml:AttributeStatement><saml:Attribute Name="{EDU_PERSON_ASSURANCE}"><saml:AttributeValue>{MEDIUM}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></samlp:Response>"#));
+        let (idp, attributes) = (idp(), Attributes { assurance: Some(EDU_PERSON_ASSURANCE.into()), ..Attributes::default() });
+        let c = check_response(&STANDARD.encode(outside), &Expect { sp: Sp { entity_id: SP, acs: ACS }, idp: &idp, request_id: Some(REQ), attributes: &attributes, now_ms: NOW, decrypt: &[], require_encrypted: false, aes_cbc: AesCbc::Off }).unwrap();
+        assert!(c.claims.assurance.is_empty(), "{:?}", c.claims.assurance);
+    }
+
+    #[test]
+    fn required_assurance_adds_rafs_conformance_value_and_misses_are_exact() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let medium = "https://refeds.org/assurance/IAP/medium";
+        assert_eq!(required_assurance(&s(&[medium])).unwrap(), s(&[RAF, medium]));
+        assert_eq!(required_assurance(&s(&["urn:example:loa:2"])).unwrap(), s(&["urn:example:loa:2"]), "another framework's values alone");
+        assert_eq!(required_assurance(&s(&["https://refeds.org/assurances/x"])).unwrap(), s(&["https://refeds.org/assurances/x"]), "only RAF's own namespace");
+        assert!(required_assurance(&s(&["IAP medium"])).is_err());
+        assert!(required_assurance(&[]).unwrap().is_empty());
+        let required = s(&[RAF, medium, "https://refeds.org/assurance/ID/unique"]);
+        assert_eq!(assurance_missing(&required, &s(&[RAF, "https://refeds.org/assurance/IAP/high", "https://refeds.org/assurance/ID/unique"])), [medium], "high alone isn't medium: RAF IdPs send both");
+        assert_eq!(assurance_missing(&required, &s(&[&RAF.to_uppercase(), medium, "https://refeds.org/assurance/ID/unique"])), [RAF], "exact");
+        assert!(assurance_missing(&required, &s(&["urn:x", "https://refeds.org/assurance/ID/unique", medium, RAF])).is_empty(), "in any order, with others");
     }
 
     #[test]

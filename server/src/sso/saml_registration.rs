@@ -7,7 +7,7 @@
 //! each still needs (`About::missing`).
 
 use super::provider::secure_url;
-use super::saml_sp::{ATTRNAME_URI, Attributes, MDUI, escape};
+use super::saml_sp::{ATTRNAME_URI, Attributes, EDU_PERSON_ASSURANCE, MDUI, escape};
 
 /// The eduPerson attributes federations release email and display name as, which botd asks
 /// for when no attribute is configured (it reads these among others).
@@ -134,8 +134,9 @@ pub struct Requested {
 }
 
 /// What botd reads from assertions: the email (required when only listed domains get in), the
-/// display name, and the groups and authentication methods attributes when named (groups
-/// required with `REQUIRED_GROUPS`). A subject identifier is asked for by `subject-id:req`
+/// display name, the groups and authentication methods attributes when named (groups
+/// required with `REQUIRED_GROUPS`), and the assurance attribute, required, when identity
+/// assurance is (ADR 0328). A subject identifier is asked for by `subject-id:req`
 /// instead, as the profile says.
 pub fn requested(attributes: &Attributes, email_required: bool, groups_required: bool) -> Vec<Requested> {
     let named = |a: &Option<String>, default: &str, friendly: &'static str, required: bool| match a {
@@ -145,6 +146,8 @@ pub fn requested(attributes: &Attributes, email_required: bool, groups_required:
     let mut out = vec![named(&attributes.email, MAIL, "mail", email_required), named(&attributes.name, DISPLAY_NAME, "displayName", false)];
     out.extend(attributes.groups.iter().map(|g| Requested { name: g.clone(), friendly: None, required: groups_required }));
     out.extend(attributes.authn_methods.iter().map(|m| Requested { name: m.clone(), friendly: None, required: false }));
+    // Read only when identity assurance is required (ADR 0328), so sign-in fails without it.
+    out.extend(attributes.assurance.iter().map(|a| Requested { name: a.clone(), friendly: (a == EDU_PERSON_ASSURANCE).then_some("eduPersonAssurance"), required: true }));
     out
 }
 
@@ -319,6 +322,9 @@ mod tests {
             ],
             "the configured names, required when sign-in needs them"
         );
+        let assured = |a: &str| requested(&Attributes { assurance: Some(a.into()), ..Attributes::default() }, false, false).pop().map(|r| (r.name, r.friendly, r.required));
+        assert_eq!(assured(EDU_PERSON_ASSURANCE), Some((EDU_PERSON_ASSURANCE.to_string(), Some("eduPersonAssurance"), true)), "required: sign-in needs it");
+        assert_eq!(assured("assurance"), Some(("assurance".to_string(), None, true)));
     }
 
     #[test]
