@@ -1,0 +1,54 @@
+# Customer health score alerts for botd (docs/adr/0307-health-score-alerts.md), from the
+# newest day botd recorded (docs/adr/0157-health-score-history-and-console.md).
+#
+# Load it from prometheus.yml, next to the SLO rules:
+#   rule_files: ["/etc/prometheus/superbot-slo.rules.yml", "/etc/prometheus/superbot-health-score.rules.yml"]
+# Check it with: promtool check rules superbot-health-score.rules.yml
+#                promtool test rules superbot-health-score.rules.test.yml
+#
+# It assumes the scrape job is named "superbot" (as in deploy/README.md), and alerts per
+# instance, so a Provider scraping many customers' servers sees each one. botd tells its
+# own alert channels of a fall too (support.health_score_fell); these rules are for the
+# Provider's support team, who route them to each customer's technical account manager.
+# The score changes once a day, so none of them pages. `botctl health-score` shows why.
+
+groups:
+  - name: superbot-health-score-alerts
+    rules:
+      # The newest recorded day is in the at-risk band: below 50.
+      - alert: SuperBotHealthScoreAtRisk
+        expr: max by (job, instance) (superbot_health_score_band{job="superbot",band="at_risk"}) == 1
+        labels:
+          severity: ticket
+        annotations:
+          summary: The customer health score is at risk
+          description: "The 30-day health score is below 50. Contact the customer's owner this week with a plan, and tell the support manager. botctl health-score shows each signal; docs/support/health-score.md says what to do about each."
+
+      # A signal was at risk on the newest recorded day, whatever the band.
+      - alert: SuperBotHealthSignalAtRisk
+        expr: max by (job, instance, signal) (superbot_health_signal_at_risk{job="superbot"}) == 1
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A health score signal is at risk: {{ $labels.signal }}"
+          description: "The {{ $labels.signal }} signal of the customer health score is at risk. Call the customer before the next check-in; docs/support/health-score.md#{{ $labels.signal }} says what to do."
+
+      # 10 points or more below the week's highest score: worth a line in the customer's record.
+      - alert: SuperBotHealthScoreFell
+        expr: max by (job, instance) (max_over_time(superbot_health_score{job="superbot"}[7d]) - superbot_health_score{job="superbot"}) >= 10
+        labels:
+          severity: ticket
+        annotations:
+          summary: The customer health score fell 10 points or more this week
+          description: "The 30-day health score is {{ $value }} points below its highest in the last 7 days. botctl health-score history shows which signals got worse; raise it at the next check-in, sooner for a signal at risk."
+
+      # botd records the score within the first hours of each UTC day: none for 36 hours means
+      # recording stopped (a full disk, a broken database), and the other rules see old news.
+      - alert: SuperBotHealthScoreNotRecorded
+        expr: time() - max by (job, instance) (superbot_health_score_recorded_timestamp_seconds{job="superbot"}) > 36 * 3600
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: botd hasn't recorded the health score for over a day
+          description: "The newest recorded health score is more than 36 hours old. botd's log says why (Health score history: couldn't record today's score); check the disk, and run botd support check."

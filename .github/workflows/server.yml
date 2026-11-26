@@ -215,6 +215,8 @@ jobs:
       - run: promtool test rules deploy/prometheus/superbot-database-encryption.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-errors.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-errors.rules.test.yml
+      - run: promtool check rules deploy/prometheus/superbot-health-score.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-health-score.rules.test.yml
 
   backup-scripts:
     needs: rust
