@@ -132,6 +132,45 @@ GCP_SECRET_MANAGER_AUTH=service-account-key
 GCP_SERVICE_ACCOUNT_KEY_FILE=/etc/superbot/gcp/key.json   # project_id in the key is used if the project isn't set
 ```
 
+### Following Secret Manager's change events
+
+Off by default ([ADR 0325](../adr/0325-following-gcp-secret-managers-change-events.md)). Secret Manager can publish a Pub/Sub message whenever a secret or one of its versions changes. botd can pull those messages and read a name again as soon as it changes, so a rotation reaches new runs in a second or two, whatever `SECRETS_CACHE_SECONDS` is. botd pulls, so it needs no inbound endpoint.
+
+Set it up once (the topic and subscription may live in another project):
+
+```sh
+gcloud pubsub topics create superbot-secrets
+# Let Secret Manager publish to it:
+gcloud beta services identity create --service=secretmanager.googleapis.com --project=<project-id>
+gcloud pubsub topics add-iam-policy-binding superbot-secrets \
+  --member=serviceAccount:service-<project-number>@gcp-sa-secretmanager.iam.gserviceaccount.com --role=roles/pubsub.publisher
+# Each of SuperBot's secrets sends its changes there; add --topics to new ones too:
+gcloud secrets update superbot-bots-OPENAI_API_KEY --add-topics=projects/<project-id>/topics/superbot-secrets
+gcloud secrets create superbot-bots-GH_TOKEN --data-file=gh.token --topics=projects/<project-id>/topics/superbot-secrets
+# One subscription for each botd, which may pull from it:
+gcloud pubsub subscriptions create superbot-secrets-botd --topic=superbot-secrets
+gcloud pubsub subscriptions add-iam-policy-binding superbot-secrets-botd \
+  --member=serviceAccount:<botd-service-account> --role=roles/pubsub.subscriber
+```
+
+Then in `.env`:
+
+```sh
+GCP_SECRET_MANAGER_EVENTS=superbot-secrets-botd                 # in GCP_SECRET_MANAGER_PROJECT
+# GCP_SECRET_MANAGER_EVENTS=projects/<other-project>/subscriptions/superbot-secrets-botd
+```
+
+The startup line ends `following change events from projects/.../subscriptions/...`. If the subscription isn't there, or botd's service account may not pull from it, botd doesn't start, and says which.
+
+- **Which changes**: only botd's own names, in its prefix, location and folders (users' folders too with `SECRETS_USER_FOLDERS=1`). Messages about other secrets, rotation reminders (`SECRET_ROTATE`) and the test message Secret Manager sends when topics are set are acknowledged and cost no request. botd reads only the message's `eventType` and `secretId`, never its data.
+- **A secret without the topic** still reaches botd within `SECRETS_CACHE_SECONDS`, as without events. Add `--topics` whenever you create one of SuperBot's secrets.
+- **One subscription per botd**: Pub/Sub hands each message to one puller, so two servers sharing a subscription would each miss half the changes.
+- **Reading again**: each read is cached, redacted and audited like any read. If it fails, nothing is cached for the name and runs that need it are refused until Secret Manager answers. Startup settings botd read once (Stripe, Linode, Incus, ...) still need a restart; the log says so.
+- **When pulls fail**: botd tries again after 1 s, then up to a minute apart. Once a pull works again, it reads every cached answer again, since messages may have been lost (or gone past the subscription's retention). Meanwhile the cache time bounds how old an answer gets, and runs carry on.
+- **Network**: botd keeps one pull open on `https://pubsub.googleapis.com` (set `GCP_PUBSUB_ENDPOINT` for Private Service Connect or a proxy), waiting up to a minute at a time. `botctl offline check` lists it.
+- **What botd shows**: `botctl secrets backend` adds a `Change events:` line, `/metrics` has `superbot_secrets_change_events_following{backend="gcp-secret-manager"}` and the other counters, and the alert rules in [`deploy/prometheus/superbot-secrets-events.rules.yml`](../../deploy/prometheus/superbot-secrets-events.rules.yml) apply, as for [Vault](vault.md#following-vaults-change-events).
+- **Audit**: `secret.gcp_events` (`subscribed`, `lost` with the reason, `resumed`), and each change as `secret.cache_refreshed` by `system` with `trigger: gcp-event`, the event type (`SECRET_VERSION_ADD`, `SECRET_DELETE`, ...) and the result. After a gap, the read of everything is `trigger: gcp-events-resumed`. Never a value.
+
 ## AWS Secrets Manager
 
 ### Set up AWS
@@ -442,7 +481,7 @@ Each app needs the federated credential trusting botd, like any other. A user's 
 
 ## Day to day
 
-- **Rotate**: add a new version (`az keyvault secret set ...`, `gcloud secrets versions add ...`, `aws secretsmanager put-secret-value ...`). botd uses it within `SECRETS_CACHE_SECONDS`, with no restart. To use it now, after a leak, run `botctl secrets refresh NAME` (or no names for everything cached): botd reads it again at once, says whether it changed, and fails closed if the store can't answer ([details](vault.md#rotating-a-value-now), [ADR 0291](../adr/0291-refreshing-the-external-secrets-cache.md)). Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart; the refresh names those whose value changed.
+- **Rotate**: add a new version (`az keyvault secret set ...`, `gcloud secrets versions add ...`, `aws secretsmanager put-secret-value ...`). botd uses it within `SECRETS_CACHE_SECONDS`, with no restart, or at once with Secret Manager's [change events](#following-secret-managers-change-events). To use it now, after a leak, run `botctl secrets refresh NAME` (or no names for everything cached): botd reads it again at once, says whether it changed, and fails closed if the store can't answer ([details](vault.md#rotating-a-value-now), [ADR 0291](../adr/0291-refreshing-the-external-secrets-cache.md)). Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart; the refresh names those whose value changed.
 - **Retire a key**: delete it. Disabling it (or its latest version on Google) is treated as an error, not as "not there", so Bot runs stop until it is deleted or enabled again. botd never falls back to an older copy. On AWS, a secret scheduled for deletion counts as deleted at once (botd checks with `DescribeSecret`); a new secret can take a few minutes to show in `botctl secrets`, because AWS's list is eventually consistent, but reads by name see it at once.
 - **When the store is down**: the same as [for Vault](vault.md#when-vault-is-down). Cached answers stand for the cache time. After that, Bot runs are refused (`bot.run_refused`, reason `secrets_unavailable`) and `GET /api/secrets` answers 503. The [secrets store runbook](../support/runbook-secrets.md) has every failure botd records and its fix.
 
