@@ -90,13 +90,14 @@ export function PromptsEditor({ prompts, custom, onSave, onCancel }: Props) {
             <Text style={styles.ghostText}>Use defaults</Text>
           </Pressable>
         ) : null}
-        <View style={{ flex: 1 }} />
-        <Pressable role="button" aria-label="Cancel" disabled={busy} style={styles.ghost} onPress={onCancel}>
-          <Text style={styles.ghostText}>Cancel</Text>
-        </Pressable>
-        <Pressable role="button" aria-label="Save prompts" aria-busy={busy} style={[styles.save, busy && styles.disabled]} disabled={busy} onPress={save}>
-          <Text style={styles.saveText}>{busy ? "Saving…" : "Save"}</Text>
-        </Pressable>
+        <View style={styles.end}>
+          <Pressable role="button" aria-label="Cancel" disabled={busy} style={styles.ghost} onPress={onCancel}>
+            <Text style={styles.ghostText}>Cancel</Text>
+          </Pressable>
+          <Pressable role="button" aria-label="Save prompts" aria-busy={busy} style={[styles.save, busy && styles.disabled]} disabled={busy} onPress={save}>
+            <Text style={styles.saveText}>{busy ? "Saving…" : "Save"}</Text>
+          </Pressable>
+        </View>
       </View>
     </View>
   );
@@ -113,7 +114,9 @@ const useStyles = themedStyles((t) => {
     remove: { padding: t.space.sm },
     removeText: { color: t.c.textMuted, fontSize: 16 },
     link: { ...k.link, paddingVertical: t.space.xs },
-    actions: { flexDirection: "row", alignItems: "center", gap: t.space.sm, marginTop: t.space.xs },
+    // Wraps so Save stays on the sheet on narrow phones at large text sizes.
+    actions: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: t.space.sm, marginTop: t.space.xs },
+    end: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: t.space.sm, marginLeft: "auto" },
     ghost: { ...k.btn, ...k.ghost },
     ghostText: { ...k.btnText, color: t.c.textMuted },
     save: { ...k.btn, ...k.primary },

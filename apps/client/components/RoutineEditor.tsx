@@ -115,13 +115,14 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
             <Text style={styles.deleteText}>Delete</Text>
           </Pressable>
         ) : null}
-        <View style={{ flex: 1 }} />
-        <Pressable role="button" aria-label="Cancel" disabled={busy} style={styles.cancel} onPress={onCancel}>
-          <Text style={styles.cancelText}>Cancel</Text>
-        </Pressable>
-        <Pressable role="button" aria-label="Save routine" aria-busy={busy} style={[styles.save, busy && styles.disabled]} disabled={busy} onPress={save}>
-          <Text style={styles.saveText}>{busy ? "Saving…" : "Save"}</Text>
-        </Pressable>
+        <View style={styles.end}>
+          <Pressable role="button" aria-label="Cancel" disabled={busy} style={styles.cancel} onPress={onCancel}>
+            <Text style={styles.cancelText}>Cancel</Text>
+          </Pressable>
+          <Pressable role="button" aria-label="Save routine" aria-busy={busy} style={[styles.save, busy && styles.disabled]} disabled={busy} onPress={save}>
+            <Text style={styles.saveText}>{busy ? "Saving…" : "Save"}</Text>
+          </Pressable>
+        </View>
       </View>
     </View>
   );
@@ -151,7 +152,9 @@ const useStyles = themedStyles((t) => {
     chipTextOn: { color: t.c.bg, fontWeight: t.font.weight.medium },
     row: { flexDirection: "row", alignItems: "center", paddingVertical: t.space.xs },
     rowText: { ...k.text, flex: 1 },
-    actions: { flexDirection: "row", alignItems: "center", gap: t.space.sm, marginTop: t.space.xs },
+    // Wraps so Save stays on the sheet on narrow phones at large text sizes.
+    actions: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: t.space.sm, marginTop: t.space.xs },
+    end: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: t.space.sm, marginLeft: "auto" },
     delete: { ...k.btn, ...k.danger },
     deleteText: { ...k.btnText, ...k.dangerText },
     cancel: { ...k.btn, ...k.ghost },
