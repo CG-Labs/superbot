@@ -25,7 +25,7 @@ There is no wordmark artwork yet. Set the name in text next to the mark (see typ
 | Sky | `#4b8df8` | Spark antenna, highlights, links |
 | Paper | `#ececec` | Eyes, text on dark |
 
-These match the client theme (`apps/client/src/theme.ts`) and the web admin (`web/styles.css`). The mark is designed for dark backgrounds; on light backgrounds place it on an Ink tile (like the favicon).
+These are the mark's colours. The apps' colours, light and dark, are design tokens in `apps/client/src/tokens.json` ([ADR 0335](adr/0335-design-system-for-the-app-and-the-console.md)), whose one accent is SuperBot Blue. The mark is designed for dark backgrounds; on light backgrounds place it on an Ink tile (like the favicon).
 
 ## Typography
 
