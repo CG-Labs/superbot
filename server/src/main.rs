@@ -2856,6 +2856,8 @@ async fn acl_changed(app: &AppState, by: &Who, id: &str, narrowed: bool) {
     }
 }
 
+pub(crate) const OWNER_CHANGED: &str = "Its owner changed meanwhile. Look again, and try again if it should still move.";
+
 /// Gives `bot` to `to` (an admin's choice): it takes one of their Bot slots, work
 /// started for the old owner ends, and its memory follows it. Its harness and model
 /// they can change after.
@@ -2869,17 +2871,20 @@ pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::U
     // Work started for the old owner runs in their folder with their keys; it
     // ends here, and its token stops working (it names the old owner). A refused
     // transfer (another request took the last slot) leaves that work running.
-    // Neither the old owner nor the new one may be being erased (ADR 0102).
+    // Neither the old owner nor the new one may be being erased (ADR 0102). It moves only
+    // from the owner the caller decided about (ADR 0315).
     let mut erasing = false;
     let moved = app.stop_if(id, || {
-        let from = app.db.bot(id).map(|b| b.owner_id).unwrap_or_default();
-        erasure::unless_erasing(&[&from, &to.id], || app.db.set_bot_owner_capped(id, &to.id, max)).unwrap_or_else(|| {
+        erasure::unless_erasing(&[&bot.owner_id, &to.id], || app.db.move_bot(id, &bot.owner_id, &to.id, max)).unwrap_or_else(|| {
             erasing = true;
             false
         })
     });
     if erasing {
         return Err(ApiError(StatusCode::CONFLICT, "Its owner or the one it would go to is being erased. Try again once that's done.".into()));
+    }
+    if !moved && app.db.bot_owner(id).as_deref() != Some(bot.owner_id.as_str()) {
+        return Err(ApiError(StatusCode::CONFLICT, OWNER_CHANGED.into()));
     }
     if !moved {
         let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": to.id, "tier": tier.name, "limit": max });

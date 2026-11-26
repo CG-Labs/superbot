@@ -241,3 +241,131 @@ async fn users_disabled_before_the_upgrade_get_their_routines_paused_at_start() 
     assert_eq!((r.enabled, r.paused_reason.as_deref()), (false, Some("owner_disabled")), "an admin resumes it");
     assert_eq!(events(port, &admin, "action=routine.paused").await[0]["actorId"], "bootstrap");
 }
+
+/// A role that only hands Bots on: `bots.manage` on top of member.
+async fn offboarder(port: u16, admin: &str, email: &str) -> (String, String, String) {
+    let offboarding = crate::service_accounts_http_tests::role(port, admin, "Offboarding", "member", &["bots.manage"]).await;
+    let (id, auth) = user_with(port, admin, email, "member").await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{offboarding}/users/{id}"), admin, "").await.0, 200);
+    (id, auth, offboarding)
+}
+
+#[tokio::test]
+async fn someone_with_bots_manage_hands_a_disabled_persons_bots_on_without_an_admin() {
+    let (port, app, admin, _) = serve_app().await;
+    let (dee, d, _) = offboarder(port, &admin, "dee@example.com").await;
+    let (ada, a) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (cal, _) = user_with(port, &admin, "cal@example.com", "member").await;
+    let (_, plain) = user_with(port, &admin, "plain@example.com", "member").await;
+    let adas = bot(&app, "Ada's", &ada);
+    let own = routine(port, &a, &adas.id, "Own").await;
+    set_status(port, &admin, &ada, "disabled").await;
+    let path = format!("/api/users/{ada}/handover");
+
+    assert_eq!(call(port, "POST", &path, &plain, &json!({ "to": cal }).to_string()).await.0, 403, "a plain member can't");
+    // Never to themselves: someone else decides who gets a leaver's Bots, chats and memory.
+    let (code, res) = call(port, "POST", &path, &d, &json!({ "to": dee }).to_string()).await;
+    assert!(code == 403 && res.contains("yourself"), "{code} {res}");
+    let denied = events(port, &admin, "action=access.denied").await;
+    assert_eq!((denied[0]["details"]["limit"].as_str(), denied[0]["details"]["user"].as_str(), denied[0]["actorId"].as_str()), (Some("self"), Some(ada.as_str()), Some(dee.as_str())), "{denied:?}");
+    assert_eq!(app.db.bot(&adas.id).unwrap().owner_id, ada, "nothing moved");
+    // The rules every handover keeps still apply.
+    let (code, res) = call(port, "POST", &format!("/api/users/{cal}/handover"), &d, &json!({ "to": dee }).to_string()).await;
+    assert!(code == 409 && res.contains("active"), "{code} {res}");
+
+    let (code, res) = call(port, "POST", &path, &d, &json!({ "to": "cal@example.com", "resumeRoutines": true }).to_string()).await;
+    assert_eq!(code, 200, "{res}");
+    let res = parse(&res);
+    assert_eq!((res["bots"].clone(), res["resumed"].clone()), (json!([adas.id]), json!([own])));
+    assert_eq!(app.db.bot(&adas.id).unwrap().owner_id, cal);
+    let r = app.db.routine(&own).unwrap();
+    assert!(r.enabled && r.author_id.as_deref() == Some(cal.as_str()), "Cal's now, and running");
+    let handed = &events(port, &admin, "action=user.handed_over").await[0];
+    assert_eq!((handed["actorId"].as_str(), handed["details"]["via"].as_str(), handed["details"]["to"].as_str()), (Some(dee.as_str()), Some("bots.manage"), Some(cal.as_str())), "{handed}");
+    let owner = &events(port, &admin, "action=bot.owner_changed").await[0];
+    assert_eq!(owner["actorId"].as_str(), Some(dee.as_str()));
+    assert_eq!(events(port, &admin, "action=routine.resumed").await[0]["details"]["reason"], "handover");
+
+    // An admin's handover says nothing of a delegate.
+    let (bea, _) = user_with(port, &admin, "bea@example.com", "member").await;
+    bot(&app, "Bea's", &bea);
+    set_status(port, &admin, &bea, "disabled").await;
+    assert_eq!(call(port, "POST", &format!("/api/users/{bea}/handover"), &admin, &json!({ "to": dee }).to_string()).await.0, 200, "an admin may hand them to Dee");
+    let handed = &events(port, &admin, "action=user.handed_over").await[0];
+    assert_eq!((handed["targetId"].as_str(), handed["details"].get("via")), (Some(bea.as_str()), None), "{handed}");
+}
+
+#[tokio::test]
+async fn bots_manage_never_hands_over_an_admins_a_custom_role_holders_or_the_primary_bot() {
+    let (port, app, admin, _) = serve_app().await;
+    let (dee, d, offboarding) = offboarder(port, &admin, "dee@example.com").await;
+    let (cal, _) = user_with(port, &admin, "cal@example.com", "member").await;
+    let (boss, _) = user_with(port, &admin, "boss@example.com", "admin").await;
+    let (lead, _) = user_with(port, &admin, "lead@example.com", "member").await;
+    assert_eq!(call(port, "PUT", &format!("/api/roles/{offboarding}/users/{lead}"), &admin, "").await.0, 200);
+    let (pam, _) = user_with(port, &admin, "pam@example.com", "member").await;
+    let bosses = bot(&app, "Boss's", &boss);
+    let leads = bot(&app, "Lead's", &lead);
+    let main = app.db.create_bot_owned("Main", "#fff", "waddle", "claude", None, true, &pam, Visibility::Shared);
+    bot(&app, "Pam's", &pam);
+    for u in [&boss, &lead, &pam] {
+        set_status(port, &admin, u, "disabled").await;
+    }
+    let to_cal = json!({ "to": cal }).to_string();
+    let hand = |who: &str| format!("/api/users/{who}/handover");
+
+    for (from, limit, says) in [(&boss, "protected_user", "Only an admin"), (&lead, "protected_user", "Only an admin"), (&pam, "primary_bot", "primary Bot")] {
+        let (code, res) = call(port, "POST", &hand(from), &d, &to_cal).await;
+        assert!(code == 403 && res.contains(says), "{from}: {code} {res}");
+        let denied = &events(port, &admin, "action=access.denied").await[0];
+        assert_eq!((denied["details"]["limit"].as_str(), denied["details"]["user"].as_str(), denied["actorId"].as_str()), (Some(limit), Some(from.as_str()), Some(dee.as_str())), "{denied}");
+    }
+    assert_eq!(app.db.bot(&bosses.id).unwrap().owner_id, boss);
+    assert_eq!(app.db.bot(&leads.id).unwrap().owner_id, lead);
+    assert_eq!(app.db.bot(&main.id).unwrap().owner_id, pam, "not even the rest of Pam's Bots");
+    assert!(events(port, &admin, "action=user.handed_over").await.is_empty());
+
+    // An admin still hands each of them over.
+    for from in [&boss, &lead, &pam] {
+        assert_eq!(call(port, "POST", &hand(from), &admin, &to_cal).await.0, 200, "{from}");
+    }
+    assert_eq!(app.db.bot(&main.id).unwrap().owner_id, cal);
+}
+
+#[tokio::test]
+async fn a_service_account_with_bots_manage_hands_nothing_over() {
+    let (port, app, admin, _) = serve_app().await;
+    let (dee, _, _) = offboarder(port, &admin, "dee@example.com").await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (cal, _) = user_with(port, &admin, "cal@example.com", "member").await;
+    let adas = bot(&app, "Ada's", &ada);
+    set_status(port, &admin, &ada, "disabled").await;
+    let sa = crate::service_accounts_http_tests::account(port, &admin, json!({ "name": "Offboarding job", "role": "Offboarding" })).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/service-accounts/{sa}"), &admin, &json!({ "owner": dee }).to_string()).await.0, 200);
+    let (tok, _) = crate::service_accounts_http_tests::token(port, &admin, &sa, json!({})).await;
+    let (code, listed) = call(port, "GET", &format!("/api/users/{ada}/routines"), &tok, "").await;
+    assert_eq!(code, 200, "it holds bots.manage: {listed}");
+
+    let (code, res) = call(port, "POST", &format!("/api/users/{ada}/handover"), &tok, &json!({ "to": cal }).to_string()).await;
+    assert!(code == 403 && res.contains("service account"), "{code} {res}");
+    let denied = &events(port, &admin, "action=access.denied").await[0];
+    assert_eq!((denied["details"]["limit"].as_str(), denied["details"]["user"].as_str()), (Some("service_account"), Some(ada.as_str())), "{denied}");
+    assert_eq!(app.db.bot(&adas.id).unwrap().owner_id, ada);
+}
+
+/// A handover decides about one person's Bots; one given to someone else meanwhile (say,
+/// by an admin, while the handover waits on another Bot's screen) is never taken from them.
+#[tokio::test]
+async fn a_bot_that_changed_hands_meanwhile_stays_with_its_new_owner() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (boss, _) = user_with(port, &admin, "boss@example.com", "admin").await;
+    let (cal, _) = user_with(port, &admin, "cal@example.com", "member").await;
+    let stale = bot(&app, "Ada's", &ada);
+    assert_eq!(call(port, "PATCH", &format!("/api/bots/{}/access", stale.id), &admin, &json!({ "owner": boss }).to_string()).await.0, 200);
+    let by = audit::Who { actor: audit::Actor::system("test"), source: Default::default() };
+    let err = crate::give_bot(&app, &by, &stale, &app.db.user(&cal).unwrap()).await.unwrap_err();
+    assert_eq!((err.0, err.1.as_str()), (StatusCode::CONFLICT, crate::OWNER_CHANGED));
+    assert_eq!(app.db.bot(&stale.id).unwrap().owner_id, boss);
+    assert!(events(port, &admin, "action=bot.transfer_refused").await.is_empty(), "not a plan refusal");
+}

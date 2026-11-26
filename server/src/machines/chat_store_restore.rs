@@ -188,7 +188,7 @@ fn bucket(s: &Settings, region: &str, folder: &Path, sealed: Sealed) -> Result<O
 
 /// Holds botd's data lock and the store's, as botd does while it runs, so nothing changes
 /// either while a restore reads and writes them.
-struct Locks(#[allow(dead_code)] std::fs::File, #[allow(dead_code)] std::fs::File);
+struct Locks(#[allow(dead_code)] database_encryption::DataDirLock, #[allow(dead_code)] database_encryption::DataDirLock);
 
 fn lock(place: &Place) -> Result<Locks, String> {
     let stopped = |e: String| format!("{e}. botd must be stopped for a restore (sudo systemctl stop superbot; Compose: docker compose stop botd)");

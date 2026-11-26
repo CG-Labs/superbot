@@ -362,14 +362,26 @@ fn reencrypt_via(path: &Path, work: &Path, from: Option<&DbKey>, to: Option<&DbK
 
 /// Held for botd's lifetime: a second botd on the same DATA_DIR would write to a database
 /// the first may be replacing, or run the same routines twice.
-pub fn lock_data_dir(db_path: &Path) -> Result<std::fs::File, String> {
+pub fn lock_data_dir(db_path: &Path) -> Result<DataDirLock, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let lock = with_suffix(db_path, "-lock");
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
     match f.try_lock() {
-        Ok(()) => Ok(f),
+        Ok(()) => Ok(DataDirLock(f)),
         Err(std::fs::TryLockError::WouldBlock) => Err(format!("another botd is using this DATA_DIR (it holds {}); stop it first", lock.display())),
         Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {e}", lock.display())),
+    }
+}
+
+/// A held `lock_data_dir` lock, let go of when dropped. Closing the file alone isn't enough: a
+/// `flock` belongs to the open file, and a child forked at that moment holds a copy of it until
+/// it execs, so the lock would outlive the drop.
+#[derive(Debug)]
+pub struct DataDirLock(std::fs::File);
+
+impl Drop for DataDirLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
 }
 
@@ -903,7 +915,11 @@ mod tests {
         let e = lock_data_dir(&path).unwrap_err();
         assert!(e.contains("another botd is using this DATA_DIR"), "{e}");
         drop(held);
-        lock_data_dir(&path).unwrap();
+        let again = lock_data_dir(&path).unwrap();
+        let forked_childs_copy = again.0.try_clone().unwrap();
+        drop(again);
+        lock_data_dir(&path).expect("let go of even while a forked child still has the file open");
+        drop(forked_childs_copy);
     }
 
     #[test]

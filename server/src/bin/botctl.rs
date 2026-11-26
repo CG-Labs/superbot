@@ -66,7 +66,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user routines <user>                      Routines that run for the user, and which are paused
   botctl user resume-routines <user>               Turn back on the routines paused when they were disabled
   botctl user handover <user> <to> [--resume]      Give a disabled user's Bots and routines to <to>;
-                                                   --resume turns their paused routines back on
+                                                   --resume turns their paused routines back on.
+                                                   With bots.manage too: never an admin's, the owner's,
+                                                   a custom-role holder's or the primary Bot, nor to you
   botctl user erase <user> [--destroy-machine] [--delete-backups] --yes
                                                    Erase their personal data for good (GDPR): Bots, chats,
                                                    sign-ins, secrets; the audit log keeps a pseudonym.

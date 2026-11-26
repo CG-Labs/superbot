@@ -5172,6 +5172,18 @@ impl Db {
             > 0
     }
 
+    /// `set_bot_owner_capped`, only while `from` still owns it: a Bot given to someone else
+    /// meanwhile is never taken from them on a decision made about `from`.
+    pub fn move_bot(&self, id: &str, from: &str, to: &str, max_bots: Option<u32>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE bots SET owner_id = ?1 WHERE id = ?2 AND owner_id = ?3 AND (?4 IS NULL OR (SELECT COUNT(*) FROM bots WHERE owner_id = ?1) < ?4)",
+                params![to, id, from, max_bots],
+            )
+            .unwrap()
+            > 0
+    }
+
     pub fn set_bot_visibility(&self, id: &str, v: Visibility) {
         self.c().execute("UPDATE bots SET visibility = ? WHERE id = ?", params![v.as_str(), id]).unwrap();
     }
@@ -13432,6 +13444,11 @@ mod tests {
         db.set_bot_visibility(&old.id, Visibility::Private);
         assert!(db.set_bot_owner_capped(&old.id, &u.id, None));
         assert_eq!(db.bot(&old.id).map(|b| (b.owner_id, b.visibility)), Some((u.id.clone(), Visibility::Private)));
+        // Moving from an owner it no longer has does nothing (ADR 0315).
+        assert!(!db.move_bot(&old.id, "operator", "operator", None));
+        assert_eq!(db.bot_owner(&old.id).as_deref(), Some(u.id.as_str()));
+        assert!(!db.move_bot(&old.id, &u.id, "operator", Some(0)), "the cap still holds");
+        assert!(db.move_bot(&old.id, &u.id, "operator", None) && db.move_bot(&old.id, "operator", &u.id, None));
         assert_eq!(db.remove_grant(&old.id, &u.id), Some(Grant::Operator));
         assert_eq!(db.remove_grant(&old.id, &u.id), None);
         let other = db.create_user(None, Some("o@example.com"), "O", Role::Member).unwrap();

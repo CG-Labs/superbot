@@ -23,7 +23,7 @@ The permission set is fixed in the code (`rbac::PERMS`): the six coarse ones abo
 | Permission | Opens | In a team |
 |--|--|--|
 | `users.manage` | `GET`/`POST /api/users`, `GET`/`PATCH /api/users/:id`, sign-in codes, signing people out, `GET /api/sessions`, `DELETE /api/sessions/:id` | Invite and withdraw member invites, remove plain members, preview their offboarding |
-| `bots.manage` | A user's Bots and routines lists, resuming their routines, `POST /api/tiers/:name/move-bots` | No |
+| `bots.manage` | A user's Bots and routines lists, resuming their routines, `POST /api/tiers/:name/move-bots`; since [ADR 0315](0315-bot-handover-under-bots-manage.md), handing a disabled person's Bots over, within limits | No |
 | `audit.view` | `GET /api/audit`, its CSV, `GET /api/access-review`, its CSV | No |
 | `billing.manage` | `GET /api/usage`, `GET /api/tiers`, a user's usage; with `users.manage`, a user's tier | The team's plan and billing |
 | `signups.approve` | `GET /api/signups`, a sign-up, approve, reject | No |
