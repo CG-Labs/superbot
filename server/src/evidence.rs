@@ -481,7 +481,7 @@ fn custom_roles(app: &App) -> Vec<Value> {
         .map(|r| {
             let (people, team) = app.db.custom_role_holders(&r.id);
             json!({
-                "id": r.id, "base": r.base.as_str(), "permissions": r.permissions, "maxDays": r.max_days, "requestable": r.requestable,
+                "id": r.id, "base": r.base.as_str(), "permissions": r.permissions, "maxDays": r.max_days, "requestable": r.requestable, "approvals": r.approvals,
                 "holders": { "server": people.len(), "team": team.len() },
                 "createdAt": rfc3339(r.created_at), "updatedAt": rfc3339(r.updated_at),
             })

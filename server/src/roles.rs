@@ -93,7 +93,7 @@ fn view(app: &AppState, r: &CustomRole) -> Value {
     let unknown: Vec<&String> = r.permissions.iter().filter(|p| Perm::delegable(p).is_none()).collect();
     json!({
         "id": r.id, "name": r.name, "description": r.description, "base": r.base, "builtIn": false,
-        "permissions": perms.names(), "unknown": unknown, "maxDays": r.max_days, "requestable": r.requestable,
+        "permissions": perms.names(), "unknown": unknown, "maxDays": r.max_days, "requestable": r.requestable, "approvals": r.approvals,
         "effective": rbac::granted(Principal::User(r.base), perms),
         "users": users.len(), "teamMembers": teams.len(), "scimMappings": app.db.scim_role_mappings_of_role(&r.id).len(),
         "samlMappings": app.db.saml_role_mappings_of_role(&r.id).len(), "scimRoleGroups": app.db.scim_role_groups_of_role(&r.id).len(),
@@ -169,6 +169,23 @@ fn parse_requestable(v: &Value) -> Res<bool> {
 }
 
 const REQUESTABLE_NEEDS_LIMIT: &str = "Only a time-bound role can be requested: give it a time limit (maxDays) too.";
+
+/// `approvals` (ADR 0320): how many different people approve a request for the role, 1 or 2.
+fn parse_approvals(v: &Value) -> Res<i64> {
+    v.as_i64().filter(|n| (1..=2).contains(n)).ok_or_else(|| bad("approvals must be 1 or 2: how many different people approve a request for it"))
+}
+
+/// Two approvals need two people who can approve requests across the server: refused while
+/// fewer than two active admins exist, as requests for it could then never be given.
+fn two_approvers_exist(app: &AppState) -> Res<()> {
+    let admins = app.db.users().iter().filter(|u| !u.service && u.active() && u.role == Role::Admin).count();
+    if admins >= 2 {
+        return Ok(());
+    }
+    Err(conflict(format!(
+        "Only {admins} active admin could approve requests for it across the server, so a request needing two approvers would wait until it lapsed. Make someone else an admin first, or keep approvals at 1."
+    )))
+}
 
 pub(crate) fn time(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default()
@@ -284,25 +301,38 @@ pub async fn list(State(app): State<AppState>) -> Json<Value> {
 
 /// `POST /api/roles` `{name, description?, base?: "member" | "readonly", permissions, maxDays?}`.
 /// With `maxDays` it is time-bound (ADR 0197); a time-bound one can be `requestable` (ADR 0209).
+/// `approvals: 2` makes a request for it need two different approvers (ADR 0320).
 pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
-    only_fields(&v, &["name", "description", "base", "permissions", "maxDays", "requestable"])?;
+    only_fields(&v, &["name", "description", "base", "permissions", "maxDays", "requestable", "approvals"])?;
     let name = parse_name(&v["name"])?;
     let description = parse_description(&v["description"])?;
     let base = if v["base"].is_null() { Role::Member } else { parse_base(&v["base"])? };
     let perms = parse_perms(&v["permissions"])?;
     let max_days = parse_max_days(&v["maxDays"])?;
     let requestable = if v["requestable"].is_null() { false } else { parse_requestable(&v["requestable"])? };
+    let approvals = if v["approvals"].is_null() { 1 } else { parse_approvals(&v["approvals"])? };
     if requestable && max_days.is_none() {
         return Err(bad(REQUESTABLE_NEEDS_LIMIT));
     }
+    if approvals == 2 {
+        two_approvers_exist(&app)?;
+    }
     let mut r = app.db.create_custom_role(&name, &description, base, &perms, max_days, by.actor.id.as_deref()).map_err(role_error)?;
+    // Before it's requestable, so nobody asks for it while it still needs one approver.
+    if approvals != r.approvals {
+        if !app.db.set_role_approvals(&r.id, approvals) {
+            return Err(gone_or_changed(&app, &r.id));
+        }
+        r = need_role(&app, &r.id)?;
+    }
     if requestable {
         if !app.db.set_role_requestable(&r.id, true) {
             return Err(gone_or_changed(&app, &r.id));
         }
         r = need_role(&app, &r.id)?;
     }
-    app.db.record(&by.event("role.created").target("role", &r.id).details(json!({ "name": r.name, "base": r.base, "permissions": perms, "maxDays": r.max_days, "requestable": r.requestable })));
+    let d = json!({ "name": r.name, "base": r.base, "permissions": perms, "maxDays": r.max_days, "requestable": r.requestable, "approvals": r.approvals });
+    app.db.record(&by.event("role.created").target("role", &r.id).details(d));
     Ok((StatusCode::CREATED, Json(view(&app, &r))))
 }
 
@@ -333,8 +363,10 @@ pub async fn get(State(app): State<AppState>, Path(key): Path<String>) -> Res {
 /// applies at once to everyone who holds the role across the server, handled as any
 /// other change of role is (`users::update_user`). `maxDays` makes it time-bound, or with
 /// null not (ADR 0197). `requestable` lets people ask for it, only while it's time-bound (ADR 0209).
+/// `approvals` is how many different people approve a request for it (ADR 0320); pending
+/// requests are decided by what it is when each approval is made.
 pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
-    only_fields(&v, &["name", "description", "base", "permissions", "maxDays", "requestable"])?;
+    only_fields(&v, &["name", "description", "base", "permissions", "maxDays", "requestable", "approvals"])?;
     expire_due(&app);
     let before = need_role(&app, &key)?;
     let name = (!v["name"].is_null()).then(|| parse_name(&v["name"])).transpose()?;
@@ -343,10 +375,14 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     let perms = (!v["permissions"].is_null()).then(|| parse_perms(&v["permissions"])).transpose()?;
     let max_days = v.get("maxDays").map(parse_max_days).transpose()?.filter(|m| *m != before.max_days);
     let requestable = (!v["requestable"].is_null()).then(|| parse_requestable(&v["requestable"])).transpose()?.filter(|r| *r != before.requestable);
+    let approvals = (!v["approvals"].is_null()).then(|| parse_approvals(&v["approvals"])).transpose()?.filter(|n| *n != before.approvals);
     if requestable == Some(true) && max_days.unwrap_or(before.max_days).is_none() {
         return Err(bad(REQUESTABLE_NEEDS_LIMIT));
     }
-    let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref(), max_days, requestable).map_err(role_error)?;
+    if approvals == Some(2) {
+        two_approvers_exist(&app)?;
+    }
+    let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref(), max_days, requestable, approvals).map_err(role_error)?;
     let after = need_role(&app, &before.id)?;
     let mut changes = serde_json::Map::new();
     if before.name != after.name {
@@ -366,6 +402,9 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     }
     if before.requestable != after.requestable {
         changes.insert("requestable".into(), json!({ "from": before.requestable, "to": after.requestable }));
+    }
+    if before.approvals != after.approvals {
+        changes.insert("approvals".into(), json!({ "from": before.approvals, "to": after.approvals }));
     }
     if !changes.is_empty() {
         app.db.record(&by.event("role.updated").target("role", &after.id).details(json!({ "name": after.name, "changes": changes, "usersMoved": moved.len() })));

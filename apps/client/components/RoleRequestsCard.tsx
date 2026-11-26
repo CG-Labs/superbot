@@ -104,7 +104,8 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
     void run(async () => {
       await api.requestRole({ role: roleId, scope, hours: Number(hours), reason: reason.trim() });
       setReason("");
-      return `Asked. An admin decides; it lapses in ${view.pendingDays} days if nobody does.`;
+      const who = (role?.approvals ?? 1) >= 2 ? "Two people approve it before it starts" : "An admin decides";
+      return `Asked. ${who}; it lapses in ${view.pendingDays} days if nobody does.`;
     });
 
   const withdraw = (id: string) =>
@@ -126,6 +127,7 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
               {role.description ? <Text style={styles.line}>{role.description}</Text> : null}
               <Text style={styles.dim}>
                 Adds {(scope === "team" ? role.teamPermissions : role.permissions).join(", ") || "nothing"}. At most {hoursLabel(role.maxHours)}.
+                {(role.approvals ?? 1) >= 2 ? " Two people approve it before it starts." : ""}
               </Text>
               {view.team && role.team ? (
                 <Chips

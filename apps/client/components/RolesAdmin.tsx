@@ -3,7 +3,9 @@ import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, Text
 import { ApiError, type SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import {
+  approveCap,
   approveChoices,
+  awaitsSecond,
   BASES,
   baseChangeWarning,
   defaultEnd,
@@ -15,6 +17,7 @@ import {
   endChoices,
   endsAt,
   endsLabel,
+  firstApprovalLabel,
   holdersLabel,
   MAX_DAYS_HINT,
   parseMaxDays,
@@ -129,7 +132,9 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   const maxDays = parseMaxDays(limit);
   const invalid = draftError(view, draft, role?.id) ?? (maxDays === undefined ? MAX_DAYS_HINT : null);
   const requestable = !!maxDays && !!draft.requestable;
-  const changes = role ? draftChanges(role, { ...draft, maxDays, requestable }) : null;
+  // Two approvers (ADR 0320) only matter for a role people may request.
+  const approvals = requestable && draft.approvals === 2 ? 2 : 1;
+  const changes = role ? draftChanges(role, { ...draft, maxDays, requestable, approvals: requestable || role.approvals === 2 ? approvals : undefined }) : null;
   const effective = effectivePermissions(view, draft.base, draft.permissions);
   const inTeam = teamPermissions(view, draft.permissions);
 
@@ -148,6 +153,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
             permissions: draft.permissions,
             ...(maxDays ? { maxDays } : {}),
             ...(requestable ? { requestable } : {}),
+            ...(approvals === 2 ? { approvals } : {}),
           });
       await onSaved(saved.id);
     });
@@ -301,6 +307,24 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
             <Text style={styles.text}>People may request it</Text>
             <Text style={styles.dim}>
               {maxDays ? "Anyone it fits can ask for it, with a reason, from Settings. An admin approves each request; it ends by itself." : "Only a time-bound role can be requested. Set days first."}
+            </Text>
+          </View>
+        </Pressable>
+        <Pressable
+          style={[styles.perm, !requestable && styles.disabled]}
+          disabled={busy || !requestable}
+          onPress={() => setDraft({ ...draft, approvals: draft.approvals === 2 ? 1 : 2 })}
+          accessibilityRole="checkbox"
+          accessibilityState={{ checked: approvals === 2, disabled: busy || !requestable }}
+          accessibilityLabel="Needs two approvers"
+        >
+          <Text style={[styles.check, approvals === 2 && styles.checkOn]}>{approvals === 2 ? "✓" : ""}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.text}>Needs two approvers</Text>
+            <Text style={styles.dim}>
+              {requestable
+                ? "Two different people approve each request before it's given, for as long as the first approved or less. Needs two active admins."
+                : "Only for a role people may request."}
             </Text>
           </View>
         </Pressable>
@@ -483,16 +507,29 @@ export function RequestRow({
   /** Why you can't approve it, though you may deny it. */
   approveBlocked?: string | null;
 }) {
-  const [hours, setHours] = useState(String(q.hours));
+  const cap = approveCap(q);
+  const second = awaitsSecond(q);
+  const needsTwo = (q.approvals ?? 1) >= 2;
+  const [hours, setHours] = useState(String(cap));
+  // A first approval made elsewhere can lower the cap after a reload.
+  useEffect(() => setHours(String(cap)), [cap]);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const yours = !!meId && q.user?.id === meId;
   const name = q.user ? personName(q.user) : "them";
+  const gaveFirst = second && !!meId && q.firstApproval?.by.id === meId;
+  const blocked = approveBlocked ?? (gaveFirst ? "You gave the first approval. Someone else gives the second." : null);
+  const first = firstApprovalLabel(q);
 
   const decide = async (yes: boolean) => {
-    const title = yes ? `Give ${q.role?.name ?? "the role"} to ${name}?` : `Deny ${name}'s request?`;
-    const body = yes ? "It starts now and ends by itself. The audit log keeps the request and your approval." : "They see your note. They can ask again.";
+    const firstOfTwo = yes && needsTwo && !second;
+    const title = !yes ? `Deny ${name}'s request?` : firstOfTwo ? `Approve ${name}'s request for ${q.role?.name ?? "the role"}?` : `Give ${q.role?.name ?? "the role"} to ${name}?`;
+    const body = !yes
+      ? "They see your note. They can ask again."
+      : firstOfTwo
+        ? "This role needs two people to approve it. Yours is the first: nothing is given until someone else approves it too, for as long as you pick or less."
+        : "It starts now and ends by itself. The audit log keeps the request and your approval.";
     if (!(await confirmAsync(title, body, yes ? "Approve" : "Deny"))) return;
     setBusy(true);
     setError(null);
@@ -517,12 +554,17 @@ export function RequestRow({
         {q.role?.applies.length ? `Adds: ${q.role.applies.join(", ")}. ` : ""}
         {requestStatusLabel(q, Date.now())}
       </Text>
+      {first ? <Text style={styles.faint}>{first}.</Text> : null}
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {yours ? (
         <Text style={styles.faint}>Your own request: {decidesYours} decides it.</Text>
       ) : (
         <>
-          {approveBlocked ? <Text style={styles.faint}>{approveBlocked}</Text> : <Chips options={approveChoices(q.hours)} value={hours} onChange={setHours} disabled={busy} />}
+          {blocked ? (
+            <Text style={styles.faint}>{blocked}</Text>
+          ) : (
+            <Chips options={approveChoices(cap, second ? "as first approved" : "as asked")} value={hours} onChange={setHours} disabled={busy} />
+          )}
           <TextInput
             style={styles.input}
             value={note}
@@ -534,7 +576,7 @@ export function RequestRow({
             accessibilityLabel={`Note for ${name}`}
           />
           <View style={styles.row}>
-            {approveBlocked ? null : <Button label="Approve" a11y={`Approve ${name}'s request`} primary disabled={busy} onPress={() => void decide(true)} />}
+            {blocked ? null : <Button label={needsTwo && !second ? "Approve (1 of 2)" : "Approve"} a11y={`Approve ${name}'s request`} primary disabled={busy} onPress={() => void decide(true)} />}
             <Button label="Deny" a11y={`Deny ${name}'s request`} danger disabled={busy} onPress={() => void decide(false)} />
           </View>
         </>

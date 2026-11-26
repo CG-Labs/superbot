@@ -1,5 +1,7 @@
 import {
+  approveCap,
   approveChoices,
+  awaitsSecond,
   baseChangeWarning,
   defaultEnd,
   draftChanges,
@@ -11,6 +13,7 @@ import {
   endNear,
   endsAt,
   endsLabel,
+  firstApprovalLabel,
   holdersLabel,
   hoursLabel,
   parseMaxDays,
@@ -240,5 +243,48 @@ describe("requests for roles (ADR 0209)", () => {
     expect(requestSummary(q)).toBe("Ada (ada@example.com) asks for On-call for 8 hours, across the server");
     expect(requestSummary({ ...q, team: { id: "t1", name: "Ops" } })).toBe("Ada (ada@example.com) asks for On-call for 8 hours, in Ops");
     expect(requestSummary({ ...q, user: null, role: null })).toBe("Someone asks for a role for 8 hours, across the server");
+  });
+});
+
+describe("two approvers (ADR 0320)", () => {
+  const NOW = Date.UTC(2026, 10, 26, 12);
+  const HOUR = 3_600_000;
+  const first = { by: { id: "u2", name: "Ada" }, at: NOW, hours: 4, note: null };
+  const q = { status: "pending" as const, grantedUntil: null, note: null, expiresAt: NOW + 6.5 * 24 * HOUR, hours: 8, approvals: 2, firstApproval: null };
+
+  it("keeps a role's approvals in its draft and sends only a change", () => {
+    const r = { id: "r1", name: "Root", description: "", base: "member", builtIn: false, permissions: [], unknown: [], effective: [], users: 0, teamMembers: 0, createdAt: 0, createdBy: null, updatedAt: 0, maxDays: 1, requestable: true } as CustomRole;
+    expect(draftOf(r).approvals).toBe(1);
+    expect(draftOf({ ...r, approvals: 2 }).approvals).toBe(2);
+    expect(draftChanges(r, { ...draftOf(r), approvals: 2 })).toEqual({ approvals: 2 });
+    expect(draftChanges({ ...r, approvals: 2 }, { ...draftOf(r), approvals: 2 })).toBeNull();
+    expect(draftChanges(r, { ...draftOf(r), approvals: undefined })).toBeNull();
+  });
+
+  it("caps the second approval at the first's hours", () => {
+    expect(awaitsSecond(q)).toBe(false);
+    expect(approveCap(q)).toBe(8);
+    expect(awaitsSecond({ ...q, firstApproval: first })).toBe(true);
+    expect(approveCap({ ...q, firstApproval: first })).toBe(4);
+    expect(approveChoices(4, "as first approved")[0].label).toBe("4 hours (as first approved)");
+    // Lowered back to one approver: the next approval gives it, as asked.
+    expect(awaitsSecond({ ...q, approvals: 1, firstApproval: first })).toBe(false);
+    expect(approveCap({ ...q, approvals: 1, firstApproval: first })).toBe(8);
+    // One whose approver can't approve now no longer caps it, nor waits for a second.
+    expect(awaitsSecond({ ...q, firstApproval: { ...first, counts: false } })).toBe(false);
+    expect(approveCap({ ...q, firstApproval: { ...first, counts: false } })).toBe(8);
+    expect(awaitsSecond({ ...q, firstApproval: { ...first, counts: true } })).toBe(true);
+  });
+
+  it("says who gave the first approval and what a request waits for", () => {
+    expect(firstApprovalLabel(q)).toBeNull();
+    expect(firstApprovalLabel({ ...q, firstApproval: first })).toBe("First approved by Ada for 4 hours");
+    expect(firstApprovalLabel({ ...q, firstApproval: { ...first, note: "ok" } })).toBe("First approved by Ada for 4 hours: “ok”");
+    expect(firstApprovalLabel({ ...q, firstApproval: { ...first, counts: false } })).toBe("Ada's first approval no longer counts: they can't approve it now, so the next approval is the first");
+    expect(firstApprovalLabel({ ...q, approvals: 1, firstApproval: first })).toBeNull();
+    expect(requestStatusLabel({ ...q, firstApproval: { ...first, counts: false } }, NOW)).toBe("Waiting for two approvers · lapses in 7 days");
+    expect(requestStatusLabel(q, NOW)).toBe("Waiting for two approvers · lapses in 7 days");
+    expect(requestStatusLabel({ ...q, firstApproval: first }, NOW)).toBe("Approved once, waiting for a second approver · lapses in 7 days");
+    expect(requestStatusLabel({ ...q, approvals: 1 }, NOW)).toBe("Waiting for an admin · lapses in 7 days");
   });
 });

@@ -177,10 +177,17 @@ async fn not_their_own_nor_a_team_admins_nor_over_the_identity_provider() {
     assert_eq!(app.db.team_member(&fay).unwrap().role_id.as_deref(), Some(standing.as_str()), "unchanged");
     // Read in the approval's own transaction.
     let saw = std::cell::Cell::new(false);
-    let r = app.db.approve_role_request(&fay_q, None, Some(&ada), None, |s| {
-        saw.set(s.from_idp);
-        Err("from_idp")
-    });
+    let r = app.db.approve_role_request(
+        &fay_q,
+        None,
+        Some(&ada),
+        None,
+        |s| {
+            saw.set(s.from_idp);
+            Err("from_idp")
+        },
+        |_| false,
+    );
     assert_eq!((saw.get(), r.unwrap_err()), (true, db::RoleRequestError::Refused("from_idp")));
     // Denying changes no role, so they may.
     assert_eq!(call(port, "POST", &at(&fay_q, "deny"), &ada_auth, "{}").await.0, 200);
@@ -305,4 +312,49 @@ async fn team_owners_and_admins_hear_of_requests_they_may_decide() {
 fn events_now(app: &App, action: &str) -> Vec<db::AuditEvent> {
     let f = audit::Filter::from_query(&HashMap::from([("action".to_string(), action.to_string())])).unwrap();
     app.db.audit_events(&f, 50, true)
+}
+
+#[tokio::test]
+async fn a_first_approval_tells_the_others_who_may_give_the_second() {
+    let (port, app, admin, _) = serve_app().await;
+    let (mail, rec) = notices(&app).await;
+    user_with(port, &admin, "second-ana@example.com", "admin").await;
+    let (ada, ada_auth) = user_with(port, &admin, "second-ada@example.com", "member").await;
+    let (eve, eve_auth) = user_with(port, &admin, "second-eve@example.com", "member").await;
+    let (cy, cy_auth) = user_with(port, &admin, "second-cy@example.com", "member").await;
+    team(port, &admin, "Alpha", &ada, &[(&eve, "admin"), (&cy, "member")]).await;
+    let body = json!({ "name": "Team helpdesk", "permissions": ["users.manage"], "maxDays": 7, "requestable": true, "approvals": 2 });
+    assert_eq!(call(port, "POST", "/api/roles", &admin, &body.to_string()).await.0, 201);
+    let phone = |who: &str| format!("ExponentPushToken[{who}-phone]");
+    for (who, auth) in [("ada", &ada_auth), ("eve", &eve_auth), ("cy", &cy_auth)] {
+        let body = json!({ "token": phone(who), "platform": "ios" }).to_string();
+        assert_eq!(call(port, "PUT", "/api/me/push", auth, &body).await.0, 200, "{who}");
+    }
+    let q = asked(port, &cy_auth, json!({ "role": "Team helpdesk", "scope": "team", "hours": 8, "reason": "Ticket 77" })).await;
+    until("the request's three emails", || Some(mailed(&mail)).filter(|m| m.len() >= 3)).await;
+    until("the request's two pushes", || Some(pushed(&rec)).filter(|p| p.len() >= 2)).await;
+
+    // The first approver's teammates and the list hear it needs a second; the first approver doesn't.
+    assert_eq!(call(port, "POST", &at(&q, "approve"), &eve_auth, r#"{"hours":4}"#).await.0, 200);
+    until("two more emails", || Some(mailed(&mail)).filter(|m| m.len() >= 5)).await;
+    until("one more push", || Some(pushed(&rec)).filter(|p| p.len() >= 3)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut more: Vec<String> = mail.got.lock().unwrap()[3..].iter().flat_map(|m| m.to.clone()).collect();
+    more.sort();
+    assert_eq!(more, ["ops@example.com", "second-ada@example.com"]);
+    let m = mail.got.lock().unwrap()[3].clone();
+    assert!(m.headers.contains("Subject: [SuperBot] second-cy@example.com's request for Team helpdesk needs a second approver"), "{}", m.headers);
+    for line in ["second-eve@example.com approved it for 4 hours.", "Why: Ticket 77", "In the team Alpha.", "Someone else approves or denies it in Roles, or the team's owners and admins in Team"] {
+        assert!(m.body.contains(line), "{line}: {}", m.body);
+    }
+    let p = rec.sent.lock().unwrap()[2].clone();
+    assert_eq!((p.to.as_str(), p.body.as_str(), &p.data), (phone("ada").as_str(), "A request on Alpha needs a second approver.", &json!({ "type": "role_request", "url": "/team" })));
+    let sent = until("the push's audit event", || Some(events_now(&app, "notification.sent")).filter(|e| e.iter().any(|e| e.details["event"] == "role.request_first_approved" && e.details["channel"] == "push"))).await;
+    let push = sent.iter().find(|e| e.details["event"] == "role.request_first_approved" && e.details["channel"] == "push").unwrap();
+    assert_eq!(push.details["users"], json!([ada]));
+
+    // The second approval gives it, and tells nobody more.
+    assert_eq!(call(port, "POST", &at(&q, "approve"), &ada_auth, "{}").await.0, 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!((mailed(&mail).len(), pushed(&rec).len()), (5, 3));
 }

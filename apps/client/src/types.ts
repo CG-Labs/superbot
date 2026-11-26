@@ -538,6 +538,8 @@ export interface CustomRole {
   maxDays?: number | null;
   /** People may ask for it (ADR 0209). Only a time-bound role can be. */
   requestable?: boolean;
+  /** How many different people approve a request for it, 1 or 2 (ADR 0320). Servers from before leave it out: 1. */
+  approvals?: number;
   createdAt: number;
   createdBy: string | null;
   updatedAt: number;
@@ -698,6 +700,8 @@ export interface RoleDraft {
   maxDays?: number | null;
   /** People may ask for it (ADR 0209); needs `maxDays`. */
   requestable?: boolean;
+  /** How many different people approve a request for it (ADR 0320). */
+  approvals?: 1 | 2;
 }
 
 export type RoleRequestStatus = "pending" | "approved" | "denied" | "cancelled" | "lapsed";
@@ -722,6 +726,11 @@ export interface RoleRequest {
   grantedUntil: number | null;
   /** While pending: what they hold in its scope now. */
   current?: CustomRoleRef | null;
+  /** How many different people approve it (ADR 0320). Servers from before leave it out: 1. */
+  approvals?: number;
+  /** The first of two approvals: the second can't give more than `hours`. */
+  /** `counts` is false once its approver couldn't approve now; the next approval replaces it (ADR 0320). */
+  firstApproval?: { by: { id: string; name?: string; email?: string | null }; at: number; hours: number; note: string | null; counts?: boolean } | null;
 }
 
 /** Whether you may ask for a role in one scope, and why not. */
@@ -731,6 +740,13 @@ export interface RequestOffer {
 }
 
 /** A role you may request, from `GET /api/me/role-requests`. */
+/** An approval's reply. With two approvers (ADR 0320) the first gives nothing yet: `role` is null and the request stays pending. */
+export interface RoleApproval {
+  request: RoleRequest;
+  role: CustomRoleRef | null;
+  approvals?: { needed: number; given: number };
+}
+
 export interface RequestableRole {
   id: string;
   name: string;
@@ -740,6 +756,8 @@ export interface RequestableRole {
   teamPermissions: string[];
   maxDays: number;
   maxHours: number;
+  /** How many different people approve a request for it (ADR 0320). */
+  approvals?: number;
   org: RequestOffer;
   /** Null when you're on no team. */
   team: RequestOffer | null;

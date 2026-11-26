@@ -252,7 +252,7 @@ async fn an_approval_checks_everything_again_as_it_gives_the_role() {
     assert_eq!(call(port, "PATCH", &format!("/api/users/{bo}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
     assert_eq!(call(port, "PATCH", &format!("/api/users/{bo}"), &admin, r#"{"status":"active"}"#).await.0, 200);
     // Even without the handlers' sweep, the database won't approve it.
-    assert!(matches!(app.db.approve_role_request(&id, None, None, None, |_| Ok(())), Err(db::RoleRequestError::NotPending(s)) if s == "lapsed"));
+    assert!(matches!(app.db.approve_role_request(&id, None, None, None, |_| Ok(()), |_| false), Err(db::RoleRequestError::NotPending(s)) if s == "lapsed"));
     assert_eq!(role_requests::lapse_due(&app), 1);
     assert_eq!(events(port, &admin, "role.request_lapsed").await[0]["details"]["why"].as_str(), Some("disabled"));
     assert!(app.db.user(&bo).unwrap().role_id.is_none());

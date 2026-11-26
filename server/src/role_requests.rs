@@ -12,9 +12,12 @@
 //! A request within a team can also be decided by that team's own owners and admins (ADR
 //! 0263), for its plain members, never over a role their identity provider gives them; they
 //! hear of new ones by email and push themselves (ADR 0302).
+//!
+//! A role can need two approvals (ADR 0320): the first is saved on the request, and a
+//! second approver, someone else, gives the role for the first's hours or fewer.
 
 use crate::audit::Who;
-use crate::db::{CustomRole, RoleRequest, RoleRequestError, TeamMember, User};
+use crate::db::{CustomRole, FirstApproval, RequestApproval, RequestState, RoleRequest, RoleRequestError, TeamMember, User};
 use crate::rbac::{Principal, Role};
 use crate::roles::{held, only_fields};
 use crate::users::Caller;
@@ -145,6 +148,13 @@ pub fn view(app: &App, q: &RoleRequest) -> Value {
         "createdAt": q.created_at, "expiresAt": q.expires_at, "decidedAt": q.decided_at,
         "decidedBy": q.decided_by.as_deref().map(|id| app.db.user(id).map_or_else(|| json!({ "id": id }), |u| person_view(&u))),
         "note": q.note, "grantedUntil": q.granted_until,
+        "approvals": role.as_ref().map_or(1, |r| r.approvals),
+        "firstApproval": q.first.as_ref().map(|f| json!({
+            "by": app.db.user(&f.by).map_or_else(|| json!({ "id": f.by }), |u| person_view(&u)),
+            "at": f.at, "hours": f.hours, "note": f.note,
+            // False once its approver couldn't approve now: the next approval replaces it.
+            "counts": q.status == "pending" && app.db.first_approval_counts(q, first_counts),
+        })),
     });
     if q.status == "pending" {
         v["current"] = current(app, q);
@@ -173,6 +183,8 @@ fn request_error(app: &App, e: RoleRequestError, q: Option<&RoleRequest>, you: b
             if you { StatusCode::BAD_REQUEST } else { StatusCode::CONFLICT },
             format!("This role can be given for at most {} now. {}", duration(h), if you { "Ask for fewer hours." } else { "Approve it for fewer hours." }),
         ),
+        RoleRequestError::OverFirst(h) => bad(format!("The first approver approved it for {}. The second approval can shorten that, never lengthen it.", duration(h))),
+        RoleRequestError::ApprovedAlready => conflict("You gave this request its first approval. Its role needs two people to approve it: someone else gives the second."),
         RoleRequestError::NotFound => not_found("Request"),
         RoleRequestError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
@@ -220,7 +232,7 @@ fn mine_view(app: &App, u: &User) -> Value {
             json!({
                 "id": r.id, "name": r.name, "description": r.description, "base": r.base,
                 "permissions": r.perms().names(), "teamPermissions": r.perms().in_team().names(),
-                "maxDays": r.max_days, "maxHours": r.max_days.map(|d| d * 24),
+                "maxDays": r.max_days, "maxHours": r.max_days.map(|d| d * 24), "approvals": r.approvals,
                 "org": offer(refusal(u, r, None, None), r),
                 "team": member.as_ref().map(|m| offer(refusal(u, r, Some(&m.team_id), Some(m)), r)),
             })
@@ -376,11 +388,83 @@ impl Decider {
     }
 }
 
+/// Whether the first of two approvals (ADR 0320) still counts: its approver could approve
+/// the request now. A server admin, or for a request within a team one of its owners or
+/// admins who isn't read-only, while the team may decide it (the asker is a plain member
+/// whose role there isn't from their identity provider). Never the asker, a service
+/// account, or someone disabled.
+pub fn first_counts(s: &RequestState) -> bool {
+    let Some((u, m)) = s.first else { return false };
+    if u.service || !u.active() || u.id == s.request.user_id {
+        return false;
+    }
+    match u.role {
+        Role::Admin => true,
+        Role::Readonly => false,
+        Role::Member => {
+            s.request.team_id.is_some() && m.is_some_and(|m| crate::teams::manages(&m.role)) && !s.from_idp && s.member.is_some_and(|m| m.role == crate::teams::MEMBER)
+        }
+    }
+}
+
+/// The first of two approvals was saved (ADR 0320): audits it as
+/// `role.request_first_approved`, tells those who may give the second, and answers with the
+/// request, still pending.
+fn first_approved(app: &AppState, by: &Who, q: &RoleRequest, replaced: Option<FirstApproval>, decider: Decider) -> Res {
+    let f = q.first.as_ref().ok_or_else(|| not_found("Request"))?;
+    let r = app.db.custom_role(&q.role_id).ok_or_else(|| not_found("Role"))?;
+    let mut d = json!({ "request": q.id, "name": r.name, "user": q.user_id, "scope": scope(q), "team": q.team_id, "hours": f.hours, "requestedHours": q.hours, "note": f.note, "approvals": r.approvals });
+    if let Some(old) = &replaced {
+        d["replaced"] = json!({ "by": old.by, "at": old.at, "hours": old.hours });
+    }
+    decider.mark(&mut d);
+    app.db.record(&by.event("role.request_first_approved").target("role", &r.id).details(d));
+    crate::notify::alert(app, second_alert(app, by, &r, q, f), "roles");
+    Ok(Json(json!({ "request": view(app, q), "role": null, "applies": [], "approvals": { "needed": r.approvals, "given": 1 } })))
+}
+
+/// What a first approval sends (ADR 0320): to the notification email list and webhook, and,
+/// for a request within a team, to its owners and admins who may give the second.
+fn second_alert(app: &AppState, by: &Who, r: &CustomRole, q: &RoleRequest, f: &FirstApproval) -> crate::notify::Alert {
+    let who = app.db.user(&q.user_id).map(|u| u.email.unwrap_or(u.name)).unwrap_or_else(|| "Someone".into());
+    let first = by.actor.email.clone().or_else(|| by.actor.name.clone()).unwrap_or_else(|| f.by.clone());
+    let team = q.team_id.as_deref().map(|t| app.db.team(t).map(|t| t.name).unwrap_or_default());
+    let deciders: Vec<User> = team_deciders(app, q).into_iter().filter(|u| u.id != f.by).collect();
+    let (place, where_) = match &team {
+        Some(t) if !deciders.is_empty() => (format!("In the team {t}."), "in Roles, or the team's owners and admins in Team"),
+        Some(t) => (format!("In the team {t}."), "in Roles"),
+        None => ("Across the server.".into(), "in Roles"),
+    };
+    let audience = team.filter(|_| !deciders.is_empty()).map(|t| crate::notify::Audience {
+        people: deciders,
+        who: "the team's owners and admins".into(),
+        page: "team",
+        push_title: "Request for a team role".into(),
+        push_body: format!("A request on {t} needs a second approver."),
+        push_type: "role_request",
+    });
+    crate::notify::Alert {
+        event: "role.request_first_approved".into(),
+        title: format!("{who}'s request for {} needs a second approver", r.name),
+        lines: vec![
+            format!("{first} approved it for {}.", duration(f.hours)),
+            format!("Why: {}", q.reason),
+            place,
+            format!("Someone else approves or denies it {where_}. It lapses in {PENDING_DAYS} days from when it was asked."),
+        ],
+        target_type: "role".into(),
+        target_id: r.id.clone(),
+        audience,
+        ..Default::default()
+    }
+}
+
 /// Gives the role `q` asks for, for its hours or fewer from now, and audits it. Not your own
 /// request. A team's owners and admins approve only for its plain members, and never over a
 /// role the person's identity provider gives them in the team; both are read in the
-/// approval's transaction, with everything else `refusal` checks.
-fn approve_as(app: &App, by: &Who, q: &RoleRequest, v: &Value, decider: Decider) -> Res {
+/// approval's transaction, with everything else `refusal` checks. For a role that needs two
+/// approvals (ADR 0320), the first is saved and the second, by someone else, gives it.
+fn approve_as(app: &AppState, by: &Who, q: &RoleRequest, v: &Value, decider: Decider) -> Res {
     if by.actor.id.as_deref() == Some(q.user_id.as_str()) {
         return Err(conflict(format!("You can't approve your own request. {}", decider.ask_another())));
     }
@@ -397,19 +481,30 @@ fn approve_as(app: &App, by: &Who, q: &RoleRequest, v: &Value, decider: Decider)
         }
         refusal(s.user, s.role, s.request.team_id.as_deref(), s.member).map_or(Ok(()), Err)
     };
-    let a = app.db.approve_role_request(&q.id, hours, by.actor.id.as_deref(), note.as_deref(), check).map_err(|e| request_error(app, e, Some(q), false))?;
+    let a = match app.db.approve_role_request(&q.id, hours, by.actor.id.as_deref(), note.as_deref(), check, first_counts).map_err(|e| request_error(app, e, Some(q), false))? {
+        RequestApproval::First { request, replaced } => return first_approved(app, by, &request, replaced, decider),
+        RequestApproval::Given(a) => a,
+    };
     let q = a.request;
     let r = app.db.custom_role(&q.role_id).ok_or_else(|| not_found("Role"))?;
     let granted = q.granted_until.unwrap_or_default();
-    let hours = hours.unwrap_or(q.hours);
+    let hours = hours.unwrap_or(a.first.as_ref().map_or(q.hours, |f| f.hours));
     let applies = if q.team_id.is_some() { r.perms().in_team().names() } else { r.perms().names() };
+    let approvers = a.first.as_ref().map(|f| json!([f.by, by.actor.id]));
     let mut d = json!({ "request": q.id, "name": r.name, "user": q.user_id, "scope": scope(&q), "team": q.team_id, "hours": hours, "requestedHours": q.hours, "expiresAt": granted, "note": q.note });
+    if let (Some(f), Some(list)) = (&a.first, &approvers) {
+        d["approvers"] = list.clone();
+        d["firstApproval"] = json!({ "by": f.by, "at": f.at, "hours": f.hours, "note": f.note });
+    }
     decider.mark(&mut d);
     app.db.record(&by.event("role.request_approved").target("role", &r.id).details(d));
     let mut d = json!({
         "name": r.name, "user": q.user_id, "scope": scope(&q), "from": held(app, a.before.0.as_deref(), a.before.1),
         "expiresAt": granted, "reason": q.reason, "request": q.id, "takenFromScim": a.taken,
     });
+    if let Some(list) = approvers {
+        d["approvers"] = list;
+    }
     match &q.team_id {
         Some(t) => {
             d["team"] = json!(t);
@@ -419,7 +514,8 @@ fn approve_as(app: &App, by: &Who, q: &RoleRequest, v: &Value, decider: Decider)
     }
     decider.mark(&mut d);
     app.db.record(&by.event("role.assigned").target("role", &r.id).details(d));
-    Ok(Json(json!({ "request": view(app, &q), "role": held(app, Some(&r.id), Some(granted)), "applies": applies })))
+    let given = if a.first.is_some() { 2 } else { 1 };
+    Ok(Json(json!({ "request": view(app, &q), "role": held(app, Some(&r.id), Some(granted)), "applies": applies, "approvals": { "needed": given, "given": given } })))
 }
 
 /// Denies `q`, with an optional note, and audits it. `team`: only while it's within that team.

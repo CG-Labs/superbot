@@ -195,6 +195,8 @@ mod rbac;
 mod retention;
 #[cfg(test)]
 mod retention_http_tests;
+#[cfg(test)]
+mod role_request_approvals_http_tests;
 mod role_requests;
 #[cfg(test)]
 mod role_requests_http_tests;
