@@ -34,6 +34,7 @@ use crate::obs::log::{log_info, log_warn};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -501,6 +502,9 @@ struct Stream {
     due: Instant,
     late: bool,
     expires: Option<Instant>,
+    /// The reader met the stream's end (a close, an error, or none left), maybe while botd
+    /// was still opening the next one.
+    ended: Arc<AtomicBool>,
     /// Vault answered a ping on this stream, so from then on it must keep doing so.
     answers: bool,
     /// Since when a ping has waited for its answer.
@@ -517,17 +521,22 @@ impl Stream {
     fn new(s: Subscribed) -> Stream {
         let (reader, writer) = tokio::io::split(s.io);
         let (tx, rx) = mpsc::channel(64);
+        let ended = Arc::new(AtomicBool::new(false));
+        let end = Arc::clone(&ended);
         let task = tokio::spawn(async move {
             let mut r = Reader::new(reader, false);
             loop {
                 let f = r.next().await;
                 let last = matches!(f, Err(_) | Ok(Frame::Close));
+                if last {
+                    end.store(true, Ordering::SeqCst);
+                }
                 if tx.send(f).await.is_err() || last {
                     break;
                 }
             }
         });
-        Stream { writer, rx, task, token: s.token, due: s.due, late: s.late, expires: s.expires, answers: false, waiting: None }
+        Stream { writer, rx, task, token: s.token, due: s.due, late: s.late, expires: s.expires, ended, answers: false, waiting: None }
     }
 
     /// Sends a frame, within `WRITE_WAIT`: a peer that stops reading can't hold botd here.
@@ -619,12 +628,12 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                 End::Lost(why) => break why,
                 End::Due { catch_up } => match inner.subscribe().await {
                     Ok(new) => {
-                        // Opened only after the old token ran out (a slow login or Vault): its
-                        // stream may have gone quiet before the new one began.
-                        let catch_up = catch_up || stream.expires.is_some_and(|at| Instant::now() >= at);
+                        // Opened only after the old token ran out (a slow login or Vault), or
+                        // after the old stream ended: changes in between had no event.
+                        let catch_up = catch_up || stream.ended.load(Ordering::SeqCst) || stream.expires.is_some_and(|at| Instant::now() >= at);
                         std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await;
                         if catch_up {
-                            log_info!("Vault: subscribed to change events with a new token; reading every cached secret again, as the old token may have stopped them early (ADR 0306).");
+                            log_info!("Vault: subscribed to change events with a new token; reading every cached secret again, as the old stream may have stopped early (ADR 0306).");
                             tx.send(Note::Resumed(None));
                         }
                     }
@@ -752,6 +761,8 @@ pub(crate) mod tests {
     pub(crate) struct Hub {
         subs: Mutex<Vec<mpsc::UnboundedSender<Out>>>,
         pub subscriptions: AtomicUsize,
+        /// Subscriptions asked for, counted before `delay_ms`.
+        pub asked: AtomicUsize,
         /// The token of each subscription.
         pub tokens: Mutex<Vec<String>>,
         /// Answers subscriptions with this status instead.
@@ -826,6 +837,7 @@ pub(crate) mod tests {
         if let Err(e) = check(&f, &h) {
             return e.into_response();
         }
+        f.events.asked.fetch_add(1, Ordering::SeqCst);
         if let ms @ 1.. = f.events.delay_ms.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(ms as u64)).await;
         }
@@ -1225,6 +1237,40 @@ pub(crate) mod tests {
         assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "the old stream never broke");
         redact::forget("events-expired-1");
         redact::forget("events-expired-2");
+    }
+
+    #[test]
+    fn an_old_stream_that_ends_while_its_replacement_opens_reads_everything_again() {
+        let (url, f) = stand_in();
+        // A 6 s login: botd subscribes again at 4 s, and the new stream opens at 5 s, before
+        // the old token runs out.
+        f.lease.store(6, Ordering::SeqCst);
+        put(&f, "bots/EVENTS_HANDOFF_TOKEN", "events-handoff-1");
+        let x = store(&url, &[("VAULT_AUTH", "approle"), ("VAULT_ROLE_ID", "role-1"), ("VAULT_SECRET_ID", "secret-id-1")], "3600");
+        x.check().unwrap();
+        x.watch().unwrap();
+        assert_eq!(get(&x, "EVENTS_HANDOFF_TOKEN").as_deref(), Some("events-handoff-1"));
+
+        f.events.delay_ms.store(1000, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(15);
+        while f.events.asked.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Vault closes the old stream while the new one is opening; the change between has
+        // no event on either.
+        f.events.close_all();
+        put(&f, "bots/EVENTS_HANDOFF_TOKEN", "events-handoff-2");
+        while f.events.subscriptions.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f.events.delay_ms.store(0, Ordering::SeqCst);
+        wait_for(|| caught_up("EVENTS_HANDOFF_TOKEN"));
+        assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 2, "with the new subscription, not a later one");
+        assert_eq!(get(&x, "EVENTS_HANDOFF_TOKEN").as_deref(), Some("events-handoff-2"), "a change with no event, read again");
+        redact::forget("events-handoff-1");
+        redact::forget("events-handoff-2");
     }
 
     #[test]
