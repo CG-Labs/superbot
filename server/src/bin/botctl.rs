@@ -2108,14 +2108,17 @@ fn about_lines(about: &Value) -> String {
     if about.is_null() {
         return String::new();
     }
-    let Some(name) = about["displayName"].as_str() else {
-        return "  Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)\n".into();
-    };
-    let contacts: Vec<&str> = about["contacts"].as_array().into_iter().flatten().filter_map(|c| c["type"].as_str()).collect();
-    let mut out = format!("  Federation listing:       {name}; contacts: {}", if contacts.is_empty() { "none".to_string() } else { contacts.join(", ") });
-    out += &match about["sirtfi"].as_str() {
-        Some(v @ ("v1" | "v2")) => format!("; Sirtfi {v}\n"),
-        _ => "\n".into(),
+    let mut out = match about["displayName"].as_str() {
+        None => "  Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)\n".to_string(),
+        Some(name) => {
+            let contacts: Vec<&str> = about["contacts"].as_array().into_iter().flatten().filter_map(|c| c["type"].as_str()).collect();
+            let contacts = if contacts.is_empty() { "none".to_string() } else { contacts.join(", ") };
+            let sirtfi = match about["sirtfi"].as_str() {
+                Some(v @ ("v1" | "v2")) => format!("; Sirtfi {v}"),
+                _ => String::new(),
+            };
+            format!("  Federation listing:       {name}; contacts: {contacts}{sirtfi}\n")
+        }
     };
     for c in about["categories"].as_array().into_iter().flatten() {
         let missing: Vec<&str> = c["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
@@ -5020,8 +5023,13 @@ mod tests {
         assert!(!saml_summary(&v).contains("Federation listing"), "an older botd says nothing of it");
         let rs = json!({ "category": "http://refeds.org/category/research-and-scholarship", "name": "Research and Scholarship", "missing": [] });
         let coco = json!({ "category": "https://refeds.org/category/code-of-conduct/v2", "name": "Code of Conduct v2", "missing": ["SP_DESCRIPTION", "SP_PRIVACY_URL"] });
-        v["about"] = json!({ "displayName": null, "contacts": [], "sirtfi": "off", "categories": [rs, coco] });
-        assert!(saml_summary(&v).contains("  Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)\n"));
+        let unset = json!({ "category": "http://refeds.org/category/research-and-scholarship", "name": "Research and Scholarship", "missing": ["SP_DISPLAY_NAME", "SP_INFORMATION_URL", "SP_CONTACT_TECHNICAL"] });
+        v["about"] = json!({ "displayName": null, "contacts": [], "sirtfi": "off", "categories": [unset] });
+        let out = saml_summary(&v);
+        assert!(
+            out.contains("  Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)\n    Research and Scholarship: set SP_DISPLAY_NAME, SP_INFORMATION_URL, SP_CONTACT_TECHNICAL\n"),
+            "the checklist is there before anything is set: {out}"
+        );
         v["about"] = json!({ "displayName": "SuperBot", "contacts": [{ "type": "technical" }, { "type": "security" }], "sirtfi": "v2", "categories": [rs, coco] });
         let out = saml_summary(&v);
         assert!(out.contains("  Federation listing:       SuperBot; contacts: technical, security; Sirtfi v2\n"), "{out}");

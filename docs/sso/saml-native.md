@@ -41,6 +41,8 @@ Acme (corp): ready
   IdP-initiated sign-in:    refused (start from SuperBot)
   Authentication context:   not checked (the IdP's MFA isn't required)
   Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)
+    Research and Scholarship: set SP_DISPLAY_NAME, SP_INFORMATION_URL, SP_CONTACT_TECHNICAL
+    Code of Conduct v2:       set SP_DISPLAY_NAME, SP_DESCRIPTION, SP_PRIVACY_URL
   IdP metadata from url (https://acme.okta.example/app/exk1abc/sso/saml/metadata):
     Sign-in URL: https://acme.okta.example/app/acme_superbot_1/exk1abc/sso/saml
     Logout URL:  https://acme.okta.example/app/exk1abc/slo/saml
@@ -486,18 +488,21 @@ botctl sso role map uni faculty@uni-b.example Auditor --idp https://login.uni-b.
 
 A research and education federation registers SuperBot from its SP metadata, and its IdPs release attributes by what that says. Describe SuperBot there ([ADR 0323](../adr/0323-saml-sp-metadata-for-federation-registration.md)):
 
+In `.env` (quote values with spaces or `<>`):
+
 ```bash
-SSO_UNI_SP_DISPLAY_NAME=SuperBot at Example University
-SSO_UNI_SP_DESCRIPTION=AI teammates for research groups, each with its own computer
+SSO_UNI_SP_DISPLAY_NAME="SuperBot at Example University"
+SSO_UNI_SP_DESCRIPTION="AI teammates for research groups, each with its own computer"
 SSO_UNI_SP_INFORMATION_URL=https://superbot.example.edu/
 SSO_UNI_SP_PRIVACY_URL=https://superbot.example.edu/privacy
-SSO_UNI_SP_ORGANIZATION=Example University
+SSO_UNI_SP_ORGANIZATION="Example University"
 SSO_UNI_SP_ORGANIZATION_URL=https://www.example.edu/
-SSO_UNI_SP_CONTACT_TECHNICAL=Research Computing <rc-ops@example.edu>
+SSO_UNI_SP_CONTACT_TECHNICAL="Research Computing <rc-ops@example.edu>"
 SSO_UNI_SP_CONTACT_SUPPORT=help@example.edu
-SSO_UNI_SP_CONTACT_ADMINISTRATIVE=Research Computing <rc-admin@example.edu>
-SSO_UNI_SP_CONTACT_SECURITY=Security Team <security@example.edu>
-SSO_UNI_SP_SIRTFI=v2   # only once you meet the Sirtfi framework
+SSO_UNI_SP_CONTACT_ADMINISTRATIVE="Research Computing <rc-admin@example.edu>"
+SSO_UNI_SP_CONTACT_SECURITY="Security Team <security@example.edu>"
+# Only once you meet the Sirtfi framework:
+SSO_UNI_SP_SIRTFI=v2
 ```
 
 - **What's published.** The name, description and links as `mdui:UIInfo` in English; the organization; each contact as a `ContactPerson`, the security one as the REFEDS security contact; Sirtfi as the `assurance-certification` entity attribute. With a display name, an `AttributeConsumingService` lists the attributes botd reads: the email and display name (your `EMAIL_ATTRIBUTE` and `NAME_ATTRIBUTE`, or eduPerson's `mail` and `displayName`), and the groups and authentication methods attributes if set. The email is marked required when `ALLOWED_DOMAINS` is set, and the groups with `REQUIRED_GROUPS`. A subject identifier is asked for as [above](#subject-identifiers-subject-id-and-pairwise-id). With none of these settings, the metadata is unchanged.

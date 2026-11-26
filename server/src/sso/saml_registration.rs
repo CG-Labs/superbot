@@ -158,10 +158,11 @@ pub fn text(raw: &str, max: usize) -> Result<String, String> {
     Ok(t.to_string())
 }
 
-/// A page people open from a listing: an https URL.
+/// A page people open from a listing: an https URL. Not `http://localhost` as `secure_url`
+/// allows: the link is opened on other people's machines.
 pub fn link(raw: &str) -> Result<String, String> {
     let u = raw.trim();
-    if u.len() > MAX_URL || !secure_url(u) {
+    if u.len() > MAX_URL || !u.starts_with("https://") || !secure_url(u) {
         return Err("must be an https URL".into());
     }
     Ok(u.to_string())
@@ -297,7 +298,7 @@ mod tests {
         }
         assert!(text(&"x".repeat(MAX_NAME + 1), MAX_NAME).is_err());
         assert_eq!(link(" https://superbot.example.edu/privacy ").unwrap(), "https://superbot.example.edu/privacy");
-        for bad in ["http://superbot.example.edu/", "superbot.example.edu", "javascript:alert(1)", ""] {
+        for bad in ["http://superbot.example.edu/", "http://localhost/privacy", "http://127.0.0.1:8080/", "superbot.example.edu", "javascript:alert(1)", ""] {
             assert!(link(bad).is_err(), "{bad}");
         }
     }
