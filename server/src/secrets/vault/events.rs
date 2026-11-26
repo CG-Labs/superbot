@@ -34,7 +34,7 @@ use crate::obs::log::{log_info, log_warn};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -653,6 +653,58 @@ impl Stream {
     }
 }
 
+/// What the stream is doing, for `botctl secrets backend` and `/metrics` (ADR 0318): counts
+/// and botd's own reasons, never a path, a value or Vault's text.
+#[derive(Default)]
+pub(crate) struct Status {
+    /// The first subscription was made: botd follows Vault's events.
+    on: AtomicBool,
+    following: AtomicBool,
+    /// When `following` last changed, in ms since the epoch.
+    since: AtomicI64,
+    changes: AtomicU64,
+    last_change: AtomicI64,
+    lost: AtomicU64,
+    catch_ups: AtomicU64,
+    last_loss: Mutex<Option<String>>,
+}
+
+impl Status {
+    fn following(&self, on: bool) {
+        self.since.store(crate::db::now(), Ordering::SeqCst);
+        self.following.store(on, Ordering::SeqCst);
+        self.on.store(true, Ordering::SeqCst);
+    }
+
+    fn lost(&self, why: &str) {
+        *self.last_loss.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
+        self.lost.fetch_add(1, Ordering::SeqCst);
+        self.following(false);
+    }
+
+    fn changed(&self) {
+        self.last_change.store(crate::db::now(), Ordering::SeqCst);
+        self.changes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn caught_up(&self) {
+        self.catch_ups.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// None until botd follows the events.
+    pub(crate) fn view(&self) -> Option<external::WatchStatus> {
+        self.on.load(Ordering::SeqCst).then(|| external::WatchStatus {
+            following: self.following.load(Ordering::SeqCst),
+            since_ms: self.since.load(Ordering::SeqCst),
+            changes: self.changes.load(Ordering::SeqCst),
+            last_change_ms: Some(self.last_change.load(Ordering::SeqCst)).filter(|t| *t > 0),
+            lost: self.lost.load(Ordering::SeqCst),
+            catch_ups: self.catch_ups.load(Ordering::SeqCst),
+            last_loss: self.last_loss.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        })
+    }
+}
+
 /// `secret.vault_events`: the stream's `state`, against Vault's address.
 fn audit_state(addr: &str, state: &str, error: Option<&str>) {
     let e = Event::new(external::actor(), "secret.vault_events").target("vault", addr);
@@ -696,6 +748,7 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
             }
         };
         drop(stream);
+        inner.events.lost(&why);
         log_warn!("Vault: change events stopped ({why}); subscribing again. Until then a change reaches botd within SECRETS_CACHE_SECONDS (ADR 0306).");
         audit_state(&addr, "lost", Some(&why));
         let mut wait = BACKOFF_START;
@@ -713,6 +766,7 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
             }
         };
         log_info!("Vault: change events resumed; reading every cached secret again for changes made meanwhile (ADR 0306).");
+        inner.events.following(true);
         audit_state(&addr, "resumed", None);
         tx.send(Note::Resumed(None));
     }
@@ -731,12 +785,13 @@ fn audit_refresh(report: &Refresh, target: (&str, &str), trigger: &str, event: O
 
 /// Applies what the stream announces to the store, on a thread of its own: reads and
 /// refreshes block, and must not hold up the stream.
-fn apply(store: Weak<ExternalStore>, rx: Rx) {
+fn apply(store: Weak<ExternalStore>, rx: Rx, status: Arc<Status>) {
     while let Some(note) = rx.recv() {
         let Some(store) = store.upgrade() else { return };
         match note {
             Note::Changed { scope, name, event, index } => {
                 let Some(entry) = store.changed(&scope, &name, index.as_deref()) else { continue };
+                status.changed();
                 let folder = scope.folder('/');
                 if entry.restart {
                     log_warn!("Vault: {name} in {folder} changed ({event}), but botd read it at startup and keeps the old value until it restarts (ADR 0291).");
@@ -763,6 +818,7 @@ fn apply(store: Weak<ExternalStore>, rx: Rx) {
                     }
                 };
                 if let Some(r) = report {
+                    status.caught_up();
                     if !r.restart().is_empty() {
                         log_warn!("Vault: {} changed while change events were down, but botd read them at startup and keeps the old values until it restarts (ADR 0291).", r.restart().join(", "));
                     }
@@ -779,8 +835,10 @@ pub(super) fn start(vault: &Vault, store: Weak<ExternalStore>) -> Result<(), Err
     let users = store.upgrade().is_some_and(|s| s.user_folders());
     let first = vault.run(|i| async move { i.subscribe().await })?;
     audit_state(&vault.inner.cfg.addr, "subscribed", None);
+    vault.inner.events.following(true);
     let (tx, rx) = queue();
-    std::thread::Builder::new().name("vault-events".into()).spawn(move || apply(store, rx)).map_err(|e| unavailable("change events", e))?;
+    let status = Arc::clone(&vault.inner.events);
+    std::thread::Builder::new().name("vault-events".into()).spawn(move || apply(store, rx, status)).map_err(|e| unavailable("change events", e))?;
     vault.worker.spawn(follow(Arc::clone(&vault.inner), first, users, tx))
 }
 
@@ -1095,6 +1153,8 @@ pub(crate) mod tests {
         assert!(x.watch().unwrap());
         assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 1);
         assert_eq!(*f.events.tokens.lock().unwrap(), ["hvs.events"]);
+        let w = x.watch_status().expect("following");
+        assert_eq!((w.following, w.changes, w.last_change_ms, w.lost, w.catch_ups), (true, 0, None, 0, 0));
         assert_eq!(audited(&url).iter().filter(|e| e.action == "secret.vault_events" && e.details["state"] == "subscribed").count(), 1);
         assert_eq!(get(&x, "EVENTS_ROTATED_TOKEN").as_deref(), Some("events-rotated-1"));
         assert_eq!(get(&x, "EVENTS_DELETED_TOKEN").as_deref(), Some("events-deleted-1"));
@@ -1143,6 +1203,9 @@ pub(crate) mod tests {
         f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_ROTATED_TOKEN"));
         wait_for(|| get(&x, "EVENTS_ROTATED_TOKEN").as_deref() == Some("events-rotated-3"));
         assert_eq!(f.reads.load(Ordering::SeqCst), reads + 1, "only the last event is for a name botd reads");
+        wait_for(|| x.watch_status().unwrap().changes == 5);
+        let w = x.watch_status().unwrap();
+        assert!(w.following && w.last_change_ms.is_some() && w.lost == 0, "{w:?}");
         wait_for(|| f.events.pongs.load(Ordering::SeqCst) > 0);
         for v in ["events-rotated-1", "events-rotated-2", "events-rotated-3", "events-startup-1", "events-startup-2", "events-deleted-1", "events-added-1"] {
             redact::forget(v);
@@ -1163,6 +1226,8 @@ pub(crate) mod tests {
         f.events.close_all();
         put(&f, "bots/EVENTS_GAP_TOKEN", "events-gap-2");
         wait_for(|| audited(&url).iter().any(|e| e.details["state"] == "lost"));
+        let w = x.watch_status().unwrap();
+        assert_eq!((w.following, w.lost, w.last_loss.as_deref()), (false, 1, Some("Vault closed the stream")));
         std::thread::sleep(BACKOFF_START * 4);
         assert_eq!(get(&x, "EVENTS_GAP_TOKEN").as_deref(), Some("events-gap-1"), "not yet: botd couldn't subscribe again");
         f.events.status.store(0, Ordering::SeqCst);
@@ -1171,6 +1236,7 @@ pub(crate) mod tests {
         assert_eq!((lost.outcome, lost.details["error"].as_str()), (Outcome::Failure, Some("Vault closed the stream")));
         assert!(audited(&url).iter().any(|e| e.details["state"] == "resumed"));
         wait_for(|| audited("vault").iter().any(|e| e.action == "secret.cache_refreshed" && e.details["trigger"] == "vault-events-resumed"));
+        wait_for(|| x.watch_status().is_some_and(|w| w.following && w.catch_ups >= 1));
 
         // A connection dropped without a word, then a server that stops answering pings.
         f.events.cut();
@@ -1181,6 +1247,7 @@ pub(crate) mod tests {
         wait_for(|| audited(&url).iter().any(|e| e.details["error"] == "Vault stopped answering pings"));
         f.events.silent.store(false, Ordering::SeqCst);
         wait_for(|| f.events.open() == 1 && f.events.subscriptions.load(Ordering::SeqCst) >= 4);
+        wait_for(|| x.watch_status().is_some_and(|w| w.following && w.lost >= 3));
         put(&f, "bots/EVENTS_GAP_TOKEN", "events-gap-3");
         f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_GAP_TOKEN"));
         wait_for(|| get(&x, "EVENTS_GAP_TOKEN").as_deref() == Some("events-gap-3"));
@@ -1460,6 +1527,7 @@ pub(crate) mod tests {
         let off = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
         assert!(!off.watch().unwrap());
         assert!(!off.describe().contains("change events"));
+        assert_eq!(off.watch_status(), None);
         let bad = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_TOKEN", "hvs.off"), ("VAULT_EVENTS", "yes")];
         let e = external::from_env(&settings(&bad), &EnvStore::fixed(&bad)).err().unwrap();
         assert!(e.contains("VAULT_EVENTS must be 1"));
