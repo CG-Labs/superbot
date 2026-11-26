@@ -18,7 +18,7 @@ import { isQueued, workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
 import { HARNESS_NAMES, hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { Message } from "../src/types";
-import { unsentFor, type Unsent } from "../src/unsent";
+import { forgetWords, keepWords, takeWords, unsentFor, type Unsent } from "../src/unsent";
 import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
 import { EmptyState } from "./EmptyState";
@@ -128,9 +128,7 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     if (restoredRef.current !== id) return;
     restoredRef.current = null;
     const words = textRef.current;
-    if (!words || store.ended) return;
-    const saved = store.words[id];
-    store.words[id] = saved && saved !== words ? `${words}\n\n${saved}` : words;
+    if (words) keepWords(store, id, words, true);
   };
   const keepRef = useRef(keepRestored);
   keepRef.current = keepRestored;
@@ -143,15 +141,15 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     if (!activeId) return;
     // Only into an empty box; otherwise it waits for the next visit or a Retry.
     const store = unsentRef.current;
-    const saved = store.words[activeId];
-    if (saved && !textRef.current) {
-      delete store.words[activeId];
+    const pending = store.words[activeId] ?? [];
+    const saved = textRef.current ? null : takeWords(store, activeId);
+    if (saved) {
       restoredRef.current = activeId;
       textRef.current = saved;
       setText(saved);
       // Back in the box, the words are sent from there; a Retry could send them twice.
       const retry = store.retries[activeId];
-      if (retry?.body === saved) {
+      if (retry && pending.includes(retry.body)) {
         delete store.retries[activeId];
         toastRef.current.dismiss(retry.toast);
       }
@@ -211,14 +209,14 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     void sendText(body, undefined, id).catch((err) => {
       if (store.ended) return;
       // Gives the words back unless something new was typed meanwhile.
-      if (!mountedRef.current || shownRef.current !== id) store.words[id] = body;
+      if (!mountedRef.current || shownRef.current !== id) keepWords(store, id, body);
       else
         setText((cur) => {
           if (!cur) {
             restoredRef.current = id;
             return body;
           }
-          store.words[id] = body;
+          keepWords(store, id, body);
           return cur;
         });
       const retry = { body, toast: 0 };
@@ -234,7 +232,7 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
               restoredRef.current = null;
               return "";
             });
-          if (store.words[id] === body) delete store.words[id];
+          forgetWords(store, id, body);
           send(body, id, store);
         },
       });
@@ -248,7 +246,7 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
       delete unsent.retries[bot.id];
       toast.dismiss(retry.toast);
     }
-    if (unsent.words[bot.id] === body) delete unsent.words[bot.id];
+    forgetWords(unsent, bot.id, body);
     restoredRef.current = null;
     setText("");
     send(body, bot.id);

@@ -249,6 +249,22 @@ describe("ChatView", () => {
       expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     });
 
+    it("keeps every message that failed, not just the last", async () => {
+      const fails: ((err: Error) => void)[] = [];
+      mockCtx.sendText = jest.fn(() => new Promise<void>((_, reject) => fails.push(reject)));
+      const view = await render(ui(true));
+      for (const words of ["Ship it", "Then tag it"]) {
+        await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), words));
+        await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+      }
+      await view.rerender(ui(false));
+      for (const fail of fails) await act(async () => fail(new TypeError("Network request failed")));
+
+      await view.rerender(ui(true));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it\n\nThen tag it");
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    });
+
     it("is forgotten on sign-out, so the next account never sees it", async () => {
       const { view, fail } = await sendThenClose();
       endUnsent(mockCtx.api as object);
