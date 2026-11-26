@@ -314,8 +314,12 @@ impl ExternalStore {
     }
 
     fn fetch(&self, scope: &Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
+        self.fetch_at(scope, name, None)
+    }
+
+    fn fetch_at(&self, scope: &Scope, name: &str, index: Option<&str>) -> Result<Option<Zeroizing<String>>, Error> {
         let started = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
-        let got = self.provider.read(scope.clone(), name);
+        let got = self.provider.read_at(scope.clone(), name, index);
         self.took(scope, name, started, got)
     }
 
@@ -409,6 +413,12 @@ impl ExternalStore {
     /// fails closed as it would once the cache ran out. Values before and after are only
     /// compared here, in memory; the report says what changed, never a value or a digest.
     pub fn refresh(&self, only: Option<&[String]>) -> Result<Refresh, RefreshError> {
+        self.refresh_at(only, None)
+    }
+
+    /// `refresh`, each read from a backend that has seen at least `index` (`Provider::read_at`):
+    /// after changes whose own reads were dropped, so none can come from before them (ADR 0306).
+    pub fn refresh_at(&self, only: Option<&[String]>, index: Option<&str>) -> Result<Refresh, RefreshError> {
         let wanted = match only {
             Some(names) => Some(refresh_names(names)?),
             None => None,
@@ -438,7 +448,7 @@ impl ExternalStore {
 
         let jobs: Vec<Job> = keys.into_iter().map(Job::Read).chain(folders.into_iter().map(Job::List)).collect();
         let done = parallel(&jobs, |job| match job {
-            Job::Read((scope, name)) => Done::Read(self.fetch(scope, name)),
+            Job::Read((scope, name)) => Done::Read(self.fetch_at(scope, name, index)),
             Job::List(scope) => Done::List(self.list_from_backend(scope)),
         });
 

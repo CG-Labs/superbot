@@ -257,9 +257,10 @@ pub(crate) fn seen(text: &str, cfg: &Config, users: bool) -> Option<Seen> {
 #[derive(Debug, PartialEq)]
 enum Note {
     Changed { scope: Scope, name: String, event: String, index: Option<String> },
-    /// Subscribed again after a gap, or after a token that may have stopped events early:
-    /// events may have been missed.
-    Resumed,
+    /// Read everything cached again: subscribed again after a gap, or after a token that may
+    /// have stopped events early, so events may have been missed; or too many changes waited.
+    /// At the newest index of the changes it stands for, when it stands for some.
+    Resumed(Option<String>),
 }
 
 /// Most names waiting to be read again; past it they make way for one read of everything.
@@ -273,6 +274,9 @@ struct Pending {
     order: VecDeque<(Scope, String)>,
     latest: HashMap<(Scope, String), (String, Option<String>)>,
     all: bool,
+    /// The index of the newest change made way for a read of everything: Vault sends events
+    /// in order, so it covers those before it.
+    floor: Option<String>,
     sender_gone: bool,
     receiver_gone: bool,
 }
@@ -303,15 +307,20 @@ impl Tx {
     fn send(&self, note: Note) {
         let mut p = self.0.lock();
         match note {
-            Note::Resumed => p.all = true,
+            Note::Resumed(index) => {
+                p.all = true;
+                p.floor = index.or(p.floor.take());
+            }
             Note::Changed { scope, name, event, index } => {
                 let key = (scope, name);
                 if let Some(waiting) = p.latest.get_mut(&key) {
                     *waiting = (event, index);
                 } else if p.order.len() >= MAX_PENDING {
+                    let newest = index.or_else(|| p.order.iter().rev().find_map(|k| p.latest.get(k).and_then(|(_, i)| i.clone())));
                     p.order.clear();
                     p.latest.clear();
                     p.all = true;
+                    p.floor = newest.or(p.floor.take());
                 } else {
                     p.order.push_back(key.clone());
                     p.latest.insert(key, (event, index));
@@ -341,7 +350,7 @@ impl Rx {
         let mut p = self.0.lock();
         loop {
             if std::mem::take(&mut p.all) {
-                return Some(Note::Resumed);
+                return Some(Note::Resumed(p.floor.take()));
             }
             if let Some(key) = p.order.pop_front() {
                 let (event, index) = p.latest.remove(&key).unwrap_or_default();
@@ -455,7 +464,7 @@ impl Inner {
     /// where the changes are applied, one after another.
     fn announce(&self, text: &str, users: bool, tx: &Tx) {
         let Some(s) = seen(text, &self.cfg, users) else { return };
-        let _ = tx.send(Note::Changed { scope: s.scope, name: s.name, event: s.event, index: s.index });
+        tx.send(Note::Changed { scope: s.scope, name: s.name, event: s.event, index: s.index });
     }
 }
 
@@ -599,7 +608,7 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                         std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await;
                         if catch_up {
                             log_info!("Vault: subscribed to change events with a new token; reading every cached secret again, as the old token may have stopped them early (ADR 0306).");
-                            let _ = tx.send(Note::Resumed);
+                            tx.send(Note::Resumed(None));
                         }
                     }
                     // The old stream may still work: keep it, and try again a little later. Its
@@ -631,7 +640,7 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
         };
         log_info!("Vault: change events resumed; reading every cached secret again for changes made meanwhile (ADR 0306).");
         audit_state(&addr, "resumed", None);
-        let _ = tx.send(Note::Resumed);
+        tx.send(Note::Resumed(None));
     }
 }
 
@@ -663,10 +672,10 @@ fn apply(store: Weak<ExternalStore>, rx: Rx) {
                 let report = Refresh { store: store.kind(), names: Some(vec![name.clone()]), entries: vec![entry], folders: Vec::new() };
                 audit_refresh(&report, ("secret", &name), "vault-event", Some(&event));
             }
-            Note::Resumed => {
+            Note::Resumed(index) => {
                 let mut tries = 0;
                 let report = loop {
-                    match store.refresh(None) {
+                    match store.refresh_at(None, index.as_deref()) {
                         Ok(r) => break Some(r),
                         // An admin's refresh began before the gap ended: wait for it, then read again.
                         Err(RefreshError::Busy) if tries < 60 => {
@@ -918,10 +927,10 @@ pub(crate) mod tests {
             tx.send(changed(&format!("N{i}_TOKEN"), "4"));
         }
         tx.send(changed("C_TOKEN", "5"));
-        assert_eq!(rx.recv(), Some(Note::Resumed), "everything read again instead");
+        assert_eq!(rx.recv(), Some(Note::Resumed(Some("5".into()))), "everything read again instead, at the newest change's index");
         tx.send(changed("D_TOKEN", "6"));
-        tx.send(Note::Resumed);
-        assert_eq!(rx.recv(), Some(Note::Resumed), "a full read first");
+        tx.send(Note::Resumed(None));
+        assert_eq!(rx.recv(), Some(Note::Resumed(None)), "a full read first");
         assert_eq!(rx.recv(), Some(changed("D_TOKEN", "6")));
         assert!(!tx.is_closed());
         drop(tx);
