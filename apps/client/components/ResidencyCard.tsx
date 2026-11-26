@@ -1,12 +1,15 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
+import { errorText, friendlyError } from "../src/errors";
 import { MARKDOWN } from "../src/fileTypes";
 import { reportFileName, reportLabel, residencyLines } from "../src/residency";
 import { saveCsv } from "../src/saveCsv";
 import { themedStyles } from "../src/theme";
 import type { MyResidency } from "../src/types";
-import { kit, Spinner } from "./ui";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit } from "./ui";
 
 export type ResidencyApi = Pick<SuperBotApi, "myResidency" | "myResidencyReport">;
 
@@ -34,7 +37,7 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
     try {
       setView(await api.myResidency());
     } catch (e) {
-      setLoadError(e instanceof Error ? e.message : String(e));
+      setLoadError(errorText(e, "Couldn't load your data's residency"));
     }
   }, [api]);
 
@@ -45,19 +48,10 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
   if (view === undefined) {
     return (
       <View style={styles.card} accessibilityLabel="Data residency">
-        <Text style={styles.cardTitle}>Data residency</Text>
-        {loadError ? (
-          <>
-            <Text style={styles.error} accessibilityRole="alert">
-              {`Couldn't load your data's residency: ${loadError}`}
-            </Text>
-            <Pressable style={styles.btn} onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Try again">
-              <Text style={styles.btnText}>Try again</Text>
-            </Pressable>
-          </>
-        ) : (
-          <Spinner />
-        )}
+        <Text style={styles.cardTitle} role="heading">
+          Data residency
+        </Text>
+        {loadError ? <InlineError message={loadError} onRetry={load} /> : <ListSkeleton label="Loading your data's residency" rows={2} />}
       </View>
     );
   }
@@ -72,7 +66,7 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
       await save(reportFileName(on, r.fileName), r.text, "Save residency report", MARKDOWN);
       setNotice("Report saved. Its digest, at the end, shows it hasn't been changed.");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -81,7 +75,9 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
   const { lines, warnings } = residencyLines(view);
   return (
     <View style={styles.card} accessibilityLabel="Data residency">
-      <Text style={styles.cardTitle}>Data residency</Text>
+      <Text style={styles.cardTitle} role="heading">
+        Data residency
+      </Text>
       {lines.map((l) => (
         <Text key={l} style={styles.line}>
           {l}
@@ -98,15 +94,19 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
           {notice}
         </Text>
       ) : null}
-      {error ? (
-        <Text style={styles.error} accessibilityRole="alert">
-          {error}
-        </Text>
-      ) : null}
+      {error ? <InlineError message={error} /> : null}
       {view.reports.length ? (
         <View style={styles.row}>
           {view.reports.map((on) => (
-            <Pressable key={on} style={[styles.btn, busy && styles.busy]} disabled={!!busy} onPress={() => void download(on)} accessibilityRole="button" accessibilityLabel={reportLabel(on)}>
+            <Pressable
+              key={on}
+              style={[styles.btn, busy && styles.busy]}
+              disabled={!!busy}
+              onPress={() => void download(on)}
+              accessibilityRole="button"
+              accessibilityLabel={reportLabel(on)}
+              aria-busy={busy === on}
+            >
               <Text style={styles.btnText}>{busy === on ? "Preparing…" : reportLabel(on)}</Text>
             </Pressable>
           ))}
@@ -125,7 +125,6 @@ const useStyles = themedStyles((t) => {
     cardTitle: k.cardTitle,
     line: k.text,
     good: k.good,
-    error: k.error,
     warn: k.warn,
     dim: k.dim,
     row: k.actions,

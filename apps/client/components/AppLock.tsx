@@ -273,7 +273,7 @@ function LockScreen({ label, message, stuck, busy, onUnlock, onSignOut }: LockSc
     <View style={styles.fill} accessibilityViewIsModal accessibilityLabel="SuperBot is locked">
       <SignInFrame title="SuperBot is locked" subtitle={stuck ? undefined : label ? `Use ${label} or your passcode to open it.` : "Use your passcode to open it."}>
         {message ? <Notice tone="danger">{message}</Notice> : null}
-        {stuck ? <PrimaryButton label="Sign out" onPress={onSignOut} disabled={busy} /> : <PrimaryButton label="Unlock" onPress={onUnlock} disabled={busy} />}
+        {stuck ? <PrimaryButton label="Sign out" onPress={onSignOut} busy={busy} /> : <PrimaryButton label="Unlock" onPress={onUnlock} busy={busy} />}
         {stuck ? null : <TextButton label="Sign out" onPress={onSignOut} disabled={busy} />}
       </SignInFrame>
     </View>

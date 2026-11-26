@@ -4,6 +4,7 @@ import { keeperQuestion, keepersQuestion } from "../src/access";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
+import { errorText, friendlyError } from "../src/errors";
 import {
   KEEP_OLD,
   canRotate,
@@ -29,9 +30,12 @@ import {
 } from "../src/serviceAccounts";
 import { hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { CustomRole, MintedServiceToken, ServiceAccount, ServiceAccountChoices, ServiceAccountDraft, ServiceAccountsView, Team } from "../src/types";
+import { EmptyState } from "./EmptyState";
+import { ErrorState, InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
 import { Chips } from "./Chips";
 import { DetailSheet, PaneTransition } from "./Shell";
-import { kit, PageHeader, Spinner } from "./ui";
+import { kit, PageHeader } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -52,7 +56,6 @@ function customRoles(choices: ServiceAccountChoices, sa?: ServiceAccount): { id:
 
 type Picked = { kind: "account"; id: string } | { kind: "new" } | null;
 
-const message = (err: unknown) => (err instanceof Error ? err.message : "Failed");
 
 const InSection = React.createContext(false);
 
@@ -62,7 +65,9 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   const nested = React.useContext(InSection);
   return (
     <View style={nested ? styles.subsection : styles.section}>
-      <Text style={nested ? styles.subsectionTitle : styles.sectionTitle}>{title}</Text>
+      <Text style={nested ? styles.subsectionTitle : styles.sectionTitle} role="heading">
+        {title}
+      </Text>
       <InSection.Provider value>{children}</InSection.Provider>
     </View>
   );
@@ -229,13 +234,13 @@ function NewAccount({ api, view, choices, admin, onBusy, onCreated }: { api: Sup
         try {
           minted = await api.createServiceToken(sa.id, { expiresInDays: days });
         } catch (err) {
-          tokenError = `Made ${sa.name}, but not its token: ${message(err)}`;
+          tokenError = `Made ${sa.name}, but not its token: ${friendlyError(err)}`;
         }
       }
       onBusy(false);
       await onCreated(sa, minted, tokenError);
     } catch (err) {
-      setError(message(err));
+      setError(friendlyError(err));
       setBusy(false);
       onBusy(false);
     }
@@ -244,14 +249,16 @@ function NewAccount({ api, view, choices, admin, onBusy, onCreated }: { api: Sup
   return (
     <View style={styles.wrap}>
       <View>
-        <Text style={styles.name}>New service account</Text>
+        <Text style={styles.name} role="heading">
+          New service account
+        </Text>
         <Text style={styles.faint}>For a script or integration: it can&apos;t sign in, takes no seat, and acts only through tokens you make for it. You own it.</Text>
       </View>
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <InlineError message={error} /> : null}
       <AccountForm draft={draft} setDraft={setDraft} choices={choices} busy={busy} editing={false} admin={admin} />
       <Section title="First token">
         <Pressable style={styles.perm} onPress={() => setFirstToken(!firstToken)} accessibilityRole="checkbox" accessibilityState={{ checked: firstToken }} accessibilityLabel="Make a token now">
-          <Text style={[styles.check, firstToken && styles.checkOn]}>{firstToken ? "✓" : ""}</Text>
+          <Text style={[styles.check, firstToken && styles.checkOn]} maxFontSizeMultiplier={1.3}>{firstToken ? "✓" : ""}</Text>
           <Text style={styles.text}>Make a token now, with everything it holds</Text>
         </Pressable>
         {firstToken ? <Chips options={expiryChoices(view)} value={days} onChange={setDays} disabled={busy} /> : null}
@@ -298,6 +305,7 @@ function AccountDetail({
   const styles = useStyles();
   const t = useTheme();
   const [full, setFull] = useState<ServiceAccount | null>(null);
+  const [fullError, setFullError] = useState<string | null>(null);
   const [draft, setDraft] = useState<ServiceAccountDraft>(draftOf(account));
   const base = useRef(draftOf(account));
   const [busy, setBusy] = useState(false);
@@ -318,9 +326,17 @@ function AccountDetail({
     setDraft((d) => rebaseDraft(d, was, now));
     setFull(next);
   }, [api, account.id]);
-  useEffect(() => {
-    loadFull().catch((err) => setError(message(err)));
+  const fetchFull = useCallback(async () => {
+    try {
+      await loadFull();
+      setFullError(null);
+    } catch (err) {
+      setFullError(errorText(err, "Couldn't load its tokens"));
+    }
   }, [loadFull]);
+  useEffect(() => {
+    void fetchFull();
+  }, [fetchFull]);
 
   const sa = full ?? account;
   const active = sa.status === "active";
@@ -343,7 +359,7 @@ function AccountDetail({
     try {
       await action();
     } catch (err) {
-      setError(message(err));
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
       onBusy(false);
@@ -426,13 +442,15 @@ function AccountDetail({
   return (
     <View style={styles.wrap}>
       <View>
-        <Text style={styles.name}>{sa.name}</Text>
+        <Text style={styles.name} role="heading">
+          {sa.name}
+        </Text>
         <Text style={styles.faint}>
           {roleLabel(sa)} · {active ? "active" : "disabled"} · owned by {sa.owner ? sa.owner.name || sa.owner.email || sa.owner.id : "nobody"} · {lastUsedLabel(sa.lastUsedAt).toLowerCase()}
         </Text>
       </View>
       {minted && minted.serviceAccount.id === sa.id ? <TokenReveal minted={minted} onDone={onDismissMinted} /> : null}
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <InlineError message={error} /> : null}
       {!sa.ownerActive ? <Text style={styles.warn}>Its owner is disabled or gone, so its tokens are refused. {admin ? "Give it an active owner below." : "Ask an admin to give it another owner."}</Text> : null}
       {sa.ownerActive && sa.team && sa.ownerOnTeam === false ? (
         <Text style={styles.warn}>Its owner isn&apos;t on {sa.team.name}, so it acts in no team: it doesn&apos;t see the team or the Bots shared with it until they are.</Text>
@@ -455,7 +473,7 @@ function AccountDetail({
               <Button label="Take back" a11y={`Take ${b.name} back`} disabled={busy} onPress={() => void takeBack(b)} />
             </View>
           ))}
-          {!keptBots.length ? <Text style={styles.dim}>None yet.</Text> : null}
+          {!keptBots.length ? <EmptyState compact glyph="+" title="It keeps no Bots yet" message="Pick some of its owner's Bots below to hand over." /> : null}
           {keptBots.length ? <Text style={styles.faint}>They stay {sa.owner?.name || "its owner"}&apos;s: taking one back, deleting the account or changing its owner leaves them with the owner.</Text> : null}
           {keepable.length && left ? (
             <>
@@ -476,7 +494,7 @@ function AccountDetail({
                     accessibilityState={{ checked: on, disabled: off }}
                     accessibilityLabel={`Hand over ${b.name}`}
                   >
-                    <Text style={[styles.check, on && styles.checkOn]}>{on ? "✓" : ""}</Text>
+                    <Text style={[styles.check, on && styles.checkOn]} maxFontSizeMultiplier={1.3}>{on ? "✓" : ""}</Text>
                     <Text style={styles.text}>{b.keptBy ? `${b.name} (from ${b.keptBy.name})` : b.name}</Text>
                   </Pressable>
                 );
@@ -491,7 +509,11 @@ function AccountDetail({
 
       <Section title={`Tokens${tokens ? ` (${sa.tokens} live)` : ""}`}>
         {tokens == null ? (
-          <Spinner />
+          fullError ? (
+            <InlineError message={fullError} onRetry={fetchFull} />
+          ) : (
+            <ListSkeleton label="Loading tokens" rows={2} />
+          )
         ) : tokens.length ? (
           tokens.map((t) => (
             <View key={t.id} style={styles.token}>
@@ -527,7 +549,12 @@ function AccountDetail({
             </View>
           ))
         ) : (
-          <Text style={styles.dim}>No tokens yet.</Text>
+          <EmptyState
+            compact
+            glyph="+"
+            title="No tokens yet"
+            message={!manage ? "An admin makes its tokens." : active ? "Make one below for whatever calls the API with it." : "Enable it to make one."}
+          />
         )}
       </Section>
 
@@ -547,7 +574,7 @@ function AccountDetail({
             const on = scopes.includes(s);
             return (
               <Pressable key={s} style={styles.perm} disabled={busy} onPress={() => setScopes(toggleScope(held, scopes, s))} accessibilityRole="checkbox" accessibilityState={{ checked: on, disabled: busy }} accessibilityLabel={`Scope ${s}`}>
-                <Text style={[styles.check, on && styles.checkOn]}>{on ? "✓" : ""}</Text>
+                <Text style={[styles.check, on && styles.checkOn]} maxFontSizeMultiplier={1.3}>{on ? "✓" : ""}</Text>
                 <Text style={styles.text}>{s}</Text>
               </Pressable>
             );
@@ -601,7 +628,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
       setView(await api.serviceAccounts());
       setError(null);
     } catch (err) {
-      setError(message(err));
+      setError(friendlyError(err));
     }
   }, [api]);
 
@@ -678,10 +705,11 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
       />
       <View style={styles.body}>
         <View style={wide ? styles.listPaneWide : styles.listPane}>
-          {error ? <Text style={styles.error}>{error}</Text> : null}
-          {!view && !error ? <Spinner style={styles.spinner} /> : null}
+          {error && !view ? <ErrorState title="Couldn't load service accounts" message={error} onRetry={load} /> : null}
+          {!view && !error ? <ListSkeleton label="Loading service accounts" rows={3} /> : null}
           {view ? (
             <ScrollView contentContainerStyle={styles.list}>
+              {error ? <InlineError message={`Couldn't load service accounts. ${error}`} onRetry={load} /> : null}
               <View style={styles.listCard}>
                 {view.serviceAccounts.map((s, i) => (
                   <Pressable
@@ -689,7 +717,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
                     style={({ pressed }) => [styles.listRow, i === 0 && styles.listRowFirst, pressed && styles.pressed, picked?.kind === "account" && picked.id === s.id && styles.selected]}
                     onPress={() => pick({ kind: "account", id: s.id })}
                     disabled={busy}
-                    accessibilityState={{ disabled: busy }}
+                    accessibilityState={{ disabled: busy, selected: picked?.kind === "account" && picked.id === s.id }}
                     accessibilityRole="button"
                     accessibilityLabel={`Service account ${s.name}`}
                   >
@@ -706,9 +734,12 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
                   </Pressable>
                 ))}
                 {!view.serviceAccounts.length ? (
-                  <Text style={styles.empty}>
-                    {!manage ? "You own no service accounts." : own ? "You own no service accounts yet. Make one for each script or integration of yours that calls the API." : "No service accounts yet. Make one for each script or integration that calls the API."}
-                  </Text>
+                  <EmptyState
+                    compact
+                    glyph="+"
+                    title={!manage ? "You own no service accounts" : own ? "You own no service accounts yet" : "No service accounts yet"}
+                    message={!manage ? undefined : own ? "Make one for each script or integration of yours that calls the API." : "Make one for each script or integration that calls the API."}
+                  />
                 ) : null}
               </View>
             </ScrollView>
@@ -739,7 +770,6 @@ const useStyles = themedStyles((t) => {
     listPane: { flex: 1, padding: t.space.md },
     listPaneWide: { width: 400, padding: t.space.md, backgroundColor: t.c.surface, borderRightWidth: hairline, borderRightColor: t.c.border },
     list: { gap: t.space.md, paddingBottom: t.space.xl },
-    spinner: { marginTop: t.space.xl },
     listCard: { ...k.card, padding: 0, gap: 0, overflow: "hidden" },
     listRow: { paddingVertical: t.space.md, paddingHorizontal: t.space.lg, gap: t.space.xxs, borderTopWidth: hairline, borderTopColor: t.c.border },
     listRowFirst: { borderTopWidth: 0 },
@@ -755,7 +785,6 @@ const useStyles = themedStyles((t) => {
     faint: k.faint,
     mono: { ...k.mono, color: t.c.textMuted },
     warn: k.warn,
-    error: k.error,
     empty: k.empty,
     section: k.card,
     sectionTitle: k.cardTitle,

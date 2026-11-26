@@ -1,12 +1,15 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
+import { errorText, friendlyError } from "../src/errors";
 import { BLOCKED, projectProblem, pushUnavailable } from "../src/push";
 import { pushDevice, type PushDevice } from "../src/pushDevice";
 import { themedStyles } from "../src/theme";
 import type { PushView } from "../src/types";
 import { Chips } from "./Chips";
-import { kit, Spinner } from "./ui";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit } from "./ui";
 
 export type PushApi = Pick<SuperBotApi, "pushDevice" | "registerPush" | "unregisterPush">;
 
@@ -29,20 +32,29 @@ export function PushCard({ api, device = pushDevice }: Props) {
   const [view, setView] = useState<PushView | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const supported = device.platform !== null;
+  const live = useRef(true);
+
+  const load = useCallback(async () => {
+    try {
+      const v = await api.pushDevice();
+      if (!live.current) return;
+      setView(v);
+      setLoadError(null);
+    } catch (e) {
+      if (live.current) setLoadError(errorText(e, "Couldn't load push notifications"));
+    }
+  }, [api]);
 
   useEffect(() => {
-    if (!supported) return;
-    let live = true;
-    api.pushDevice().then(
-      (v) => live && setView(v),
-      (e: unknown) => live && setError(e instanceof Error ? e.message : String(e)),
-    );
+    live.current = true;
+    if (supported) void load();
     return () => {
-      live = false;
+      live.current = false;
     };
-  }, [api, supported]);
+  }, [load, supported]);
 
   const run = async (fn: () => Promise<string | null>) => {
     setBusy(true);
@@ -51,7 +63,7 @@ export function PushCard({ api, device = pushDevice }: Props) {
     try {
       setNotice(await fn());
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(false);
     }
@@ -88,7 +100,7 @@ export function PushCard({ api, device = pushDevice }: Props) {
   const unavailable = pushUnavailable(view, supported);
   const body = () => {
     if (!supported) return <Text style={styles.dim}>{unavailable}</Text>;
-    if (!view) return error ? null : <Spinner />;
+    if (!view) return loadError ? null : <ListSkeleton label="Loading push notifications" rows={2} />;
     const d = view.device;
     // With push paused on the server, a saved phone can still be removed, not added.
     if (!view.available && !d) return <Text style={styles.dim}>{unavailable}</Text>;
@@ -139,7 +151,9 @@ export function PushCard({ api, device = pushDevice }: Props) {
 
   return (
     <View style={styles.card} accessibilityLabel="Push notifications">
-      <Text style={styles.cardTitle}>Push notifications</Text>
+      <Text style={styles.cardTitle} role="heading">
+        Push notifications
+      </Text>
       <Text style={styles.dim}>
         Hear about waiting approvals, requests for roles and finished routines when SuperBot is closed. A notification names the Bot and nothing it asked, and no role; tap it to see the details here. Signing out turns it off.
       </Text>
@@ -148,11 +162,8 @@ export function PushCard({ api, device = pushDevice }: Props) {
           {notice}
         </Text>
       ) : null}
-      {error ? (
-        <Text style={styles.error} accessibilityRole="alert">
-          {error}
-        </Text>
-      ) : null}
+      {loadError ? <InlineError message={loadError} onRetry={load} /> : null}
+      {error ? <InlineError message={error} /> : null}
       {body()}
     </View>
   );
@@ -166,7 +177,6 @@ const useStyles = themedStyles((t) => {
     field: k.field,
     label: k.label,
     good: k.good,
-    error: k.error,
     dim: k.dim,
   });
 });

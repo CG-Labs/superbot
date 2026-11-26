@@ -1,8 +1,12 @@
+/// <reference types="node" />
+import fs from "fs";
+import path from "path";
 import React from "react";
 import * as RN from "react-native";
 import { renderHook } from "@testing-library/react-native";
+import { kit } from "../../components/ui";
 import tokens from "../tokens.json";
-import { colors, themes, ThemeScope, useTheme, type Palette } from "../theme";
+import { botColorNames, botColors, themes, ThemeScope, useTheme, type Palette } from "../theme";
 
 function luminance(hex: string): number {
   const n = parseInt(hex.slice(1), 16);
@@ -52,7 +56,7 @@ describe("design tokens", () => {
       expect(contrast(c.accent, c[ground])).toBeGreaterThanOrEqual(3);
     });
 
-    it.each(["bg", "surface"] as const)("keeps skeleton blocks visible on %s, where they load", (ground) => {
+    it.each(["bg", "surface", "raised"] as const)("keeps skeleton blocks visible on %s, where they load", (ground) => {
       // Decorative, but they must still read as shapes.
       expect(contrast(c.selected, c[ground])).toBeGreaterThan(1.1);
     });
@@ -69,17 +73,118 @@ describe("design tokens", () => {
       expect(contrast(c.onAccent, c.accent)).toBeGreaterThanOrEqual(4.5);
     });
   });
+});
 
-  it("keeps the light focus ring visible on screens still dark-only", () => {
-    for (const ground of ["bg", "surface", "raised"] as const) {
-      expect(contrast(tokens.color.light.accent, tokens.color.dark[ground])).toBeGreaterThanOrEqual(3);
-    }
+/** Text colour, ground, and the contrast it needs: 4.5 for text, 3 for faint hints and large glyphs. */
+type Pair = [fg: keyof Palette, bg: keyof Palette, min: number];
+const body = (grounds: (keyof Palette)[]): Pair[] =>
+  grounds.flatMap((g): Pair[] => [
+    ["text", g, 4.5],
+    ["textMuted", g, 4.5],
+    ["accentText", g, 4.5],
+    ["textFaint", g, 3],
+  ]);
+const status = (grounds: (keyof Palette)[]): Pair[] =>
+  grounds.flatMap((g): Pair[] => [
+    ["danger", g, 4.5],
+    ["warning", g, 4.5],
+    ["success", g, 4.5],
+  ]);
+const kitPairs: Pair[] = [
+  ...body(["bg", "raised"]),
+  ...status(["bg", "raised"]),
+  ["onAccent", "accent", 4.5],
+  ["danger", "dangerSoft", 4.5],
+  ["warning", "warningSoft", 4.5],
+  ["success", "successSoft", 4.5],
+  ["accentText", "accentSoft", 4.5],
+  ["text", "accentSoft", 4.5],
+  ["textMuted", "selected", 4.5],
+  ["text", "selected", 4.5],
+  ["text", "codeBg", 4.5],
+  ["text", "hover", 4.5],
+];
+
+/** Every screen of the app and the token pairs its text, tags, notices and buttons use (ADR 0345). */
+const screens: Record<string, Pair[]> = {
+  "chat and sidebar": [...body(["bg", "surface", "raised", "elevated"]), ["text", "userBubble", 4.5], ["onAccent", "accent", 4.5], ["text", "selected", 4.5]],
+  "sign-in and the app lock": [...body(["bg", "raised"]), ["danger", "dangerSoft", 4.5], ["onAccent", "accent", 4.5], ["text", "codeBg", 4.5]],
+  settings: [...kitPairs, ["text", "warningSoft", 4.5]],
+  plan: kitPairs,
+  secrets: kitPairs,
+  team: kitPairs,
+  "approval policy": kitPairs,
+  users: [...kitPairs, ...body(["surface"])],
+  roles: [...kitPairs, ...body(["surface"])],
+  "service accounts": [...kitPairs, ...body(["surface"]), ["text", "codeBg", 4.5]],
+  "audit log": [...kitPairs, ...body(["surface"])],
+  "access review": kitPairs,
+  "Bot settings": [
+    ...body(["surface", "raised"]),
+    ...status(["surface"]),
+    ["onAccent", "accent", 4.5],
+    ["danger", "dangerSoft", 4.5],
+    ["text", "selected", 4.5],
+    // A picked schedule preset is filled with the text colour, as in Chips.
+    ["bg", "text", 4.5],
+    ["accentText", "hover", 4.5],
+    ["text", "codeBg", 4.5],
+  ],
+  "new Bot": [...body(["elevated", "bg"]), ["onAccent", "accent", 4.5], ["danger", "dangerSoft", 4.5], ["text", "selected", 4.5]],
+  approvals: [...body(["elevated", "raised"]), ["warning", "warningSoft", 4.5], ["onAccent", "accent", 4.5]],
+  "screen viewer": [...body(["bg", "surface"]), ["onAccent", "accent", 4.5], ["text", "raised", 4.5], ["danger", "dangerSoft", 4.5]],
+};
+
+describe.each(["light", "dark"] as const)("contrast on every screen in %s", (scheme) => {
+  const c: Palette = themes[scheme].c;
+
+  it.each(Object.entries(screens))("%s", (_name, pairs) => {
+    const failing = pairs.filter(([fg, bg, min]) => contrast(c[fg], c[bg]) < min).map(([fg, bg, min]) => `${fg} on ${bg} < ${min}`);
+    expect(failing).toEqual([]);
   });
 
-  it("gives screens not yet on the design system the dark palette's neutrals", () => {
-    expect(colors.bgMain).toBe(tokens.color.dark.bg);
-    expect(colors.text).toBe(tokens.color.dark.text);
-    expect(colors.border).toBe(tokens.color.dark.border);
+  it("keeps every text style of the settings and admin kit readable where it sits", () => {
+    const name = (hex: unknown) => (Object.keys(c) as (keyof Palette)[]).find((k) => c[k] === hex);
+    /** Text styles drawn on a fill of their own rather than on a card or the canvas. */
+    const filled: Record<string, keyof Palette> = { primaryText: "accent", dangerText: "dangerSoft" };
+    const failing: string[] = [];
+    for (const [key, style] of Object.entries(kit(themes[scheme])) as [string, Record<string, unknown>][]) {
+      const fg = name(style.color);
+      if (!fg) continue;
+      const bg = name(style.backgroundColor) ?? filled[key];
+      const min = fg === "textFaint" ? 3 : 4.5;
+      for (const ground of bg ? [bg] : (["bg", "surface", "raised", "elevated"] as const)) {
+        if (contrast(c[fg], c[ground]) < min) failing.push(`${key}: ${fg} on ${ground}`);
+      }
+    }
+    expect(failing).toEqual([]);
+  });
+});
+
+describe("every screen follows light and dark (ADR 0345)", () => {
+  const root = path.join(__dirname, "..", "..");
+  const sources = ["app", "components"].flatMap((dir) =>
+    fs
+      .readdirSync(path.join(root, dir))
+      .filter((f) => /\.tsx?$/.test(f))
+      .map((f) => `${dir}/${f}`),
+  );
+  const read = (f: string) => fs.readFileSync(path.join(root, f), "utf8");
+
+  it("leaves no screen on the dark-only colours", () => {
+    expect(sources.filter((f) => /<ThemeScope scheme="dark">/.test(read(f)))).toEqual([]);
+  });
+
+  it("keeps fixed colours to art, brands and remote screens", () => {
+    const allowed = new Set([
+      "components/BotAvatar.tsx", // A Bot's own art.
+      "components/LoginScreen.tsx", // Apple's sign-in button is black or white by Apple's rules.
+      "components/ScreenFrame.tsx", // The remote display's letterbox.
+      "components/ScreenFrame.web.tsx",
+      "components/ScreenViewer.tsx",
+    ]);
+    const hex = /["'`]#[0-9a-fA-F]{3,8}["'`]/;
+    expect(sources.filter((f) => !allowed.has(f) && hex.test(read(f)))).toEqual([]);
   });
 });
 
@@ -102,5 +207,11 @@ describe("useTheme", () => {
     const wrapper = ({ children }: { children: React.ReactNode }) => <ThemeScope scheme="dark">{children}</ThemeScope>;
     const { result } = await renderHook(() => useTheme(), { wrapper });
     expect(result.current.scheme).toBe("dark");
+  });
+});
+
+describe("Bot colours", () => {
+  it("each have a name for screen readers", () => {
+    expect(botColorNames).toHaveLength(botColors.length);
   });
 });

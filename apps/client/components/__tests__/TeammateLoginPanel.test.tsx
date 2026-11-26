@@ -1,6 +1,8 @@
 import React from "react";
+import * as RN from "react-native";
 import { act, render, screen, userEvent } from "@testing-library/react-native";
 import { TeammateLoginPanel } from "../TeammateLoginPanel";
+import { themes } from "../../src/theme";
 import type { LoginEvent, TeammateLoginsView } from "../../src/types";
 
 const view = (state: "logged_in" | "logged_out"): TeammateLoginsView => ({
@@ -97,10 +99,45 @@ describe("TeammateLoginPanel (ADR 0062)", () => {
     expect(screen.getByLabelText("Log in to Claude Code")).toBeOnTheScreen();
   });
 
-    it("shows the server's words when it refuses", async () => {
+  it("shows the server's words when it refuses, with a retry", async () => {
     const api = fakeApi();
     api.teammateLogins.mockRejectedValueOnce(new Error("Machine not found"));
     await render(<TeammateLoginPanel api={api} ownerId="u1" ownerName="Ada" harness="claude" canWrite />);
-    expect(await screen.findByText("Machine not found")).toBeOnTheScreen();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't check your Claude Code login. Machine not found");
+    expect(screen.queryByLabelText("Log in to Claude Code")).not.toBeOnTheScreen();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Log in to Claude Code")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows a skeleton while it checks your login, under its heading", async () => {
+    const api = fakeApi();
+    let answer: (v: TeammateLoginsView) => void = () => {};
+    api.teammateLogins.mockImplementationOnce(() => new Promise<TeammateLoginsView>((resolve) => (answer = resolve)));
+    await render(<TeammateLoginPanel api={api} ownerId="u1" ownerName="Ada" harness="claude" canWrite />);
+    expect(screen.getByRole("heading", { name: "Your Claude Code login" })).toBeOnTheScreen();
+    expect(screen.getByRole("progressbar", { name: "Loading your Claude Code login" })).toBeOnTheScreen();
+    await act(async () => answer(view("logged_out")));
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByLabelText("Log in to Claude Code")).toBeOnTheScreen();
+  });
+
+  it("says in plain words when logging out fails", async () => {
+    const api = fakeApi();
+    api.teammateLogins.mockResolvedValueOnce(view("logged_in"));
+    api.teammateLogout.mockRejectedValueOnce(new TypeError("Network request failed"));
+    await render(<TeammateLoginPanel api={api} ownerId="u1" ownerName="Ada" harness="claude" canWrite />);
+    await userEvent.setup().press(await screen.findByLabelText("Log out of Claude Code"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Can't reach the server. Check your connection and try again.");
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it.each(["light", "dark"] as const)("follows the device's %s setting", async (scheme) => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    await render(<TeammateLoginPanel api={fakeApi()} ownerId="u1" ownerName="Ada" harness="claude" canWrite />);
+    const c = themes[scheme].c;
+    expect(screen.getByText("Your Claude Code login")).toHaveStyle({ color: c.text });
+    expect(await screen.findByText("Log in with your own account")).toHaveStyle({ color: c.accentText });
+    jest.restoreAllMocks();
   });
 });

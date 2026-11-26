@@ -123,6 +123,39 @@ export function ListSkeleton({ label, rows = 3, avatar }: { label: string; rows?
   );
 }
 
+/**
+ * A settings or admin screen loading: a heading and a card or two of rows in the screen's column,
+ * the way the shared kit lays them out (ADR 0337). `inset={false}` drops its padding inside a
+ * column that already has some.
+ */
+export function PageSkeleton({ label = "Loading", cards = 2, inset = true }: { label?: string; cards?: number; inset?: boolean }) {
+  const styles = useStyles();
+  return (
+    <SkeletonGroup label={label} style={[styles.page, !inset && styles.pageBare]}>
+      {Array.from({ length: cards }, (_, i) => (
+        <View key={i} style={styles.pageGroup}>
+          <Skeleton width={i ? 120 : 88} height={11} />
+          <View style={styles.card}>
+            <ListRows rows={i ? 2 : 3} />
+          </View>
+        </View>
+      ))}
+    </SkeletonGroup>
+  );
+}
+
+/**
+ * A small busy mark for an action that's running, such as a save from a screen's header.
+ * Screen readers hear `label` as busy rather than a spinner with no name.
+ */
+export function BusyDots({ label }: { label: string }) {
+  return (
+    <View accessible role="progressbar" aria-label={label} aria-busy testID="busy">
+      <ThinkingDots />
+    </View>
+  );
+}
+
 /** The app starting: the shell's outline (the sidebar, and the chat on wide windows) instead of a blank screen. */
 export function AppSkeleton() {
   const t = useTheme();
@@ -198,6 +231,16 @@ const useStyles = themedStyles((t) =>
     rows: { gap: t.space.md },
     row: { flexDirection: "row", alignItems: "center", gap: t.space.md, paddingVertical: t.space.xs },
     rowText: { flex: 1, gap: t.space.xs + 2 },
+    page: { flex: 1, alignSelf: "center", width: "100%", maxWidth: 720, padding: t.space.lg, gap: t.space.xl },
+    pageBare: { padding: 0 },
+    pageGroup: { gap: t.space.md },
+    card: {
+      backgroundColor: t.c.raised,
+      borderRadius: t.radius.lg,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: t.c.border,
+      padding: t.space.lg,
+    },
     app: { flex: 1, backgroundColor: t.c.bg },
     appWide: { flexDirection: "row" },
     side: { flex: 1, padding: t.space.lg, gap: t.space.md },

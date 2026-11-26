@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, waitFor } from "@testing-library/react-native";
+import { act, render, screen, userEvent, waitFor } from "@testing-library/react-native";
 import { ServiceAccountsAdmin } from "../ServiceAccountsAdmin";
 import type { SuperBotApi } from "../../src/api";
 import { confirmAsync } from "../../src/dialogs";
@@ -379,6 +379,67 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     const u = userEvent.setup();
     await open(api, u);
     expect(screen.getByText(/Its owner is disabled or gone/)).toBeTruthy();
+  });
+});
+
+describe("ServiceAccountsAdmin: loading, empty and error states (ADR 0345)", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("shows a skeleton while the list loads, then an error that tries again", async () => {
+    const api = mockApi();
+    let fail: (e: Error) => void = () => {};
+    api.serviceAccounts.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await show(api);
+    expect(screen.getByRole("progressbar", { name: "Loading service accounts" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load service accountsCan't reach the server. Check your connection and try again.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Service account HR sync")).toBeOnTheScreen();
+    expect(api.serviceAccounts).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says when there are no service accounts yet", async () => {
+    await show(mockApi({ ...VIEW, serviceAccounts: [] }));
+    expect(await screen.findByRole("heading", { name: "No service accounts yet" })).toBeOnTheScreen();
+  });
+
+  it("shows a skeleton while its tokens load, and a retry when they don't", async () => {
+    const api = mockApi();
+    let fail: (e: Error) => void = () => {};
+    api.serviceAccount.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Service account HR sync"));
+    expect(screen.getByRole("progressbar", { name: "Loading tokens" })).toBeOnTheScreen();
+    await act(async () => fail(new Error("Server error")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load its tokens. Server error");
+    await u.press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Revoke CI")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says when it has no tokens, titles its sections and marks the picked account", async () => {
+    const api = mockApi({ ...VIEW, serviceAccounts: [{ ...SA, tokens: 0 }] });
+    api.serviceAccount.mockResolvedValue({ ...SA, tokens: 0, tokenList: [] });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByRole("button", { name: "Service account HR sync" })).not.toBeSelected();
+    await u.press(screen.getByRole("button", { name: "Service account HR sync" }));
+    expect(await screen.findByRole("heading", { name: "No tokens yet" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Service account HR sync" })).toBeSelected();
+    expect(screen.getByRole("heading", { name: "HR sync" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Tokens (0 live)" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "New token" })).toBeOnTheScreen();
+  });
+
+  it("shows a failed revoke as an alert in plain words", async () => {
+    const api = mockApi();
+    api.revokeServiceToken.mockRejectedValueOnce(new TypeError("Network request failed"));
+    const u = userEvent.setup();
+    await open(api, u);
+    await u.press(screen.getByLabelText("Revoke CI"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Can't reach the server. Check your connection and try again.");
   });
 });
 

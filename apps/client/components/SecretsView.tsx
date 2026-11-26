@@ -2,10 +2,14 @@ import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
+import { errorText, friendlyError } from "../src/errors";
 import { managedIn, normalizeSecretName, savedLine, secretNameProblem, secretValueProblem } from "../src/secrets";
 import { themedStyles, type } from "../src/theme";
 import type { PersonalSecret } from "../src/types";
-import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
+import { EmptyState } from "./EmptyState";
+import { InlineError } from "./ErrorState";
+import { PageSkeleton } from "./Skeleton";
+import { kit, PageHeader, usePlaceholder } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "mySecrets" | "setMySecret" | "deleteMySecret">;
@@ -25,6 +29,8 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
   const placeholder = usePlaceholder();
   const [list, setList] = useState<PersonalSecret[] | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
+  /** Why the list didn't load; the form still works, so it shows beside it with a retry. */
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
@@ -35,9 +41,9 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
   const load = useCallback(async () => {
     try {
       setList(await api.mySecrets());
-      setError(null);
+      setLoadError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setLoadError(errorText(e, "Couldn't load your secrets"));
     }
   }, [api]);
 
@@ -83,7 +89,7 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
       );
       await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -106,7 +112,7 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
       setNotice(`Deleted ${s.name}.`);
       await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -114,11 +120,11 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
 
   const header = <PageHeader title="Your secrets" onBack={onBack} />;
 
-  if (list === undefined && !error) {
+  if (list === undefined && !loadError) {
     return (
       <View style={styles.root}>
         {header}
-        <Spinner style={styles.loading} />
+        <PageSkeleton label="Loading your secrets" />
       </View>
     );
   }
@@ -136,11 +142,8 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
             {notice}
           </Text>
         ) : null}
-        {error ? (
-          <Text style={styles.error} accessibilityRole="alert">
-            {error}
-          </Text>
-        ) : null}
+        {loadError ? <InlineError message={loadError} onRetry={load} /> : null}
+        {error ? <InlineError message={error} /> : null}
         {list?.length ? (
           <View style={styles.list}>
             {list.map((s, i) => (
@@ -186,12 +189,19 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
           </View>
         ) : list ? (
           <View style={styles.list}>
-            <Text style={styles.empty}>No secrets yet.</Text>
+            <EmptyState
+              compact
+              glyph="+"
+              title="No secrets yet"
+              message={canWrite ? "Add an API key below and your Bots get it on their next run." : "Your Bots get any you add, as environment variables."}
+            />
           </View>
         ) : null}
         {canWrite ? (
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>{replacing ? `New value for ${replacing}` : "Add a secret"}</Text>
+            <Text style={styles.cardTitle} role="heading">
+              {replacing ? `New value for ${replacing}` : "Add a secret"}
+            </Text>
             {replacing ? null : (
               <TextInput
                 style={[styles.input, styles.mono]}
@@ -257,10 +267,8 @@ const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
     root: k.root,
-    loading: { marginTop: t.space.xxl },
     body: k.body,
     good: k.good,
-    error: k.error,
     warn: k.warn,
     dim: k.dim,
     card: k.card,
@@ -269,7 +277,6 @@ const useStyles = themedStyles((t) => {
     item: { ...k.row, flexWrap: "wrap" },
     itemFirst: k.rowFirst,
     grow: { flex: 1, minWidth: 160, gap: t.space.xxs },
-    empty: k.empty,
     name: { ...k.mono, ...type(t, "md"), fontWeight: t.font.weight.medium },
     mono: { fontFamily: t.font.mono },
     input: k.input,

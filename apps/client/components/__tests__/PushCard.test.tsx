@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, waitFor, within } from "@testing-library/react-native";
+import { act, render, screen, userEvent, waitFor, within } from "@testing-library/react-native";
 import { PushCard, type PushApi } from "../PushCard";
 import type { PushDevice } from "../../src/pushDevice";
 import type { PushRegistration, PushView } from "../../src/types";
@@ -107,7 +107,34 @@ it("shows the server's reason, like a session that can't have a phone", async ()
   const api = fakeApi(ON);
   api.pushDevice.mockRejectedValueOnce(new Error("Push notifications need a signed-in session."));
   await render(<PushCard api={api} device={fakeDevice()} />);
-  expect(await screen.findByText(/need a signed-in session/)).toBeTruthy();
+  expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load push notifications. Push notifications need a signed-in session.");
+});
+
+it("shows a skeleton while it loads, then a retry that loads it", async () => {
+  const api = fakeApi(ON);
+  let fail: (e: Error) => void = () => {};
+  api.pushDevice.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+  await render(<PushCard api={api} device={fakeDevice()} />);
+  expect(screen.getByRole("heading", { name: "Push notifications" })).toBeOnTheScreen();
+  expect(screen.getByRole("progressbar", { name: "Loading push notifications" })).toBeOnTheScreen();
+  await act(async () => fail(new TypeError("Failed to fetch")));
+  expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load push notifications. Can't reach the server. Check your connection and try again.");
+  expect(screen.queryByRole("progressbar")).toBeNull();
+  await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+  expect(await screen.findByLabelText("Push notifications on or off")).toBeTruthy();
+  expect(api.pushDevice).toHaveBeenCalledTimes(2);
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("says why turning it on failed, without a retry", async () => {
+  const user = userEvent.setup();
+  const api = fakeApi(ON);
+  api.registerPush.mockRejectedValueOnce(new TypeError("Network request failed"));
+  await render(<PushCard api={api} device={fakeDevice({}, "granted")} />);
+  await screen.findByLabelText("Push notifications on or off");
+  await user.press(chip("Push notifications on or off", "On"));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Can't reach the server. Check your connection and try again.");
+  expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
 });
 
 it("still lets you remove a saved phone while the server has push paused", async () => {

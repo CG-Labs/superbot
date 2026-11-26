@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent } from "@testing-library/react-native";
+import { act, render, screen, userEvent } from "@testing-library/react-native";
 import { AuditChainPanel } from "../AuditChainPanel";
 import { AuditLog } from "../AuditLog";
 import type { SuperBotApi } from "../../src/api";
@@ -89,14 +89,30 @@ describe("AuditChainPanel", () => {
   it("says why the state couldn't load", async () => {
     const api = { auditChain: jest.fn(async () => Promise.reject(new Error("Admins only"))), auditVerify: jest.fn() };
     await render(<AuditChainPanel api={api as unknown as Pick<SuperBotApi, "auditChain" | "auditVerify">} />);
-    expect(await screen.findByText("Admins only")).toBeOnTheScreen();
+    expect(await screen.findByText("Couldn't load the chain's state. Admins only")).toBeOnTheScreen();
+  });
+
+  it("shows a skeleton while it checks, then a retry that loads the state", async () => {
+    const api = fakeApi([state()], report());
+    let fail: (e: Error) => void = () => {};
+    api.auditChain.mockImplementationOnce(() => new Promise<AuditChainState>((_, reject) => (fail = reject)));
+    const user = userEvent.setup();
+    await render(<AuditChainPanel api={api} />);
+    expect(screen.getByRole("heading", { name: "Hash chain" })).toBeOnTheScreen();
+    expect(screen.getByRole("progressbar", { name: "Checking the chain" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load the chain's state. Can't reach the server. Check your connection and try again.");
+    await user.press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText(/^Checkpoint key 0123456789abcdef/)).toBeOnTheScreen();
+    expect(api.auditChain).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("opens from the audit log's header, and only then asks for it", async () => {
     const api = { ...fakeApi([state()], report()), audit: jest.fn(async () => ({ events: [], nextBefore: null })), auditCsv: jest.fn() };
     const user = userEvent.setup();
     await render(<AuditLog api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
-    await screen.findByText("No events match.");
+    await screen.findByRole("heading", { name: "No events match" });
     expect(api.auditChain).not.toHaveBeenCalled();
     await user.press(screen.getByLabelText("The hash chain's state"));
     expect(await screen.findByTestId("audit-chain")).toBeOnTheScreen();

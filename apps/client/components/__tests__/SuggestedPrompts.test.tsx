@@ -1,6 +1,8 @@
 import React from "react";
+import * as RN from "react-native";
 import { render, screen, userEvent } from "@testing-library/react-native";
 import { SuggestedPrompts } from "../SuggestedPrompts";
+import { themes } from "../../src/theme";
 
 describe("SuggestedPrompts", () => {
   it("offers each prompt as a button that says what tapping does", async () => {
@@ -24,7 +26,7 @@ describe("SuggestedPrompts", () => {
     const onEdit = jest.fn();
     await render(<SuggestedPrompts botName="Scout" prompts={[]} onUse={jest.fn()} onEdit={onEdit} />);
 
-    expect(screen.getByText("No suggested prompts")).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "No suggested prompts" })).toBeOnTheScreen();
     await user.press(screen.getByRole("button", { name: "Edit suggested prompts" }));
     expect(onEdit).toHaveBeenCalled();
   });
@@ -32,5 +34,14 @@ describe("SuggestedPrompts", () => {
   it("shows nothing when there are none and nothing to edit", async () => {
     await render(<SuggestedPrompts botName="Scout" prompts={[]} onUse={jest.fn()} />);
     expect(screen.queryByText("Suggested")).not.toBeOnTheScreen();
+  });
+
+  it.each(["light", "dark"] as const)("follows the device's %s setting", async (scheme) => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    await render(<SuggestedPrompts botName="Scout" prompts={["Check the build"]} onUse={jest.fn()} />);
+    const c = themes[scheme].c;
+    expect(screen.getByRole("button", { name: "Ask Scout: Check the build" }).parent).toHaveStyle({ backgroundColor: c.raised });
+    expect(screen.getByText("Check the build")).toHaveStyle({ color: c.text });
+    jest.restoreAllMocks();
   });
 });

@@ -1,7 +1,9 @@
 import React from "react";
-import { render, screen, userEvent, waitFor } from "@testing-library/react-native";
+import * as RN from "react-native";
+import { act, render, screen, userEvent, waitFor } from "@testing-library/react-native";
 import { KeeperPanel } from "../KeeperPanel";
 import { confirmAsync } from "../../src/dialogs";
+import { themes } from "../../src/theme";
 import type { BotAccessView, BotKeeper } from "../../src/types";
 
 jest.mock("../../src/dialogs", () => ({ confirmAsync: jest.fn(async () => true) }));
@@ -62,7 +64,7 @@ describe("KeeperPanel (ADR 0229)", () => {
 
     api.keepBot.mockRejectedValueOnce(new Error("CI keeps 20 Bots already"));
     await u.press(screen.getByText("CI"));
-    expect(await screen.findByText("CI keeps 20 Bots already")).toBeTruthy();
+    expect(await screen.findByRole("alert")).toHaveTextContent("CI keeps 20 Bots already");
     expect(api.getBotAccess).toHaveBeenCalledTimes(2);
   });
 
@@ -85,5 +87,27 @@ describe("KeeperPanel (ADR 0229)", () => {
     await render(<KeeperPanel api={api} botId="b1" botName="Ledger" />);
     await waitFor(() => expect(api.getBotAccess).toHaveBeenCalled());
     expect(screen.queryByText("Kept by a service account")).toBeNull();
+  });
+
+  it("shows nothing while the accounts load, then why they couldn't, with a retry", async () => {
+    const api = mockApi(view());
+    let fail: (e: Error) => void = () => {};
+    api.getBotAccess.mockImplementationOnce(() => new Promise<BotAccessView>((_, reject) => (fail = reject)));
+    await render(<KeeperPanel api={api} botId="b1" botName="Ledger" />);
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.queryByText("Kept by a service account")).toBeNull();
+
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load the service accounts. Can't reach the server. Check your connection and try again.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("Kept by a service account")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it.each(["light", "dark"] as const)("follows the device's %s setting", async (scheme) => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    await render(<KeeperPanel api={mockApi(view())} botId="b1" botName="Ledger" />);
+    expect(await screen.findByText("Kept by a service account")).toHaveStyle({ color: themes[scheme].c.textMuted });
+    jest.restoreAllMocks();
   });
 });

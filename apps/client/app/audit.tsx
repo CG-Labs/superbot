@@ -3,7 +3,8 @@ import { Redirect, useLocalSearchParams } from "expo-router";
 import { StyleSheet, View } from "react-native";
 import { AuditLog } from "../components/AuditLog";
 import { RouteNotice, RouteScreen, useGoBack } from "../components/Shell";
-import { kit, Spinner } from "../components/ui";
+import { PageSkeleton } from "../components/Skeleton";
+import { kit } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { linkedFilters } from "../src/audit";
 import { useSuperBot } from "../src/SuperBotContext";
@@ -22,7 +23,7 @@ export default function AuditScreen() {
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <Spinner />
+        <PageSkeleton />
       </View>
     );
   }

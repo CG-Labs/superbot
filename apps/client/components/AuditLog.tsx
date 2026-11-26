@@ -16,14 +16,18 @@ import {
   targetLabel,
   type AuditFilters,
 } from "../src/audit";
+import { errorText, friendlyError } from "../src/errors";
 import { saveCsv } from "../src/saveCsv";
 import { hairline, themedStyles, type } from "../src/theme";
 import type { AuditEvent } from "../src/types";
+import { EmptyState } from "./EmptyState";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
 import { AuditChainPanel } from "./AuditChainPanel";
 import { AuditEventDetail } from "./AuditEventDetail";
 import { Chips } from "./Chips";
 import { DetailSheet, PaneTransition } from "./Shell";
-import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
+import { kit, PageHeader, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -162,7 +166,7 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
         setError(null);
       } catch (err) {
         if (n !== seq.current) return;
-        setError(err instanceof Error ? err.message : "Couldn't load the audit log");
+        setError(errorText(err, before == null ? "Couldn't load the audit log" : "Couldn't load older events"));
         if (before == null) {
           shown.current = q;
           setEvents([]);
@@ -205,7 +209,7 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
     try {
       await saveCsv(csvFileName(), await api.auditCsv(shown.current));
     } catch (err) {
-      setExportError(err instanceof Error ? err.message : "Export failed");
+      setExportError(friendlyError(err, "Export failed. Try again."));
     } finally {
       setExporting(false);
     }
@@ -250,7 +254,7 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
           </Pressable>
         ) : null}
       </View>
-      {filterError ? <Text style={styles.error}>{filterError}</Text> : null}
+      {filterError ? <InlineError message={filterError} /> : null}
     </>
   );
   // Phones scroll the filters, so the list keeps some of the screen.
@@ -289,14 +293,21 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
       )}
       ListEmptyComponent={
         loading ? (
-          <Spinner style={styles.spinner} />
+          <ListSkeleton label="Loading the audit log" rows={4} />
+        ) : error ? (
+          <InlineError message={error} onRetry={() => load(shown.current)} />
         ) : (
-          <Text style={error ? styles.error : styles.empty}>{error ?? "No events match."}</Text>
+          <EmptyState
+            compact
+            glyph="⌕"
+            title="No events match"
+            message={active ? "Change or clear the filters to see more." : "Nothing has been recorded yet."}
+          />
         )
       }
       ListFooterComponent={
         <View style={styles.footer}>
-          {events?.length && error ? <Text style={styles.error}>{error}</Text> : null}
+          {events?.length && error ? <InlineError message={error} onRetry={() => load(shown.current, next ?? undefined)} /> : null}
           {next != null && !loading ? (
             <Pressable
               style={[styles.moreBtn, loadingMore && styles.busy]}
@@ -356,7 +367,11 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
           {showFilters ? filterPanel : null}
         </>
       )}
-      {exportError ? <Text style={styles.error}>{exportError}</Text> : null}
+      {exportError ? (
+        <View style={styles.notice}>
+          <InlineError message={exportError} />
+        </View>
+      ) : null}
       {wide ? (
         <View style={styles.body}>
           {list}
@@ -429,7 +444,7 @@ const useStyles = themedStyles((t) => {
     tag: k.tag,
     badTag: k.tagDanger,
     empty: k.empty,
-    error: { ...k.error, paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
+    notice: { paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
     footer: { alignItems: "center", gap: t.space.md, paddingVertical: t.space.lg },
     moreBtn: k.btn,
     moreText: k.btnText,

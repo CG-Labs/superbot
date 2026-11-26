@@ -1,14 +1,17 @@
 import React, { useState } from "react";
 import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { availabilityProblem, LOCK_AFTER_OPTIONS, lockAfterLabel } from "../src/appLock";
+import { friendlyError } from "../src/errors";
 import { themedStyles } from "../src/theme";
 import { useAppLock } from "./AppLock";
 import { Chips } from "./Chips";
+import { InlineError } from "./ErrorState";
 import { PushCard, type PushApi } from "./PushCard";
 import { ResidencyCard, type ResidencyApi } from "./ResidencyCard";
 import { RoleRequestsCard, type RoleRequestsApi } from "./RoleRequestsCard";
+import { ListSkeleton } from "./Skeleton";
 import { TwoFactorCard, type MfaApi } from "./TwoFactor";
-import { kit, PageHeader, Spinner } from "./ui";
+import { kit, PageHeader } from "./ui";
 
 interface Props {
   onBack: () => void;
@@ -25,14 +28,14 @@ export function SettingsView({ onBack, api, admin = false }: Props) {
     <View style={styles.root}>
       <PageHeader title="Settings" onBack={onBack} />
       <ScrollView contentContainerStyle={styles.body}>
-        <Text style={styles.section} accessibilityRole="header">
+        <Text style={styles.section} role="heading">
           This device
         </Text>
         <AppLockCard />
         {api ? <PushCard api={api} /> : null}
         {api ? (
           <>
-            <Text style={styles.section} accessibilityRole="header">
+            <Text style={styles.section} role="heading">
               Your account
             </Text>
             <TwoFactorCard api={api} admin={admin} />
@@ -62,7 +65,7 @@ export function AppLockCard() {
       if (problem) setError(problem);
       else setNotice(done);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(false);
     }
@@ -71,8 +74,10 @@ export function AppLockCard() {
   if (!availability) {
     return (
       <View style={styles.card} accessibilityLabel="App lock">
-        <Text style={styles.cardTitle}>App lock</Text>
-        <Spinner />
+        <Text style={styles.cardTitle} role="heading">
+          App lock
+        </Text>
+        <ListSkeleton label="Loading App lock" rows={2} />
       </View>
     );
   }
@@ -81,7 +86,9 @@ export function AppLockCard() {
   if (availability.kind === "unsupported") {
     return (
       <View style={styles.card} accessibilityLabel="App lock">
-        <Text style={styles.cardTitle}>App lock</Text>
+        <Text style={styles.cardTitle} role="heading">
+          App lock
+        </Text>
         <Text style={styles.dim}>{problem}</Text>
       </View>
     );
@@ -90,7 +97,9 @@ export function AppLockCard() {
   const label = availability.kind === "available" || availability.kind === "not-enrolled" ? availability.label : "biometrics";
   return (
     <View style={styles.card} accessibilityLabel="App lock">
-      <Text style={styles.cardTitle}>App lock</Text>
+      <Text style={styles.cardTitle} role="heading">
+        App lock
+      </Text>
       <Text style={styles.dim}>
         Ask for {label} or your device passcode when SuperBot opens, and hide your chats in the app switcher. This is kept on this device only; signing out turns it off.
       </Text>
@@ -99,11 +108,7 @@ export function AppLockCard() {
           {notice}
         </Text>
       ) : null}
-      {error ? (
-        <Text style={styles.error} accessibilityRole="alert">
-          {error}
-        </Text>
-      ) : null}
+      {error ? <InlineError message={error} /> : null}
       {problem ? <Text style={styles.warn}>{settings.enabled ? `${problem} Until then, SuperBot asks for your device passcode, or for you to sign out if it has none.` : problem}</Text> : null}
       <View style={styles.field} accessibilityLabel="App lock on or off">
         <Text style={styles.label}>App lock</Text>
@@ -141,7 +146,6 @@ const useStyles = themedStyles((t) => {
     field: k.field,
     label: k.label,
     good: k.good,
-    error: k.error,
     warn: k.warn,
     dim: k.dim,
   });

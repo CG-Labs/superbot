@@ -1,6 +1,8 @@
 import React from "react";
+import * as RN from "react-native";
 import { render, screen, userEvent } from "@testing-library/react-native";
 import { RoutineEditor } from "../RoutineEditor";
+import { themes } from "../../src/theme";
 import type { Routine } from "../../src/types";
 
 const routine: Routine = {
@@ -18,7 +20,7 @@ describe("RoutineEditor", () => {
     const onSave = jest.fn().mockResolvedValue(undefined);
     await render(<RoutineEditor onSave={onSave} onCancel={jest.fn()} />);
 
-    expect(screen.getByText("New routine")).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "New routine" })).toBeOnTheScreen();
     expect(screen.queryByRole("button", { name: "Delete routine" })).not.toBeOnTheScreen();
     await user.type(screen.getByLabelText("Routine name"), "Standup");
     await user.press(screen.getByRole("button", { name: "Weekdays 9:00" }));
@@ -68,5 +70,18 @@ describe("RoutineEditor", () => {
     expect(onDelete).toHaveBeenCalled();
     await user.press(screen.getByRole("button", { name: "Cancel" }));
     expect(onCancel).toHaveBeenCalled();
+  });
+
+  it.each(["light", "dark"] as const)("follows the device's %s setting, saving with the accent and deleting in red", async (scheme) => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    await render(<RoutineEditor routine={routine} onSave={jest.fn()} onDelete={jest.fn()} onCancel={jest.fn()} />);
+    const c = themes[scheme].c;
+    expect(screen.getByRole("heading", { name: "Edit routine" })).toHaveStyle({ color: c.text });
+    expect(screen.getByRole("button", { name: "Save routine" })).toHaveStyle({ backgroundColor: c.accent });
+    expect(screen.getByText("Save")).toHaveStyle({ color: c.onAccent });
+    expect(screen.getByRole("button", { name: "Delete routine" })).toHaveStyle({ backgroundColor: c.dangerSoft });
+    expect(screen.getByText("Delete")).toHaveStyle({ color: c.danger });
+    expect(screen.getByLabelText("Routine name").props.placeholderTextColor).toBe(c.textFaint);
+    jest.restoreAllMocks();
   });
 });

@@ -3,7 +3,8 @@ import { Redirect } from "expo-router";
 import { StyleSheet, View } from "react-native";
 import { ServiceAccountsAdmin } from "../components/ServiceAccountsAdmin";
 import { RouteNotice, RouteScreen, useGoBack } from "../components/Shell";
-import { kit, Spinner } from "../components/ui";
+import { PageSkeleton } from "../components/Skeleton";
+import { kit } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { canSeeServiceAccounts } from "../src/serviceAccounts";
 import { useSuperBot } from "../src/SuperBotContext";
@@ -21,7 +22,7 @@ export default function ServiceAccountsScreen() {
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <Spinner />
+        <PageSkeleton />
       </View>
     );
   }
