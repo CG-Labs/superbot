@@ -15,6 +15,7 @@
 
 pub mod aws;
 pub mod azure;
+pub(crate) mod changes;
 pub mod env;
 pub mod external;
 pub mod gcp;

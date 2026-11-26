@@ -23,22 +23,22 @@
 //! - Audited: `secret.vault_events` (`subscribed`, `lost`, `resumed`), and what each change
 //!   or gap read again as `secret.cache_refreshed`, with `trigger` `vault-event` or
 //!   `vault-events-resumed`, never a value. Whether a stream is open, and the changes,
-//!   losses and catch-ups so far, show in `botctl secrets backend` and `/metrics` (`Status`,
+//!   losses and catch-ups so far, show in `botctl secrets backend` and `/metrics` (`changes::Status`,
 //!   ADR 0318).
 //!
 //! Only the client side of RFC 6455 that this needs is here: the handshake over reqwest's
 //! upgraded connection, masked pings, pongs and a close out, and messages in.
 
-use super::super::external::{self, ExternalStore, Refresh, RefreshError, Scope};
-use super::super::{Error, SecretStore};
+use super::super::changes::{self, Note, Tx};
+use super::super::external::{self, ExternalStore, Scope};
+use super::super::Error;
 use super::{unavailable, Auth, Config, Inner, Vault};
 use crate::audit::{Event, Outcome};
 use crate::obs::log::{log_info, log_warn};
 use base64::Engine;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -259,132 +259,6 @@ pub(crate) fn seen(text: &str, cfg: &Config, users: bool) -> Option<Seen> {
     }
     let index = meta["vault_index"].as_str().filter(|i| !i.is_empty() && i.len() <= 1024 && i.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b))).map(String::from);
     Some(Seen { scope, name: name.to_string(), index, event: event.to_string() })
-}
-
-/// What the stream tells the thread that applies it to the store.
-#[derive(Debug, PartialEq)]
-enum Note {
-    Changed { scope: Scope, name: String, event: String, index: Option<String> },
-    /// Read everything cached again: subscribed again after a gap, or after a token that may
-    /// have stopped events early, so events may have been missed; or too many changes waited.
-    /// At the newest index of the changes it stands for, when it stands for some.
-    Resumed(Option<String>),
-}
-
-/// Most names waiting to be read again; past it they make way for one read of everything.
-const MAX_PENDING: usize = 1024;
-
-/// Changes waiting for the thread that applies them. A name changed again before it is read
-/// waits once, so a busy name can't hold up the rest or pile up reads; past `MAX_PENDING`
-/// names, they are dropped for one read of everything cached. Each is read at the newest
-/// index seen so far: Vault sends events in order, so it covers every change before it, and
-/// no read or list asks for less than one already applied.
-#[derive(Default)]
-struct Pending {
-    order: VecDeque<(Scope, String)>,
-    /// The latest event type for each name waiting.
-    latest: HashMap<(Scope, String), String>,
-    all: bool,
-    newest: Option<String>,
-    /// The read of everything stands for dropped changes, so it asks for `newest` too.
-    floor: bool,
-    sender_gone: bool,
-    receiver_gone: bool,
-}
-
-#[derive(Default)]
-struct Queue {
-    pending: Mutex<Pending>,
-    ready: Condvar,
-}
-
-impl Queue {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-/// The stream's end of the queue.
-struct Tx(Arc<Queue>);
-/// The applying thread's end.
-struct Rx(Arc<Queue>);
-
-fn queue() -> (Tx, Rx) {
-    let q = Arc::new(Queue::default());
-    (Tx(Arc::clone(&q)), Rx(q))
-}
-
-impl Tx {
-    fn send(&self, note: Note) {
-        let mut p = self.0.lock();
-        match note {
-            Note::Resumed(index) => {
-                p.all = true;
-                if index.is_some() {
-                    p.newest = index;
-                    p.floor = true;
-                }
-            }
-            Note::Changed { scope, name, event, index } => {
-                if index.is_some() {
-                    p.newest = index;
-                }
-                let key = (scope, name);
-                if let Some(waiting) = p.latest.get_mut(&key) {
-                    *waiting = event;
-                } else if p.order.len() >= MAX_PENDING {
-                    p.order.clear();
-                    p.latest.clear();
-                    p.all = true;
-                    p.floor = true;
-                } else {
-                    p.order.push_back(key.clone());
-                    p.latest.insert(key, event);
-                }
-            }
-        }
-        drop(p);
-        self.0.ready.notify_one();
-    }
-
-    /// Nothing applies changes any more: the store is gone.
-    fn is_closed(&self) -> bool {
-        self.0.lock().receiver_gone
-    }
-}
-
-impl Drop for Tx {
-    fn drop(&mut self) {
-        self.0.lock().sender_gone = true;
-        self.0.ready.notify_one();
-    }
-}
-
-impl Rx {
-    /// The next thing to apply, a read of everything first; None once the stream is gone.
-    fn recv(&self) -> Option<Note> {
-        let mut p = self.0.lock();
-        loop {
-            if std::mem::take(&mut p.all) {
-                let index = if std::mem::take(&mut p.floor) { p.newest.clone() } else { None };
-                return Some(Note::Resumed(index));
-            }
-            if let Some(key) = p.order.pop_front() {
-                let event = p.latest.remove(&key).unwrap_or_default();
-                return Some(Note::Changed { scope: key.0, name: key.1, event, index: p.newest.clone() });
-            }
-            if p.sender_gone {
-                return None;
-            }
-            p = self.0.ready.wait(p).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-}
-
-impl Drop for Rx {
-    fn drop(&mut self) {
-        self.0.lock().receiver_gone = true;
-    }
 }
 
 /// A subscription Vault accepted, and the token it was made with.
@@ -657,74 +531,6 @@ impl Stream {
     }
 }
 
-/// What the stream is doing, for `botctl secrets backend` and `/metrics` (ADR 0318): counts
-/// and botd's own reasons, never a path, a value or Vault's text.
-#[derive(Default)]
-pub(crate) struct Status {
-    /// The first subscription was made: botd follows Vault's events.
-    on: AtomicBool,
-    following: AtomicBool,
-    /// When `following` last changed, in ms since the epoch.
-    since: AtomicI64,
-    changes: AtomicU64,
-    last_change: AtomicI64,
-    lost: AtomicU64,
-    catch_ups: AtomicU64,
-    last_loss: Mutex<Option<String>>,
-}
-
-impl Status {
-    fn following(&self, on: bool) {
-        self.since.store(crate::db::now(), Ordering::SeqCst);
-        self.following.store(on, Ordering::SeqCst);
-        self.on.store(true, Ordering::SeqCst);
-    }
-
-    fn lost(&self, why: &str) {
-        *self.last_loss.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
-        self.lost.fetch_add(1, Ordering::SeqCst);
-        self.following(false);
-    }
-
-    /// The stream is still open but may deliver nothing: the token it was made with ran out
-    /// and no new subscription could be made. Not a loss: nothing broke, and no catch-up yet.
-    fn stalled(&self, why: &str) {
-        if self.following.load(Ordering::SeqCst) {
-            *self.last_loss.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
-            self.following(false);
-        }
-    }
-
-    /// A new subscription replaced the one kept past its token.
-    fn renewed(&self) {
-        if !self.following.load(Ordering::SeqCst) {
-            self.following(true);
-        }
-    }
-
-    fn changed(&self) {
-        self.last_change.store(crate::db::now(), Ordering::SeqCst);
-        self.changes.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn caught_up(&self) {
-        self.catch_ups.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// None until botd follows the events.
-    pub(crate) fn view(&self) -> Option<external::WatchStatus> {
-        self.on.load(Ordering::SeqCst).then(|| external::WatchStatus {
-            following: self.following.load(Ordering::SeqCst),
-            since_ms: self.since.load(Ordering::SeqCst),
-            changes: self.changes.load(Ordering::SeqCst),
-            last_change_ms: Some(self.last_change.load(Ordering::SeqCst)).filter(|t| *t > 0),
-            lost: self.lost.load(Ordering::SeqCst),
-            catch_ups: self.catch_ups.load(Ordering::SeqCst),
-            last_loss: self.last_loss.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-        })
-    }
-}
-
 /// `secret.vault_events`: the stream's `state`, against Vault's address.
 fn audit_state(addr: &str, state: &str, error: Option<&str>) {
     let e = Event::new(external::actor(), "secret.vault_events").target("vault", addr);
@@ -802,62 +608,7 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
     }
 }
 
-/// `secret.cache_refreshed` for what botd read again on its own, by `trigger`.
-fn audit_refresh(report: &Refresh, target: (&str, &str), trigger: &str, event: Option<&str>) {
-    let mut details = report.audit_details();
-    details["trigger"] = json!(trigger);
-    if let Some(e) = event {
-        details["event"] = json!(e);
-    }
-    let outcome = if report.ok() { Outcome::Success } else { Outcome::Failure };
-    external::audit(Event::new(external::actor(), "secret.cache_refreshed").target(target.0, target.1).outcome(outcome).details(details));
-}
-
-/// Applies what the stream announces to the store, on a thread of its own: reads and
-/// refreshes block, and must not hold up the stream.
-fn apply(store: Weak<ExternalStore>, rx: Rx, status: Arc<Status>) {
-    while let Some(note) = rx.recv() {
-        let Some(store) = store.upgrade() else { return };
-        match note {
-            Note::Changed { scope, name, event, index } => {
-                let Some(entry) = store.changed(&scope, &name, index.as_deref()) else { continue };
-                status.changed();
-                let folder = scope.folder('/');
-                if entry.restart {
-                    log_warn!("Vault: {name} in {folder} changed ({event}), but botd read it at startup and keeps the old value until it restarts (ADR 0291).");
-                } else {
-                    log_info!("Vault: {name} in {folder} changed ({event}); new runs get what Vault has now (VAULT_EVENTS, ADR 0306).");
-                }
-                let report = Refresh { store: store.kind(), names: Some(vec![name.clone()]), entries: vec![entry], folders: Vec::new() };
-                audit_refresh(&report, ("secret", &name), "vault-event", Some(&event));
-            }
-            Note::Resumed(index) => {
-                let mut tries = 0;
-                let report = loop {
-                    match store.refresh_at(None, index.as_deref()) {
-                        Ok(r) => break Some(r),
-                        // An admin's refresh began before the gap ended: wait for it, then read again.
-                        Err(RefreshError::Busy) if tries < 60 => {
-                            tries += 1;
-                            std::thread::sleep(Duration::from_secs(1));
-                        }
-                        Err(e) => {
-                            log_warn!("Vault: couldn't read the cache again after change events resumed ({e}); answers cached before end within SECRETS_CACHE_SECONDS (ADR 0306).");
-                            break None;
-                        }
-                    }
-                };
-                if let Some(r) = report {
-                    status.caught_up();
-                    if !r.restart().is_empty() {
-                        log_warn!("Vault: {} changed while change events were down, but botd read them at startup and keeps the old values until it restarts (ADR 0291).", r.restart().join(", "));
-                    }
-                    audit_refresh(&r, ("secret_store", r.store), "vault-events-resumed", None);
-                }
-            }
-        }
-    }
-}
+const SOURCE: changes::Source = changes::Source { label: "Vault", setting: "VAULT_EVENTS, ADR 0306", change: "vault-event", resumed: "vault-events-resumed" };
 
 /// Subscribes now, so botd doesn't start when Vault won't take it, then follows the stream
 /// on Vault's runtime and applies it to `store` on a thread of its own.
@@ -866,9 +617,8 @@ pub(super) fn start(vault: &Vault, store: Weak<ExternalStore>) -> Result<(), Err
     let first = vault.run(|i| async move { i.subscribe().await })?;
     audit_state(&vault.inner.cfg.addr, "subscribed", None);
     vault.inner.events.following(true);
-    let (tx, rx) = queue();
-    let status = Arc::clone(&vault.inner.events);
-    std::thread::Builder::new().name("vault-events".into()).spawn(move || apply(store, rx, status)).map_err(|e| unavailable("change events", e))?;
+    let (tx, rx) = changes::queue();
+    changes::start_applying("vault-events", store, rx, Arc::clone(&vault.inner.events), &SOURCE).map_err(|e| unavailable("change events", e))?;
     vault.worker.spawn(follow(Arc::clone(&vault.inner), first, users, tx))
 }
 
@@ -878,7 +628,7 @@ pub(crate) mod tests {
     use super::super::super::external::tests::audited;
     use super::super::super::http::tests::settings;
     use super::super::super::leases::tests::wait_for;
-    use super::super::super::redact;
+    use super::super::super::{redact, SecretStore};
     use super::super::tests::{check, put, stand_in, F};
     use super::*;
     use axum::extract::{Request, State};
@@ -1098,33 +848,6 @@ pub(crate) mod tests {
         }
         let e = Reader::new(&frame(TEXT, b"x", None)[..], true).next().await.unwrap_err();
         assert!(e.to_string().contains("unmasked frame from a client"), "{e}");
-    }
-
-    #[test]
-    fn a_name_changed_again_waits_once_and_too_many_make_way_for_one_full_read() {
-        let changed = |name: &str, index: &str| Note::Changed { scope: Scope::Bots, name: name.into(), event: "kv-v2/data-write".into(), index: Some(index.into()) };
-        let (tx, rx) = queue();
-        tx.send(changed("A_TOKEN", "1"));
-        tx.send(changed("B_TOKEN", "2"));
-        tx.send(changed("A_TOKEN", "3"));
-        assert_eq!(rx.recv(), Some(changed("A_TOKEN", "3")), "once, in its first place, at the newest index");
-        assert_eq!(rx.recv(), Some(changed("B_TOKEN", "3")), "never at less than one already applied");
-
-        for i in 0..MAX_PENDING {
-            tx.send(changed(&format!("N{i}_TOKEN"), "4"));
-        }
-        tx.send(changed("C_TOKEN", "5"));
-        assert_eq!(rx.recv(), Some(Note::Resumed(Some("5".into()))), "everything read again instead, at the newest change's index");
-        tx.send(changed("D_TOKEN", "6"));
-        tx.send(Note::Resumed(None));
-        assert_eq!(rx.recv(), Some(Note::Resumed(None)), "a full read first");
-        assert_eq!(rx.recv(), Some(changed("D_TOKEN", "6")));
-        assert!(!tx.is_closed());
-        drop(tx);
-        assert_eq!(rx.recv(), None, "the stream is gone");
-        let (tx, rx) = queue();
-        drop(rx);
-        assert!(tx.is_closed(), "the store is gone");
     }
 
     #[test]
