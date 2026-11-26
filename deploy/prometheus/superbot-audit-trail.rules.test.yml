@@ -78,7 +78,7 @@ tests:
               instance: a:8080
             exp_annotations:
               summary: The audit log's hash chain check failed
-              description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; copy app.sqlite, tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
+              description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; save an online copy of its database (botd database backup, not a plain copy of app.sqlite, whose newest events may still be in app.sqlite-wal), tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
 
   # Timestamps: a ticket after an hour of failing, none for a short outage.
   - interval: 1m

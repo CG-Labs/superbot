@@ -862,7 +862,7 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
         }
         if chain_failed {
             f = f.runbook("support/runbook-audit-trail.md#the-chain-check-failed").next(
-                "A failed chain check can mean the audit log was changed: don't restart or restore yet, copy app.sqlite, and tell the security owner.",
+                "A failed chain check can mean the audit log was changed: don't restart or restore yet, save an online copy with `botd database backup` (a plain copy of app.sqlite misses events still in app.sqlite-wal), and tell the security owner.",
             );
         }
         out.push(f);

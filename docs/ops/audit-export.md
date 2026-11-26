@@ -119,7 +119,7 @@ With metrics on, `/metrics` has `superbot_audit_checkpoint_last_timestamp_second
 
 ### If it's broken
 
-1. Don't restart or restore yet. Copy `app.sqlite` (and `DATA_DIR/master.key` if the database is encrypted) somewhere safe.
+1. Don't restart or restore yet. Save an online copy of the database somewhere safe: `botd database backup <DATA_DIR>/app.sqlite <new file>`, as botd's user (SQLite's online backup, as the server's backups take; an encrypted database stays encrypted under the master key). Not a plain copy of `app.sqlite` while botd runs: in WAL mode its newest events may still be only in `app.sqlite-wal` ([the runbook](../support/runbook-audit-trail.md#first-five-minutes) has the commands).
 2. Note `firstBroken`. Compare that event and the ones around it with your SIEM's copy (`id`, `chainPrev`, `chainHash`) and your backups.
 3. Restoring a backup older than events the SIEM already has also shows as a broken pin: expected after a restore, and worth recording.
 4. Treat an unexplained break as a security incident.

@@ -15,7 +15,17 @@ The settings and checks are in the [audit export guide](../ops/audit-export.md);
    ```
 
    A support bundle has the week's `audit.*` failures, and every stopped sink, in `audit-summary.json`; [bundle triage](triage.md) lists them as `audit.audit_trail`, and suggests Severity 2 when a chain check failed. The Prometheus rules in [`superbot-audit-trail.rules.yml`](../../deploy/prometheus/superbot-audit-trail.rules.yml) raise the same four things: a failing sink, a stopped sink, failing timestamps and a failed check.
-2. **A failed chain check comes first.** Before anything else: don't restart botd, restore a backup or run `botctl audit verify` with new options. Copy `app.sqlite`, and `DATA_DIR/master.key` if the database is encrypted, somewhere safe, and tell the customer's security owner. Then [the chain check failed](#the-chain-check-failed).
+2. **A failed chain check comes first.** Before anything else: don't restart botd, restore a backup or run `botctl audit verify` with new options. Save an online copy of the database, and tell the customer's security owner. Not a plain `cp` of `app.sqlite`: botd keeps running and the database is in WAL mode, so its newest events may still be only in `app.sqlite-wal`, and the copy would miss them. `botd database backup` takes SQLite's online backup, the one the server's backups use: one consistent moment, WAL included, plain or encrypted:
+
+   ```sh
+   # installer (DATA_DIR from ~superbot/superbot/.env if it isn't the default)
+   sudo -H -u superbot botd database backup ~superbot/superbot/data/app.sqlite ~superbot/evidence-$(date -u +%Y%m%dT%H%M%SZ).sqlite
+   # Compose
+   docker compose exec botd botd database backup /data/app.sqlite /backups/evidence-<UTC time>.sqlite
+   docker compose cp botd:/backups/evidence-<UTC time>.sqlite .
+   ```
+
+   Move the copy off the server, with its SHA-256 in the ticket. An encrypted database's copy stays encrypted under the master key, which is never in `DATA_DIR` (installer: `~superbot/.config/superbot/master.key`; Compose: `SUPERBOT_MASTER_KEY`): note where it is, and don't rotate it until this is closed. Keep the server's backup archives from before the break too, out of the backups folder before retention deletes them: they hold the log as it was. Then [the chain check failed](#the-chain-check-failed).
 3. **Did anything change?** `AUDIT_EXPORT` or a sink's token edited, the SIEM's collector, token, data collection rule or API key rotated, a network or proxy change, the archive bucket's policy or Object Lock, a restore, an erasure, an upgrade, or the TSA's address or CA.
 
 ## The export is failing

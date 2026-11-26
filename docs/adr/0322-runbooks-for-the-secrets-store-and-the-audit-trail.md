@@ -22,7 +22,7 @@ Constraints: Rust first, no new dependencies, nothing that changes what botd rec
 ### Two runbooks in the shape of the others
 
 - [`runbook-secrets.md`](../support/runbook-secrets.md): runs refused; every `secret.*` action botd records for reads and sign-ins, with every `error` kind (`secrets::Error::kind` and the lease code's own); per-run credentials and their leases. Severity 1 when runs are refused for everyone, 2 for many or a rotation after a leak that didn't land, 3 for one user or one entry.
-- [`runbook-audit-trail.md`](../support/runbook-audit-trail.md): the export failing (each reason the sinks record), a sink stopped, the chain check failed (each reason, with the checkpoint's and timestamp's), timestamps failing. Severity 3 for export and timestamps, since events wait in botd's database; 2 for a failed chain check until it's explained; 1 when it isn't, which is a suspected security incident. It says not to restart or restore before copying `app.sqlite`, since that's the evidence.
+- [`runbook-audit-trail.md`](../support/runbook-audit-trail.md): the export failing (each reason the sinks record), a sink stopped, the chain check failed (each reason, with the checkpoint's and timestamp's), timestamps failing. Severity 3 for export and timestamps, since events wait in botd's database; 2 for a failed chain check until it's explained; 1 when it isn't, which is a suspected security incident. It says not to restart or restore before saving an online copy of the database with `botd database backup`, since that's the evidence: the database is in WAL mode and botd keeps running, so a plain copy of `app.sqlite` can miss the newest events, still only in `app.sqlite-wal`. `botd database backup` is the online backup `superbot-backup` already takes, for a plain or an encrypted database alike.
 
 Both link the setup guides for detail rather than repeat them.
 
@@ -30,7 +30,7 @@ Both link the setup guides for detail rather than repeat them.
 
 - Two audit groups: `audit.secrets` (`secret.*`) and `audit.audit_trail` (`audit.*`), each naming its runbook.
 - `audit.export_stopped` counts in its group though it's recorded as a success: the SIEM gets nothing from then on.
-- `audit.audit_trail` is always a warning, not only at 10. A failed `audit.verified` suggests Severity 2 (so `botctl support-triage` exits 1) and adds the chain section with "copy `app.sqlite` first" as its next step.
+- `audit.audit_trail` is always a warning, not only at 10. A failed `audit.verified` suggests Severity 2 (so `botctl support-triage` exits 1) and adds the chain section with "save an online copy with `botd database backup` first" as its next step.
 - Runs refused `secrets_unavailable` add the secrets runbook's runs refused section to `audit.run_limits`.
 
 ### Prometheus rules for the audit trail

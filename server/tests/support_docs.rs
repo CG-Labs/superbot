@@ -921,6 +921,11 @@ fn the_audit_trail_runbook_explains_every_reason_botd_records() {
     assert!(page.contains("superbot-audit-trail.rules.yml"), "the runbook names its alert rules");
     let guide = fs::read_to_string(repo().join("docs/ops/audit-export.md")).unwrap();
     assert!(guide.contains("(../support/runbook-audit-trail.md") && guide.contains("superbot-audit-trail.rules.yml"), "the audit export guide points at the runbook and the rules");
+
+    // Evidence of a changed log is an online copy: a plain one of app.sqlite misses the WAL.
+    for (what, text) in [("the runbook", page.as_str()), ("the audit export guide", guide.as_str()), ("the rules", rules.as_str()), ("triage", triage.as_str())] {
+        assert!(text.contains("botd database backup") && text.contains("app.sqlite-wal"), "{what} saves evidence with botd database backup, and says why");
+    }
 }
 
 /// ADR 0322: every `secret.*` action the external store, its sign-ins and per-run
