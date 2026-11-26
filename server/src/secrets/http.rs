@@ -77,6 +77,14 @@ impl Worker {
         let got = if multi { tokio::task::block_in_place(wait) } else { wait() };
         got.unwrap_or_else(|| Err(Error::Unavailable(format!("{}: no answer in time", self.label))))
     }
+
+    /// Runs `job` in the background for as long as it lasts, outside the request permits:
+    /// a subscription that stays open (ADR 0306), not a request.
+    pub fn spawn(&self, job: impl std::future::Future<Output = ()> + Send + 'static) -> Result<(), Error> {
+        let rt = self.rt.as_ref().ok_or_else(|| Error::Unavailable(format!("{}: the client stopped", self.label)))?;
+        rt.spawn(job);
+        Ok(())
+    }
 }
 
 /// An HTTP client for a backend: rustls, timeouts, no redirects. `ca` is the PEM of a

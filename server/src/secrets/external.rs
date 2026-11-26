@@ -21,7 +21,8 @@
 //!   like the others; values are redacted from that user's Bots.
 //! - `refresh` reads every cached answer again at once, for an admin who rotated a value
 //!   and can't wait out the cache, and says which names botd read at startup have
-//!   changed since, which only a restart picks up (ADR 0291).
+//!   changed since, which only a restart picks up (ADR 0291). A backend that announces
+//!   changes (Vault's events, ADR 0306) has each one read again as it comes (`changed`).
 
 use super::leases::{self, RunCredentials};
 use super::{check_name, check_user_name, env_shaped, redact, server_secret, Error, Secret, SecretStore};
@@ -86,7 +87,7 @@ impl Scope {
 
     /// Whether `name` may be read from this folder: a name is only read from its own
     /// shared folder, and a user's folder holds only names a user may save.
-    fn holds(&self, name: &str) -> bool {
+    pub(crate) fn holds(&self, name: &str) -> bool {
         match self {
             Scope::User(_) => check_user_name(name).is_ok(),
             s => scope_of(name).as_ref() == Some(s),
@@ -123,6 +124,11 @@ pub trait Provider: Send + Sync {
     fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error>;
     /// Names in `scope`. Never values.
     fn list(&self, scope: Scope) -> Result<Vec<String>, Error>;
+    /// Starts telling `store` of changes as the backend announces them (`ExternalStore::changed`),
+    /// if it is set to; whether it does. An error when it is set to but can't (ADR 0306).
+    fn watch(&self, _store: std::sync::Weak<ExternalStore>) -> Result<bool, Error> {
+        Ok(false)
+    }
 }
 
 /// Audit events from reads, waiting for `start_audit` to write them: a read can happen
@@ -305,6 +311,12 @@ impl ExternalStore {
     fn fetch(&self, scope: &Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
         let started = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let got = self.provider.read(scope.clone(), name);
+        self.took(scope, name, started, got)
+    }
+
+    /// What a read of `name` that began at `started` got: cached unless a refresh began
+    /// since, redacted, and audited.
+    fn took(&self, scope: &Scope, name: &str, started: u64, got: Result<Option<Zeroizing<String>>, Error>) -> Result<Option<Zeroizing<String>>, Error> {
         let key = (scope.clone(), name.to_string());
         let details = |found: Option<bool>, err: Option<&Error>| {
             let mut d = self.details(scope, "read");
@@ -430,23 +442,9 @@ impl ExternalStore {
         for (job, done) in jobs.into_iter().zip(done) {
             match (job, done) {
                 (Job::Read(key), Done::Read(now)) => {
-                    let result = match (old.get(&key), &now) {
-                        (_, Err(_)) => Change::Unavailable,
-                        (Some(Some(a)), Ok(Some(b))) if a.as_str() == b.as_str() => Change::Unchanged,
-                        (Some(Some(_)), Ok(Some(_))) => Change::Changed,
-                        (Some(None), Ok(Some(_))) => Change::Added,
-                        (Some(Some(_)), Ok(None)) => Change::Removed,
-                        (None, Ok(Some(_))) => Change::Found,
-                        (Some(None) | None, Ok(None)) => Change::NotFound,
-                    };
-                    let at_startup = startup.get(&key);
-                    let restart = match (at_startup, &now) {
-                        (Some(then), Ok(now)) => then.as_ref().map(|v| v.as_str()) != now.as_ref().map(|v| v.as_str()),
-                        _ => false,
-                    };
-                    let read_at_startup = at_startup.is_some();
+                    let (old, at_startup) = (old.get(&key), startup.get(&key));
                     let (scope, name) = key;
-                    entries.push(Refreshed { name, scope: scope.as_str(), user_id: scope.user_id().map(str::to_string), result, startup: read_at_startup, restart });
+                    entries.push(Refreshed::compared(name, &scope, old, at_startup, &now));
                 }
                 (Job::List(scope), Done::List(now)) => {
                     let before = listed_before.get(&scope);
@@ -460,6 +458,30 @@ impl ExternalStore {
             }
         }
         Ok(Refresh { store: self.provider.kind(), names: wanted.map(|w| w.into_iter().collect()), entries, folders })
+    }
+
+    /// Has the backend tell this store of changes as they happen, if it is set to
+    /// (`VAULT_EVENTS`, ADR 0306): whether it does. An error stops botd at startup.
+    pub fn watch(self: &Arc<Self>) -> Result<bool, Error> {
+        self.provider.watch(Arc::downgrade(self))
+    }
+
+    /// The backend announced a change to `name` in `scope`, and read it again as `got`
+    /// (ADR 0306). The answer replaces what was cached as a read would (audited, redacted,
+    /// fail closed when `got` is an error), and the folder's list is dropped so a name that
+    /// came or went shows at its next use. A read already in flight can't cache over it.
+    /// None when the store doesn't read that name there (another folder's, user folders off).
+    pub fn changed(&self, scope: &Scope, name: &str, got: Result<Option<Zeroizing<String>>, Error>) -> Option<Refreshed> {
+        if !scope.holds(name) || (scope.user_id().is_some() && !self.user_folders) {
+            return None;
+        }
+        let key = (scope.clone(), name.to_string());
+        let started = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let old = self.values.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|(_, v)| v.clone());
+        let at_startup = self.startup.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        let now = self.took(scope, name, started, got);
+        self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(scope);
+        Some(Refreshed::compared(name.to_string(), scope, old.as_ref(), at_startup.as_ref(), &now))
     }
 }
 
@@ -567,6 +589,27 @@ pub struct Refreshed {
     pub startup: bool,
     /// They read another answer than the backend's now, and hold it until botd restarts.
     pub restart: bool,
+}
+
+impl Refreshed {
+    /// `name` read again as `now`, against what was cached before (`old`) and what botd's
+    /// startup settings read (`at_startup`), when they did.
+    fn compared(name: String, scope: &Scope, old: Option<&Option<Zeroizing<String>>>, at_startup: Option<&Option<Zeroizing<String>>>, now: &Result<Option<Zeroizing<String>>, Error>) -> Refreshed {
+        let result = match (old, now) {
+            (_, Err(_)) => Change::Unavailable,
+            (Some(Some(a)), Ok(Some(b))) if a.as_str() == b.as_str() => Change::Unchanged,
+            (Some(Some(_)), Ok(Some(_))) => Change::Changed,
+            (Some(None), Ok(Some(_))) => Change::Added,
+            (Some(Some(_)), Ok(None)) => Change::Removed,
+            (None, Ok(Some(_))) => Change::Found,
+            (Some(None) | None, Ok(None)) => Change::NotFound,
+        };
+        let restart = match (at_startup, now) {
+            (Some(then), Ok(now)) => then.as_ref().map(|v| v.as_str()) != now.as_ref().map(|v| v.as_str()),
+            _ => false,
+        };
+        Refreshed { name, scope: scope.as_str(), user_id: scope.user_id().map(str::to_string), result, startup: at_startup.is_some(), restart }
+    }
 }
 
 /// One folder a refresh listed again: how many names it has, and which came or went
@@ -839,9 +882,10 @@ pub fn user_folders(raw: &str) -> Result<bool, String> {
 
 /// The settings of backends other than `chosen` that are set: probably a mistake.
 pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'static str> {
-    const KEYS: [(&str, &str); 12] = [
+    const KEYS: [(&str, &str); 13] = [
         ("vault", "VAULT_ADDR"),
         ("vault", "VAULT_RUN_CREDENTIALS"),
+        ("vault", "VAULT_EVENTS"),
         ("azure-keyvault", "AZURE_KEYVAULT_URL"),
         ("azure-keyvault", "AZURE_KEYVAULT_AUTH"),
         ("azure-keyvault", "AZURE_RUN_CREDENTIALS"),

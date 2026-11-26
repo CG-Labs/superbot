@@ -16,7 +16,8 @@
 //! mounted somewhere other than the secrets. Requests run on a runtime of their own
 //! (`http::Worker`). It is also the `leases::Issuer` of `VAULT_RUN_CREDENTIALS`: a new
 //! lease from a dynamic secrets engine for each run, renewed while the run lasts (ADR 0221)
-//! and revoked when it ends (ADR 0185).
+//! and revoked when it ends (ADR 0185). With `VAULT_EVENTS=1` it follows Vault's change
+//! events and reads a name again as it changes (`events`, ADR 0306).
 
 use super::external::{self, Provider, Scope};
 use super::http::Worker;
@@ -29,6 +30,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
+
+pub(crate) mod events;
 
 /// Where Kubernetes mounts a pod's service account token.
 pub const KUBERNETES_TOKEN_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
@@ -288,6 +291,8 @@ pub struct Config {
     pub auth: Auth,
     /// PEM of the CA that signed Vault's certificate, when it isn't a public one.
     pub ca: Option<String>,
+    /// `VAULT_EVENTS=1`: follow Vault's change events and read a name again as it changes (ADR 0306).
+    pub events: bool,
 }
 
 /// A mount, prefix or namespace: `/`-separated parts of letters, digits, `.`, `_` and `-`.
@@ -409,6 +414,11 @@ impl Config {
             "" => None,
             path => Some(std::fs::read_to_string(path).map_err(|e| format!("VAULT_CACERT ({path}): {e}"))?),
         };
+        let events = match var("VAULT_EVENTS").trim() {
+            "" | "0" => false,
+            "1" => true,
+            other => return Err(format!("VAULT_EVENTS must be 1 (follow Vault's change events, Vault Enterprise) or 0, not {other:?}")),
+        };
         Ok(Config {
             addr,
             namespace,
@@ -418,6 +428,7 @@ impl Config {
             field,
             auth,
             ca,
+            events,
         })
     }
 }
@@ -753,11 +764,13 @@ impl Inner {
         result
     }
 
-    /// GETs `path`; when Vault refuses the token, gets a new one and asks once more.
-    async fn get(&self, path: &str) -> Result<Option<Value>, Error> {
+    /// GETs `path`; when Vault refuses the token, gets a new one and asks once more. With
+    /// `index` (an event's `vault_index`), a node that hasn't caught up with it yet waits or
+    /// refuses rather than answering from before the change (ADR 0306).
+    async fn get(&self, path: &str, index: Option<&str>) -> Result<Option<Value>, Error> {
         for fresh in [false, true] {
             let token = self.token(fresh).await?;
-            if let Some(v) = self.get_with(path, &token, fresh).await? {
+            if let Some(v) = self.get_with(path, &token, fresh, index).await? {
                 return Ok(v);
             }
         }
@@ -766,8 +779,12 @@ impl Inner {
 
     /// GETs `path` with `token`: the answer (None for 404), or None if Vault refused the
     /// token and `last` is false.
-    async fn get_with(&self, path: &str, token: &str, last: bool) -> Result<Option<Option<Value>>, Error> {
-        let res = self.request(reqwest::Method::GET, path).header("X-Vault-Token", token).send().await.map_err(|e| unavailable(path, e))?;
+    async fn get_with(&self, path: &str, token: &str, last: bool, index: Option<&str>) -> Result<Option<Option<Value>>, Error> {
+        let mut r = self.request(reqwest::Method::GET, path).header("X-Vault-Token", token);
+        if let Some(i) = index {
+            r = r.header("X-Vault-Index", i);
+        }
+        let res = r.send().await.map_err(|e| unavailable(path, e))?;
         let status = res.status();
         if status == reqwest::StatusCode::FORBIDDEN && !last {
             return Ok(None);
@@ -841,9 +858,9 @@ impl Inner {
         }))
     }
 
-    async fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
+    async fn read(&self, scope: Scope, name: &str, index: Option<&str>) -> Result<Option<Zeroizing<String>>, Error> {
         let path = self.secret_path("data", &scope, name);
-        let Some(body) = self.get(&path).await? else { return Ok(None) };
+        let Some(body) = self.get(&path, index).await? else { return Ok(None) };
         let data = &body["data"]["data"];
         if data.is_null() && body["data"]["metadata"].is_object() {
             // A deleted version: no value until a new one is written.
@@ -862,7 +879,7 @@ impl Inner {
 
     async fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
         let path = format!("{}/metadata/{}/{}/", self.cfg.mount, self.cfg.prefix, scope.folder('/'));
-        let Some(body) = self.get(&format!("{path}?list=true")).await? else { return Ok(Vec::new()) };
+        let Some(body) = self.get(&format!("{path}?list=true"), None).await? else { return Ok(Vec::new()) };
         let keys = body["data"]["keys"].as_array().ok_or_else(|| Error::Unavailable(format!("Vault: listing {path} gave no keys")))?;
         Ok(keys.iter().filter_map(Value::as_str).filter(|k| !k.ends_with('/')).map(String::from).collect())
     }
@@ -873,7 +890,7 @@ impl Inner {
         let mut body = None;
         for fresh in [false, true] {
             let token = self.token_for(run_for, fresh).await?;
-            if let Some(b) = self.get_with(path, &token, fresh).await? {
+            if let Some(b) = self.get_with(path, &token, fresh, None).await? {
                 body = b;
                 break;
             }
@@ -1021,16 +1038,25 @@ impl Provider for Vault {
             AuthNamespace::Path(n) => format!(" in namespace {n}"),
         };
         let ns = c.namespace.as_deref().map(|n| format!(", namespace {n}")).unwrap_or_default();
-        format!("HashiCorp Vault at {}{ns}, KV v2 {}/{}/{{bots,server}}/<NAME> field {:?}, {auth}{auth_ns}", c.addr, c.mount, c.prefix, c.field)
+        let events = if c.events { ", following Vault's change events" } else { "" };
+        format!("HashiCorp Vault at {}{ns}, KV v2 {}/{}/{{bots,server}}/<NAME> field {:?}, {auth}{auth_ns}{events}", c.addr, c.mount, c.prefix, c.field)
     }
 
     fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
         let name = name.to_string();
-        self.run(move |i| async move { i.read(scope, &name).await })
+        self.run(move |i| async move { i.read(scope, &name, None).await })
     }
 
     fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
         self.run(move |i| async move { i.list(scope).await })
+    }
+
+    fn watch(&self, store: std::sync::Weak<external::ExternalStore>) -> Result<bool, Error> {
+        if !self.inner.cfg.events {
+            return Ok(false);
+        }
+        events::start(self, store)?;
+        Ok(true)
     }
 }
 
@@ -1053,17 +1079,17 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct Fake {
         /// `<mount>/<path>` → fields.
-        kv: Mutex<HashMap<String, Value>>,
+        pub kv: Mutex<HashMap<String, Value>>,
         pub tokens: Mutex<Vec<String>>,
         /// JWTs a `kubernetes` or `jwt` mount accepts: (mount, role, JWT).
         pub jwts: Mutex<Vec<(String, Option<String>, String)>>,
         pub logins: AtomicUsize,
-        reads: AtomicUsize,
+        pub reads: AtomicUsize,
         down: AtomicBool,
         namespaces: Mutex<Vec<String>>,
         /// The namespace each login was sent to ("" for none).
         pub login_namespaces: Mutex<Vec<String>>,
-        lease: AtomicUsize,
+        pub lease: AtomicUsize,
         delay_ms: AtomicUsize,
         /// `<engine>/creds/<role>` → the fields each lease from it has.
         creds: Mutex<HashMap<String, Value>>,
@@ -1109,6 +1135,8 @@ pub(crate) mod tests {
         ec2_nonce: Mutex<Option<String>>,
         /// The role of each `ec2` login Vault let in.
         ec2_logins: Mutex<Vec<String>>,
+        /// Change event streams (ADR 0306).
+        pub events: events::tests::Hub,
     }
 
     /// The instance's PKCS#7 identity document as IMDS gives it: base64 in lines of 64.
@@ -1131,7 +1159,7 @@ pub(crate) mod tests {
         format!("{}.{}.{}", b64(json!({ "alg": "RS256", "kid": "k1" })), b64(json!({ "iss": "https://kubernetes.default.svc", "sub": sub, "exp": now + exp_in })), crate::random_hex(16))
     }
 
-    fn check(f: &Fake, h: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    pub(crate) fn check(f: &Fake, h: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
         if f.down.load(Ordering::SeqCst) {
             return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "errors": ["Vault is sealed"] }))));
         }
@@ -1148,6 +1176,7 @@ pub(crate) mod tests {
             return e;
         }
         f.reads.fetch_add(1, Ordering::SeqCst);
+        f.events.saw(&h);
         let delay = f.delay_ms.load(Ordering::SeqCst) as u64;
         tokio::time::sleep(Duration::from_millis(delay)).await;
         if rest.ends_with("/MALFORMED_TOKEN") {
@@ -1481,6 +1510,7 @@ pub(crate) mod tests {
             .route("/v1/{engine}/creds/{role}", axum::routing::get(creds))
             .route("/v1/sys/leases/revoke/{*lease}", axum::routing::put(revoke))
             .route("/v1/sys/leases/renew/{*lease}", axum::routing::put(renew))
+            .route("/v1/sys/events/subscribe/{*types}", axum::routing::get(events::tests::subscribe))
             .route("/latest/api/token", axum::routing::put(imds_token))
             .route("/latest/meta-data/iam/security-credentials/", axum::routing::get(imds_roles))
             .route("/latest/meta-data/iam/security-credentials/{role}", axum::routing::get(imds_role))
