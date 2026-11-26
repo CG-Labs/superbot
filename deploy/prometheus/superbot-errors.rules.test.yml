@@ -41,7 +41,7 @@ tests:
               harness: claude
             exp_annotations:
               summary: "Bot runs on claude are failing"
-              description: "50% of claude runs in the last 30 minutes ended in error or timeout. Check the harness's CLI version and login, its model provider's status, and botd's run.finished log lines for that harness."
+              description: "50% of claude runs in the last 30 minutes ended in error or timeout. Check the harness's CLI version and login, its model provider's status, and botd's run.finished log lines for that harness. See docs/support/runbook-harness-outage.md#first-five-minutes."
 
   # Stopped and interrupted runs aren't failures.
   - interval: 1m
@@ -88,7 +88,7 @@ tests:
               route_class: bots
             exp_annotations:
               summary: "botd's bots routes are failing"
-              description: "10% of bots requests in the last 10 minutes were answered with a 5xx. Check the error tracker (ERROR_REPORT_DSN) or botd's http.request log lines at level warn for that routeClass."
+              description: "10% of bots requests in the last 10 minutes were answered with a 5xx. Check the error tracker (ERROR_REPORT_DSN) or botd's http.request log lines at level warn for that routeClass. See docs/support/runbook-server-errors.md#requests-failing."
 
   # One failure in a hundred is under the line.
   - interval: 1m
@@ -120,7 +120,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: botd panicked
-              description: "botd at botd:9464 panicked in the last 15 minutes. A request that panics answers 500; a task that panics stops. Find it in the error tracker or botd's server.panic log line, and its message in botd's stderr."
+              description: "botd at botd:9464 panicked in the last 15 minutes. A request that panics answers 500; a task that panics stops. Find it in the error tracker or botd's server.panic log line, and its message in botd's stderr. See docs/support/runbook-server-errors.md#panics."
       - eval_time: 30m
         alertname: SuperBotPanics
         exp_alerts: []
@@ -143,7 +143,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: Bot runs have waited for a slot for 30 minutes
-              description: "2 runs at botd:9464 are waiting for a run slot, and some have been waiting for 30 minutes without a break. Raise MAX_CONCURRENT_RUNS or a tier's concurrentRuns (ADR 0073), or look for runs that don't finish."
+              description: "2 runs at botd:9464 are waiting for a run slot, and some have been waiting for 30 minutes without a break. Raise MAX_CONCURRENT_RUNS or a tier's concurrentRuns (ADR 0073), or look for runs that don't finish. See docs/support/runbook-harness-outage.md#causes-and-fixes."
 
   # A queue that drains now and then is a busy server, not a backlog.
   - interval: 1m
@@ -175,7 +175,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: botd's error reports aren't reaching the error tracker
-              description: "The error tracker refused or didn't answer reports from botd at botd:9464 in the last 30 minutes, so panics and 5xx answers may be missing there. Check ERROR_REPORT_DSN, the tracker's rate limits, and botd's log for \"error tracker\"."
+              description: "The error tracker refused or didn't answer reports from botd at botd:9464 in the last 30 minutes, so panics and 5xx answers may be missing there. Check ERROR_REPORT_DSN, the tracker's rate limits, and botd's log for \"error tracker\". See docs/support/runbook-server-errors.md#error-reports-arent-arriving."
 
   - interval: 1m
     input_series:

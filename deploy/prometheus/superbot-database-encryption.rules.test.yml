@@ -25,7 +25,7 @@ tests:
               instance: a:8080
             exp_annotations:
               summary: "The database isn't encrypted"
-              description: "botd's database on a:8080 is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/ops/database-encryption.md."
+              description: "botd's database on a:8080 is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/support/runbook-encryption.md#the-database-isnt-encrypted."
 
   # Plain by choice on one server doesn't hide another server's plain database.
   - interval: 1m
@@ -48,7 +48,7 @@ tests:
               instance: b:8080
             exp_annotations:
               summary: "The database isn't encrypted"
-              description: "botd's database on b:8080 is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/ops/database-encryption.md."
+              description: "botd's database on b:8080 is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/support/runbook-encryption.md#the-database-isnt-encrypted."
 
   # A plain copy left for a day: a ticket; an encrypted database without one: nothing.
   - interval: 1m
@@ -77,4 +77,4 @@ tests:
               instance: a:8080
             exp_annotations:
               summary: "A plain copy of the database is still in DATA_DIR"
-              description: "botd encrypted the database on a:8080 and kept a plain copy of it, which holds every chat unencrypted. Once SuperBot runs well, delete it (botctl database names it). See docs/ops/database-encryption.md#the-plain-copy."
+              description: "botd encrypted the database on a:8080 and kept a plain copy of it, which holds every chat unencrypted. Once SuperBot runs well, delete it (botctl database names it). See docs/support/runbook-encryption.md#a-plain-copy-is-left."

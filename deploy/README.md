@@ -498,6 +498,8 @@ The metrics cover requests (by route class, method and status class, with latenc
 
 **Audit trail.** With a SIEM export or archive, `superbot_audit_export_failing{kind,name}` is 1 while a sink fails; `superbot_audit_export_stopped_sinks` counts sinks taken out of `AUDIT_EXPORT`, and `superbot_audit_export_last_stop_timestamp_seconds` is when the newest of them stopped; with a timestamp authority, `superbot_audit_timestamp_failing` is 1 while timestamps fail; and `superbot_events_total{event="audit.verified",outcome="failure"}` counts failed checks of the chain. Design: [ADR 0322](../docs/adr/0322-runbooks-for-the-secrets-store-and-the-audit-trail.md). The alert rules (an export failing for 15 minutes, a sink stopped, timestamps failing for an hour: tickets; a failed chain check: a page) are in [`prometheus/superbot-audit-trail.rules.yml`](prometheus/superbot-audit-trail.rules.yml), tested with `promtool test rules prometheus/superbot-audit-trail.rules.test.yml`. Each links its section of the [audit trail runbook](../docs/support/runbook-audit-trail.md).
 
+Every alert in these rule files ends with the section of the [support runbooks](../docs/support/README.md) that says what to do, and that section names it ([ADR 0331](../docs/adr/0331-every-alert-links-its-runbook.md)).
+
 On the installer's server, with a Prometheus (or Grafana Alloy, or an OpenTelemetry Collector) on the same host:
 
 ```sh
