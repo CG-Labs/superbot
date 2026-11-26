@@ -83,18 +83,21 @@ const AUDIT_WARN: u64 = 10;
 /// The reason codes only SAML sign-in gives (runbook-saml.md's reasons table). Codes both
 /// runbooks have (`not_linked`, `idp_error`, `wrong_audience`, `unknown_state`) go to the
 /// sign-in one, and to the SAML one too when the failures were SAML sign-ins.
-pub const SAML_REASONS: [&str; 17] = [
+pub const SAML_REASONS: [&str; 20] = [
     "authn_context",
     "bad_encryption",
     "bad_signature",
+    "bad_subject_id",
     "cbc_unsigned_response",
     "encrypted_assertion",
     "expired",
     "idp_initiated_loop",
     "idp_session_ended",
     "in_response_to_mismatch",
+    "no_subject_id",
     "not_yet_valid",
     "stale_authn",
+    "subject_id_scope",
     "transient_subject",
     "unknown_idp",
     "unsigned",

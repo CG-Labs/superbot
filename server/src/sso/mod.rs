@@ -471,7 +471,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 43] = [
+const ONLY_FOR: [(&str, &[&str]); 44] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -515,11 +515,12 @@ const ONLY_FOR: [(&str, &[&str]); 43] = [
     ("MAX_AUTHN_AGE", &["saml"]),
     ("IDP_SESSION_LIMIT", &["saml"]),
     ("DISCOVERY_URL", &["saml"]),
+    ("SUBJECT", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 28] = [
+const SAML_NATIVE_ONLY: [&str; 29] = [
     "IDP_ENTITY_IDS",
     "IDP_ENTITY_CATEGORIES",
     "IDP_METADATA_URL",
@@ -548,6 +549,7 @@ const SAML_NATIVE_ONLY: [&str; 28] = [
     "MAX_AUTHN_AGE",
     "IDP_SESSION_LIMIT",
     "DISCOVERY_URL",
+    "SUBJECT",
 ];
 
 /// Native SAML's IdP: `IDP_ENTITY_ID`, or several of a federation's in `IDP_ENTITY_IDS` (ADR
@@ -787,7 +789,11 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                     None => Ok(None),
                 }
             };
-            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")?, groups: attribute("GROUPS_ATTRIBUTE")?, authn_methods: attribute("AUTHN_METHODS_ATTRIBUTE")? };
+            let subject = match var(&key("SUBJECT")) {
+                None => saml_sp::Subject::NameId,
+                Some(v) => saml_sp::Subject::parse(&v).ok_or_else(|| format!("{} must be nameid, subject-id, or pairwise-id", key("SUBJECT")))?,
+            };
+            let attributes = saml_sp::Attributes { email: attribute("EMAIL_ATTRIBUTE")?, name: attribute("NAME_ATTRIBUTE")?, groups: attribute("GROUPS_ATTRIBUTE")?, authn_methods: attribute("AUTHN_METHODS_ATTRIBUTE")?, subject };
             let mut required_groups: Vec<String> = Vec::new();
             for g in list(&key("REQUIRED_GROUPS")) {
                 let g = saml_roles::group_name(&g).map_err(|e| format!("{}: {e}", key("REQUIRED_GROUPS")))?;
@@ -1063,6 +1069,9 @@ fn claim_details(d: &mut Value, c: &Claims) {
     }
     if let Some(b) = c.response_binding {
         d["responseBinding"] = json!(b);
+    }
+    if let Some(s) = c.subject_from {
+        d["subjectFrom"] = json!(s);
     }
 }
 
@@ -1945,7 +1954,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let Some(p) = a.sso.provider(&id).filter(|p| p.saml_sp()) else {
         return not_found("SAML provider").into_response();
     };
-    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, aes_cbc, response_binding, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, aes_cbc, response_binding, attributes, .. } = &p.kind else {
         return not_found("SAML provider").into_response();
     };
     let keys = a.app.as_ref().and_then(|app| published_keys(app, p, KeyUse::Signing).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
@@ -1959,7 +1968,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let enc_certs: Vec<&str> = enc.iter().map(|k| k.cert.as_str()).collect();
     // Even without DISCOVERY_URL: a federation's own discovery service may send people back.
     let discovery = p.several_idps().then(|| a.sso.discovery_response_url(&id));
-    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc, *response_binding, discovery.as_deref());
+    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc, *response_binding, discovery.as_deref(), attributes.subject);
     ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
 }
 
@@ -2451,22 +2460,33 @@ fn logout_decrypt_keys(app: &AppState, p: &Provider, encryption: Encryption) -> 
 /// with the binding it came over (`redirect`, `post` or `soap`).
 #[allow(clippy::too_many_arguments)]
 fn idp_signed_out(a: &Auth, app: &AppState, source: &Source, id: &str, idp: &saml_sp::IdpMetadata, request_id: &str, name_id: &str, session_indexes: &[String], issued_ms: i64, binding: &str) {
-    let subject = format!("{}|{}", idp.entity_id, saml::subject(name_id));
+    // A session is the IdP's to end if it was made with this NameID, as the IdP sent it, also
+    // when it names the person by a subject identifier attribute (ADR 0319), set now or then.
+    // With an attribute set, the NameID names no one, so it finds no session by identity but
+    // those from before NameIDs were kept.
+    let by_attribute = a.sso.provider(id).is_some_and(|p| p.subject_from().is_some());
+    let key = format!("{}|{}", idp.entity_id, saml::subject(name_id));
     let named = |l: Option<&db::SamlLogin>| session_indexes.is_empty() || l.and_then(|l| l.session_index.as_ref()).is_none_or(|i| session_indexes.contains(i));
+    let theirs = |h: &Handoff| (h.claims.issuer == idp.entity_id && h.saml.as_ref().is_some_and(|l| l.name_id == name_id)) || (!by_attribute && h.claims.key() == key);
     // Codes first, as when an admin revokes: a redemption holds them until its session exists.
-    a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| !(h.provider == id && h.claims.key() == subject && named(h.saml.as_ref())));
+    a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| !(h.provider == id && theirs(h) && named(h.saml.as_ref())));
     // Only sessions from before the request was issued: replayed after a restart, which
     // forgets used IDs, it finds nothing left to revoke.
-    let revoked = app.db.revoke_saml_sessions(id, &subject, session_indexes, issued_ms + saml_sp::SKEW_MS, "saml_logout");
+    let revoked = app.db.revoke_saml_sessions(id, &idp.entity_id, name_id, &key, by_attribute, session_indexes, issued_ms + saml_sp::SKEW_MS, "saml_logout");
     let mut users: Vec<&str> = revoked.iter().map(|s| s.user_id.as_str()).collect();
     users.sort_unstable();
     users.dedup();
     let sessions: Vec<&str> = revoked.iter().map(|s| s.id.as_str()).collect();
-    let details = json!({
-        "provider": id, "idp": "saml", "issuer": idp.entity_id, "subject": saml::subject(name_id), "requestId": request_id,
+    let subject = revoked.first().and_then(|s| s.idp_subject.clone()).or_else(|| (!by_attribute).then(|| key.clone()));
+    let person = subject.as_deref().and_then(|s| s.strip_prefix(&format!("{}|", idp.entity_id)));
+    let mut details = json!({
+        "provider": id, "idp": "saml", "issuer": idp.entity_id, "subject": person, "requestId": request_id,
         "sessionIndexes": session_indexes, "sessions": sessions, "users": users, "revoked": sessions.len(), "binding": binding,
     });
-    let mut actor = slo_actor(id, Some(subject.clone()));
+    if subject.as_deref() != Some(key.as_str()) {
+        details["nameId"] = json!(crate::audit::clip(name_id, 128));
+    }
+    let mut actor = slo_actor(id, subject);
     actor.id = (users.len() == 1).then(|| users[0].to_string());
     a.record(Who { actor, source: source.clone() }.event("auth.slo").details(details));
 }
@@ -2522,7 +2542,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     let loaded: Vec<Arc<saml_sp::IdpMetadata>> = p.listed_idps().iter().filter_map(|e| p.idp_loaded_for(e)).collect();
     let view = |m: &saml_sp::IdpMetadata| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
-        json!({ "entityId": m.entity_id, "name": m.name, "scopes": m.scopes, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age(&m.entity_id).map(|d| d.as_secs()), "validUntil": m.valid_until, "expired": !m.valid_at(now) })
+        json!({ "entityId": m.entity_id, "name": m.name, "scopes": m.scopes, "subjectScopes": m.subject_scopes, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age(&m.entity_id).map(|d| d.as_secs()), "validUntil": m.valid_until, "expired": !m.valid_at(now) })
     };
     let idp = if several { None } else { loaded.first().map(|m| view(m)) };
     // Several IdPs (ADR 0282): each, loaded or not, in the order they're configured. Every IdP
@@ -2585,7 +2605,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
         "groupsAttribute": attributes.groups, "requiredGroups": required_groups,
         "roleMappings": a.app.as_ref().map(|app| app.db.saml_role_mappings_of(&p.id).len()),
-        "idpInitiated": idp_initiated.as_str(),
+        "idpInitiated": idp_initiated.as_str(), "subject": attributes.subject.as_str(),
         "authnContext": authn_context.as_ref().map(|c| json!({ "required": c.accepted, "methodsAttribute": attributes.authn_methods, "requested": c.request })),
         "forceAuthn": freshness.force_authn, "maxAuthnAgeSeconds": freshness.max_authn_age_ms.map(|ms| ms / 1000), "idpSessionLimit": freshness.idp_session_limit,
         "certificateWarnings": a.app.as_ref().map_or_else(Vec::new, |app| saml_expiry::warnings(app, p, now)),
@@ -3243,6 +3263,34 @@ mod tests {
         assert!(saml(&[("SSO_ADFS_IDP_INITIATED", "restart")]).is_err(), "the broker handles the bridge's");
         let e = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "oidc"), ("SSO_CORP_ISSUER", "https://idp.example"), ("SSO_CORP_CLIENT_ID", "x")], &[("SSO_CORP_IDP_INITIATED", "restart")]).err().unwrap();
         assert!(e.contains("only for SSO_CORP_TYPE=saml"), "{e}");
+    }
+
+    #[test]
+    fn reads_what_people_are_known_by() {
+        let subject = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { attributes, .. } => attributes.subject,
+            _ => unreachable!(),
+        };
+        assert_eq!(subject(&native(&[]).unwrap()), saml_sp::Subject::NameId, "the NameID by default");
+        assert_eq!(native(&[]).unwrap().providers[0].subject_from(), None);
+        assert_eq!(subject(&native(&[("SSO_CORP_SUBJECT", "nameid")]).unwrap()), saml_sp::Subject::NameId);
+        assert_eq!(subject(&native(&[("SSO_CORP_SUBJECT", "Subject-Id")]).unwrap()), saml_sp::Subject::SubjectId);
+        let p = native(&[("SSO_CORP_SUBJECT", "pairwise-id")]).unwrap();
+        assert_eq!((subject(&p), p.providers[0].subject_from()), (saml_sp::Subject::PairwiseId, Some("pairwise-id")));
+        for bad in ["any", "persistent", "eppn"] {
+            let e = native(&[("SSO_CORP_SUBJECT", bad)]).err().unwrap_or_default();
+            assert!(e.contains("SSO_CORP_SUBJECT must be nameid, subject-id, or pairwise-id"), "{bad}: {e}");
+        }
+        assert!(saml(&[("SSO_ADFS_SUBJECT", "subject-id")]).is_err(), "the broker picks the bridge's subject");
+        let e = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "oidc"), ("SSO_CORP_ISSUER", "https://idp.example"), ("SSO_CORP_CLIENT_ID", "x")], &[("SSO_CORP_SUBJECT", "subject-id")]).err().unwrap();
+        assert!(e.contains("only for SSO_CORP_TYPE=saml"), "{e}");
+
+        // Links typed by an admin or sent by SCIM are held to the attribute's syntax.
+        let by_attribute = &p.providers[0];
+        assert_eq!(by_attribute.subject(" Q7JZ3X=@Uni.Example ").as_deref(), Ok("q7jz3x=@uni.example"));
+        let e = by_attribute.subject("00u1ADA-Persistent").unwrap_err();
+        assert!(e.contains("pairwise-id") && e.contains("SSO_CORP_SUBJECT=pairwise-id"), "{e}");
+        assert_eq!(native(&[]).unwrap().providers[0].subject("00u1ADA-Persistent").as_deref(), Ok("00u1ada-persistent"), "a NameID, as before");
     }
 
     #[test]

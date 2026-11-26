@@ -2180,6 +2180,10 @@ fn saml_summary(v: &Value) -> String {
         "  IdP-initiated sign-in:    {}\n",
         if v["idpInitiated"].as_str() == Some("restart") { "restarted as SP-initiated" } else { "refused (start from SuperBot)" }
     );
+    out += &match v["subject"].as_str() {
+        Some(a @ ("subject-id" | "pairwise-id")) => format!("  People known by:          their {a} attribute, at the IdP's shibmd:Scope (SUBJECT={a}); the NameID is for logout only\n"),
+        _ => "  People known by:          their NameID, which must be persistent\n".to_string(),
+    };
     let authn = &v["authnContext"];
     match authn["required"].as_array() {
         Some(required) => {
@@ -2237,6 +2241,10 @@ fn saml_summary(v: &Value) -> String {
         return out;
     }
     out += ":\n";
+    if matches!(v["subject"].as_str(), Some("subject-id" | "pairwise-id")) {
+        let scopes: Vec<&str> = idp["subjectScopes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        out += &format!("    Subject scopes: {}\n", if scopes.is_empty() { "none (no one can sign in: the metadata lists no shibmd:Scope)".to_string() } else { scopes.join(", ") });
+    }
     out += &idp_lines(idp, "    ");
     out
 }
@@ -4869,6 +4877,10 @@ mod tests {
         assert!(out.contains("IdP-initiated sign-in:    refused (start from SuperBot)\n"), "{out}");
         v["idpInitiated"] = json!("restart");
         assert!(saml_summary(&v).contains("IdP-initiated sign-in:    restarted as SP-initiated\n"));
+        assert!(saml_summary(&v).contains("People known by:          their NameID, which must be persistent\n"));
+        v["subject"] = json!("pairwise-id");
+        assert!(saml_summary(&v).contains("People known by:          their pairwise-id attribute, at the IdP's shibmd:Scope (SUBJECT=pairwise-id); the NameID is for logout only\n"));
+        v["subject"] = json!("nameid");
         v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "sloUrl": "https://idp.example/slo", "sloSoapUrl": "https://idp.example/soap", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
         v["sloUrl"] = json!("https://bots.example/api/auth/sso/corp/slo");
         v["sloSoapUrl"] = json!("https://bots.example/api/auth/sso/corp/slo/soap");
@@ -4882,7 +4894,12 @@ mod tests {
         assert!(out.contains("SP signing certificate:   SHA-256 12:34 (generated), expires 2030-03-17"), "{out}");
         assert!(out.contains("Signs AuthnRequests:      yes") && out.contains("Single logout:            yes\n"), "{out}");
         assert!(out.contains("Back-channel logout:      from the IdP, and to it\n    SOAP SLO URL:            https://bots.example/api/auth/sso/corp/slo/soap\n"), "{out}");
-        assert!(out.contains("    SOAP logout URL:  https://idp.example/soap\n"), "{out}");
+        assert!(out.contains("    SOAP logout URL:  https://idp.example/soap\n") && !out.contains("Subject scopes"), "{out}");
+        let mut scoped = v.clone();
+        scoped["subject"] = json!("subject-id");
+        assert!(saml_summary(&scoped).contains("from botctl:\n    Subject scopes: none (no one can sign in: the metadata lists no shibmd:Scope)\n    Sign-in URL: "));
+        scoped["idp"]["subjectScopes"] = json!(["uni.example", "staff.uni.example"]);
+        assert!(saml_summary(&scoped).contains("    Subject scopes: uni.example, staff.uni.example\n"));
         let mut post = v.clone();
         post["idp"]["sloBinding"] = json!("post");
         let out_post = saml_summary(&post);

@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::saml_sp::{self, AesCbc, Attributes, AuthnContext, Encryption, Freshness, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, RequestBinding, ResponseBinding, SpKey};
+use super::saml_sp::{self, AesCbc, Attributes, AuthnContext, Encryption, Freshness, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, RequestBinding, ResponseBinding, SpKey, Subject};
 use super::{apple, saml, saml_aggregate, xmldsig};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -42,7 +42,8 @@ pub enum Kind {
     /// IdP's `entity_id`, with its name for the person as the subject.
     Saml { issuer: String, entity_id: String, alias: String, map: ClaimMap, allowed_domains: Vec<String> },
     /// A SAML 2.0 IdP botd is the service provider for itself (ADR 0127), see `saml_sp`.
-    /// Identities are stored like the bridge's: under `entity_id`, the NameID lowercased.
+    /// Identities are stored like the bridge's: under `entity_id`, the NameID lowercased, or
+    /// with `attributes.subject` the subject identifier attribute's value (ADR 0319).
     /// AuthnRequests go over the binding `request_binding` picks from the IdP's metadata (ADR
     /// 0235). `sign_requests` signs them with the SP key (ADR 0137), which is
     /// `SSO_<ID>_PRIVATE_KEY` with `sp_cert` (base64 DER) when that is set, else generated.
@@ -409,6 +410,9 @@ pub struct Claims {
     pub encryption: Option<&'static str>,
     /// Native SAML: how the response came, `post` or `artifact` (ADR 0268), for the audit log.
     pub response_binding: Option<&'static str>,
+    /// Native SAML: the subject identifier attribute the subject is, `subject-id` or
+    /// `pairwise-id` (ADR 0319), for the audit log. None: the NameID, or not SAML.
+    pub subject_from: Option<&'static str>,
 }
 
 impl Claims {
@@ -979,6 +983,15 @@ impl Provider {
         self.every_idp().is_some() || self.idps().len() > 1
     }
 
+    /// Native SAML: the subject identifier attribute people are known by, `subject-id` or
+    /// `pairwise-id` (ADR 0319). None: the NameID, or not native SAML.
+    pub fn subject_from(&self) -> Option<&'static str> {
+        match &self.kind {
+            Kind::SamlSp { attributes, .. } => attributes.subject.attribute().map(|_| attributes.subject.as_str()),
+            _ => None,
+        }
+    }
+
     /// Native SAML with several IdPs: the federation's discovery service, if set (ADR 0314).
     pub fn discovery_service(&self) -> Option<&str> {
         match &self.kind {
@@ -1020,6 +1033,10 @@ impl Provider {
         match self.kind {
             Kind::Entra { .. } => guid(s).ok_or_else(|| "subject must be the user's Entra object id (a GUID)".into()),
             Kind::GitHub { .. } => github::user_id(s).ok_or_else(|| "subject must be the GitHub user's numeric id (gh api users/<login> --jq .id), not the login".into()),
+            Kind::SamlSp { attributes: Attributes { subject: Subject::SubjectId | Subject::PairwiseId, .. }, .. } => {
+                let which = self.subject_from().unwrap_or_default();
+                saml_sp::subject_id_value(s).ok_or_else(|| format!("subject must be the person's {which} at the IdP, a value like 8f2a91c4@uni.example (SSO_{}_SUBJECT={which}), not a NameID", self.id.to_ascii_uppercase()))
+            }
             Kind::Saml { .. } | Kind::SamlSp { .. } if !s.is_empty() && s.len() <= 255 => Ok(saml::subject(s)),
             _ if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
             _ => Err("subject must be 1 to 255 characters".into()),
@@ -1379,7 +1396,7 @@ impl Provider {
                     _ => false,
                 };
                 let email = t.str("email").filter(|_| edov).map(|e| e.trim().to_string()).filter(|e| !e.is_empty() && e.len() <= 254);
-                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email, name, username: None, authn_context: None, encryption: None, response_binding: None })
+                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email, name, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
             }
             // Identities are stored under the configured issuer, so a link made with
             // `botctl user link` and a sign-in name the same one.
@@ -1399,7 +1416,7 @@ impl Provider {
                 if !hosted_domains.is_empty() && !t.str("hd").and_then(domain).is_some_and(|d| hosted_domains.contains(&d)) {
                     return Err(Invalid("wrong_domain"));
                 }
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email: Some(email), name, username: None, authn_context: None, encryption: None, response_binding: None })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email: Some(email), name, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
             }
             Kind::Oidc { issuer, map, allowed_domains } => {
                 if !same_issuer(issuer, &meta.issuer) || iss != meta.issuer {
@@ -1407,7 +1424,7 @@ impl Provider {
                 }
                 let subject = subject_of(t, &map.subject)?;
                 let email = email_within(t, &map.email, allowed_domains)?;
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
             }
             // The broker checked the SAML assertion; its signed token says which IdP it used.
             Kind::Saml { issuer, entity_id, alias, map, allowed_domains } => {
@@ -1419,7 +1436,7 @@ impl Provider {
                 }
                 let subject = saml::subject(&subject_of(t, &map.subject)?);
                 let email = email_within(t, &map.email, allowed_domains)?;
-                Ok(Claims { issuer: entity_id.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None })
+                Ok(Claims { issuer: entity_id.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
             }
             // Apple's token never has the name: it is posted once, beside it (`apple::posted_name`).
             Kind::Apple { issuer, allowed_domains, .. } => {
@@ -1435,7 +1452,7 @@ impl Provider {
                         return Err(Invalid("wrong_domain"));
                     }
                 }
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: None, username: None, authn_context: None, encryption: None, response_binding: None })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: None, username: None, authn_context: None, encryption: None, response_binding: None, subject_from: None })
             }
             Kind::GitHub { .. } | Kind::SamlSp { .. } => Err(Invalid("not_configured")),
         }
