@@ -1,12 +1,14 @@
-//! Regional chat stores (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293): pinned
-//! people's chats, routines, approvals, Bots' memory, their own facts, their sign-in sessions
-//! and their own secrets in a database in their region, the first part of splitting botd's
+//! Regional chat stores (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR
+//! 0299, ADR 0304): pinned people's chats, routines, approvals, Bots' memory, their own
+//! facts, their sign-in sessions, their own secrets, second factors and model usage records
+//! in a database in their region, the first part of splitting botd's
 //! database by region. REGION_DATA_DIRS names a folder per
 //! region, which the operator puts on storage in that region; botd keeps `chats.sqlite`
 //! there (keyed like its own database) and its backups in `backups/` beside it, never in
 //! DATA_DIR. A Bot's chat, routines, approvals and memory live in the store of its owner's
 //! pin (their team's, else their own), a person's facts (`USER.md`), sessions (with each
-//! one's SAML sign-in and push device) and own secrets in the store of the person's pin, and they move when
+//! one's SAML sign-in and push device), own secrets, second factor and usage records in the
+//! store of the person's pin, and they move when
 //! that changes: at startup, after a pin or unpin, and on every reconcile pass. botd's own
 //! copy of a Bot's memory or a person's facts is otherwise its file in DATA_DIR. Accounts
 //! and the audit log stay where botd runs; botd still reads and writes the stores from
@@ -253,7 +255,7 @@ fn place_name(region: &Option<String>) -> String {
 }
 
 /// Moves every Bot's chat, routines, approvals and memory, and every person's facts,
-/// sign-ins, own secrets and second factor, to
+/// sign-ins, own secrets, second factor and usage records, to
 /// where their pin says they belong now, each move audited as `residency.chats_moved` by
 /// botd itself. A failure is logged and left for the next pass.
 ///
@@ -284,7 +286,7 @@ pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
         Ok(m) => m,
         Err(e) => {
             log_warn!(
-                "Regional chat stores: chats, routines, approvals, Bots' memory and people's facts, sessions, secrets and second factors couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215)."
+                "Regional chat stores: chats, routines, approvals, Bots' memory and people's facts, sessions, secrets, second factors and usage records couldn't be moved to where they belong; the next pass tries again: {e} (ADR 0215)."
             );
             return Vec::new();
         }
@@ -299,7 +301,7 @@ pub(crate) fn place_held(db: &Db, data_dir: &Path) -> Vec<ChatMove> {
         db.record(&Who::system(ACTOR).event(MOVED).details(json!({
             "from": m.from, "to": m.to, "bots": m.bots, "messages": m.messages, "routines": m.routines, "approvals": m.approvals, "memories": m.memories, "facts": m.facts,
             "sessions": m.sessions, "samlSessions": m.saml_sessions, "pushDevices": m.push_devices, "personalKeys": m.user_secrets,
-            "secondFactors": m.second_factors, "recoveryCodes": m.recovery_codes,
+            "secondFactors": m.second_factors, "recoveryCodes": m.recovery_codes, "usageRecords": m.usage_records,
         })));
     }
     moves
@@ -608,7 +610,7 @@ pub fn finish_clearing<T>(db: &Db, cleared: Vec<(String, Result<Clearing, String
                 "region": store.region, "bots": done.bots, "users": done.users, "backups": done.backups, "messages": done.held.messages, "routines": done.held.routines,
                 "approvals": done.held.approvals, "memories": done.held.memories, "facts": done.held.facts, "sessions": done.held.sessions,
                 "samlSessions": done.held.saml_sessions, "pushDevices": done.held.push_devices, "personalKeys": done.held.user_secrets,
-                "secondFactors": done.held.second_factors, "recoveryCodes": done.held.recovery_codes,
+                "secondFactors": done.held.second_factors, "recoveryCodes": done.held.recovery_codes, "usageRecords": done.held.usage_records,
             })
         };
         let r = match (failed.is_empty(), copies.get(&store.region)) {
@@ -682,7 +684,7 @@ fn store_view(cp: &ControlPlane, store: &ChatStore, held: &Held) -> Value {
     json!({
         "region": store.region, "messages": held.messages, "routines": held.routines, "approvals": held.approvals, "memories": held.memories, "facts": held.facts,
         "sessions": held.sessions, "samlSessions": held.saml_sessions, "pushDevices": held.push_devices, "personalKeys": held.user_secrets,
-        "secondFactors": held.second_factors, "recoveryCodes": held.recovery_codes,
+        "secondFactors": held.second_factors, "recoveryCodes": held.recovery_codes, "usageRecords": held.usage_records,
         "backups": b.len(), "lastBackupAt": b.first().map(|(t, _)| *t),
         "offHost": cp.chat_copies.as_deref().and_then(|c| c.view(store)),
     })
@@ -720,9 +722,9 @@ pub fn warnings(app: &App, cp: &ControlPlane, at: i64) -> Vec<String> {
             }
             if users > 0 {
                 whose.push(if users == 1 {
-                    "the facts, sign-ins, secrets or second factor of 1 person".to_string()
+                    "the facts, sign-ins, secrets, second factor or usage records of 1 person".to_string()
                 } else {
-                    format!("the facts, sign-ins, secrets or second factors of {users} people")
+                    format!("the facts, sign-ins, secrets, second factors or usage records of {users} people")
                 });
             }
             format!("{}'s chat store's backups may still hold {} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region, whose.join(" and "))
@@ -786,6 +788,7 @@ pub fn against(app: &App, cp: &ControlPlane, region: &str, owners: &[String], se
         "personalKeys": each(|h| h.user_secrets),
         "secondFactors": each(|h| h.second_factors),
         "recoveryCodes": each(|h| h.recovery_codes),
+        "usageRecords": each(|h| h.usage_records),
         "inRegion": elsewhere.total() == 0 && (database.total() == 0 || server_in) && earlier.is_empty(),
         "earlierCopies": earlier,
         "lastBackupAt": last,
@@ -835,12 +838,31 @@ pub fn outside(app: &App, region: &str, user_id: &str) -> Vec<String> {
     if there.total() > 0 {
         out.push(format!("their {} in another region's chat store (ADR 0299)", factor_words(&there)));
     }
+    let (here, there) = (database.usage(), elsewhere.usage());
+    if has && here.total() > 0 {
+        out.push(format!("they have {} in botd's own database, not {region}'s chat store (ADR 0304)", here.describe()));
+    }
+    if there.total() > 0 {
+        out.push(format!("they have {} in another region's chat store (ADR 0304)", there.describe()));
+    }
     out
 }
 
 /// The kinds of rows `against` counts, by their key in it.
-pub(super) const KINDS: [&str; 11] =
-    ["messages", "routines", "approvals", "memories", "facts", "sessions", "samlSessions", "pushDevices", "personalKeys", "secondFactors", "recoveryCodes"];
+pub(super) const KINDS: [&str; 12] = [
+    "messages",
+    "routines",
+    "approvals",
+    "memories",
+    "facts",
+    "sessions",
+    "samlSessions",
+    "pushDevices",
+    "personalKeys",
+    "secondFactors",
+    "recoveryCodes",
+    "usageRecords",
+];
 
 /// "second factor is", or "recovery codes are" when the second factor itself is elsewhere.
 fn factor_words(h: &Held) -> &'static str {

@@ -714,7 +714,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
     assert!(md.contains("## Chats") && md.contains("- **Messages in it:** 3"), "{md}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
     assert_eq!(lon_row["chatStore"]["messages"].as_i64(), Some(3), "{regions}");
@@ -765,7 +765,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
     assert_eq!(
         me["chats"],
-        json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true, "secrets": true, "secondFactors": true }),
+        json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true }),
         "the move is done; only old backups are left: {me}"
     );
 
@@ -790,7 +790,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert!(!r["warnings"].to_string().contains("backups of gb-lon's chat store"), "{r}");
     assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()));
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(!regions["residency"]["warnings"].to_string().contains("may still hold the rows"), "{regions}");
 }
@@ -1074,7 +1074,7 @@ async fn a_pinned_persons_sign_ins_are_kept_in_their_regions_chat_store() {
     let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
     assert_eq!((r["status"].as_str(), r["chats"]["sessions"]["inStore"].as_i64(), r["chats"]["sessions"]["inServerDatabase"].as_i64()), (Some("kept"), Some(2), Some(0)), "{r}");
     assert!(
-        r["notCovered"][0].as_str().unwrap().contains("owners' facts, sign-ins, own secrets and second factors, which are in the region's chat store (accounts, the audit log"),
+        r["notCovered"][0].as_str().unwrap().contains("owners' facts, sign-ins, own secrets, second factors and model usage records, which are in the region's chat store (accounts, the audit log"),
         "{r}"
     );
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
@@ -1209,6 +1209,77 @@ async fn a_pinned_persons_second_factor_is_kept_in_their_regions_chat_store_and_
     assert_eq!((count("user_mfa"), count("mfa_recovery_codes"), in_main("user_mfa"), in_main("mfa_recovery_codes")), (0, 0, 1, 10));
     let (_, view) = call_json(port, "GET", "/api/auth/mfa", &ada_s, "").await;
     assert_eq!(view["enabled"].as_bool(), Some(true), "{view}");
+}
+
+#[tokio::test]
+async fn a_pinned_persons_usage_records_are_kept_in_their_regions_chat_store_and_still_count() {
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false, new_derived_keys: false }).unwrap();
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let used = |run: &str, tokens: u64| {
+        let row = crate::db::TokenRow {
+            user_id: ada.clone(),
+            bot_id: "bot-0304".into(),
+            run_id: run.into(),
+            message_id: None,
+            harness: "claude".into(),
+            model: Some("m".into()),
+            reported: true,
+            input: tokens,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            at: crate::db::now(),
+            meter: None,
+        };
+        app.db.record_tokens(&[row]).unwrap();
+    };
+    used("r1", 100);
+    let count = || rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM token_usage", [], |r| r.get::<_, i64>(0)).unwrap();
+    let tokens = || async { call_json(port, "GET", "/api/me/usage", &ada_s, "").await.1["tokens"]["total"].as_u64() };
+
+    // A pin moves them into London's store, audited, and her usage still counts them.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    assert_eq!(count(), 1);
+    let moved = audit(port, &admin, chat_stores::MOVED).await;
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["usageRecords"].as_i64()), (Some("gb-lon"), Some(1)), "{moved:?}");
+    assert_eq!(tokens().await, Some(100));
+    // New ones are written there.
+    used("r2", 20);
+    assert_eq!(count(), 2);
+    assert_eq!(tokens().await, Some(120));
+
+    // The report counts them.
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(
+        (r["status"].as_str(), r["chats"]["usageRecords"]["inStore"].as_i64(), r["chats"]["usageRecords"]["inServerDatabase"].as_i64()),
+        (Some("kept"), Some(2), Some(0)),
+        "{r}"
+    );
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains("- **Model usage records in it:** 2"), "{md}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!(me["chats"]["usageRecords"].as_bool(), Some(true), "{me}");
+
+    // One left in botd's own database makes the pin unkept until reconcile moves it.
+    app.db.conn_for_tests().execute_batch("INSERT INTO main.token_usage SELECT * FROM chats_0.token_usage LIMIT 1; DELETE FROM chats_0.token_usage WHERE id IN (SELECT id FROM main.token_usage);").unwrap();
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!(r["status"].as_str(), Some("data_outside"), "{r}");
+    assert!(r["outside"].to_string().contains("they have 1 model usage record in botd's own database, not gb-lon's chat store (ADR 0304)"), "{r}");
+    assert_eq!(reconcile_as(port, &admin).await["usageRecordsMoved"].as_i64(), Some(1));
+    assert_eq!(count(), 2);
+
+    // Unpinned, they come back to botd's own database.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!(count(), 0);
+    assert_eq!(tokens().await, Some(120));
 }
 
 #[tokio::test]
