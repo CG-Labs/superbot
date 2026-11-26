@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// Bumped when a file's shape changes, so tools reading bundles can tell them apart.
-pub const FORMAT: u32 = 1;
+/// Bumped when a file's shape changes, so tools reading bundles can tell them apart. 2:
+/// `branch-protection.json` judged against the change management policy (ADR 0303).
+pub const FORMAT: u32 = 2;
 pub const PREFIX: &str = "superbot-changes-";
 /// GitHub stops a date-filtered listing of workflow runs at 1,000.
 const SEARCH_CAP: u64 = 1_000;
@@ -49,7 +50,8 @@ const README: &str = "SuperBot change-management evidence bundle
 Made by superbot-evidence from the GitHub API with a read-only token, for a SOC 2 Type II
 evidence store (docs/security/soc2-evidence-plan.md, ADR 0148). It covers the period in
 manifest.json: from its first day (00:00 UTC) up to, not including, its last. Branch
-protection is as of createdAt, which may be after the period.
+protection is as of createdAt, which may be after the period, and the manifest names
+checklist row CC8.1-1 only when it met the change management policy then.
 
   pull-requests.json      every pull request merged into the branch in the period: author,
                           reviews and approvers, checks on its last commit, which were
@@ -58,7 +60,9 @@ protection is as of createdAt, which may be after the period.
                           commit; every update of the branch (merges, pushes, force
                           pushes); and every commit that reached the branch without one
   branch-protection.json  the branch's protection now: rulesets and classic protection,
-                          required checks and approvals, force pushes and deletions
+                          required checks and approvals, force pushes and deletions,
+                          who can bypass them, and whether it meets the change
+                          management policy as far as the token could see
   workflow-runs.json      every GitHub Actions run on the branch in the period, counted by
                           workflow and conclusion, by day, and listed
   manifest.json           what is in this bundle, the period, and each file's SHA-256
@@ -239,9 +243,207 @@ fn enabled(v: &Value, key: &str) -> Option<bool> {
     v.get(key)?.get("enabled")?.as_bool()
 }
 
+/// The settings the change management policy asks of the branch's protection
+/// (docs/security/policies/change-management.md#reviews-and-segregation-of-duties), in
+/// order, with what the summary calls them.
+pub const POLICY: [(&str, &str); 5] = [
+    ("requiredApproval", "an approval required"),
+    ("requiredChecks", "status checks required"),
+    ("forcePushesBlocked", "force pushes blocked"),
+    ("deletionsBlocked", "deletion blocked"),
+    ("administratorsIncluded", "administrators included"),
+];
+
+/// The checklist row a bundle names only while the branch's protection meets the policy.
+pub const PROTECTION_ROW: &str = "CC8.1-1";
+
+/// Each ruleset whose rules apply to the branch, by id, as `GET /repos/{repo}/rulesets/{id}`
+/// shows it, or the status GitHub refused it with.
+pub type Rulesets = BTreeMap<u64, Result<Value, u16>>;
+
+/// Who can bypass a ruleset, or None when GitHub doesn't say: it shows the list only to
+/// those who can edit the ruleset.
+fn bypass_actors(rulesets: &Rulesets, id: Option<u64>) -> Option<&Vec<Value>> {
+    rulesets.get(&id?)?.as_ref().ok()?.get("bypass_actors")?.as_array()
+}
+
+/// One place a requirement could be enforced: whether it is (None: this token can't see)
+/// and whether nobody can bypass it there (None: can't see).
+struct Enforcer {
+    name: String,
+    enforces: Option<bool>,
+    unbypassable: Option<bool>,
+}
+
+/// Where each of the policy's first four requirements is enforced, from the rules, the
+/// rulesets they come from, classic protection, and what the branch itself shows.
+fn sources(info: &Value, rules: &Result<Vec<Value>, u16>, rulesets: &Rulesets, classic: &Result<Value, u16>) -> [Vec<Enforcer>; 4] {
+    let mut out: [Vec<Enforcer>; 4] = Default::default();
+    match rules {
+        Ok(rs) => {
+            for r in rs {
+                let at = match r["type"].as_str() {
+                    Some("pull_request") if r["parameters"]["required_approving_review_count"].as_u64().unwrap_or_default() >= 1 => 0,
+                    Some("required_status_checks") if r["parameters"]["required_status_checks"].as_array().is_some_and(|c| !c.is_empty()) => 1,
+                    Some("non_fast_forward") => 2,
+                    Some("deletion") => 3,
+                    _ => continue,
+                };
+                let id = r["ruleset_id"].as_u64();
+                let name = id.map_or_else(|| "a ruleset".to_string(), |id| format!("ruleset {id}"));
+                out[at].push(Enforcer { name, enforces: Some(true), unbypassable: bypass_actors(rulesets, id).map(Vec::is_empty) });
+            }
+        }
+        Err(_) => {
+            for s in &mut out {
+                s.push(Enforcer { name: "rulesets".into(), enforces: None, unbypassable: None });
+            }
+        }
+    }
+    match classic {
+        Ok(c) => {
+            let admins = enabled(c, "enforce_admins");
+            let reviews = &c["required_pull_request_reviews"];
+            let allowances = ["users", "teams", "apps"].iter().any(|k| reviews["bypass_pull_request_allowances"][k].as_array().is_some_and(|a| !a.is_empty()));
+            let rsc = &c["required_status_checks"];
+            let named = |k: &str| rsc[k].as_array().is_some_and(|a| !a.is_empty());
+            let enforces = [
+                reviews["required_approving_review_count"].as_u64().unwrap_or_default() >= 1,
+                rsc.is_object() && (named("contexts") || named("checks")),
+                enabled(c, "allow_force_pushes") == Some(false),
+                enabled(c, "allow_deletions") == Some(false),
+            ];
+            for (i, e) in enforces.into_iter().enumerate() {
+                let unbypassable = if i == 0 && allowances { Some(false) } else { admins };
+                out[i].push(Enforcer { name: "classic".into(), enforces: Some(e), unbypassable });
+            }
+        }
+        Err(_) if info["protected"].as_bool().unwrap_or(false) => {
+            for s in &mut out {
+                s.push(Enforcer { name: "classic".into(), enforces: None, unbypassable: None });
+            }
+        }
+        Err(_) => {}
+    }
+    // Classic required checks are shown on the branch to any token, with whether they bind
+    // administrators ("everyone") or not ("non_admins").
+    let shown = &info["protection"]["required_status_checks"];
+    let level = shown["enforcement_level"].as_str().unwrap_or("off");
+    if level != "off" && ["contexts", "checks"].iter().any(|k| shown[k].as_array().is_some_and(|a| !a.is_empty())) {
+        out[1].push(Enforcer { name: "classic, as shown on the branch".into(), enforces: Some(true), unbypassable: Some(level == "everyone") });
+    }
+    out
+}
+
+fn state(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "met",
+        Some(false) => "notMet",
+        None => "unknown",
+    }
+}
+
+/// The branch's protection against the change management policy, as far as the token
+/// sees: each requirement met, not met or unknown, where it is enforced and who can
+/// bypass it, and whether the whole policy is met (null when that can't be seen).
+pub fn judge(info: &Value, rules: &Result<Vec<Value>, u16>, rulesets: &Rulesets, classic: &Result<Value, u16>) -> (Value, Value) {
+    let srcs = sources(info, rules, rulesets, classic);
+    let names = |keep: &dyn Fn(&Enforcer) -> bool, s: &[Enforcer]| -> Vec<String> {
+        let mut v: Vec<String> = s.iter().filter(|x| keep(x)).map(|x| x.name.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let mut requirements = serde_json::Map::new();
+    let mut enforced = Vec::new();
+    for (i, s) in srcs.iter().enumerate() {
+        let on = s.iter().any(|x| x.enforces == Some(true));
+        let e = if on {
+            Some(true)
+        } else if s.iter().all(|x| x.enforces == Some(false)) {
+            Some(false)
+        } else {
+            None
+        };
+        // Unbypassable where any source enforces it without a bypass; unknown while a source
+        // that might have enforced it so can't be seen.
+        let u = if !on {
+            None
+        } else if s.iter().any(|x| x.enforces == Some(true) && x.unbypassable == Some(true)) {
+            Some(true)
+        } else if s.iter().any(|x| x.enforces.is_none() || (x.enforces == Some(true) && x.unbypassable.is_none())) {
+            None
+        } else {
+            Some(false)
+        };
+        enforced.push((e, u));
+        requirements.insert(
+            POLICY[i].0.into(),
+            json!({
+                "state": state(e),
+                "enforcedBy": names(&|x| x.enforces == Some(true), s),
+                "withoutBypass": u,
+                "bypassableAt": names(&|x| x.enforces == Some(true) && x.unbypassable == Some(false), s),
+                "unseen": names(&|x| x.enforces.is_none() || (x.enforces == Some(true) && x.unbypassable.is_none()), s),
+            }),
+        );
+    }
+    let admins = if enforced.iter().any(|(e, u)| *e == Some(true) && *u == Some(false)) {
+        Some(false)
+    } else if enforced.iter().any(|(e, u)| e.is_none() || (*e == Some(true) && u.is_none())) {
+        None
+    } else {
+        Some(enforced.iter().any(|(e, _)| *e == Some(true)))
+    };
+    requirements.insert(POLICY[4].0.into(), json!({ "state": state(admins) }));
+    let states: Vec<&str> = POLICY.iter().map(|(id, _)| requirements[*id]["state"].as_str().unwrap_or("unknown")).collect();
+    let meets = if states.iter().all(|s| *s == "met") {
+        json!(true)
+    } else if states.contains(&"notMet") {
+        json!(false)
+    } else {
+        Value::Null
+    };
+    let pick = |want: &str| -> Vec<&str> { POLICY.iter().zip(&states).filter(|(_, s)| **s == want).map(|((id, _), _)| *id).collect() };
+    let mut bypass = Vec::new();
+    let mut seen = Vec::new();
+    for (id, r) in rulesets {
+        let view = match r {
+            Ok(v) => {
+                let actors = v["bypass_actors"].as_array().map(|a| {
+                    a.iter().map(|x| json!({ "actorType": x["actor_type"], "actorId": x["actor_id"], "bypassMode": x["bypass_mode"] })).collect::<Vec<_>>()
+                });
+                for x in actors.iter().flatten() {
+                    bypass.push(format!("ruleset {id}: {} {} ({})", x["actorType"].as_str().unwrap_or("?"), x["actorId"].as_u64().map_or_else(|| "-".into(), |n| n.to_string()), x["bypassMode"].as_str().unwrap_or("always")));
+                }
+                json!({ "id": id, "name": v["name"], "sourceType": v["source_type"], "source": v["source"], "enforcement": v["enforcement"], "bypassActors": actors })
+            }
+            Err(status) => json!({ "id": id, "available": false, "status": status }),
+        };
+        seen.push(view);
+    }
+    if let Ok(c) = classic {
+        if enabled(c, "enforce_admins") == Some(false) {
+            bypass.push("classic: administrators not included".into());
+        }
+        let n: usize = ["users", "teams", "apps"].iter().map(|k| c["required_pull_request_reviews"]["bypass_pull_request_allowances"][k].as_array().map_or(0, Vec::len)).sum();
+        if n > 0 {
+            bypass.push(format!("classic: {n} allowed to bypass pull request requirements"));
+        }
+    }
+    let policy = json!({
+        "basis": "the change management policy's settings for the branch (docs/security/policies/change-management.md#reviews-and-segregation-of-duties), as this token sees them when the bundle is made",
+        "meetsPolicy": meets,
+        "requirements": requirements,
+        "rulesets": seen,
+    });
+    let exceptions = json!({ "notMet": pick("notMet"), "unseen": pick("unknown"), "bypass": bypass });
+    (policy, exceptions)
+}
+
 /// `branch-protection.json`, and what it requires. `rules` and `classic` are Err with the
 /// status GitHub refused them with.
-pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, classic: &Result<Value, u16>) -> (Value, Required) {
+pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, rulesets: &Rulesets, classic: &Result<Value, u16>) -> (Value, Required) {
     let mut req = Required::default();
     let none = Vec::new();
     let rule_list = rules.as_ref().unwrap_or(&none);
@@ -347,6 +549,7 @@ pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, c
         }),
         Err(status) => json!({ "available": false, "status": status }),
     };
+    let (policy, exceptions) = judge(info, rules, rulesets, classic);
     let view = json!({
         "branch": branch,
         "protected": protected,
@@ -365,6 +568,8 @@ pub fn protection(branch: &str, info: &Value, rules: &Result<Vec<Value>, u16>, c
             "enabled": info["protection"]["enabled"],
             "requiredStatusChecks": { "enforcementLevel": shown["enforcement_level"], "contexts": shown["contexts"] },
         },
+        "policy": policy,
+        "exceptions": exceptions,
     });
     (view, req)
 }
@@ -561,7 +766,13 @@ pub fn collect(api: &mut dyn Api, o: &Options) -> Result<Collected, Failure> {
     let branch_info = api.get(&format!("/repos/{repo}/branches/{branch}"))?.body;
     let rules = optional(all(api, &format!("/repos/{repo}/rules/branches/{branch}?per_page=100"), None))?;
     let classic = optional(api.get(&format!("/repos/{repo}/branches/{branch}/protection")).map(|r| r.body))?;
-    let (protection, required) = protection(&branch, &branch_info, &rules, &classic);
+    let mut rulesets = Rulesets::new();
+    for id in rules.iter().flatten().filter_map(|r| r["ruleset_id"].as_u64()) {
+        if let std::collections::btree_map::Entry::Vacant(e) = rulesets.entry(id) {
+            e.insert(optional(api.get(&format!("/repos/{repo}/rulesets/{id}")).map(|r| r.body))?);
+        }
+    }
+    let (protection, required) = protection(&branch, &branch_info, &rules, &rulesets, &classic);
 
     let mut pulls = Vec::new();
     for listed in merged(api, repo, &branch, p)? {
@@ -776,6 +987,16 @@ pub struct Bundle {
     pub manifest_sha256: String,
 }
 
+/// A file's criteria and checklist rows in the manifest: CC8.1-1 only while the branch's
+/// protection meets the policy, and a file that was evidence for nothing else names nothing.
+pub fn mapped(s: &Section, meets: bool) -> (Vec<&'static str>, Vec<&'static str>) {
+    if meets || !s.rows.contains(&PROTECTION_ROW) {
+        return (s.criteria.to_vec(), s.rows.to_vec());
+    }
+    let rows: Vec<&str> = s.rows.iter().copied().filter(|r| *r != PROTECTION_ROW).collect();
+    if rows.is_empty() { (Vec::new(), Vec::new()) } else { (s.criteria.to_vec(), rows) }
+}
+
 pub fn build(c: &Collected, p: &Period, src: &Source, now_ms: i64) -> Bundle {
     let name = name(p, now_ms);
     let created = rfc3339(now_ms);
@@ -786,6 +1007,7 @@ pub fn build(c: &Collected, p: &Period, src: &Source, now_ms: i64) -> Bundle {
     };
     let mut protection = c.protection.clone();
     protection["snapshotAt"] = json!(created);
+    let meets = c.protection["policy"]["meetsPolicy"] == true;
     let mut files: Vec<(&str, Vec<u8>)> = vec![
         ("README.txt", README.as_bytes().to_vec()),
         ("pull-requests.json", json_file(&with_period(pull_requests(c, &created)))),
@@ -795,8 +1017,8 @@ pub fn build(c: &Collected, p: &Period, src: &Source, now_ms: i64) -> Bundle {
     let listed: Vec<Value> = files
         .iter()
         .map(|(n, b)| {
-            let s = SECTIONS.iter().find(|s| s.file == *n);
-            json!({ "name": n, "bytes": b.len(), "sha256": sha256(b), "criteria": s.map(|s| s.criteria).unwrap_or_default(), "checklist": s.map(|s| s.rows).unwrap_or_default() })
+            let (criteria, rows) = SECTIONS.iter().find(|s| s.file == *n).map(|s| mapped(s, meets)).unwrap_or_default();
+            json!({ "name": n, "bytes": b.len(), "sha256": sha256(b), "criteria": criteria, "checklist": rows })
         })
         .collect();
     let manifest = json!({
@@ -814,6 +1036,7 @@ pub fn build(c: &Collected, p: &Period, src: &Source, now_ms: i64) -> Bundle {
         },
         "pullRequests": c.pulls.len(),
         "workflowRuns": c.runs.len(),
+        "protectionMeetsPolicy": c.protection["policy"]["meetsPolicy"],
         "files": listed,
         "notIncluded": "the token, pull request and review bodies, comments, commit messages, emails, logs and artifacts",
     });
@@ -850,6 +1073,25 @@ pub fn summary(c: &Collected) -> String {
     }
     if c.required.checks.is_empty() {
         out += &format!("\n  {} requires no status checks that this token can see.", c.branch);
+    }
+    let labels = |key: &str| -> String {
+        let ids: Vec<&str> = c.protection["exceptions"][key].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        POLICY.iter().filter(|(id, _)| ids.contains(id)).map(|(_, label)| *label).collect::<Vec<_>>().join(", ")
+    };
+    match c.protection["policy"]["meetsPolicy"].as_bool() {
+        Some(true) => out += &format!("\n  {}'s protection meets the change management policy, as this token sees it.", c.branch),
+        Some(false) => out += &format!("\n  {}'s protection doesn't meet the change management policy: not {}.", c.branch, labels("notMet")),
+        None => {
+            out += &format!(
+                "\n  {}'s protection can't be judged against the change management policy with this token: it can't see whether {}. Classic protection needs a token with Administration read; a ruleset's bypass list, a token that can edit it.",
+                c.branch,
+                labels("unseen")
+            )
+        }
+    }
+    let bypass: Vec<&str> = c.protection["exceptions"]["bypass"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if !bypass.is_empty() {
+        out += &format!("\n  Can bypass {}'s protection: {}", c.branch, bypass.join("; "));
     }
     if let Err(status) = c.updates {
         out += &format!("\n  GitHub answered {status} for {}'s activity: direct pushes are known only from commit dates.", c.branch);
@@ -954,7 +1196,8 @@ mod tests {
     #[test]
     fn protection_reads_rulesets_and_classic_and_says_what_it_cant_see() {
         let unprotected = json!({ "protected": false, "protection": { "enabled": false, "required_status_checks": { "enforcement_level": "off", "contexts": [] } } });
-        let (v, req) = protection("main", &unprotected, &Ok(vec![]), &Err(404));
+        let none = Rulesets::new();
+        let (v, req) = protection("main", &unprotected, &Ok(vec![]), &none, &Err(404));
         assert_eq!(req, Required::default());
         assert_eq!(v["summary"], json!({ "pullRequestRequired": false, "requiredApprovals": null, "requiredChecks": [], "requiredCheckApps": {}, "forcePushesBlocked": false, "deletionsBlocked": false, "adminsIncluded": null }));
         assert_eq!(v["classic"]["available"], false);
@@ -965,7 +1208,7 @@ mod tests {
             json!({ "type": "deletion" }),
         ];
         let shown = json!({ "protected": true, "protection": { "enabled": true, "required_status_checks": { "enforcement_level": "non_admins", "contexts": ["docs"] } } });
-        let (v, req) = protection("main", &shown, &Ok(rules.clone()), &Err(403));
+        let (v, req) = protection("main", &shown, &Ok(rules.clone()), &none, &Err(403));
         assert_eq!(req.checks, BTreeMap::from([("docs".to_string(), None), ("rust".to_string(), Some(15368))]), "the app a ruleset pins is kept");
         assert_eq!(v["summary"]["requiredCheckApps"], json!({ "rust": 15368 }));
         assert_eq!(req.approvals, Some(1));
@@ -977,13 +1220,101 @@ mod tests {
             "enforce_admins": { "enabled": true }, "allow_force_pushes": { "enabled": false }, "allow_deletions": { "enabled": true },
             "restrictions": { "users": [{ "login": "someone" }] },
         });
-        let (v, req) = protection("main", &shown, &Ok(rules), &Ok(classic));
+        let (v, req) = protection("main", &shown, &Ok(rules), &none, &Ok(classic));
         assert_eq!(req.approvals, Some(2));
         assert_eq!(req.checks.get("server"), Some(&Some(77)), "classic protection's app is kept");
         assert_eq!(v["summary"]["forcePushesBlocked"], true);
         assert_eq!(v["summary"]["deletionsBlocked"], true, "a ruleset blocks it even where classic allows it");
         assert_eq!(v["summary"]["adminsIncluded"], true);
         assert!(!v.to_string().contains("someone"), "who may push isn't listed");
+    }
+
+    fn all_rules(approvals: u64) -> Vec<Value> {
+        vec![
+            json!({ "type": "pull_request", "parameters": { "required_approving_review_count": approvals }, "ruleset_id": 42 }),
+            json!({ "type": "required_status_checks", "parameters": { "required_status_checks": [{ "context": "rust" }] }, "ruleset_id": 42 }),
+            json!({ "type": "non_fast_forward", "ruleset_id": 42 }),
+            json!({ "type": "deletion", "ruleset_id": 42 }),
+        ]
+    }
+
+    fn states(policy: &Value) -> Vec<&str> {
+        POLICY.iter().map(|(id, _)| policy["requirements"][*id]["state"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn protection_is_judged_against_the_policy_only_as_far_as_the_token_sees() {
+        let unprotected = json!({ "protected": false, "protection": { "enabled": false } });
+        let protected = json!({ "protected": true, "protection": { "enabled": true } });
+        let ruleset = |body: Value| Rulesets::from([(42, Ok(body))]);
+
+        let (p, e) = judge(&unprotected, &Ok(vec![]), &Rulesets::new(), &Err(404));
+        assert_eq!((states(&p), p["meetsPolicy"].clone()), (vec!["notMet"; 5], json!(false)), "nothing protects it");
+        assert_eq!(e["notMet"].as_array().unwrap().len(), 5);
+
+        let (p, e) = judge(&protected, &Ok(all_rules(1)), &ruleset(json!({ "name": "main", "enforcement": "active", "bypass_actors": [] })), &Err(403));
+        assert_eq!((states(&p), p["meetsPolicy"].clone()), (vec!["met"; 5], json!(true)), "a ruleset nobody bypasses is enough, whatever classic protection hides");
+        assert_eq!(p["requirements"]["requiredApproval"]["enforcedBy"], json!(["ruleset 42"]));
+        assert_eq!(e, json!({ "notMet": [], "unseen": [], "bypass": [] }));
+
+        let (p, e) = judge(&protected, &Ok(all_rules(1)), &ruleset(json!({ "name": "main" })), &Err(403));
+        assert_eq!(states(&p), ["met", "met", "met", "met", "unknown"], "GitHub hides the bypass list from tokens that can't edit the ruleset");
+        assert_eq!((p["meetsPolicy"].clone(), e["unseen"].clone()), (Value::Null, json!(["administratorsIncluded"])));
+        assert_eq!(p["requirements"]["deletionsBlocked"]["unseen"], json!(["classic", "ruleset 42"]));
+        let (p, _) = judge(&protected, &Ok(all_rules(1)), &Rulesets::from([(42, Err(404))]), &Err(403));
+        assert_eq!((states(&p)[4], p["rulesets"][0]["available"].clone(), p["rulesets"][0]["status"].clone()), ("unknown", json!(false), json!(404)));
+
+        let admins = json!({ "bypass_actors": [{ "actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "always" }, { "actor_type": "OrganizationAdmin", "actor_id": null, "bypass_mode": "pull_request" }] });
+        let (p, _) = judge(&protected, &Ok(all_rules(1)), &ruleset(admins.clone()), &Err(403));
+        assert_eq!(states(&p)[4], "unknown", "hidden classic protection might still bind administrators");
+        let (p, e) = judge(&protected, &Ok(all_rules(1)), &ruleset(admins), &Ok(json!({})));
+        assert_eq!((states(&p)[4], p["meetsPolicy"].clone()), ("notMet", json!(false)), "anyone who can bypass it breaks administrators included");
+        assert_eq!(e["bypass"], json!(["ruleset 42: RepositoryRole 5 (always)", "ruleset 42: OrganizationAdmin - (pull_request)"]));
+        assert_eq!(p["requirements"]["requiredChecks"]["bypassableAt"], json!(["ruleset 42"]));
+        assert_eq!(p["rulesets"][0]["bypassActors"][0], json!({ "actorType": "RepositoryRole", "actorId": 5, "bypassMode": "always" }));
+
+        let (p, e) = judge(&protected, &Ok(all_rules(0)), &ruleset(json!({ "bypass_actors": [] })), &Err(404));
+        assert_eq!(states(&p)[0], "unknown", "no approvals required by the ruleset; classic protection might, but can't be seen");
+        assert_eq!(e["unseen"], json!(["requiredApproval", "administratorsIncluded"]));
+
+        let (p, _) = judge(&protected, &Err(403), &Rulesets::new(), &Err(403));
+        assert_eq!((states(&p), p["meetsPolicy"].clone()), (vec!["unknown"; 5], Value::Null), "neither rulesets nor classic protection seen");
+
+        let classic = |admins: bool, allowances: Value| {
+            json!({
+                "required_status_checks": { "contexts": ["server"], "checks": [] },
+                "required_pull_request_reviews": { "required_approving_review_count": 1, "bypass_pull_request_allowances": allowances },
+                "enforce_admins": { "enabled": admins }, "allow_force_pushes": { "enabled": false }, "allow_deletions": { "enabled": false },
+            })
+        };
+        let (p, _) = judge(&protected, &Ok(vec![]), &Rulesets::new(), &Ok(classic(true, json!({ "users": [], "teams": [], "apps": [] }))));
+        assert_eq!((states(&p), p["meetsPolicy"].clone()), (vec!["met"; 5], json!(true)), "classic protection with administrators included");
+        let (p, e) = judge(&protected, &Ok(vec![]), &Rulesets::new(), &Ok(classic(true, json!({ "users": [{ "login": "lead" }] }))));
+        assert_eq!((states(&p)[4], p["requirements"]["requiredApproval"]["withoutBypass"].clone()), ("notMet", json!(false)));
+        assert_eq!(e["bypass"], json!(["classic: 1 allowed to bypass pull request requirements"]));
+        assert!(!p.to_string().contains("lead") && !e.to_string().contains("lead"), "counted, not named");
+        let (p, e) = judge(&protected, &Ok(vec![]), &Rulesets::new(), &Ok(classic(false, json!({}))));
+        assert_eq!((states(&p)[4], e["bypass"].clone()), ("notMet", json!(["classic: administrators not included"])));
+        let (p, _) = judge(&protected, &Ok(all_rules(1)), &ruleset(json!({ "bypass_actors": [] })), &Ok(classic(false, json!({}))));
+        assert_eq!(p["meetsPolicy"], true, "what classic protection lets administrators skip, a ruleset nobody bypasses still enforces");
+
+        let shown = |level: &str| json!({ "protected": true, "protection": { "enabled": true, "required_status_checks": { "enforcement_level": level, "contexts": ["docs"] } } });
+        let (p, _) = judge(&shown("non_admins"), &Ok(vec![]), &Rulesets::new(), &Err(403));
+        let checks = &p["requirements"]["requiredChecks"];
+        assert_eq!((checks["state"].as_str(), checks["withoutBypass"].clone(), checks["bypassableAt"].clone()), (Some("met"), Value::Null, json!(["classic, as shown on the branch"])), "admins skip it there, but hidden classic settings might not");
+        let (p, _) = judge(&shown("everyone"), &Ok(vec![]), &Rulesets::new(), &Err(403));
+        assert_eq!(p["requirements"]["requiredChecks"]["withoutBypass"], true, "shown to any token as binding administrators");
+    }
+
+    #[test]
+    fn cc8_1_1_is_named_only_while_protection_meets_the_policy() {
+        let get = |file: &str, meets: bool| mapped(SECTIONS.iter().find(|s| s.file == file).unwrap(), meets);
+        assert_eq!(get("pull-requests.json", true), (vec!["CC3.4", "CC8.1"], vec!["CC3.4-1", PROTECTION_ROW, "CC8.1-2"]));
+        assert_eq!(get("pull-requests.json", false), (vec!["CC3.4", "CC8.1"], vec!["CC3.4-1", "CC8.1-2"]), "still a population of changes to sample");
+        assert_eq!(get("branch-protection.json", true), (vec!["CC8.1"], vec![PROTECTION_ROW]));
+        assert_eq!(get("branch-protection.json", false), (vec![], vec![]), "evidence of nothing else");
+        let runs = SECTIONS.iter().find(|s| s.file == "workflow-runs.json").unwrap();
+        assert_eq!(get("workflow-runs.json", false), (runs.criteria.to_vec(), runs.rows.to_vec()));
     }
 
     struct Fake(HashMap<String, (Value, Option<String>)>, Vec<String>);

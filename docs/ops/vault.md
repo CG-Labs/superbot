@@ -210,6 +210,53 @@ Off Azure, `VAULT_AZURE_CREDENTIALS=client-certificate` signs in as a service pr
 
 When a login fails, botd logs the status only (`Vault: AWS login at auth/aws answered 400 Bad Request`), since Vault's text can echo what was sent. Vault's log has the reason: usually a principal the role doesn't bind, a missing or wrong server id header, or a region that doesn't match the mount's.
 
+### The instance's own identity (gce and ec2)
+
+Design: [ADR 0298](../adr/0298-vault-sign-in-with-the-instances-own-identity.md). The `gcp` and `aws` methods also have a type that logs in with a document the cloud signs for the VM itself, rather than with botd's IAM identity. Use them when the Vault role should be bound to where botd runs (project, zone, labels, instance group; AMI, account, VPC, subnet), or when botd's service account may not be given the Service Account Token Creator role the `iam` type needs.
+
+**GCE** (`VAULT_GCP_TYPE=gce`). botd asks the metadata server for the VM's identity token for `http://vault/<role>` with the instance's details (`format=full`), and logs in with it. Google signs it as the VM's service account, so botd needs no IAM permission at all.
+
+```sh
+vault write auth/gcp/role/superbot-vm type=gce \
+  bound_projects=<project> bound_zones=europe-west2-a,europe-west2-b \
+  bound_labels=app:superbot \
+  token_policies=superbot token_ttl=1h
+```
+
+```sh
+VAULT_AUTH=gcp
+VAULT_GCP_TYPE=gce
+VAULT_GCP_ROLE=superbot-vm
+# VAULT_GCP_MOUNT=gcp
+# GCE_METADATA_HOST=169.254.169.254
+```
+
+Vault's own Google credentials need `compute.instances.get`, and `compute.instanceGroups.list` for roles bound to instance groups (`roles/compute.viewer` has both), with the Compute Engine API on. The VM needs a service account; a 404 from the metadata server says so. `VAULT_GCP_CREDENTIALS` must be `metadata` (the default), and `VAULT_GCP_SERVICE_ACCOUNT` isn't used: the token is the VM's own account's. On GKE, use `VAULT_AUTH=kubernetes` or the `iam` type instead: Vault's `gce` roles check a Compute Engine instance.
+
+**EC2** (`VAULT_AWS_TYPE=ec2`). botd reads the instance's PKCS#7-signed identity document from IMDSv2 and logs in with it and a nonce. At the instance's first login, Vault ties the nonce to the instance id. After that it takes a login from that instance only with the same nonce. So the nonce is what stops another process on the instance, which can read the same document, from logging in as botd.
+
+```sh
+vault write auth/aws/role/superbot auth_type=ec2 \
+  bound_ami_id=<ami-id> bound_account_id=<account-id> bound_vpc_id=<vpc-id> \
+  token_policies=superbot token_ttl=1h
+```
+
+```sh
+openssl rand -hex 32 > /etc/superbot/vault-aws-nonce && chmod 600 /etc/superbot/vault-aws-nonce
+```
+
+```sh
+VAULT_AUTH=aws
+VAULT_AWS_TYPE=ec2
+VAULT_AWS_NONCE_FILE=/etc/superbot/vault-aws-nonce   # or VAULT_AWS_NONCE
+VAULT_AWS_ROLE=superbot                              # or leave it out for the role named after the AMI
+# VAULT_AWS_MOUNT=aws
+```
+
+botd sends its own nonce rather than taking the one Vault would make, so a restart logs in again, and Vault neither returns it nor writes it to its audit log. Keep it like any other secret: it is reserved, masked in Bots' output, kept from everything botd starts, and redacted from the support bundle. Use a different nonce on each instance. Leave the role's `disallow_reauthentication` off, or botd can't log in again when its token ends. If the nonce is lost or changed, Vault refuses botd (`answered 400`, with a hint) until an operator deletes the instance's entry with `vault delete auth/aws/identity-accesslist/<instance-id>`. The `iam` type's `VAULT_AWS_REGION`, `VAULT_AWS_HEADER_VALUE` and `VAULT_AWS_CREDENTIALS` are refused with `ec2`, and botd needs no AWS keys. Vault itself needs AWS credentials to check the instance (`ec2:DescribeInstances`), and in some regions AWS's public certificate for the document (`auth/aws/config/certificate`). HashiCorp recommends the `iam` type where it fits. Choose `ec2` when the role must be bound to the AMI or network rather than the IAM role.
+
+Both types: the startup line says which (`GCP login (gce) as role superbot-vm at auth/gcp, the VM's identity token of the metadata server's service account`), logins are audited as `secret.vault_login` with `type` (`gce` or `ec2`) beside `method` and `role`, never the token, the document or the nonce, and `botd offline check` lists only the metadata service.
+
 ## Each user's own secrets
 
 Off by default ([ADR 0174](../adr/0174-users-secrets-in-the-external-store.md)). With `SECRETS_USER_FOLDERS=1`, botd also reads `secret/superbot/users/<user id>/<NAME>`, and gives those values only to Bots that user owns:
