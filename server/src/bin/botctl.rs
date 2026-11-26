@@ -1966,7 +1966,13 @@ fn saml_summary(v: &Value) -> String {
         s("metadataUrl"),
     );
     let several: Vec<&str> = v["idpEntityIds"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    if several.len() > 1 {
+    if let Some(e) = v["everyIdp"].as_object() {
+        let hidden = e["hidden"].as_u64().filter(|&n| n > 0).map(|n| format!(", {n} hidden from the chooser")).unwrap_or_default();
+        out += &format!("  IdPs:                     every IdP of the federation ({} now{hidden}), chosen at each sign-in\n", e["idps"].as_u64().unwrap_or(0));
+        for c in e["categories"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            out += &format!("    Only those in category:  {c}\n");
+        }
+    } else if several.len() > 1 {
         out += &format!("  IdPs:                     {}, chosen at each sign-in\n", several.len());
     } else {
         out += &format!("  IdP entity ID:            {}\n", s("idpEntityId"));
@@ -4817,6 +4823,16 @@ mod tests {
         assert!(saml_summary(&v).contains("    Valid until: 2027-01-15\n"));
         v["idp"]["expired"] = json!(true);
         assert!(saml_summary(&v).contains("    Valid until: 2027-01-15 (expired: no longer used)\n"));
+    }
+
+    #[test]
+    fn saml_summary_shows_every_idp_of_a_federation_by_count() {
+        let mut v = json!({ "provider": "fed", "label": "Fed", "idpEntityIds": [], "everyIdp": { "idps": 4200, "hidden": 0, "categories": [] } });
+        let out = saml_summary(&v);
+        assert!(out.contains("  IdPs:                     every IdP of the federation (4200 now), chosen at each sign-in\n") && !out.contains("IdP entity ID"), "{out}");
+        v["everyIdp"] = json!({ "idps": 900, "hidden": 3, "categories": ["https://refeds.org/sirtfi"] });
+        let out = saml_summary(&v);
+        assert!(out.contains("(900 now, 3 hidden from the chooser)") && out.contains("    Only those in category:  https://refeds.org/sirtfi\n"), "{out}");
     }
 
     #[test]
