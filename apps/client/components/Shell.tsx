@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { AccessibilityInfo, Animated, Easing, Modal, Platform, ScrollView, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
+import { Animated, Easing, Modal, Platform, ScrollView, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import { router, type Href } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useReducedMotion } from "../src/motion";
 import { type Scheme, type Theme, themedStyles, useTheme } from "../src/theme";
 import { kit, PageHeader } from "./ui";
 
@@ -16,40 +17,10 @@ export function useGoBack(fallback: Href = "/home"): () => void {
   return useCallback(() => goBack(fallback), [fallback]);
 }
 
-/** `prefers-reduced-motion` on web, which can be read at once; native settings arrive later. */
-function webPreference(): boolean | null {
-  if (Platform.OS !== "web" || typeof window === "undefined" || !window.matchMedia) return null;
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-}
-
-/**
- * Whether the device asks for less motion (iOS and Android settings, `prefers-reduced-motion` on
- * web), following its changes; `null` until the setting is known.
- */
-export function useMotionPreference(): boolean | null {
-  const [reduced, setReduced] = useState(webPreference);
-  useEffect(() => {
-    let live = true;
-    const set = (on: boolean) => live && setReduced(on);
-    AccessibilityInfo.isReduceMotionEnabled()
-      .then(set)
-      .catch(() => live && setReduced((was) => was ?? false));
-    const sub = AccessibilityInfo.addEventListener("reduceMotionChanged", set);
-    return () => {
-      live = false;
-      sub.remove();
-    };
-  }, []);
-  return reduced;
-}
-
-/**
- * A duration from the tokens' motion scale, or none when the device asks for less motion. Until
- * the setting is known nothing moves, so no one who asked for less motion sees a pane slide in.
- */
+/** A duration from the tokens' motion scale, or none when `useReducedMotion` holds motion back. */
 export function useMotion(): { reduced: boolean; duration: (speed: keyof Theme["motion"]) => number } {
   const t = useTheme();
-  const reduced = useMotionPreference() !== false;
+  const reduced = useReducedMotion();
   const duration = useCallback((speed: keyof Theme["motion"]) => (reduced ? 0 : t.motion[speed]), [reduced, t]);
   return { reduced, duration };
 }
