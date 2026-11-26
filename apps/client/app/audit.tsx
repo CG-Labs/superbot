@@ -1,8 +1,8 @@
 import React from "react";
-import { Redirect, router, useLocalSearchParams } from "expo-router";
-import { StyleSheet, Text, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { Redirect, useLocalSearchParams } from "expo-router";
+import { StyleSheet, View } from "react-native";
 import { AuditLog } from "../components/AuditLog";
+import { RouteNotice, RouteScreen, useGoBack } from "../components/Shell";
 import { kit, Spinner } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { linkedFilters } from "../src/audit";
@@ -15,6 +15,7 @@ import { themedStyles } from "../src/theme";
  */
 export default function AuditScreen() {
   const styles = useStyles();
+  const back = useGoBack();
   const { ready, api, me, bots } = useSuperBot();
   const params = useLocalSearchParams<Record<string, string>>();
   // A link or reload lands here before the saved session is restored: wait, don't bounce to /home.
@@ -26,32 +27,22 @@ export default function AuditScreen() {
     );
   }
   if (!api) return <Redirect href="/" />;
-  const back = () => (router.canGoBack() ? router.back() : router.replace("/home"));
   const botName = (id: string) => bots.find((b) => b.id === id)?.name;
   const initial = linkedFilters(params);
   return (
-    <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
+    <RouteScreen>
       {isAdmin(me) ? (
         <AuditLog key={JSON.stringify(initial)} api={api} onBack={back} botName={botName} bots={bots} initial={initial} />
       ) : (
-        <View style={styles.denied}>
-          <Text style={styles.text}>Only admins can see the audit log.</Text>
-          <Text style={styles.link} onPress={back}>
-            Back to Bots
-          </Text>
-        </View>
+        <RouteNotice title="Audit log" message="Only admins can see the audit log." onBack={back} />
       )}
-    </SafeAreaView>
+    </RouteScreen>
   );
 }
 
 const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
-    root: k.root,
     loading: k.center,
-    denied: k.center,
-    text: k.text,
-    link: k.link,
   });
 });

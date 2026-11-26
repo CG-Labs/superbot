@@ -8,6 +8,7 @@ import { BotDetailsPanel } from "../components/BotDetailsPanel";
 import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
+import { PaneTransition } from "../components/Shell";
 import { Sidebar } from "../components/Sidebar";
 import { isAdmin, openConsole, openSetup, watchSetup } from "../src/admin";
 import { planAvailable } from "../src/billing";
@@ -128,7 +129,7 @@ export default function HomeScreen() {
   return (
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
       {focused ? <StatusBar style={t.scheme === "dark" ? "light" : "dark"} /> : null}
-      <View style={styles.row}>
+      <PaneTransition style={styles.row} paneKey={mobilePane} from={mobilePane === "chat" ? "right" : "left"}>
         {showSidebar ? (
           <Sidebar
             compact={!wide}
@@ -162,7 +163,7 @@ export default function HomeScreen() {
           />
         ) : null}
         {wide && viewer ? <View style={styles.screenPanel}>{viewer}</View> : null}
-      </View>
+      </PaneTransition>
       {!wide ? (
         <Modal visible={!!viewer} animationType="slide" onRequestClose={() => setScreen(null)}>
           <SafeAreaView style={styles.screenModal}>{viewer}</SafeAreaView>
