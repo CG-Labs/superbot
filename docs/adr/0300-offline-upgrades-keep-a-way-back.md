@@ -68,6 +68,6 @@ A rollback that stops after the restore is run again with the same command. The 
     - the flags need `--offline` and `--upgrade`, and refuse each other where they conflict.
   - `offline.yml`, with no network, an encrypted database and encrypted backups: the upgrade records a backup of the older release. The downgrade refusal offers `--rollback`. `--rollback` then removes a secret saved after the upgrade and keeps one saved before, puts back the `.env` from before the upgrade, and serves HTTPS again. Upgrading again takes a new backup.
 - Not covered:
-  - Docker Compose (`offline-bundle.sh load`): Compose's volumes are the operator's, and `superbot-restore` is how to go back there ([backup-restore.md](../ops/backup-restore.md)).
+  - Docker Compose (`offline-bundle.sh load`): Compose's volumes are the operator's, and `superbot-restore` is how to go back there ([backup-restore.md](../ops/backup-restore.md)). (Done in [ADR 0327](0327-compose-upgrades-keep-a-way-back.md).)
   - Going back more than one upgrade: the backup is replaced by the next upgrade's.
   - Host state outside DATA_DIR and `.env`: per-user accounts and their folders, `/opt/hermes`, `/opt/superbot-harnesses`, and changes users' machines made from the newer release.
