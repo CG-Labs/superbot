@@ -363,6 +363,10 @@ pub struct Audience {
     pub push_body: String,
     /// The push's `type`, which the app opens `page` for.
     pub push_type: &'static str,
+    /// Only them, about something of their own, such as their request being decided (ADR
+    /// 0329): never the global list or webhook, no console link, read-only people too, and
+    /// email whenever email is on, since they aren't being asked to answer.
+    pub only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -410,8 +414,19 @@ impl Notice {
         let mut out = String::new();
         if let (NoticeKind::Alert, Some(a)) = (self.kind, &self.alert) {
             out.push_str(&format!("{}\n\n", clip(&a.title)));
+            // A notice of someone's own request keeps its lines whole: a decider's note there
+            // runs to 500 characters.
+            let only = a.audience.as_ref().is_some_and(|w| w.only);
             for l in &a.lines {
-                out.push_str(&format!("  {}\n", clip(l)));
+                let l = if only { l.split_whitespace().collect::<Vec<_>>().join(" ") } else { clip(l) };
+                out.push_str(&format!("  {l}\n"));
+            }
+            if let Some(w) = a.audience.as_ref().filter(|w| w.only) {
+                if let Some(l) = &a.app_link {
+                    out.push_str(&format!("\n  Open it in SuperBot: {l}\n"));
+                }
+                out.push_str(&format!("\n--\nSuperBot tells {} of this by email while email is on in the console's Settings, and on phones that have push for approvals on.\n", w.who));
+                return out;
             }
             if let (Some(l), Some(who)) = (&a.app_link, a.audience.as_ref().map(|w| &w.who)) {
                 out.push_str(&format!("\n  Open it in SuperBot ({who}): {l}"));
@@ -844,11 +859,13 @@ impl Notifier {
     /// Where an alert goes: the global email list and webhook, and its audience (ADR 0302):
     /// their addresses while email and `email.deciders` are on, and their phones that want
     /// approvals. Read-only people, service accounts and disabled people are never in it.
+    /// An audience that is `only` them (ADR 0329) gets no list or webhook, keeps read-only
+    /// people, and gets email while email is on.
     pub fn alert_plan(&self, db: &Db, a: &Alert, s: &Settings) -> Plan {
-        let mut plan = self.plan(db, None, s);
-        let Some(w) = &a.audience else { return plan };
-        let people: Vec<User> = w.people.iter().filter(|u| !u.service && u.active() && rbac::allows(Principal::User(u.role), Perm::Approve)).cloned().collect();
-        if self.smtp.is_some() && s.email.enabled && s.email.deciders {
+        let Some(w) = &a.audience else { return self.plan(db, None, s) };
+        let mut plan = if w.only { Plan::default() } else { self.plan(db, None, s) };
+        let people: Vec<User> = w.people.iter().filter(|u| !u.service && u.active() && (w.only || rbac::allows(Principal::User(u.role), Perm::Approve))).cloned().collect();
+        if self.smtp.is_some() && s.email.enabled && (w.only || s.email.deciders) {
             for e in people.iter().filter_map(|u| u.email.clone()).filter(|e| smtp::address_ok(e)) {
                 if !plan.email.iter().any(|x| x.eq_ignore_ascii_case(&e)) {
                     plan.email.push(e);
@@ -871,7 +888,7 @@ impl Notifier {
         }
         a.title = secrets::redact::text(&a.title).into_owned();
         a.lines = a.lines.iter().map(|l| secrets::redact::text(l).into_owned()).collect();
-        a.link = self.links.console(page);
+        a.link = self.links.console(page).filter(|_| !a.audience.as_ref().is_some_and(|w| w.only));
         a.app_link = a.audience.as_ref().and_then(|w| self.links.page(w.page));
         let n = Notice { kind: NoticeKind::Alert, bot_id: String::new(), bot_name: String::new(), items: Vec::new(), more: 0, alert: Some(a) };
         self.deliver(app, &n, &plan, false).await

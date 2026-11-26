@@ -191,6 +191,45 @@ fn the_plan_follows_the_global_settings_and_each_bots_own() {
     secrets::global().delete(&own).unwrap();
 }
 
+#[test]
+fn an_alert_only_for_its_audience_skips_the_list_and_the_webhook() {
+    let _turn = GLOBAL_URL.blocking_lock();
+    let app = test_app();
+    let db = &app.db;
+    let member = user(db, "only-member@example.com", Role::Member);
+    let readonly = user(db, "only-ro@example.com", Role::Readonly);
+    let gone = user(db, "only-gone@example.com", Role::Member);
+    db.update_user(&gone.id, crate::db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+    let gone = db.user(&gone.id).unwrap();
+    let n = Notifier::new(Some(smtp::Smtp::for_test("127.0.0.1", 1, smtp::Tls::None, None, None)), Some("https://bots.example.com".into()));
+    secrets::global().put(webhook::URL, "https://hooks.example.com/all").unwrap();
+    let mut s = Settings { email: EmailSettings { enabled: true, to: vec!["ops@example.com".into()], deciders: false }, webhook: WebhookSettings { enabled: true, ..Default::default() }, ..Default::default() };
+    let people = vec![member.clone(), readonly.clone(), gone.clone()];
+    let mut a = Alert { event: "role.request_denied".into(), title: "Your request for On-call was denied".into(), audience: Some(Audience { people, who: "whoever asked".into(), page: "settings", ..Default::default() }), ..Default::default() };
+    let ids = |p: &Plan| p.deciders.iter().map(|u| u.id.clone()).collect::<Vec<_>>();
+
+    let plan = n.alert_plan(db, &a, &s);
+    assert_eq!((plan.email.clone(), plan.webhook.is_some(), ids(&plan)), (vec!["ops@example.com".to_string()], true, vec![member.id.clone()]), "deciders: the list, the webhook, and people who may approve");
+
+    a.audience.as_mut().unwrap().only = true;
+    let plan = n.alert_plan(db, &a, &s);
+    assert_eq!(plan.email, ["only-member@example.com", "only-ro@example.com"], "only them, read-only too, whatever email.deciders says");
+    assert!(plan.webhook.is_none(), "never the webhook");
+    assert_eq!(ids(&plan), [member.id.clone(), readonly.id.clone()], "never someone disabled");
+    s.email.enabled = false;
+    assert!(n.alert_plan(db, &a, &s).is_empty(), "no email while email is off, and no push without a provider");
+    secrets::global().delete(webhook::URL).unwrap();
+
+    let long = format!("Note: {}", "word ".repeat(90));
+    a.lines = vec![long.clone()];
+    a.app_link = n.links.page("settings");
+    let notice = Notice { kind: NoticeKind::Alert, bot_id: String::new(), bot_name: String::new(), items: Vec::new(), more: 0, alert: Some(a) };
+    let body = notice.email_body(None);
+    assert!(body.contains("Open it in SuperBot: https://bots.example.com/app/settings") && body.contains("SuperBot tells whoever asked of this"), "{body}");
+    assert!(!body.contains("Console") && !body.contains("notification email list"), "{body}");
+    assert!(body.contains(long.trim_end()), "lines kept whole: {body}");
+}
+
 struct Rig {
     app: Arc<App>,
     notifier: Arc<Notifier>,

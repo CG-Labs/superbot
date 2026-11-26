@@ -5,7 +5,7 @@ import type { PushView } from "./types";
 export type PushPermission = "granted" | "denied" | "undetermined";
 
 /** Where a tapped push opens. Only these places, whatever the payload says. */
-export type PushLink = { pathname: "/home"; params: { approval: string } } | { pathname: "/home"; params: { bot: string } } | { pathname: "/home" } | { pathname: "/team" };
+export type PushLink = { pathname: "/home"; params: { approval: string } } | { pathname: "/home"; params: { bot: string } } | { pathname: "/home" } | { pathname: "/team" } | { pathname: "/settings" };
 
 /** The project id `app.json` ships with until whoever builds the app sets a real one. */
 export const PLACEHOLDER_PROJECT_ID = "00000000-0000-4000-8000-000000000001";
@@ -18,7 +18,8 @@ export function botParam(v: string | string[] | undefined): string | null {
 
 /**
  * Where a push's data sends a tap (ADR 0080): an approval opens the inbox on it, a
- * routine opens its Bot's chat, and a request for a team role opens Team (ADR 0302).
+ * routine opens its Bot's chat, a request for a team role opens Team (ADR 0302), and
+ * your own request being decided opens Settings, where it's listed (ADR 0329).
  * Pushes carry only ids; the app fetches the rest.
  * Anything else opens home, and nothing that isn't SuperBot's opens at all.
  */
@@ -37,6 +38,8 @@ export function pushLink(data: unknown): PushLink | null {
     }
     case "role_request":
       return { pathname: "/team" };
+    case "role_decision":
+      return { pathname: "/settings" };
     case "test":
       return { pathname: "/home" };
     default:
