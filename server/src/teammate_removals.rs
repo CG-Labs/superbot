@@ -331,6 +331,9 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
         return Tried::Failed(why.into());
     }
     let logins = app.teammate_logins.stop_for(&row.owner_id, &row.user_id);
+    if let Some(screens) = &app.screens {
+        screens.remove_account(&row.account).await;
+    }
     // The work goes to the owner's own account, made now if they never ran a Bot here.
     // With no one to hand it to, it's kept aside a while for an admin instead: the
     // account still goes now.

@@ -309,6 +309,11 @@ impl RunAs {
 /// botd, and must be botd's own; the file is 0640. Nobody else can write there, so the
 /// account can't swap anything in. Through the folder's ACL the account may read.
 pub fn write_shared(base: &Path, path: &Path, body: &str) -> io::Result<()> {
+    write_shared_bytes(base, path, body.as_bytes())
+}
+
+/// `write_shared` for bytes, such as a screen's X cookie (ADR 0342).
+pub fn write_shared_bytes(base: &Path, path: &Path, body: &[u8]) -> io::Result<()> {
     let rel = path.strip_prefix(base).map_err(|_| io::Error::other(format!("{} is outside {}", path.display(), base.display())))?;
     if !trusted_dir(base) {
         return Err(io::Error::other(format!("{} isn't a folder root made", base.display())));
@@ -326,7 +331,7 @@ pub fn write_shared(base: &Path, path: &Path, body: &str) -> io::Result<()> {
     let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
     remove(&tmp);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o640).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
-    f.write_all(body.as_bytes())?;
+    f.write_all(body)?;
     // The group bits set the ACL's mask, so the account can read it whatever the umask.
     f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
     std::fs::rename(&tmp, dir.join(name))

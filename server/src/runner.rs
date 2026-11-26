@@ -1406,10 +1406,12 @@ impl App {
             let bound = teammate.map(String::from).or_else(|| spot.teammate_user.as_ref().and(for_other.clone()));
             let token = self.run_token(&bot, msg, &by, &run_id, bound.as_deref(), attempt, &host);
             env.insert("BOT_TOKEN".into(), token.secret.clone());
+            // With per-user accounts the screen is the run's account's own (ADR 0342).
+            let screen_owner = run_as.as_ref().and(self.isolation()).and_then(|iso| screen::Owner::new(iso, run_space, &bot.id));
             if spot.screens
                 && spot.machine.is_none()
                 && let Some(screens) = &self.screens
-                && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
+                && let Ok(info) = screens.ensure(&bot.id, screen_owner.as_ref(), |id| self.is_running(id)).await
             {
                 env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
             }
@@ -3054,6 +3056,12 @@ pub fn test_app() -> Arc<App> {
 /// is the server after a restart.
 #[cfg(test)]
 pub fn test_app_in(dir: PathBuf) -> Arc<App> {
+    test_app_with(dir, None)
+}
+
+/// `test_app_in`, with screens.
+#[cfg(test)]
+pub fn test_app_with(dir: PathBuf, screens: Option<Screens>) -> Arc<App> {
     let db = Db::open(&dir.join("app.sqlite")).unwrap();
     let workspace = dir.join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -3072,7 +3080,7 @@ pub fn test_app_in(dir: PathBuf) -> Arc<App> {
             sandbox_host: crate::sandbox::Host { namespaces: true, programs: crate::sandbox::PROGRAMS.map(String::from).into() },
             home: Some(dir.join("home")),
         },
-        None,
+        screens,
     );
     app.license.set_testing(true);
     app

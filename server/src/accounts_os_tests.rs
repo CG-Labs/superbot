@@ -8,7 +8,7 @@ use crate::audit::{Actor, ActorKind, Who};
 use crate::acl::Visibility;
 use crate::db::Bot;
 use crate::rbac::Role;
-use crate::runner::{App, test_app};
+use crate::runner::{App, test_app, test_app_with};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -16,11 +16,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn setup() -> Option<(Arc<App>, Arc<Isolation>)> {
+    setup_with(false)
+}
+
+/// `setup`, with per-user screens on (ADR 0342) when `screens`.
+fn setup_with(screens: bool) -> Option<(Arc<App>, Arc<Isolation>)> {
     if std::env::var("SUPERBOT_ISOLATION_OS_TEST").as_deref() != Ok("1") {
         eprintln!("skipped: run deploy/test-isolation.sh");
         return None;
     }
-    let app = test_app();
+    let app = match screens {
+        false => test_app(),
+        true => {
+            let dir = crate::db::temp_path("app");
+            let s = crate::screen::Screens::from_env(dir.join("screens"), true).expect("screens need Xvfb and openbox: deploy/test-isolation.sh installs them");
+            test_app_with(dir, Some(s))
+        }
+    };
     // As DATA_DIR is in production: in botd's home, which only botd's account can open.
     std::fs::set_permissions(&app.cfg.data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let run_dir = PathBuf::from(std::env::var("SUPERBOT_RUN_DIR").expect("SUPERBOT_RUN_DIR"));
@@ -461,4 +473,170 @@ async fn a_leaving_teammates_account_goes_and_the_shared_bot_keeps_working() {
     assert!(log_in(&app, &ada, &bea).await.1);
     assert!(iso.ready_in(bea_space));
     assert!(!iso.workspace_in(bea_space).unwrap().join("notes.txt").exists());
+}
+
+// Per-user screens on one server (ADR 0342).
+
+/// A GET of `/?token=` on a viewer port: the status line and body.
+async fn view(port: u16, token: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(mut c) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return "refused".into() };
+    let _ = c.write_all(format!("GET /?token={token} HTTP/1.0\r\nHost: test\r\n\r\n").as_bytes()).await;
+    let mut out = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), c.read_to_string(&mut out)).await;
+    out
+}
+
+fn uid_of(account: &str) -> u32 {
+    crate::passwd::by_name(account).unwrap_or_else(|| panic!("no account {account}")).uid
+}
+
+/// SysV shared memory segments of `uid` that another account may attach.
+fn shared_segments(uid: u32) -> Vec<String> {
+    let table = std::fs::read_to_string("/proc/sysvipc/shm").unwrap_or_default();
+    table
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let perms = f.get(2).and_then(|p| u32::from_str_radix(p, 8).ok()).unwrap_or(0);
+            f.get(7).and_then(|u| u.parse::<u32>().ok()) == Some(uid) && perms & 0o077 != 0
+        })
+        .map(String::from)
+        .collect()
+}
+
+/// The screen-probe prompt for the fake harness, aimed at another run's screen.
+fn screen_probe(other: &HashMap<String, String>) -> String {
+    let bus = other["bus"].trim_start_matches("unix:path=").to_string();
+    format!("SCREEN {} {} {bus}", other["display"], other["xauthority"])
+}
+
+/// ISOLATION=users with screens: user A's Bot's screen runs as A's account, takes only
+/// the cookie in A's folder, and its viewer answers only A's token. User B's run, as B's
+/// account, can't open A's display, read A's cookie or reach A's session bus, and a port
+/// B's account listens on never passes for a viewer of A's.
+#[tokio::test]
+#[ignore = "needs root's setup: deploy/test-isolation.sh"]
+async fn user_bs_run_cannot_see_or_control_user_as_screen() {
+    let Some((app, iso)) = setup_with(true) else { return };
+    let a = user_and_bot(&app, "a@example.com");
+    let b = user_and_bot(&app, "b@example.com");
+    let (a_acct, b_acct) = (accounts::account(&a.owner_id).unwrap(), accounts::account(&b.owner_id).unwrap());
+
+    // A's run gets A's own screen, which its tools can open.
+    let mine = probes(&run(&app, &a, "SCREEN none none none").await);
+    eprintln!("A's run saw: {mine:?}");
+    assert_eq!(mine["user"], a_acct, "{mine:?}");
+    assert_eq!(mine["own_display"], "open", "{mine:?}");
+    let cookie = iso.bot_settings_in(Space::User(&a.owner_id), &a.id).unwrap().join("screen.xauth");
+    assert_eq!(mine["xauthority"], cookie.display().to_string(), "the cookie is in A's read-only settings folder: {mine:?}");
+    assert!(mine["bus"].starts_with(&format!("unix:path={}", iso.home(&a.owner_id).unwrap().display())), "{mine:?}");
+    let n: u16 = mine["display"].trim_start_matches(':').parse().unwrap();
+    let sock = PathBuf::from(format!("/tmp/.X11-unix/X{n}"));
+    let a_uid = uid_of(&a_acct);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::symlink_metadata(&sock).unwrap().uid(), a_uid, "A's X server runs as A's account");
+    let m = std::fs::metadata(&cookie).unwrap();
+    assert_eq!(m.mode() & 0o7777, 0o640, "botd's file, which A's account reads and never changes");
+    assert!(shared_segments(a_uid).is_empty(), "no shared memory of A's that others may attach: {:?}", shared_segments(a_uid));
+
+    // The web app's view of A's screen: through botd's port to voxl, as A's account.
+    let owner = crate::screen::Owner::new(&iso, Space::User(&a.owner_id), &a.id).unwrap();
+    let screens = app.screens.as_ref().unwrap();
+    let info = screens.ensure(&a.id, Some(&owner), |_| true).await.unwrap();
+    assert_eq!(info.display, mine["display"], "the same screen as A's run");
+    let seen = view(info.port, &info.token).await;
+    assert!(seen.contains(" 200 ") && seen.contains(&format!("user={a_acct};display=open")), "{seen}");
+    assert!(view(info.port, &"0".repeat(32)).await.contains(" 401 "), "a wrong token gets nothing");
+
+    // B's run, as B's account, has a screen of its own and none of A's.
+    let got = probes(&run(&app, &b, &screen_probe(&mine)).await);
+    eprintln!("B's run saw: {got:?}");
+    assert_eq!(got["user"], b_acct, "{got:?}");
+    assert_eq!(got["own_display"], "open", "{got:?}");
+    assert_ne!(got["display"], mine["display"], "{got:?}");
+    for k in ["other_display", "other_display_with_cookie", "other_display_own_cookie", "other_cookie", "other_bus"] {
+        assert_eq!(got[k], "denied", "{k}: {got:?}");
+    }
+    assert!(shared_segments(uid_of(&b_acct)).is_empty());
+
+    // A loopback port B's account listens on never passes for A's viewer: botd checks
+    // whose each one is before it pipes a view there.
+    let b_run = iso.run_as_in(Space::User(&b.owner_id)).unwrap();
+    let listen = "import socket,time\ns=socket.socket()\ns.bind(('127.0.0.1',0))\ns.listen()\nprint(s.getsockname()[1],flush=True)\nc=s.accept()\ntime.sleep(30)";
+    let (bin, args) = b_run.argv_strings("python3", vec!["-c".into(), listen.into()]);
+    let mut squatter = tokio::process::Command::new(bin)
+        .args(args)
+        .current_dir(iso.home(&b.owner_id).unwrap())
+        .env_clear()
+        .env("SUPERBOT_PATH", "/usr/local/bin:/usr/bin:/bin")
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    tokio::io::BufReader::new(squatter.stdout.take().unwrap()).read_line(&mut line).await.unwrap();
+    let port: u16 = line.trim().parse().unwrap_or_else(|_| panic!("no port from B's listener: {line:?}"));
+    let c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(!crate::screen::held_by(&c, a_uid).await, "B's port isn't A's viewer");
+    assert!(crate::screen::held_by(&c, uid_of(&b_acct)).await, "it is B's, as /proc/net/tcp says");
+    drop(squatter);
+
+    // A stopped screen leaves nothing of A's running, and its cookie is gone.
+    screens.remove(&a.id).await;
+    let start = Instant::now();
+    while std::fs::symlink_metadata(&sock).is_ok() {
+        assert!(start.elapsed() < Duration::from_secs(15), "A's X server is still up");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!cookie.exists());
+    while view(info.port, &info.token).await != "refused" {
+        assert!(start.elapsed() < Duration::from_secs(15), "something still answers on A's viewer port");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// ADR 0342 with teammates' accounts (ADR 0064): a teammate's run of a shared Bot gets a
+/// screen of its own, as their account, which the owner's run can't open, nor theirs the
+/// owner's. Their account's removal stops it.
+#[tokio::test]
+#[ignore = "needs root's setup: deploy/test-isolation.sh"]
+async fn a_teammates_screen_of_a_shared_bot_is_their_own() {
+    let Some((app, iso)) = setup_with(true) else { return };
+    app.shared_bots.set(crate::acl::SharedBots::Isolated).unwrap();
+    let mk = |email: &str| app.db.create_user(None, Some(email), email, Role::Member).unwrap().id;
+    let (ada, bea) = (mk("ada@example.com"), mk("bea@example.com"));
+    let team = app.db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, &ada, Visibility::Shared);
+    let bea_space = Space::of(&ada, Some(&bea));
+    let (ada_acct, bea_acct) = (accounts::account(&ada).unwrap(), bea_space.account().unwrap());
+    assert!(log_in(&app, &ada, &bea).await.1);
+
+    let ada_saw = probes(&run(&app, &team, "SCREEN none none none").await);
+    assert_eq!((ada_saw["user"].as_str(), ada_saw["own_display"].as_str()), (ada_acct.as_str(), "open"), "{ada_saw:?}");
+    let bea_saw = probes(&run_for(&app, &team, Some(&bea), &screen_probe(&ada_saw)).await);
+    eprintln!("Ada's run saw: {ada_saw:?}\nBea's run saw: {bea_saw:?}");
+    assert_eq!((bea_saw["user"].as_str(), bea_saw["own_display"].as_str()), (bea_acct.as_str(), "open"), "{bea_saw:?}");
+    assert_ne!(bea_saw["display"], ada_saw["display"]);
+    assert_eq!(bea_saw["xauthority"], iso.bot_settings_in(bea_space, &team.id).unwrap().join("screen.xauth").display().to_string());
+    for k in ["other_display", "other_display_with_cookie", "other_display_own_cookie", "other_cookie", "other_bus"] {
+        assert_eq!(bea_saw[k], "denied", "{k}: {bea_saw:?}");
+    }
+    let back = probes(&run(&app, &team, &screen_probe(&bea_saw)).await);
+    for k in ["other_display", "other_display_with_cookie", "other_display_own_cookie", "other_cookie", "other_bus"] {
+        assert_eq!(back[k], "denied", "Ada's run on Bea's screen, {k}: {back:?}");
+    }
+
+    // Her account's removal stops her screen first; Ada's keeps going.
+    let bea_sock = PathBuf::from(format!("/tmp/.X11-unix/X{}", bea_saw["display"].trim_start_matches(':')));
+    let ada_sock = PathBuf::from(format!("/tmp/.X11-unix/X{}", ada_saw["display"].trim_start_matches(':')));
+    app.screens.as_ref().unwrap().remove_account(&bea_acct).await;
+    let start = Instant::now();
+    while std::fs::symlink_metadata(&bea_sock).is_ok() {
+        assert!(start.elapsed() < Duration::from_secs(15), "Bea's X server is still up");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(std::fs::symlink_metadata(&ada_sock).is_ok(), "Ada's screen is still up");
+    app.screens.as_ref().unwrap().remove(&team.id).await;
 }
