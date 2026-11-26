@@ -450,7 +450,7 @@ struct Inner {
     http: reqwest::Client,
     token: Mutex<Option<Token>>,
     /// The change stream's state, with `VAULT_EVENTS=1` (ADR 0318).
-    events: Arc<events::Status>,
+    events: Arc<super::changes::Status>,
 }
 
 /// Clones share one client, token and runtime: the store and the run credentials' issuer.
