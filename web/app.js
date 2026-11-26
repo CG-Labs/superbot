@@ -762,17 +762,25 @@ const endsText = (h) => (h.expiresAt ? ` · until ${esc(fmt(h.expiresAt))}` : ""
 // Requests for roles (ADR 0209): approve for as long as asked or shorter, or deny with a note.
 const hoursText = (h) => (h % 24 === 0 ? `${h / 24} day${h === 24 ? "" : "s"}` : `${h} hour${h === 1 ? "" : "s"}`);
 const SHORTER = [720, 168, 72, 24, 8, 4, 1];
+// Two approvers (ADR 0320): the second approves for the first's hours or fewer, and never the first approver.
+const awaitsSecond = (q) => (q.approvals || 1) >= 2 && !!q.firstApproval;
 function requestCard(q) {
   const where = q.team ? `in ${esc(q.team.name || "their team")}` : "across the server";
   const yours = q.user?.id === me.user?.id;
-  const choices = [[q.hours, `${hoursText(q.hours)} (as asked)`], ...SHORTER.filter((h) => h < q.hours).map((h) => [h, hoursText(h)])];
+  const second = awaitsSecond(q);
+  const needsTwo = (q.approvals || 1) >= 2;
+  const cap = second ? Math.min(q.hours, q.firstApproval.hours) : q.hours;
+  const choices = [[cap, `${hoursText(cap)} (${second ? "as first approved" : "as asked"})`], ...SHORTER.filter((h) => h < cap).map((h) => [h, hoursText(h)])];
+  const f = second ? q.firstApproval : null;
+  const gaveFirst = f && f.by.id === me.user?.id;
   return `<div class="card" data-request="${esc(q.id)}">
-    <div class="bar">${q.user ? who(q.user) : "Someone"} <span class="sub">asks for <b>${esc(q.role?.name || "a role")}</b> for ${esc(hoursText(q.hours))}, ${where} · lapses ${esc(fmt(q.expiresAt))}</span></div>
+    <div class="bar">${q.user ? who(q.user) : "Someone"} <span class="sub">asks for <b>${esc(q.role?.name || "a role")}</b> for ${esc(hoursText(q.hours))}, ${where} · lapses ${esc(fmt(q.expiresAt))}${needsTwo ? " · needs two approvers" : ""}</span></div>
     <p class="hint">“${esc(q.reason)}”${q.current ? ` · has ${esc(q.current.name)} now` : ""}${q.role?.applies?.length ? ` · adds ${esc(q.role.applies.join(", "))}` : ""}</p>
+    ${f ? `<p class="sub">First approved by ${who(f.by)} for ${esc(hoursText(f.hours))}${f.note ? `: “${esc(f.note)}”` : ""}. Waiting for a second approver.</p>` : ""}
     ${yours ? '<p class="sub">Your own request: another admin decides it.</p>' : `<form class="bar" data-act="decide-request" autocomplete="off">
-      <select name="hours" title="How long it's given for, from now">${choices.map(([h, label]) => `<option value="${h}">${esc(label)}</option>`).join("")}</select>
+      ${gaveFirst ? '<span class="sub">You gave the first approval. Someone else gives the second.</span>' : `<select name="hours" title="How long it's given for, from now">${choices.map(([h, label]) => `<option value="${h}">${esc(label)}</option>`).join("")}</select>`}
       <input name="note" class="wide" placeholder="Note (optional, they see it)" maxlength="500" />
-      <button type="submit" class="btn primary" value="approve">Approve</button>
+      ${gaveFirst ? "" : `<button type="submit" class="btn primary" value="approve">${needsTwo && !second ? "Approve (1 of 2)" : "Approve"}</button>`}
       <button type="submit" class="btn" value="deny">Deny</button>
     </form>`}
   </div>`;
@@ -783,7 +791,7 @@ function roleCard(r) {
   const held = r.users + r.teamMembers > 0;
   const givable = rolesTab.teams.flatMap((t) => t.members.filter((m) => !d.holders.teams.some((h) => h.team.id === t.id && h.user.id === m.id)).map((m) => [t, m]));
   return `<div class="card" data-role="${esc(r.id)}">
-    <div class="bar"><b>${esc(r.name)}</b> <span class="sub">${esc(baseName(r.base))} + ${esc(permNames(r.permissions))} · ${esc(holdersText(r))}${r.maxDays ? ` · time-bound, at most ${r.maxDays} day${r.maxDays === 1 ? "" : "s"}` : ""}${r.requestable ? " · people may request it" : ""}</span>
+    <div class="bar"><b>${esc(r.name)}</b> <span class="sub">${esc(baseName(r.base))} + ${esc(permNames(r.permissions))} · ${esc(holdersText(r))}${r.maxDays ? ` · time-bound, at most ${r.maxDays} day${r.maxDays === 1 ? "" : "s"}` : ""}${r.requestable ? " · people may request it" : ""}${r.approvals === 2 ? " · needs two approvers" : ""}</span>
       <button type="button" class="btn push" data-act="edit-role">Edit</button>
       <button type="button" class="btn" data-act="delete-role" ${held ? 'disabled title="Take it away from everyone first"' : ""}>Delete</button></div>
     ${r.description ? `<p class="hint">${esc(r.description)}</p>` : ""}
@@ -830,6 +838,7 @@ function renderRoleForm() {
   $("role-base").value = r?.base || "member";
   $("role-max-days").value = r?.maxDays || "";
   $("role-requestable").checked = !!r?.requestable;
+  $("role-approvals").checked = r?.approvals === 2;
   showRequestable();
   $("role-perms").innerHTML = roles.permissions.map((p) => `<label><input type="checkbox" value="${esc(p.name)}" ${r?.permissions.includes(p.name) ? "checked" : ""} />
     <span><code>${esc(p.name)}</code>${p.team ? ' <span class="tag">also within a team</span>' : ""}<span class="sub">${esc(p.description)}</span></span></label>`).join("");
@@ -841,13 +850,17 @@ function showRoleEffective() {
   const perms = checkedPerms();
   $("role-effective").textContent = `Can do: ${effectivePerms($("role-base").value, perms).join(", ")}. Within a team: ${permNames(teamPerms(perms))}.`;
 }
-// Only a time-bound role can be requested.
+// Only a time-bound role can be requested, and only a requestable one needs two approvers.
 function showRequestable() {
   const limited = !!$("role-max-days").value.trim();
   $("role-requestable").disabled = !limited;
   if (!limited) $("role-requestable").checked = false;
+  const requestable = $("role-requestable").checked;
+  $("role-approvals").disabled = !requestable;
+  if (!requestable) $("role-approvals").checked = false;
 }
 $("role-max-days").addEventListener("input", showRequestable);
+$("role-requestable").addEventListener("change", showRequestable);
 $("role-perms").addEventListener("change", showRoleEffective);
 $("role-base").addEventListener("change", showRoleEffective);
 $("role-cancel").addEventListener("click", () => {
@@ -859,6 +872,7 @@ $("role-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const days = $("role-max-days").value.trim();
   const body = { name: $("role-name").value.trim(), description: $("role-description").value.trim(), base: $("role-base").value, permissions: checkedPerms(), maxDays: days ? Number(days) : null, requestable: !!days && $("role-requestable").checked };
+  body.approvals = body.requestable && $("role-approvals").checked ? 2 : 1;
   const r = roles.roles.find((x) => x.id === rolesTab.editing);
   if (rolesTab.editing && !r) return fail(new Error("That role didn't load. Reload the page before saving."));
   try {
@@ -894,9 +908,12 @@ $("role-requests-list").addEventListener("submit", async (e) => {
   try {
     if (approve) {
       const hours = Number(f.hours.value);
-      if (!confirm(`Give ${q.role?.name || "the role"} to ${name} for ${hoursText(hours)}, from now? It ends by itself.`)) return;
-      await api("POST", `/api/role-requests/${key(q.id)}/approve`, note ? { hours, note } : { hours });
-      notice(`Gave ${q.role?.name || "the role"} to ${name} for ${hoursText(hours)}.`, false);
+      const firstOfTwo = (q.approvals || 1) >= 2 && !awaitsSecond(q);
+      if (firstOfTwo) {
+        if (!confirm(`Approve ${name}'s request for ${q.role?.name || "the role"} for ${hoursText(hours)}? It needs two approvers: nothing is given until someone else approves it too, for as long or less.`)) return;
+      } else if (!confirm(`Give ${q.role?.name || "the role"} to ${name} for ${hoursText(hours)}, from now? It ends by itself.`)) return;
+      const r = await api("POST", `/api/role-requests/${key(q.id)}/approve`, note ? { hours, note } : { hours });
+      notice(r?.request?.status === "pending" ? `First approval given. Someone else gives ${name} the role.` : `Gave ${q.role?.name || "the role"} to ${name} for ${hoursText(hours)}.`, false);
     } else {
       if (!confirm(`Deny ${name}'s request for ${q.role?.name || "a role"}? They see your note and can ask again.`)) return;
       await api("POST", `/api/role-requests/${key(q.id)}/deny`, note ? { note } : {});
