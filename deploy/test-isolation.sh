@@ -4,7 +4,9 @@
 # tests: user B's Bot, through the real run path, against user A's folder and logins, and
 # a teammate's run of an owner's shared Bot, as its own account with its own login
 # (docs/adr/0064-teammate-accounts-on-one-server.md), and that account's removal when the
-# teammate leaves (docs/adr/0066-removing-teammate-accounts-on-one-server.md).
+# teammate leaves (docs/adr/0066-removing-teammate-accounts-on-one-server.md). With Xvfb,
+# each run's screen is its account's own, which no other account opens or views
+# (docs/adr/0342-per-user-screens-on-one-server.md).
 #
 # It adds accounts, a sudoers rule, and /srv/superbot-test, so run it only on a throwaway
 # host (CI does), as root:
@@ -40,7 +42,8 @@ cleanup
 trap cleanup EXIT
 
 log "Setting up a service account and per-user accounts with deploy/install.sh's functions"
-apt-get install -y -qq acl sudo >/dev/null
+pkgs=(acl sudo xvfb openbox dbus-daemon x11-utils python3)
+apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq "${pkgs[@]}" >/dev/null; }
 id "$SVC" >/dev/null 2>&1 || useradd -m -s /bin/bash "$SVC"
 home=$(getent passwd "$SVC" | cut -d: -f6)
 install -d -m 0755 "$LIB/bin" "$LIB/fake" "$LIB/share/deploy"
@@ -49,6 +52,7 @@ install -m 0755 "$test_bin" "$LIB/botd-tests"
 for h in claude pi hermes; do
   install -m 0755 "$repo/deploy/test-isolation-harness.sh" "$LIB/fake/$h"
 done
+install -m 0755 "$repo/deploy/test-isolation-voxl.sh" "$LIB/fake/voxl"
 install -m 0644 "$repo/deploy/superbot-userctl.sh" "$LIB/share/deploy/superbot-userctl.sh"
 install -d -o "$SVC" -g "$SVC" -m 0700 "$home/superbot"
 install -o "$SVC" -g "$SVC" -m 0600 /dev/null "$home/superbot/.env"
