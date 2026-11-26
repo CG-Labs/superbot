@@ -18,6 +18,7 @@ pub use chats::{
     ChatMove, ChatStore, Doc, Held, MovesOut, SECOND_FACTOR, SECRETS, Whose, attach_to, compare_copy, drop_from_copy, held_apart_from, held_in_copy, keep_only_in_copy,
     kept_in_region, places, sign_ins_from, upgrade_copy, user_place,
 };
+pub use chats::{StoreMoved, moved_to, remove_store_files};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 

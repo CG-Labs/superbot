@@ -833,6 +833,13 @@ impl UserSecrets {
         Ok(())
     }
 
+    /// Runs `f` with this connection and the stores attached to it, held so nothing else
+    /// uses it meanwhile: a store moving while botd runs, so no secret is written to the
+    /// store's old file once it is copied (ADR 0309).
+    pub fn holding<T>(&self, f: impl FnOnce(&Connection, &[crate::db::ChatStore]) -> T) -> T {
+        f(&self.c(), self.stores())
+    }
+
     /// How many secrets the attached stores hold.
     pub fn in_stores(&self) -> Result<usize, Error> {
         let c = self.c();
