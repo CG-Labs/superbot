@@ -26,7 +26,7 @@ tests:
               job: superbot
             exp_annotations:
               summary: botd is spending its availability error budget fast
-              description: "50% of requests are failing with a 5xx. At this rate the 30-day error budget (docs/slo.md) runs out within days. Check /status, botd's logs (LOG_FORMAT=json, level warn) and superbot_http_requests_total by route_class."
+              description: "50% of requests are failing with a 5xx. At this rate the 30-day error budget (docs/slo.md) runs out within days. Check /status, botd's logs (LOG_FORMAT=json, level warn) and superbot_http_requests_total by route_class. See docs/support/runbook-server-errors.md#requests-failing."
       - eval_time: 70m
         alertname: SuperBotDown
         exp_alerts: []
@@ -67,7 +67,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: Prometheus can't scrape botd
-              description: "botd at botd:9464 hasn't answered a scrape for 2 minutes. Every minute down counts against the availability SLO (docs/slo.md)."
+              description: "botd at botd:9464 hasn't answered a scrape for 2 minutes. Every minute down counts against the availability SLO (docs/slo.md). See docs/support/runbook-machine-down.md#the-server-itself."
 
   # A quarter of runs time out over an hour.
   - interval: 1m
@@ -87,7 +87,7 @@ tests:
               job: superbot
             exp_annotations:
               summary: Many Bot runs are failing
-              description: "25% of Bot runs in the last hour ended in error or timeout, above the 10% run objective (docs/slo.md). Check superbot_runs_total by harness and the model providers' status."
+              description: "25% of Bot runs in the last hour ended in error or timeout, above the 10% run objective (docs/slo.md). Check superbot_runs_total by harness and the model providers' status. See docs/support/runbook-harness-outage.md#first-five-minutes."
 
   # Fast burn, short windows only: six healthy hours, then 5% fail for 30 minutes.
   # The 1h and 5m pair pages while the 6h share stays low; ten minutes after it
@@ -191,7 +191,7 @@ tests:
               instance: https://<your-domain>/status.json
             exp_annotations:
               summary: The public status page isn't answering
-              description: "The outside-in probe of /status.json has failed for 2 minutes (no answer, or a 503 for a major outage): users likely can't reach SuperBot. These minutes are the availability SLO's bad minutes (docs/slo.md)."
+              description: "The outside-in probe of /status.json has failed for 2 minutes (no answer, or a 503 for a major outage): users likely can't reach SuperBot. These minutes are the availability SLO's bad minutes (docs/slo.md). See docs/support/runbook-machine-down.md#the-server-itself."
       - eval_time: 13m
         alertname: SuperBotStatusProbeFailing
         exp_alerts: []

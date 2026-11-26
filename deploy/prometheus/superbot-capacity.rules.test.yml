@@ -28,7 +28,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: "A machine was refused because no Incus host had room"
-              description: "Placement refused or held back a machine in the last 15 minutes (machine.placement_failed in the audit log names the plan and each host's reason). Add capacity or a host before more are refused."
+              description: "Placement refused or held back a machine in the last 15 minutes (machine.placement_failed in the audit log names the plan and each host's reason). Add capacity or a host before more are refused. See docs/support/runbook-capacity.md#no-room-for-new-machines."
       - eval_time: 17m
         alertname: SuperBotMachinesWaitingForRoom
         exp_alerts:
@@ -38,7 +38,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: "Machines are waiting for room on an Incus host"
-              description: "1 machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load."
+              description: "1 machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load. See docs/support/runbook-capacity.md#no-room-for-new-machines."
       - eval_time: 55m
         alertname: SuperBotMachinesWaitingForRoom
         exp_alerts: []
@@ -101,7 +101,7 @@ tests:
               resource: cpus
             exp_annotations:
               summary: "Incus hosts are nearly out of room (cpus)"
-              description: "Less than 15% of the open Incus hosts' cpus is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
+              description: "Less than 15% of the open Incus hosts' cpus is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines. See docs/support/runbook-capacity.md#no-room-for-new-machines."
       - eval_time: 36m
         alertname: SuperBotNoOpenIncusHost
         exp_alerts: []
@@ -117,7 +117,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: "No Incus host is open for new machines"
-              description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each."
+              description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each. See docs/support/runbook-capacity.md#no-room-for-new-machines."
 
   # What hosts use: botd's own memory and disk, and an Incus host's load per CPU.
   - interval: 1m
@@ -170,7 +170,7 @@ tests:
               kind: server
             exp_annotations:
               summary: "Host botd is using over 90% of its memory"
-              description: "botd (server) has used over 90% of its memory for 15 minutes. On an Incus host, containers may be OOM-killed under load: lower INCUS_CAPACITY's memory or move machines off (ADR 0081). On botd's own host, check what else runs there."
+              description: "botd (server) has used over 90% of its memory for 15 minutes. On an Incus host, containers may be OOM-killed under load: lower INCUS_CAPACITY's memory or move machines off (ADR 0081). On botd's own host, check what else runs there. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
       - eval_time: 30m
         alertname: SuperBotHostDiskFilling
         exp_alerts:
@@ -183,7 +183,7 @@ tests:
               disk: data
             exp_annotations:
               summary: "Disk data on host botd is over 85% full"
-              description: "botd (server) has used over 85% of its data disk. On an Incus host, snapshots and a restore in place's second copy count here but not in INCUS_CAPACITY; on botd's own host, DATA_DIR holds the database and backups. Free space or grow the disk."
+              description: "botd (server) has used over 85% of its data disk. On an Incus host, snapshots and a restore in place's second copy count here but not in INCUS_CAPACITY; on botd's own host, DATA_DIR holds the database and backups. Free space or grow the disk. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
       - eval_time: 30m
         alertname: SuperBotHostDiskFull
         exp_alerts:
@@ -196,7 +196,7 @@ tests:
               disk: data
             exp_annotations:
               summary: "Disk data on host botd is nearly full"
-              description: "botd (server) has used over 95% of its data disk. Writes will soon fail: machines' disks on an Incus pool, or botd's database and backups in DATA_DIR. Free space now."
+              description: "botd (server) has used over 95% of its data disk. Writes will soon fail: machines' disks on an Incus pool, or botd's database and backups in DATA_DIR. Free space now. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
       - eval_time: 30m
         alertname: SuperBotHostCPUSaturated
         exp_alerts: []
@@ -211,7 +211,7 @@ tests:
               kind: incus
             exp_annotations:
               summary: "Host a is overloaded"
-              description: "a (incus) has had a 5-minute load average over 1.5 per CPU for 30 minutes, so Bots' runs there are slow. On an Incus host, lower INCUS_CAPACITY's CPUs (they may be overcommitted, ADR 0081) or move machines off."
+              description: "a (incus) has had a 5-minute load average over 1.5 per CPU for 30 minutes, so Bots' runs there are slow. On an Incus host, lower INCUS_CAPACITY's CPUs (they may be overcommitted, ADR 0081) or move machines off. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
 
   # An Incus host that answers but stops saying what it uses, or never has; not one that
   # is down (its own alert says so), and never botd's own host.
@@ -246,7 +246,7 @@ tests:
               kind: incus
             exp_annotations:
               summary: "botd can't read what Incus host c uses"
-              description: "c answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
+              description: "c answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\"). See docs/support/runbook-capacity.md#a-hosts-readings-are-stale."
       - eval_time: 40m
         alertname: SuperBotIncusHostReadingStale
         exp_alerts:
@@ -258,7 +258,7 @@ tests:
               kind: incus
             exp_annotations:
               summary: "botd can't read what Incus host a uses"
-              description: "a answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
+              description: "a answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\"). See docs/support/runbook-capacity.md#a-hosts-readings-are-stale."
           - exp_labels:
               severity: ticket
               job: superbot
@@ -267,7 +267,7 @@ tests:
               kind: incus
             exp_annotations:
               summary: "botd can't read what Incus host c uses"
-              description: "c answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
+              description: "c answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\"). See docs/support/runbook-capacity.md#a-hosts-readings-are-stale."
 
   # Each botd's hosts are its own: one server with no open host, or nearly out of room,
   # alerts even while another in the same job has plenty.
@@ -305,7 +305,7 @@ tests:
               instance: one:9464
             exp_annotations:
               summary: "No Incus host is open for new machines"
-              description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each."
+              description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each. See docs/support/runbook-capacity.md#no-room-for-new-machines."
       - eval_time: 10m
         alertname: SuperBotMachinesWaitingForRoom
         exp_alerts:
@@ -315,7 +315,7 @@ tests:
               instance: two:9464
             exp_annotations:
               summary: "Machines are waiting for room on an Incus host"
-              description: "1 machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load."
+              description: "1 machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load. See docs/support/runbook-capacity.md#no-room-for-new-machines."
       - eval_time: 20m
         alertname: SuperBotIncusCapacityLow
         exp_alerts:
@@ -326,7 +326,7 @@ tests:
               resource: cpus
             exp_annotations:
               summary: "Incus hosts are nearly out of room (cpus)"
-              description: "Less than 15% of the open Incus hosts' cpus is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
+              description: "Less than 15% of the open Incus hosts' cpus is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines. See docs/support/runbook-capacity.md#no-room-for-new-machines."
 
   # A machine left on another team's dedicated host (ADR 0166) opens a ticket after 15
   # minutes, and closes once it is moved.
@@ -347,7 +347,7 @@ tests:
               instance: botd:9464
             exp_annotations:
               summary: "Machines are on Incus hosts their team's dedication doesn't allow"
-              description: "2 machines are on a host dedicated to another team, or on a shared host while their team has hosts of its own, since their owner joined or left a team. botctl machine hosts lists them under misplaced; move each with botctl machine restore <user> <backup-id> --host <name> --yes."
+              description: "2 machines are on a host dedicated to another team, or on a shared host while their team has hosts of its own, since their owner joined or left a team. botctl machine hosts lists them under misplaced; move each with botctl machine restore <user> <backup-id> --host <name> --yes. See docs/support/runbook-capacity.md#machines-on-another-teams-host."
       - eval_time: 45m
         alertname: SuperBotMachinesOnAnotherTeamsHost
         exp_alerts: []

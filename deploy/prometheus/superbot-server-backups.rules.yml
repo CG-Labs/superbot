@@ -22,7 +22,7 @@ groups:
           severity: ticket
         annotations:
           summary: Server backups stay on the host
-          description: "botd isn't copying its backups off this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET with its endpoint and keys (deploy/install.sh --backup-s3-bucket, or .env) and restart botd. See docs/ops/backup-restore.md."
+          description: "botd isn't copying its backups off this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET with its endpoint and keys (deploy/install.sh --backup-s3-bucket, or .env) and restart botd. See docs/support/runbook-backups.md#server-backups."
 
       # The newest archive off the host is older than SERVER_BACKUP_RPO_HOURS.
       - alert: SuperBotServerBackupPastRPO
@@ -31,7 +31,7 @@ groups:
           severity: page
         annotations:
           summary: Server backups are past their RPO
-          description: "The newest server backup copied off the host is older than its RPO. botctl backups shows the last copy and its error; if no newer archive is in BACKUP_DIR, check superbot-backup's timer (systemctl status superbot-backup.timer) or the Compose backup sidecar."
+          description: "The newest server backup copied off the host is older than its RPO. botctl backups shows the last copy and its error; if no newer archive is in BACKUP_DIR, check superbot-backup's timer (systemctl status superbot-backup.timer) or the Compose backup sidecar. See docs/support/runbook-backups.md#server-backups."
 
       # Copies keep failing: each is retried every 30 minutes.
       - alert: SuperBotServerBackupCopyFailing
@@ -40,4 +40,4 @@ groups:
           severity: ticket
         annotations:
           summary: Copying server backups off the host keeps failing
-          description: "botd failed to copy a server backup to its store at least twice in two hours. The audit log (server.backup_copy_failed) and botctl backups have the error: usually the store's keys, bucket or network."
+          description: "botd failed to copy a server backup to its store at least twice in two hours. The audit log (server.backup_copy_failed) and botctl backups have the error: usually the store's keys, bucket or network. See docs/support/runbook-backups.md#server-backups."
