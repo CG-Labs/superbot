@@ -22,7 +22,7 @@ groups:
           severity: page
         annotations:
           summary: A sign-in worked right after a burst of failed ones
-          description: "botd saw a sign-in succeed from an IP or to an account that had just reached its failure limit (SIGNIN_ALERT_IP_FAILURES, SIGNIN_ALERT_ACCOUNT_FAILURES). Find it in the audit log (auth.suspicious_sign_in, pattern success_after_failures) and, if it wasn't them, end the person's sessions and disable them."
+          description: "botd saw a sign-in succeed from an IP or to an account that had just reached its failure limit (SIGNIN_ALERT_IP_FAILURES, SIGNIN_ALERT_ACCOUNT_FAILURES). Find it in the audit log (auth.suspicious_sign_in, pattern success_after_failures) and, if it wasn't them, end the person's sessions and disable them. See docs/support/runbook-sign-in.md#suspicious-sign-ins."
 
       # Many wrong guesses at one account from any IP: the break-glass password, or a second
       # factor after someone already had the first.
@@ -32,7 +32,7 @@ groups:
           severity: ticket
         annotations:
           summary: One account is getting many failed sign-ins
-          description: "An account reached SIGNIN_ALERT_ACCOUNT_FAILURES failed sign-ins within SIGNIN_ALERT_WINDOW. For a second factor, the person's password or sign-in code may be known to someone else. The audit log (auth.suspicious_sign_in, pattern account_failures) names the account."
+          description: "An account reached SIGNIN_ALERT_ACCOUNT_FAILURES failed sign-ins within SIGNIN_ALERT_WINDOW. For a second factor, the person's password or sign-in code may be known to someone else. The audit log (auth.suspicious_sign_in, pattern account_failures) names the account. See docs/support/runbook-sign-in.md#suspicious-sign-ins."
 
       # One burst from one IP is routine on the internet. Several in an hour mean someone
       # keeps coming back after the sign-in limiter's pauses.
@@ -42,7 +42,7 @@ groups:
           severity: ticket
         annotations:
           summary: Repeated bursts of failed sign-ins
-          description: "Three or more bursts of failed sign-ins from single IPs in the last hour, each past SIGNIN_ALERT_IP_FAILURES. The audit log (auth.suspicious_sign_in, pattern ip_failures) has the IPs; block them at the proxy or firewall if they persist."
+          description: "Three or more bursts of failed sign-ins from single IPs in the last hour, each past SIGNIN_ALERT_IP_FAILURES. The audit log (auth.suspicious_sign_in, pattern ip_failures) has the IPs; block them at the proxy or firewall if they persist. See docs/support/runbook-sign-in.md#suspicious-sign-ins."
 
       # Guessing spread over many IPs stays under each IP's limit; the total doesn't.
       - alert: SuperBotSignInFailuresHigh
@@ -52,7 +52,7 @@ groups:
           severity: ticket
         annotations:
           summary: Many failed sign-ins across the server
-          description: "More than 100 failed sign-ins (passwords, sign-in codes, second factors) in 15 minutes. Check superbot_signin_failures_total by method and the audit log's auth.login_failed events for where they come from."
+          description: "More than 100 failed sign-ins (passwords, sign-in codes, second factors) in 15 minutes. Check superbot_signin_failures_total by method and the audit log's auth.login_failed events for where they come from. See docs/support/runbook-sign-in.md#suspicious-sign-ins."
 
       - alert: SuperBotSignInFromNewNetwork
         expr: sum by (job) (increase(superbot_signin_suspicious_total{job="superbot",pattern="new_ip"}[15m])) > 0
@@ -60,4 +60,4 @@ groups:
           severity: ticket
         annotations:
           summary: An admin signed in from a new network
-          description: "Someone covered by SIGNIN_ALERT_NEW_IP (admins by default) signed in from a network none of their kept sessions came from. Confirm it was them: the audit log (auth.suspicious_sign_in, pattern new_ip) has the account and IP."
+          description: "Someone covered by SIGNIN_ALERT_NEW_IP (admins by default) signed in from a network none of their kept sessions came from. Confirm it was them: the audit log (auth.suspicious_sign_in, pattern new_ip) has the account and IP. See docs/support/runbook-sign-in.md#suspicious-sign-ins."

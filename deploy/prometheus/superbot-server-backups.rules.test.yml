@@ -25,7 +25,7 @@ tests:
               instance: a:8080
             exp_annotations:
               summary: Server backups stay on the host
-              description: "botd isn't copying its backups off this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET with its endpoint and keys (deploy/install.sh --backup-s3-bucket, or .env) and restart botd. See docs/ops/backup-restore.md."
+              description: "botd isn't copying its backups off this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET with its endpoint and keys (deploy/install.sh --backup-s3-bucket, or .env) and restart botd. See docs/support/runbook-backups.md#server-backups."
       - eval_time: 70m
         alertname: SuperBotServerBackupPastRPO
         exp_alerts: []
@@ -50,7 +50,7 @@ tests:
               instance: b:8080
             exp_annotations:
               summary: Server backups stay on the host
-              description: "botd isn't copying its backups off this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET with its endpoint and keys (deploy/install.sh --backup-s3-bucket, or .env) and restart botd. See docs/ops/backup-restore.md."
+              description: "botd isn't copying its backups off this host, so losing the host loses them. Set SERVER_BACKUP_S3_BUCKET with its endpoint and keys (deploy/install.sh --backup-s3-bucket, or .env) and restart botd. See docs/support/runbook-backups.md#server-backups."
 
   # Copying: past the RPO pages at once and stops when a copy lands.
   - interval: 1m
@@ -74,7 +74,7 @@ tests:
               instance: a:8080
             exp_annotations:
               summary: Server backups are past their RPO
-              description: "The newest server backup copied off the host is older than its RPO. botctl backups shows the last copy and its error; if no newer archive is in BACKUP_DIR, check superbot-backup's timer (systemctl status superbot-backup.timer) or the Compose backup sidecar."
+              description: "The newest server backup copied off the host is older than its RPO. botctl backups shows the last copy and its error; if no newer archive is in BACKUP_DIR, check superbot-backup's timer (systemctl status superbot-backup.timer) or the Compose backup sidecar. See docs/support/runbook-backups.md#server-backups."
       - eval_time: 40m
         alertname: SuperBotServerBackupsOnHost
         exp_alerts: []
@@ -104,7 +104,7 @@ tests:
               instance: a:8080
             exp_annotations:
               summary: Copying server backups off the host keeps failing
-              description: "botd failed to copy a server backup to its store at least twice in two hours. The audit log (server.backup_copy_failed) and botctl backups have the error: usually the store's keys, bucket or network."
+              description: "botd failed to copy a server backup to its store at least twice in two hours. The audit log (server.backup_copy_failed) and botctl backups have the error: usually the store's keys, bucket or network. See docs/support/runbook-backups.md#server-backups."
       - eval_time: 240m
         alertname: SuperBotServerBackupCopyFailing
         exp_alerts: []

@@ -24,7 +24,7 @@ groups:
           severity: ticket
         annotations:
           summary: "The database isn't encrypted"
-          description: "botd's database on {{ $labels.instance }} is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/ops/database-encryption.md."
+          description: "botd's database on {{ $labels.instance }} is plain, so anyone who gets app.sqlite, a disk image or a copy of DATA_DIR can read every chat in it. Set SUPERBOT_DATABASE_ENCRYPTION=required and restart (deploy/install.sh --database-encryption required); botd encrypts it and keeps a plain copy until you delete it. Or set it to off to keep it plain by choice. botctl database shows the state. See docs/support/runbook-encryption.md#the-database-isnt-encrypted."
       # Encrypting left a plain copy beside the database for a day.
       - alert: SuperBotDatabasePlainCopyLeft
         expr: max by (job, instance) (superbot_database_plain_copies{job="superbot"}) > 0
@@ -33,4 +33,4 @@ groups:
           severity: ticket
         annotations:
           summary: "A plain copy of the database is still in DATA_DIR"
-          description: "botd encrypted the database on {{ $labels.instance }} and kept a plain copy of it, which holds every chat unencrypted. Once SuperBot runs well, delete it (botctl database names it). See docs/ops/database-encryption.md#the-plain-copy."
+          description: "botd encrypted the database on {{ $labels.instance }} and kept a plain copy of it, which holds every chat unencrypted. Once SuperBot runs well, delete it (botctl database names it). See docs/support/runbook-encryption.md#a-plain-copy-is-left."
