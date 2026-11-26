@@ -1467,8 +1467,13 @@ out=$(lcheck old renewed LICENSE_FILE="$T/lkey") || fail "a renewal the bundle t
 grep -Fq "License: 0.2.0 would run Bots with the key in --license-file" <<<"$out" || fail "the renewal given wasn't judged: $out"
 [[ $(cat "$T/lbundle/bin/judged") == renewed && $(cat "$T/lbundle/bin/args") == "--key-file - --home $LH" ]] \
   || fail "the bundle's botd didn't judge the key in --license-file: $(cat "$T/lbundle/bin/args" "$T/lbundle/bin/judged")"
+printf 'rene\n  wed\n' >"$T/lwrapped"
+out=$(lcheck old renewed LICENSE_FILE="$T/lwrapped") || fail "a key wrapped across lines stopped the upgrade: $out"
+[[ $(cat "$T/lbundle/bin/judged") == renewed ]] || fail "a wrapped key wasn't judged as it is installed: $(cat "$T/lbundle/bin/judged")"
 if out=$(lcheck old old LICENSE_FILE="$T/lkey"); then fail "an upgrade went on with a --license-file its botd doesn't take: $out"; fi
 grep -Fq "0.2.0 wouldn't run Bots with the key in --license-file" <<<"$out" || fail "a --license-file the bundle refuses wasn't said: $out"
+out=$(lcheck old "" TESTING_MODE_ON=true) || fail "--testing-mode stopped on the license: $out"
+grep -Fq "License: --testing-mode sets TESTING_MODE=on, so 0.2.0 runs Bots with or without a license" <<<"$out" || fail "--testing-mode wasn't said: $out"
 mv "$T/lnow/botd" "$T/lnow/botd.away"
 out=$(lcheck old "") || fail "an upgrade from a release that can't check licenses stopped: $out"
 grep -Fq "The running release can't say whether Bots run now" <<<"$out" || fail "an older running release wasn't said: $out"
@@ -1522,6 +1527,18 @@ done
 cmp -s "$RB/bundle/bin/env" "$RH/superbot/.env" || fail "the older botd didn't read the .env from before the upgrade"
 [[ ! -e $(cat "$RB/bundle/bin/copy") ]] || fail "the license check left botd's user's copy of the .env behind"
 
+lrb_host "" renewed
+rm -f "$RB/systemctl"
+if out=$(lrollback "write_license_key() { return 1; }; "); then fail "a rollback went on though it couldn't keep the renewal: $out"; fi
+for want in "Couldn't put the license installed since the upgrade back as $RH/superbot/data/license.key. superbot is left stopped" \
+  "The key is kept in $RB/dir/license.key"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a renewal that couldn't be kept didn't say $want: $out"
+done
+[[ $(cat "$RB/dir/license.key") == renewed && $(stat -c %a "$RB/dir/license.key") == 600 ]] || fail "the renewal wasn't kept root-only"
+[[ $(cat "$RH"/superbot/data/.pre-restore-*/license.key) == renewed ]] || fail "the renewal isn't in the restore's copy of the data"
+! grep -q "systemctl start" "$RB/systemctl" || fail "superbot was started without the renewal"
+rm -rf "$RB/dir"
+
 lrb_host "" old
 out=$(lrollback) || fail "a rollback whose older release takes only the license from before failed: $out"
 for want in "The license installed since the upgrade to 0.2.0 isn't one $VERSION takes" \
@@ -1551,7 +1568,7 @@ if command -v age-keygen >/dev/null 2>&1; then
 fi
 rm -f "$RB/bin/botd" "$RB/bin/accepts" "$RB/bin/args" "$RB/bin/pwd" "$RB/bin/judged" "$RB/bin/env" "$RB/bin/copy"
 cp "$T/bin/botd" "$RB/bundle/bin/botd"
-ok "a rollback keeps a renewal the older release takes, else judges the backup's license, and stops when Bots run now but wouldn't after"
+ok "a rollback keeps a renewal the older release takes (leaving botd stopped if it can't write it), else judges the backup's license, and stops when Bots run now but wouldn't after"
 
 # A dry run of the whole offline install, as main runs it, without root. With unprivileged
 # namespaces, it runs with no network at all.

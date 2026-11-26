@@ -1842,9 +1842,9 @@ botd_checks_license() { [[ -x "$1" ]] && grep -qaF "Usage: botd license check" "
 
 # BOTD's `botd license check` as botd's user, over the server's .env, or over ENV_FILE (root's,
 # handed over as a copy botd's user owns, read in the folder the unit runs botd in). KEY, a file
-# root reads, is judged as DATA_DIR/license.key; an empty one judges none. Prints what it said,
-# and returns its status: 0 Bots would run, 1 they wouldn't, else it didn't run.
-# shellcheck disable=SC2024 # root reads KEY and hands it over on stdin, on purpose
+# root reads, is judged as DATA_DIR/license.key, whitespace dropped as write_license_key installs
+# it; an empty one judges none. Prints what it said, and returns its status: 0 Bots would run,
+# 1 they wouldn't, else it didn't run.
 license_verdict() {
   local botd=$1 key=${2:-} env_file=${3:-} home copy rc=0
   local -a args=(license check)
@@ -1852,10 +1852,10 @@ license_verdict() {
   [[ -z "$key" ]] || args+=(--key-file -)
   if [[ -n "$env_file" ]]; then
     copy=$(cat -- "$env_file" | (cd / && sudo -u "$SUPERBOT_USER" sh -c 'f=$(mktemp) && cat >"$f" && echo "$f"')) || return 3
-    (cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$botd" "${args[@]}" --env-file "$copy" <"${key:-/dev/null}") 2>&1 || rc=$?
+    tr -d '[:space:]' <"${key:-/dev/null}" | (cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$botd" "${args[@]}" --env-file "$copy") 2>&1 || rc=$?
     rm -f -- "$copy"
   else
-    (cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$botd" "${args[@]}" --home "$home" <"${key:-/dev/null}") 2>&1 || rc=$?
+    tr -d '[:space:]' <"${key:-/dev/null}" | (cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$botd" "${args[@]}" --home "$home") 2>&1 || rc=$?
   fi
   return "$rc"
 }
@@ -1911,11 +1911,15 @@ offline_license_check() {
   if ! id "$SUPERBOT_USER" &>/dev/null || [[ ! -f "$home/superbot/.env" ]]; then
     # A new server: Bots don't run yet, so a key the bundle's botd doesn't take is only said.
     [[ -n "$LICENSE_FILE" ]] && botd_checks_license "$botd" || return 0
-    out=$(cd / && env -i PATH=/usr/bin:/bin "$botd" license check --key-file - <"$LICENSE_FILE" 2>&1) || true
+    out=$(tr -d '[:space:]' <"$LICENSE_FILE" | (cd / && env -i PATH=/usr/bin:/bin "$botd" license check --key-file -) 2>&1) || true
     case $(license_mode "$out") in
       active | grace) log "License: $OFFLINE_VERSION takes the key in --license-file: $(license_detail "$out")" ;;
       *) warn "The key in --license-file isn't a license $OFFLINE_VERSION takes: $(license_detail "$out") Install one it takes before Bots can run (botctl license install, $doc)" ;;
     esac
+    return 0
+  fi
+  if [[ "$TESTING_MODE_ON" == true ]]; then
+    log "License: --testing-mode sets TESTING_MODE=on, so $OFFLINE_VERSION runs Bots with or without a license (test servers only)"
     return 0
   fi
   if ! botd_checks_license "$botd"; then
@@ -2881,11 +2885,12 @@ rollback_restore() {
   rm -f -- "$record" "$archive" "$env"
   log "Put back DATA_DIR and .env from before the upgrade to $OFFLINE_INSTALLED"
   if [[ -n "$ROLLBACK_LICENSE" ]]; then
-    if write_license_key "$ROLLBACK_LICENSE" "$data_dir/license.key"; then
-      log "Kept the license installed since the upgrade as $data_dir/license.key"
-    else
-      warn "Couldn't put the license installed since the upgrade back as $data_dir/license.key: install it again (botctl license install)"
+    # The backup's license wasn't judged, so the older release must not start without this one.
+    if ! write_license_key "$ROLLBACK_LICENSE" "$data_dir/license.key"; then
+      install -m 0600 -- "$ROLLBACK_LICENSE" "$dir/license.key" || true
+      die "Couldn't put the license installed since the upgrade back as $data_dir/license.key. superbot is left stopped, on the data from before the upgrade. The key is kept in $dir/license.key (root's) and in $data_dir's newest .pre-restore-* folder: as $SUPERBOT_USER, copy it to $data_dir/license.key, then run the same command again (docs/ops/air-gapped.md#going-back)"
     fi
+    log "Kept the license installed since the upgrade as $data_dir/license.key"
   fi
   grep -F 'Previous data kept' <<<"$out" | sed 's/^superbot-restore: /    /' || true
   log "The .env $OFFLINE_INSTALLED ran with is kept as $kept"

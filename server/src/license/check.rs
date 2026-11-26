@@ -133,7 +133,7 @@ fn seats_used(s: &Settings, data_dir: &Path) -> Result<Option<u32>, String> {
         }
     };
     let c = database_encryption::open_read_only(&path, key.as_ref()).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Some(crate::db::Db::seats_used(&c)))
+    crate::db::Db::count_seats(&c).map(Some).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// What this botd's start would make of the license `s` sets, with `key` in place of
@@ -343,6 +343,12 @@ mod tests {
         let v = judge(&settings(&[("DATA_DIR", &dd)]), Some(&lic));
         assert!(v.usable() && v.text().contains("Seats: not counted (the database is encrypted, and no master key here opens it)"), "{}", v.text());
         let _ = std::fs::remove_file(key_file);
+
+        // A count that fails is not counted, rather than none in use.
+        let odd = data("lc-odd");
+        rusqlite::Connection::open(odd.join("app.sqlite")).unwrap().execute_batch("CREATE TABLE t (v TEXT)").unwrap();
+        let v = judge(&settings(&[("DATA_DIR", &odd.display().to_string())]), Some(&lic));
+        assert!(v.text().contains("Seats: not counted (") && v.text().contains("no such table: users"), "{}", v.text());
     }
 
     #[test]

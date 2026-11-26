@@ -34,19 +34,19 @@ It prints where the license comes from, its mode (`active`, `grace`, `expired`, 
 `install.sh --offline` runs `offline_license_check` once the bundle, machines' settings and the rollback's backup have been checked, before anything changes:
 
 - **Now:** the running release's botd judges the server's license, as botd's user with only `PATH` and `HOME`, as for `botd machines check`.
-- **After:** the bundle's botd judges the license the upgrade leaves: the server's own, or the key in `--license-file`, given on stdin so botd's user never reads root's file.
+- **After:** the bundle's botd judges the license the upgrade leaves: the server's own, or the key in `--license-file`, given on stdin so botd's user never reads root's file. A key is given with its whitespace dropped, as the installer installs it, so a key wrapped across lines is judged as it will be.
 - If Bots run now but wouldn't after, the upgrade stops, says why, and says that nothing has changed: re-run with `--license-file` naming a key the release takes, checked first with the bundle's `botd license check`. A dry run says it would stop, and goes on.
 - If Bots don't run now either, or the running release can't say, it warns and goes on. Stopping would only keep a server that runs no Bots on the old release.
 - Otherwise it logs what the new release makes of the license, and warns on each warning.
 
-A botd is run with `license check` only when its file holds `botd license check`'s usage text, since an older botd would take the unknown subcommand as a start. Without it, the check is skipped with a warning. A new install with `--license-file` says whether the bundle's botd takes the key, and goes on either way, since no Bots run yet.
+With `--testing-mode`, which writes `TESTING_MODE=on`, Bots run with or without a license, so the check only says so. A botd is run with `license check` only when its file holds `botd license check`'s usage text, since an older botd would take the unknown subcommand as a start. Without it, the check is skipped with a warning. A new install with `--license-file` says whether the bundle's botd takes the key, and goes on either way, since no Bots run yet.
 
 ### A rollback keeps a renewal
 
 On `--rollback`, the older release's botd judges the license over the `.env` it puts back, read from a copy botd's user owns in botd's working directory, as in ADR 0300. Which license that is:
 
 - the key in `--license-file`, when given, which the install then installs as usual;
-- else the license installed now, when it differs from the backup's and the older release takes it. It is read as botd's user, since DATA_DIR is theirs, and kept by root in a 0700 folder. Once the backup is restored, it is written back as `DATA_DIR/license.key`, as botd's user, 0600, so a renewal installed since the upgrade outlives the rollback;
+- else the license installed now, when it differs from the backup's and the older release takes it. It is read as botd's user, since DATA_DIR is theirs, and kept by root in a 0700 folder. Once the backup is restored, it is written back as `DATA_DIR/license.key`, as botd's user, 0600, so a renewal installed since the upgrade outlives the rollback. The backup's license wasn't judged then, so if that write fails, the rollback stops with botd still stopped, and says where the key is: a root-only copy in the rollback folder, and the restore's `.pre-restore-*` copy of DATA_DIR;
 - else the backup's, which root reads from the archive, decrypting it with the backup key when it's encrypted.
 
 The same stop applies: if Bots run now but the older release wouldn't run them with that license, the rollback changes nothing and asks for `--license-file`.
@@ -65,13 +65,14 @@ The same stop applies: if Bots run now but the older release wouldn't run them w
 - The seats check reads botd's database read-only, while botd runs. A database it can't open is reported as seats not counted, not as a failure.
 - Release builds trust no key in CI, so the stop and the renewal kept on a rollback are tested with stand-in botds; the real command is tested in CI in testing mode.
 - Tested:
-  - `cargo test`: the server's license and a key given are judged as at start, `LICENSE_KEY` winning over the key; a key this botd doesn't trust, an ended license, the grace period, testing mode, a `TESTING_MODE` botd refuses and an empty key; seats in an encrypted database with the master key, and without it; the options and exit codes; and no connection from the new code.
+  - `cargo test`: the server's license and a key given are judged as at start, `LICENSE_KEY` winning over the key; a key this botd doesn't trust, an ended license, the grace period, testing mode, a `TESTING_MODE` botd refuses and an empty key; seats in an encrypted database with the master key, and without it, and a count that fails reported as not counted; the options and exit codes; and no connection from the new code.
   - `deploy/test-offline.sh`, with stand-in botds:
     - an upgrade runs both botds as botd's user with no environment and stops, changing nothing, when Bots run now but wouldn't after;
     - a dry run, a license neither release takes, a running release or a bundle's botd from before the check, and an online install go on;
     - `--license-file` is judged on stdin in the license's place;
     - a new install's `--license-file` is judged, and goes on either way;
-    - a rollback keeps a renewal the older release takes, 0600, else judges and puts back the backup's license (plain and encrypted), judges with the old `.env` from a copy botd's user owns and removes, stops when Bots run now but wouldn't after, and installs `--license-file` over the backup's.
+    - a key wrapped across lines is judged without its whitespace, and `--testing-mode` goes on;
+    - a rollback keeps a renewal the older release takes, 0600, stops with botd stopped and the key kept when it can't write it, else judges and puts back the backup's license (plain and encrypted), judges with the old `.env` from a copy botd's user owns and removes, stops when Bots run now but wouldn't after, and installs `--license-file` over the backup's.
   - `offline.yml`, with no network and an encrypted database: `botd license check` as botd's user counts seats with the master key, judges a key given as invalid without installing it, and with no testing mode and no license says Bots wouldn't run. The upgrade and the rollback each log what the bundle's botd makes of the license.
 - Not covered:
   - Docker Compose: its `.env` and volumes are the operator's. `botd license check --env-file` runs in the image the same way.
