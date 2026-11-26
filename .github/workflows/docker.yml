@@ -25,6 +25,7 @@ on:
       - 'deploy/superbot-userctl.sh'
       - 'deploy/install.sh'
       - 'deploy/hermes-share.sh'
+      - 'deploy/offline-bundle.sh'
       - 'server/**'
       - 'web/**'
       - 'site/**'
