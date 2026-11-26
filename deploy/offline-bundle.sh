@@ -18,6 +18,11 @@
 #   deploy/offline-bundle.sh check-compose [--image REF] [--key-file FILE] [-- COMPOSE_OPTION...]
 #                                  # whether botd from REF (else the image Compose would run) would start
 #                                  # with the stack's settings and run Bots with its license, before you switch
+#   deploy/offline-bundle.sh backup-compose [--dir DIR] [-- COMPOSE_OPTION...]
+#                                  # a rollback point before you switch: the running botd's backup, kept in DIR
+#                                  # (default ./superbot-rollback) with the image it was taken on
+#   deploy/offline-bundle.sh rollback-compose [--dir DIR] [--identity FILE] [-- COMPOSE_OPTION...]
+#                                  # once .env names that image again: restore the rollback point and start on it
 #   deploy/offline-bundle.sh load-hermes HERMES_BUNDLE [--sha256 HEX] [--image REF] [--env-file FILE] [--volume NAME]
 #                                  # Hermes Agent for Compose: the checked tree in a Docker volume,
 #                                  # for the pin of the image Compose runs, mounted by docker-compose.hermes.yml
@@ -40,7 +45,7 @@ HERMES_VOLUME_MARK=.superbot-hermes
 HERMES_VOLUME_NEW=""
 
 usage() {
-  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The first of SUPERBOT_OCI and CANDIDATES (then superbot-oci on PATH) that runs here: one
@@ -645,6 +650,7 @@ cmd_load() {
   elif compose_stack_here; then
     compose_upgrade_check "$ref"
     log "To switch the stack to it: SUPERBOT_VERSION=$OFFLINE_VERSION in .env (or SUPERBOT_IMAGE=$ref), then docker compose up -d"
+    compose_rollback_notice
   else
     log "Before you switch a Compose stack to $ref, check it from the stack's folder: $0 check-compose --image $ref (docs/ops/air-gapped.md#upgrading-with-compose)"
   fi
@@ -708,6 +714,62 @@ stack_botd_run() {
 # The last line in COMPOSE_ERR that isn't Compose's progress.
 compose_err() { grep -vE '^ *(Network|Volume|Container) ' "$COMPOSE_ERR" | tail -n 1 || true; }
 
+# Whether botd from IMAGE would start with the stack's settings: its own `botd settings check`
+# (ADR 0310), else `botd machines check`, run as Compose would start botd. A refusal dies naming
+# each refused setting, saying nothing has changed and AGAIN (what to run once .env is fixed).
+compose_settings_check() {
+  local image=$1 again=$2 doc=$3 what="" out rc refused
+  if image_botd_has "$image" "Usage: botd settings check"; then
+    what=settings
+  elif image_botd_has "$image" "Usage: botd machines check"; then
+    what=machines
+  else
+    warn "botd in $image can't check its settings (botd settings check), so they weren't checked"
+    return 0
+  fi
+  rc=0
+  out=$(stack_botd_run "$image" "$what" check </dev/null) || rc=$?
+  case $rc in
+    0) log "Settings: botd from $image would start with this stack's settings (botd $what check)" ;;
+    1)
+      refused=$(sed -n "s/^botd wouldn't start with these settings: //p" <<<"$out")
+      [[ -n "$refused" ]] || refused=$(tail -n 1 <<<"$out")
+      warn "botd from $image wouldn't start with this stack's settings: $(head -n 1 <<<"$refused")"
+      tail -n +2 <<<"$refused" | sed 's/^/    and: /' >&2
+      die "Nothing in the stack has changed: keep it on the image it runs. Change what botd names in .env (the running botd reads it again only when Compose recreates it), $again ($doc)"
+      ;;
+    *) die "botd $what check didn't finish in $image (status $rc), so the stack's settings weren't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)" ;;
+  esac
+}
+
+# Whether a newer release than IMAGE's botd has run on the stack's database. botd starts on a
+# database a newer botd migrated without refusing it, so this is asked of the image's own
+# `botd support check` (ADR 0187), read-only, as Compose would start botd
+# (docs/adr/0327-compose-upgrades-keep-a-way-back.md). Dies when one has.
+compose_downgrade_check() {
+  local image=$1 out rc line why doc="docs/ops/air-gapped.md#going-back-with-compose"
+  if ! image_botd_has "$image" "Usage: botd support check"; then
+    warn "botd in $image can't check the stack's database (botd support check), so whether a newer release ran on it wasn't checked"
+    return 0
+  fi
+  rc=0
+  out=$(stack_botd_run "$image" support check </dev/null) || rc=$?
+  ((rc <= 1)) \
+    || die "botd support check didn't finish in $image (status $rc), so the stack's database wasn't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)"
+  line=$(grep -E '^(ok|info|warn|fail) +database ' <<<"$out" | head -n 1) || true
+  if [[ -z "$line" ]]; then
+    warn "botd support check in $image said nothing of the stack's database, so whether a newer release ran on it wasn't checked: $(compose_err)"
+    return 0
+  fi
+  why=$(grep -oE 'made by a newer botd \([^)]*\)|botd [^ ;]+ ran on it last; this is [^ ;]+' <<<"$line" | head -n 1) || true
+  if [[ -z "$why" ]]; then
+    log "Database: no release newer than botd in $image has run on this stack's database (botd support check)"
+    return 0
+  fi
+  warn "botd from $image is older than the release that last ran on this stack's database: $why"
+  die "Nothing in the stack has changed: keep it on the image it runs. An older botd starts on a database a newer one changed, and may not work on it. To go back, restore the rollback point taken before the upgrade on that image: $0 rollback-compose, or a backup made on that release ($doc)"
+}
+
 # Whether botd from IMAGE (empty: the image Compose would run botd from now) would start with
 # the Compose stack's settings and run Bots with its license, before the stack is switched to it
 # (docs/adr/0317-compose-upgrades-checked-first.md). The image's own `botd settings check` and
@@ -715,7 +777,7 @@ compose_err() { grep -vE '^ *(Network|Volume|Container) ' "$COMPOSE_ERR" | tail 
 # says whether Bots run now. KEY, a file, is judged as the license in its place. Nothing in the
 # stack changes: it dies listing what to change, or returns.
 compose_upgrade_check() {
-  local image=${1:-} key=${2:-} configured what out rc refused now_rc=2 why lic doc="docs/ops/air-gapped.md#upgrading-with-compose"
+  local image=${1:-} key=${2:-} configured out rc now_rc=2 why lic doc="docs/ops/air-gapped.md#upgrading-with-compose"
   COMPOSE_ERR="$OFFLINE_TMP/compose.err"
   if [[ -n "$image" ]]; then
     [[ "$image" != -* && "$image" != *'$'* && "$image" != *[[:space:]]* ]] || die "--image \"$image\" isn't an image reference"
@@ -734,29 +796,8 @@ compose_upgrade_check() {
   docker image inspect "$image" >/dev/null 2>&1 \
     || die "No image $image here: load the release's images first ($0 load <bundle>), or docker pull it from your registry"
 
-  what=""
-  if image_botd_has "$image" "Usage: botd settings check"; then
-    what=settings
-  elif image_botd_has "$image" "Usage: botd machines check"; then
-    what=machines
-  else
-    warn "botd in $image can't check its settings (botd settings check), so they weren't checked"
-  fi
-  if [[ -n "$what" ]]; then
-    rc=0
-    out=$(stack_botd_run "$image" "$what" check </dev/null) || rc=$?
-    case $rc in
-      0) log "Settings: botd from $image would start with this stack's settings (botd $what check)" ;;
-      1)
-        refused=$(sed -n "s/^botd wouldn't start with these settings: //p" <<<"$out")
-        [[ -n "$refused" ]] || refused=$(tail -n 1 <<<"$out")
-        warn "botd from $image wouldn't start with this stack's settings: $(head -n 1 <<<"$refused")"
-        tail -n +2 <<<"$refused" | sed 's/^/    and: /' >&2
-        die "Nothing in the stack has changed: keep it on the image it runs. Change what botd names in .env (the running botd reads it again only when Compose recreates it), then check again: $0 check-compose --image $image ($doc)"
-        ;;
-      *) die "botd $what check didn't finish in $image (status $rc), so the stack's settings weren't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)" ;;
-    esac
-  fi
+  compose_downgrade_check "$image"
+  compose_settings_check "$image" "then check again: $0 check-compose --image $image" "$doc"
 
   if ! image_botd_has "$image" "Usage: botd license check"; then
     warn "botd in $image can't check licenses (botd license check), so the license wasn't checked"
@@ -819,6 +860,181 @@ cmd_check_compose() {
   else
     log "Compose would run botd from $COMPOSE_IMAGE, as .env says: docker compose up -d switches the stack to it"
   fi
+  compose_rollback_notice
+}
+
+# Before a switch: the way back, the rollback point backup-compose took on the image botd runs
+# now, else how to take one.
+compose_rollback_notice() {
+  local dir=$COMPOSE_ROLLBACK_DIR doc="docs/ops/air-gapped.md#going-back-with-compose" cid id
+  cid=$(stack ps -q botd 2>/dev/null | head -n 1) || true
+  id=$([[ -z "$cid" ]] || docker inspect -f '{{.Image}}' "$cid" 2>/dev/null) || true
+  if [[ -n "$id" && -f "$dir/record" && "$(record_value "$dir/record" image_id)" == "$id" ]]; then
+    log "Way back: the rollback point in $dir, taken $(record_value "$dir/record" taken) on the image botd runs now ($0 rollback-compose, $doc)"
+  else
+    log "For a way back, take a rollback point first, with botd on the release it runs now: $0 backup-compose ($doc)"
+  fi
+}
+
+# --- Compose upgrades keep a way back (docs/adr/0327-compose-upgrades-keep-a-way-back.md) -----
+
+# Where backup-compose keeps its one rollback point, from the folder Compose runs in.
+COMPOSE_ROLLBACK_DIR=superbot-rollback
+ROLLBACK_ARCHIVE_RE='^superbot-compose-[a-z0-9_-]+-[0-9]{8}-[0-9]{6}\.tar\.gz(\.age)?$'
+
+# NAME's value in a rollback record, read as text, never run.
+record_value() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
+
+compose_needs_docker() {
+  { command -v docker && docker compose version; } >/dev/null 2>&1 || die "$1 needs docker and its Compose plugin"
+  OFFLINE_TMP=$(mktemp -d)
+  trap cleanup_offline EXIT
+  COMPOSE_ERR="$OFFLINE_TMP/compose.err"
+}
+
+# DIR, made if missing: a folder of this user's that only they can open, not a link.
+rollback_dir() {
+  [[ -n "$1" && "$1" != -* ]] || die "--dir needs a folder"
+  (umask 077 && mkdir -p -- "$1") || die "Couldn't make $1"
+  [[ -d "$1" && ! -L "$1" && -O "$1" ]] || die "$1 isn't a folder of yours (or is a link): give --dir a folder only you own"
+  chmod 0700 -- "$1"
+}
+
+cmd_backup_compose() {
+  local dir=$COMPOSE_ROLLBACK_DIR cid image image_id project ext name old sha stamp part doc="docs/ops/air-gapped.md#going-back-with-compose"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir) dir=${2:-}; shift 2 ;;
+      --) shift; COMPOSE_OPTS=("$@"); break ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1 (Compose's own options go after --)" ;;
+    esac
+  done
+  compose_needs_docker backup-compose
+  cid=$(stack ps -q botd 2>"$COMPOSE_ERR") \
+    || die "docker compose can't read this stack: $(compose_err) (run this from the folder you run Compose from, or give Compose's options after --)"
+  cid=$(head -n 1 <<<"$cid")
+  [[ -n "$cid" ]] || die "botd isn't running in this Compose stack: start it on the release you are leaving (docker compose up -d), then take the rollback point ($doc)"
+  read -r image image_id project < <(docker inspect -f '{{.Config.Image}} {{.Image}} {{index .Config.Labels "com.docker.compose.project"}}' "$cid" 2>/dev/null) || true
+  [[ "${image_id:-}" =~ ^sha256:[0-9a-f]{64}$ && "${project:-}" =~ ^[a-z0-9][a-z0-9_-]*$ && -n "${image:-}" && "$image" != *'$'* ]] \
+    || die "Couldn't tell which image and Compose project botd's container $cid runs"
+  rollback_dir "$dir"
+  part="$dir/.partial"
+  rm -f -- "$part"
+  # The running release's own superbot-backup, as the backup service runs it: a consistent copy
+  # of the database, encrypted to the stack's backup recipients when it has them.
+  if ! (umask 077 && stack exec -T botd superbot-backup - </dev/null >"$part" 2>"$COMPOSE_ERR"); then
+    rm -f -- "$part"
+    die "superbot-backup failed in botd: $(compose_err). No rollback point was taken, and the last one is kept ($doc)"
+  fi
+  if [[ "$(head -c 21 "$part")" == age-encryption.org/v1 ]]; then
+    ext=.tar.gz.age
+  elif [[ "$(head -c 2 "$part" | od -An -tx1 | tr -d ' \n')" == 1f8b ]]; then
+    ext=.tar.gz
+  else
+    rm -f -- "$part"
+    die "superbot-backup in botd wrote no archive. No rollback point was taken, and the last one is kept ($doc)"
+  fi
+  stamp=$(date -u +%Y%m%d-%H%M%S)
+  name="superbot-compose-$project-$stamp$ext"
+  mv -- "$part" "$dir/$name"
+  sha=$(sha256sum <"$dir/$name" | awk '{ print $1 }')
+  old=""
+  [[ ! -f "$dir/record" ]] || old=$(record_value "$dir/record" archive)
+  (umask 077 && printf 'format=1\nproject=%s\nimage=%s\nimage_id=%s\ntaken=%s\narchive=%s\nsha256=%s\n' \
+    "$project" "$image" "$image_id" "$(date -u +%FT%TZ)" "$name" "$sha" >"$dir/.record.new") || die "Couldn't write $dir/.record.new"
+  mv -- "$dir/.record.new" "$dir/record"
+  [[ "$old" == "$name" || ! "$old" =~ $ROLLBACK_ARCHIVE_RE ]] || rm -f -- "${dir:?}/$old"
+  log "Rollback point: $dir/$name ($(du -h "$dir/$name" | cut -f1)), of botd on $image. One is kept: the next backup-compose replaces it."
+  [[ "$ext" == .tar.gz.age ]] || warn "It isn't encrypted (the stack has no SUPERBOT_BACKUP_AGE_RECIPIENTS): keep $dir private"
+  log "To go back to $image after you switch, losing everything since: set SUPERBOT_VERSION (or SUPERBOT_IMAGE=$image) in .env back, then $0 rollback-compose$([[ "$dir" == "$COMPOSE_ROLLBACK_DIR" ]] || printf ' --dir %s' "$dir")$([[ "$ext" != .tar.gz.age ]] || printf ' --identity <your backup key>') ($doc)"
+}
+
+# The number of .pre-restore-* folders superbot-restore has left in botd's DATA_DIR, from IMAGE:
+# one more after a failed restore means it had started swapping the data.
+pre_restores() {
+  # shellcheck disable=SC2016 # expanded in the container
+  SUPERBOT_IMAGE=$1 stack run --rm --no-deps -T --entrypoint sh botd -c 'ls -d "${DATA_DIR:-/data}"/.pre-restore-* 2>/dev/null | wc -l' </dev/null 2>"$COMPOSE_ERR"
+}
+
+cmd_rollback_compose() {
+  local dir=$COMPOSE_ROLLBACK_DIR identity="" rec format project image image_id taken archive sha cid now_project running configured have
+  local before after out rc newest doc="docs/ops/air-gapped.md#going-back-with-compose"
+  local -a mount=() rargs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir) dir=${2:-}; shift 2 ;;
+      --identity) identity=${2:-}; shift 2 ;;
+      --) shift; COMPOSE_OPTS=("$@"); break ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1 (Compose's own options go after --)" ;;
+    esac
+  done
+  rec="$dir/record"
+  [[ -f "$rec" ]] \
+    || die "No rollback point in $dir: backup-compose takes one before you switch. Without one, restore a backup made on the release you go back to (docs/ops/backup-restore.md)"
+  format=$(record_value "$rec" format) project=$(record_value "$rec" project) image=$(record_value "$rec" image)
+  image_id=$(record_value "$rec" image_id) taken=$(record_value "$rec" taken) archive=$(record_value "$rec" archive) sha=$(record_value "$rec" sha256)
+  [[ "$format" == 1 ]] || die "$rec isn't a rollback record this offline-bundle.sh reads (format ${format:-missing})"
+  [[ "$project" =~ ^[a-z0-9][a-z0-9_-]*$ && "$image_id" =~ ^sha256:[0-9a-f]{64}$ && "$sha" =~ ^[0-9a-f]{64}$ && -n "$taken" \
+    && -n "$image" && "$image" != -* && "$image" != *'$'* && "$image" != *[[:space:]]* && "$archive" =~ $ROLLBACK_ARCHIVE_RE ]] \
+    || die "$rec is damaged: it isn't a record backup-compose wrote"
+  [[ -f "$dir/$archive" ]] || die "The rollback point's archive $dir/$archive is gone"
+  [[ "$(sha256sum <"$dir/$archive" | awk '{ print $1 }')" == "$sha" ]] \
+    || die "$dir/$archive has changed since backup-compose took it (its SHA-256 isn't the record's), so it can't be trusted to go back with. Nothing has changed"
+  if [[ "$archive" == *.age ]]; then
+    [[ -n "$identity" ]] || die "The rollback point is encrypted: give your backup key with --identity <file> (the age identity, readable by the container's user, uid 10001). Nothing has changed"
+    [[ -f "$identity" && -r "$identity" ]] || die "Can't read the backup key in --identity $identity"
+    identity="$(cd "$(dirname -- "$identity")" && pwd)/$(basename -- "$identity")"
+    [[ "$identity" != *:* ]] || die "--identity $identity: docker can't mount a path with ':' in it; copy the key elsewhere. Nothing has changed"
+    mount=(-v "$identity:/run/superbot-age-identity:ro")
+    rargs=(--identity /run/superbot-age-identity)
+  fi
+  compose_needs_docker rollback-compose
+
+  cid=$(stack ps -a -q botd 2>"$COMPOSE_ERR") \
+    || die "docker compose can't read this stack: $(compose_err) (run this from the folder you run Compose from, or give Compose's options after --)"
+  cid=$(head -n 1 <<<"$cid")
+  [[ -n "$cid" ]] || die "This Compose stack has never run botd, so there is nothing to roll back"
+  read -r running now_project < <(docker inspect -f '{{.Config.Image}} {{index .Config.Labels "com.docker.compose.project"}}' "$cid" 2>/dev/null) || true
+  [[ "${now_project:-}" == "$project" ]] \
+    || die "The rollback point is of the Compose project $project, not this one (${now_project:-unknown}): run this from that stack's folder, or give its Compose options after --"
+  configured=$(stack config --images botd 2>"$COMPOSE_ERR") || die "docker compose can't read this stack: $(compose_err)"
+  configured=$(head -n 1 <<<"$configured")
+  [[ "$configured" == "$image" ]] \
+    || die "Compose would start botd from $configured, but the rollback point was taken on $image: set SUPERBOT_VERSION (or SUPERBOT_IMAGE=$image) in .env back to it first, so the data goes back to the release that made it. Nothing has changed ($doc)"
+  have=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) \
+    || die "No image $image here: load that release's images again ($0 load <its bundle>), or docker pull it from your registry. Nothing has changed"
+  [[ "$have" == "$image_id" ]] \
+    || die "$image here is another build ($have) than the rollback point was taken on ($image_id): load that release's bundle again. Nothing has changed"
+
+  compose_settings_check "$image" "then run this again" "$doc"
+  rc=0
+  out=$(SUPERBOT_IMAGE=$image stack run --rm --no-deps -T "${mount[@]}" botd superbot-restore "${rargs[@]}" --check - <"$dir/$archive" 2>"$COMPOSE_ERR") || rc=$?
+  [[ $rc -eq 0 ]] || die "superbot-restore in $image refused the rollback point: $(compose_err). Nothing has changed"
+  newest=$(sed -n 's/^newest audit: *//p' <<<"$out" | head -n 1)
+  log "Rollback point: $archive, taken $taken on $image (its newest audit event: ${newest:-unknown}); superbot-restore --check passed"
+  before=$(pre_restores "$image") || die "Couldn't look in botd's data volume: $(compose_err). Nothing has changed"
+
+  warn "Going back to $image: everything saved in this stack since $taken is lost"
+  stack stop >/dev/null 2>"$COMPOSE_ERR" || { stack start >/dev/null 2>&1 || true; die "docker compose stop failed: $(compose_err). Nothing has changed"; }
+  rc=0
+  SUPERBOT_IMAGE=$image stack run --rm --no-deps -T "${mount[@]}" botd superbot-restore "${rargs[@]}" - <"$dir/$archive" >/dev/null 2>"$COMPOSE_ERR" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    local why
+    why=$(compose_err)
+    after=$(pre_restores "$image") || after=""
+    if [[ "$after" == "$before" ]]; then
+      stack start >/dev/null 2>"$COMPOSE_ERR" || die "The restore failed before it changed botd's data ($why), and the stack didn't start again: $(compose_err). Start it with docker compose start"
+      die "The restore failed before it changed botd's data: $why. The stack runs again as it was, on $running. The rollback point is kept"
+    fi
+    die "The restore failed while it swapped botd's data in: $why. The stack stays stopped: the data from before is in the newest .pre-restore-* folder in botd's data volume. Run this again, or move that folder's contents back (docker compose run --rm --no-deps --entrypoint sh botd) and docker compose start ($doc)"
+  fi
+  rm -f -- "$rec" "${dir:?}/$archive"
+  log "Restored botd's data from $taken. Starting the stack on $image"
+  stack up -d --wait >/dev/null 2>"$COMPOSE_ERR" \
+    || die "The data is back as it was on $taken, but the stack didn't come up healthy on $image: $(compose_err). See docker compose ps and docker compose logs botd ($doc)"
+  log "The stack runs on $image again, with its data from $taken. What the restore replaced is in .pre-restore-* in botd's data volume: remove it once SuperBot looks right"
 }
 
 # --- Hermes Agent for Compose (docs/adr/0275-hermes-agent-bundle-for-docker-compose.md) -------
@@ -1164,8 +1380,10 @@ case "${1:-}" in
   verify) shift; cmd_verify "$@" ;;
   load) shift; cmd_load "$@" ;;
   check-compose) shift; cmd_check_compose "$@" ;;
+  backup-compose) shift; cmd_backup_compose "$@" ;;
+  rollback-compose) shift; cmd_rollback_compose "$@" ;;
   load-hermes) shift; cmd_load_hermes "$@" ;;
   push) shift; cmd_push "$@" ;;
   -h|--help|"") usage ;;
-  *) die "Unknown command: $1 (build, hermes, harnesses, verify, load, check-compose, load-hermes or push)" ;;
+  *) die "Unknown command: $1 (build, hermes, harnesses, verify, load, check-compose, backup-compose, rollback-compose, load-hermes or push)" ;;
 esac
