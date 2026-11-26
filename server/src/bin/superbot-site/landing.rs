@@ -80,7 +80,19 @@ fn plan_card(label: &str, kind: &str, lede: &str, items: &[String], price: &str,
     )
 }
 
-pub fn landing(plans: &[Plan], contact_url: &str, repo_url: &str) -> String {
+/// The block of the server's landing page (`site/index.html`) between
+/// `<!-- shared:{name}:start -->` and `<!-- shared:{name}:end -->`, with its `/site/` asset
+/// paths pointed at this site's `assets/`, so both landing pages say the same things.
+pub fn shared(index: &str, name: &str) -> Result<String, String> {
+    let (start, end) = (format!("<!-- shared:{name}:start -->\n"), format!("<!-- shared:{name}:end -->"));
+    let from = index.find(&start).ok_or(format!("site/index.html: no {start:?} marker"))? + start.len();
+    let to = index[from..].find(&end).ok_or(format!("site/index.html: no {end:?} marker"))? + from;
+    Ok(index[from..to].replace("\"/site/", "\"assets/"))
+}
+
+/// The public landing page. `index` is the server's landing page, whose product picture,
+/// value rows, feature grid and security strip it shares.
+pub fn landing(plans: &[Plan], index: &str, contact_url: &str, repo_url: &str) -> Result<String, String> {
     let contact = esc(contact_url);
     let sales = format!(r#"<a class="btn btn-ghost btn-small" href="{contact}">Contact sales</a>"#);
     let mut cards = plan_card(
@@ -119,119 +131,74 @@ pub fn landing(plans: &[Plan], contact_url: &str, repo_url: &str) -> String {
     ));
     let main = format!(
         r##"  <main id="main">
-    <section class="hero">
-      <div class="wrap hero-grid">
-        <div>
-          <p class="eyebrow">AI teammates with their own computer</p>
-          <h1>Your always-on AI team.</h1>
-          <p class="lede">SuperBot gives every person a team of AI agents that keep working when you don't. They work on their own always-on computer, so they can browse, write, run tools and finish real tasks, then hand back to you when they need a human.</p>
-          <div class="cta">
-            <a class="btn btn-primary" href="docs/index.html">Read the docs</a>
-            <a class="btn btn-ghost" href="#plans">See plans</a>
-          </div>
-          <p class="fine">Open source. Self-host it with a license, or let us run it for you.</p>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wrap">
+        <p class="eyebrow">AI teammates with their own computer</p>
+        <h1 id="hero-title">Your <span class="nowrap">always-on</span> AI team.</h1>
+        <p class="lede">Every person gets AI agents that work on their own always-on computer. They browse, write, run tools and finish real tasks, then hand back to you when they need a human.</p>
+        <div class="cta">
+          <a class="btn btn-primary" href="docs/install.html">Get started</a>
+          <a class="link-arrow" href="#plans">See plans</a>
         </div>
-        <div class="hero-art" aria-hidden="true">
-          <div class="window">
-            <div class="window-bar"><span></span><span></span><span></span></div>
-            <ul class="chat">
-              <li class="msg you">Every weekday at 8:00, brief me on our top accounts.</li>
-              <li class="msg bot"><img src="assets/mark.svg" alt="" width="22" height="22" /><span>Done. Routine "Morning brief" runs weekdays at 08:00. I'll post it here and flag anything that needs you.</span></li>
-              <li class="msg bot"><img src="assets/mark.svg" alt="" width="22" height="22" /><span>The vendor portal wants a sign-in. Can you take over my screen for a minute?</span></li>
-            </ul>
-          </div>
-        </div>
-      </div>
+        <p class="fine">Open source. Self-host it with a license, or let us run it for you.</p>
+{shot}      </div>
     </section>
 
-    <section id="features" class="band" aria-labelledby="features-title">
+{values}
+    <section id="plans" class="band" aria-labelledby="plans-title">
       <div class="wrap">
-        <h2 id="features-title">Built to do the work, not just talk about it</h2>
-        <ul class="features">
-          <li class="card">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
-            <h3>A real computer, always on</h3>
-            <p>Your agents work on an always-on server with real apps and a real browser. Each one gets its own screen, and you can watch or take over at any time.</p>
-          </li>
-          <li class="card">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="3" /><circle cx="17" cy="10" r="2.5" /><path d="M3 19c0-3 2.5-5 5-5s5 2 5 5M14 19c0-2.2 1.4-3.8 3-3.8s3 1.6 3 3.8" /></svg>
-            <h3>Personal and team bots</h3>
-            <p>Keep private bots for your own work, and share team bots so everyone builds on the same knowledge. You choose who can see and run each one.</p>
-          </li>
-          <li class="card">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></svg>
-            <h3>Routines that run themselves</h3>
-            <p>Schedule briefings, reports, checks and follow-ups in plain words. Results land in your chat, and bots can ask each other for help.</p>
-          </li>
-          <li class="card">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z" /><path d="M9 12l2 2 4-4" /></svg>
-            <h3>You stay in control</h3>
-            <p>Risky actions wait for your approval. Every action is recorded in an audit log, and secrets are encrypted at rest.</p>
-          </li>
-        </ul>
-      </div>
-    </section>
-
-    <section id="plans" aria-labelledby="plans-title">
-      <div class="wrap">
-        <h2 id="plans-title">Plans</h2>
-        <p class="lede">Run SuperBot yourself with a license, or have it managed for you on a plan per person. Every deployment is on a paid plan; there is no free tier.</p>
+        <div class="section-head">
+          <h2 id="plans-title">Plans</h2>
+          <p class="lede">Run SuperBot yourself with a license, or have it managed for you on a plan per person. Every deployment is on a paid plan; there is no free tier.</p>
+        </div>
         <ul class="plans">
 {cards}        </ul>
-        <p class="fine">Managed plan limits are those of the plans SuperBot ships with (<a href="{repo}/blob/main/deploy/tiers.example.json">tiers file</a>). Prices are not published yet. Uptime targets are in the <a href="docs/slo.html">SLO</a>.</p>
-      </div>
-    </section>
-
-    <section id="security" class="band" aria-labelledby="security-title">
-      <div class="wrap security">
-        <div>
-          <h2 id="security-title">Enterprise sign-in from day one</h2>
-          <p>Sign in with Microsoft Entra ID, Google, GitHub, Apple, any OpenID Connect provider, or SAML 2.0 through a broker. Roles, approvals and a full audit trail keep your admins in charge. Buyers can read the <a href="docs/security/index.html">security pack</a>.</p>
-        </div>
-        <ul class="badges" aria-label="Supported sign-in providers">
-          <li>Microsoft Entra ID</li>
-          <li>Google</li>
-          <li>GitHub</li>
-          <li>Apple</li>
-          <li>OpenID Connect</li>
-          <li>SAML 2.0</li>
-        </ul>
+        <p class="fine plans-note">Managed plan limits are those of the plans SuperBot ships with (<a href="{repo}/blob/main/deploy/tiers.example.json">tiers file</a>). Prices are not published yet. Uptime targets are in the <a href="docs/slo.html">SLO</a>.</p>
       </div>
     </section>
 
     <section id="docs" aria-labelledby="docs-title">
       <div class="wrap">
-        <h2 id="docs-title">Documentation</h2>
-        <ul class="features">
+        <div class="section-head">
+          <h2 id="docs-title">Documentation</h2>
+          <p class="lede">Install it, connect your sign-in, run it and review it.</p>
+        </div>
+        <ul class="grid">
           <li class="card"><h3><a href="docs/install.html">Install</a></h3><p>Set up a server with the installer or Docker Compose.</p></li>
+          <li class="card"><h3><a href="docs/install.html#air-gapped-no-internet">Air-gapped installs</a></h3><p>Install and upgrade from an offline bundle, with nothing downloaded.</p></li>
           <li class="card"><h3><a href="docs/index.html#single-sign-on">Single sign-on</a></h3><p>Entra ID, Google, GitHub, Apple, OIDC, SAML and SCIM.</p></li>
+          <li class="card"><h3><a href="docs/security/index.html">Security pack</a></h3><p>Policies, controls and evidence for your security review.</p></li>
           <li class="card"><h3><a href="docs/index.html#operations">Operations</a></h3><p>Backups and restores, key rotation and machines.</p></li>
           <li class="card"><h3><a href="docs/index.html#decisions">Decisions</a></h3><p>Every design decision, as an ADR.</p></li>
         </ul>
       </div>
     </section>
 
-    <section class="closing band" aria-labelledby="closing-title">
+    <section class="closing" aria-labelledby="closing-title">
       <div class="wrap">
-        <h2 id="closing-title">Put an AI team to work</h2>
-        <p>Talk to us about a license, a managed plan or Enterprise.</p>
-        <a class="btn btn-primary" href="{contact}">Contact sales</a>
+        <div class="closing-card">
+          <h2 id="closing-title">Put an AI team to work</h2>
+          <p>Talk to us about a license, a managed plan or Enterprise.</p>
+          <div class="cta"><a class="btn btn-primary" href="{contact}">Contact sales</a></div>
+        </div>
       </div>
     </section>
   </main>
 "##,
+        shot = shared(index, "shot")?,
+        values = shared(index, "values")?,
         repo = esc(repo_url),
     );
-    page(
+    Ok(page(
         &Shell {
             out: "index.html",
             title: "SuperBot · Your always-on AI team",
-            description: "SuperBot gives every person on your team always-on AI agents that work on a real computer. Self-host it with a license, or choose a managed plan per person.",
+            description: "SuperBot gives every person on your team always-on AI agents that work on their own computer. Self-host it with a license, even air-gapped, or choose a managed plan per person.",
             repo_url,
             docs: false,
         },
         &main,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -262,7 +229,8 @@ mod tests {
         let plans = plans(&shipped).unwrap();
         let labels: Vec<&str> = plans.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(labels, ["Starter", "Pro", "Max"]);
-        let html = landing(&plans, "https://example.com/contact", "https://github.com/o/r");
+        let index = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../site/index.html")).unwrap();
+        let html = landing(&plans, &index, "https://example.com/contact", "https://github.com/o/r").unwrap();
         for label in ["Self-host", "Starter", "Pro", "Max", "Enterprise", "Contact sales", "Pricing to be published", "3 Bots"] {
             assert!(html.contains(label), "{label}");
         }
@@ -270,5 +238,17 @@ mod tests {
             assert!(!html.contains(price), "{price}");
         }
         assert!(html.contains(r#"href="https://example.com/contact""#));
+        for shared in ["An AI computer for every person", "Run it on your servers, even air-gapped", "Built to do the work", "Signed releases", r#"src="assets/mark.svg""#] {
+            assert!(html.contains(shared), "{shared}");
+        }
+        assert!(!html.contains("\"/site/"));
+    }
+
+    #[test]
+    fn shared_blocks_come_from_the_server_landing_page() {
+        let index = "a\n<!-- shared:x:start -->\n<img src=\"/site/mark.svg\" />\n<!-- shared:x:end -->\nb";
+        assert_eq!(shared(index, "x").unwrap(), "<img src=\"assets/mark.svg\" />\n");
+        assert!(shared(index, "y").unwrap_err().contains("no \"<!-- shared:y:start -->\\n\" marker"));
+        assert!(shared("<!-- shared:x:start -->\n", "x").unwrap_err().contains("shared:x:end"));
     }
 }

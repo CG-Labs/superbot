@@ -8,6 +8,7 @@ on:
       - "web/login.html"
       - "web/app.js"
       - "web/styles.css"
+      - "site/assets/site.css"
       - ".github/workflows/client.yml"
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - "web/login.html"
       - "web/app.js"
       - "web/styles.css"
+      - "site/assets/site.css"
       - ".github/workflows/client.yml"
 
 permissions:

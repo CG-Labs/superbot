@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { FlatList, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import {
   ACTORS,
@@ -23,6 +22,7 @@ import type { AuditEvent } from "../src/types";
 import { AuditChainPanel } from "./AuditChainPanel";
 import { AuditEventDetail } from "./AuditEventDetail";
 import { Chips } from "./Chips";
+import { DetailSheet, PaneTransition } from "./Shell";
 import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
 
 interface Props {
@@ -361,20 +361,15 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
         <View style={styles.body}>
           {list}
           <ScrollView style={styles.detailPane} contentContainerStyle={styles.detailBody}>
-            {detail ?? <Text style={styles.empty}>Pick an event to see all of it.</Text>}
+            <PaneTransition paneKey={selected ? String(selected.id) : ""}>{detail ?? <Text style={styles.empty}>Pick an event to see all of it.</Text>}</PaneTransition>
           </ScrollView>
         </View>
       ) : (
         <>
           {list}
-          <Modal visible={!!selected} animationType="slide" onRequestClose={() => setSelected(null)}>
-            <SafeAreaView style={styles.modalRoot}>
-              <Pressable style={styles.modalHeader} onPress={() => setSelected(null)} accessibilityRole="button" accessibilityLabel="Back to the audit log">
-                <Text style={styles.back}>‹ Audit log</Text>
-              </Pressable>
-              <ScrollView contentContainerStyle={styles.modalBody}>{detail}</ScrollView>
-            </SafeAreaView>
-          </Modal>
+          <DetailSheet visible={!!selected} onClose={() => setSelected(null)} backText="‹ Audit log" backLabel="Back to the audit log">
+            {detail}
+          </DetailSheet>
         </>
       )}
     </View>
@@ -385,7 +380,6 @@ const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
     root: k.root,
-    back: k.backText,
     headerActions: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
     btn: { ...k.btn, ...k.btnSmall },
     btnOn: { backgroundColor: t.c.selected },
@@ -408,9 +402,6 @@ const useStyles = themedStyles((t) => {
     spinner: { marginTop: t.space.xl },
     detailPane: { width: 440, flexGrow: 0, backgroundColor: t.c.surface, borderLeftWidth: hairline, borderLeftColor: t.c.border },
     detailBody: { padding: t.space.xl },
-    modalRoot: { flex: 1, backgroundColor: t.c.bg },
-    modalHeader: { ...k.header, minHeight: 0 },
-    modalBody: { padding: t.space.lg },
     // The rows together make one card: hairlines between them, the card's corners on the first and last.
     row: {
       paddingVertical: t.space.md,

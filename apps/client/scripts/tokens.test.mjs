@@ -9,8 +9,7 @@ import { css, hasTokens, targets, withTokens } from "./tokens.mjs";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tokens = JSON.parse(fs.readFileSync(path.join(root, "src/tokens.json"), "utf8"));
 
-test("the console's style sheet and the sign-in page's own styles both carry the block", () => {
-  assert.deepEqual(targets, ["styles.css", "login.html"]);
+test("the sign-in page's own styles carry the block", () => {
   const login = fs.readFileSync(path.resolve(root, "../../web/login.html"), "utf8");
   assert.ok(hasTokens(login));
   const style = login.slice(login.indexOf("<style>"), login.indexOf("</style>"));
@@ -34,4 +33,13 @@ test("replaces only its own block, and puts it first when there is none", () => 
   assert.equal(withTokens(once, block), once);
   const edited = once.replace("--c-bg: #faf9f7;", "--c-bg: #000000;");
   assert.equal(withTokens(edited, block), once);
+});
+
+test("the console, the sign-in page and the landing page carry the same block", () => {
+  const block = css(tokens);
+  assert.deepEqual(targets, ["web/styles.css", "web/login.html", "site/assets/site.css"]);
+  for (const target of targets) {
+    const text = fs.readFileSync(path.resolve(root, "../..", target), "utf8");
+    assert.ok(text.includes(block), target);
+  }
 });

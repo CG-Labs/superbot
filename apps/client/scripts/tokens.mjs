@@ -1,16 +1,15 @@
-// Writes the design tokens (src/tokens.json, ADR 0335) into the admin console's CSS as custom properties,
+// Writes the design tokens (src/tokens.json, ADR 0335) into the admin console's and the landing page's CSS as custom properties,
 // and into the sign-in page's own styles, which /login serves without the console's style sheet (ADR 0341).
-//   npm run tokens        update web/styles.css and web/login.html
-//   npm run tokens:check  verify both match src/tokens.json (CI)
+//   npm run tokens        update web/styles.css, web/login.html and site/assets/site.css
+//   npm run tokens:check  verify they all match src/tokens.json (CI)
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tokensFile = path.join(root, "src/tokens.json");
-const web = path.resolve(root, "../../web");
 /** The files that carry the block. An HTML page must already have its markers inside its `<style>`. */
-export const targets = ["styles.css", "login.html"];
+export const targets = ["web/styles.css", "web/login.html", "site/assets/site.css"];
 
 const START = "/* tokens:start: made from apps/client/src/tokens.json by `npm run tokens`; edit that file, not this block */";
 const END = "/* tokens:end */";
@@ -66,22 +65,24 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const block = css(read());
   const check = process.argv.includes("--check");
   let stale = false;
-  for (const name of targets) {
-    const file = path.join(web, name);
+  for (const target of targets) {
+    const file = path.resolve(root, "../..", target);
     const current = fs.readFileSync(file, "utf8");
-    if (name.endsWith(".html") && !hasTokens(current)) {
-      console.error(`web/${name} has no tokens block: put the tokens:start and tokens:end markers inside its <style>`);
+    if (target.endsWith(".html") && !hasTokens(current)) {
+      console.error(`${target} has no tokens block: put the tokens:start and tokens:end markers inside its <style>`);
       process.exit(1);
     }
     const next = withTokens(current, block);
     if (check) {
       if (next !== current) {
-        console.error(`web/${name} is out of date with src/tokens.json: run \`npm run tokens\` in apps/client`);
+        console.error(`${target} is out of date with src/tokens.json: run \`npm run tokens\` in apps/client`);
         stale = true;
-      } else console.log(`web/${name} matches src/tokens.json`);
+      } else {
+        console.log(`${target} matches src/tokens.json`);
+      }
     } else {
       fs.writeFileSync(file, next);
-      console.log(`updated web/${name} tokens`);
+      console.log(`updated ${target} tokens`);
     }
   }
   if (stale) process.exit(1);

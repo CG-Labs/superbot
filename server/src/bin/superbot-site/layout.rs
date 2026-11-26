@@ -52,9 +52,9 @@ pub fn page(s: &Shell, main: &str) -> String {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{title}</title>
   <meta name="description" content="{description}" />
-  <meta name="color-scheme" content="dark light" />
-  <meta name="theme-color" content="#171717" media="(prefers-color-scheme: dark)" />
-  <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#faf9f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#1b1a19" media="(prefers-color-scheme: dark)" />
   <link rel="icon" type="image/svg+xml" href="{root}assets/mark.svg" />
   <link rel="stylesheet" href="{root}assets/site.css" />
   <link rel="stylesheet" href="{root}assets/docs.css" />{search}
@@ -64,12 +64,13 @@ pub fn page(s: &Shell, main: &str) -> String {
   <header class="top">
     <div class="wrap top-row">
       <a class="brand" href="{root}index.html" aria-label="SuperBot home">
-        <span class="tile"><img src="{root}assets/mark.svg" alt="" width="28" height="28" /></span>
+        <span class="tile"><img src="{root}assets/mark.svg" alt="" width="24" height="24" /></span>
         <span>SuperBot</span>
       </a>
       <nav aria-label="Main">
         <ul class="nav">
-          <li class="nav-extra"><a href="{root}index.html#features">Features</a></li>
+          <li class="nav-extra"><a href="{root}index.html#computer">Product</a></li>
+          <li class="nav-extra"><a href="{root}index.html#security">Security</a></li>
           <li class="nav-extra"><a href="{root}index.html#plans">Plans</a></li>
           <li><a href="{root}docs/index.html"{current}>Docs</a></li>
           <li><a class="btn btn-primary btn-small" href="{repo}">GitHub</a></li>
@@ -79,16 +80,40 @@ pub fn page(s: &Shell, main: &str) -> String {
   </header>
 {main}
   <footer class="foot">
-    <div class="wrap foot-row">
-      <span>&copy; SuperBot</span>
-      <nav aria-label="Footer">
-        <ul class="nav">
-          <li><a href="{root}docs/index.html">Docs</a></li>
-          <li><a href="{root}docs/security/index.html">Security</a></li>
-          <li><a href="{root}docs/changelog.html">Changelog</a></li>
-          <li><a href="{repo}">Source</a></li>
-        </ul>
-      </nav>
+    <div class="wrap">
+      <div class="foot-grid">
+        <div class="foot-about">
+          <a class="brand" href="{root}index.html" aria-label="SuperBot home"><span class="tile"><img src="{root}assets/mark.svg" alt="" width="24" height="24" /></span><span>SuperBot</span></a>
+          <p>AI teammates with their own computer. Open source, self-hosted or managed.</p>
+        </div>
+        <nav aria-labelledby="foot-product">
+          <h2 id="foot-product">Product</h2>
+          <ul>
+            <li><a href="{root}index.html#computer">Your own computer</a></li>
+            <li><a href="{root}index.html#features">Features</a></li>
+            <li><a href="{root}index.html#self-host">Self-host</a></li>
+            <li><a href="{root}index.html#plans">Plans</a></li>
+          </ul>
+        </nav>
+        <nav aria-labelledby="foot-docs">
+          <h2 id="foot-docs">Resources</h2>
+          <ul>
+            <li><a href="{root}docs/index.html">Docs</a></li>
+            <li><a href="{root}docs/install.html">Install</a></li>
+            <li><a href="{root}docs/security/index.html">Security pack</a></li>
+            <li><a href="{root}docs/changelog.html">Changelog</a></li>
+          </ul>
+        </nav>
+        <nav aria-labelledby="foot-project">
+          <h2 id="foot-project">Project</h2>
+          <ul>
+            <li><a href="{repo}">Source on GitHub</a></li>
+            <li><a href="{root}docs/security-policy.html">Security policy</a></li>
+            <li><a href="{root}docs/index.html#decisions">Decisions</a></li>
+          </ul>
+        </nav>
+      </div>
+      <div class="foot-base"><span>&copy; SuperBot</span></div>
     </div>
   </footer>
 </body>

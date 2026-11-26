@@ -8,9 +8,9 @@ For buyers, security reviewers and procurement. It describes SuperBot as the cod
 
 | Page | What it answers |
 |------|-----------------|
-| [Architecture](architecture.md) | The parts, where they run, how they connect, and the trust boundaries between them. |
-| [Data flows](data-flows.md) | What data is stored where, how it is encrypted in transit and at rest, and what leaves for model providers, push, email, billing and backups. |
-| [Access control and isolation](access-control.md) | Sign-in, roles, Bot permissions, per-run Bot tokens, approvals, the audit log, the licence key, and how one user is kept from another. |
+| [Architecture](architecture.md) | The parts, where they run, how they connect, and the trust boundaries between them, including air-gapped installs and the enterprise integrations: native SAML, external secret stores, audit export and residency pins. |
+| [Data flows](data-flows.md) | What data is stored where (including a region's chat store under a residency pin), how it is encrypted in transit and at rest, and what leaves for model providers, push, email, billing, IdPs, secrets stores, SIEMs and backups. |
+| [Access control and isolation](access-control.md) | Sign-in (native SAML included), roles, Bot permissions, per-run Bot tokens, secrets in an external store, residency pins, approvals, the audit log and its export, the licence key, and how one user is kept from another. |
 | [Subprocessors](subprocessors.md) | Every outside service the code can talk to, what it receives, and the setting that turns it on. |
 | [Security questionnaire FAQ](questionnaire-faq.md) | Short answers to common questionnaire questions. |
 | [Machine recovery objectives](machine-recovery-objectives.md) | Backup schedule, RPO and RTO per plan for managed machines, as text for an SLA or DPA. |
@@ -40,5 +40,5 @@ Earlier reviews: [auth review, November 2026](auth-review-2026-11.md) and its [S
 ## Not in this pack yet (Planned)
 
 - SOC 2 Type II (M5, [#57](https://github.com/CG-Labs/superbot/issues/57)) ([roadmap](../ROADMAP.md)). The [readiness checklist](soc2-readiness-checklist.md) is the path to it; the [policy set](policies/README.md) is drafted but not adopted, no auditor is engaged and no observation period has started. SuperBot is not SOC 2 certified.
-- An external penetration test before M3 general availability ([roadmap risks](../ROADMAP.md)).
+- An external penetration test, part of the SOC 2 owner work on [#57](https://github.com/CG-Labs/superbot/issues/57) ([roadmap](../ROADMAP.md#finish-line)).
 - A reviewed, published privacy policy, terms, DPA and DPIA, and the managed service's own subprocessor list (M4, GDPR row of the [roadmap](../ROADMAP.md)). The [templates](dpa-template.md) above are drafts until counsel reviews them and a provider fills them in. Erasure is built ([ADR 0102](../adr/0102-erasing-a-users-data.md)); a single export of a person's data is not ([what is missing](gdpr-self-hosting.md#what-exists-and-what-is-missing)).
