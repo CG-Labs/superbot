@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
-import { keeperQuestion } from "../src/access";
+import { keeperQuestion, keepersQuestion } from "../src/access";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
@@ -293,7 +293,7 @@ function AccountDetail({
   const [rotating, setRotating] = useState<string | null>(null);
   const [keepOld, setKeepOld] = useState(0);
   const [rotateDays, setRotateDays] = useState(view.defaultDays);
-  const [handing, setHanding] = useState("");
+  const [handing, setHanding] = useState<string[]>([]);
 
   const loadFull = useCallback(async () => {
     const next = await api.serviceAccount(account.id);
@@ -316,7 +316,8 @@ function AccountDetail({
   const tokens = full?.tokenList;
   const keptBots = full?.keptBotList ?? [];
   const keepable = full?.keepable ?? [];
-  const room = keptBots.length < (view.maxKeptBots ?? 20);
+  const left = Math.max(0, (view.maxKeptBots ?? 20) - keptBots.length);
+  const picked = keepable.filter((k) => handing.includes(k.id));
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -374,14 +375,16 @@ function AccountDetail({
     await refresh();
   });
 
+  const handLabel = picked.length > 1 ? `Hand over ${picked.length} Bots` : "Hand it over";
   const handOver = async () => {
-    const b = keepable.find((k) => k.id === handing);
-    if (!b) return;
-    const q = keeperQuestion(b.name, sa.name, b.keptBy?.name ?? null);
-    if (!(await confirmAsync(q.title, q.body, "Hand it over"))) return;
+    if (!picked.length) return;
+    const q = keepersQuestion(picked.map((b) => ({ name: b.name, from: b.keptBy?.name ?? null })), sa.name);
+    if (!(await confirmAsync(q.title, q.body, handLabel))) return;
     void run(async () => {
-      await api.keepBot(b.id, sa.id);
-      setHanding("");
+      // One Bot keeps to the route servers from before ADR 0324 have too.
+      if (picked.length === 1) await api.keepBot(picked[0].id, sa.id);
+      else await api.keepBots(sa.id, picked.map((b) => b.id));
+      setHanding([]);
       await refresh();
     });
   };
@@ -437,12 +440,31 @@ function AccountDetail({
           ))}
           {!keptBots.length ? <Text style={styles.dim}>None yet.</Text> : null}
           {keptBots.length ? <Text style={styles.faint}>They stay {sa.owner?.name || "its owner"}&apos;s: taking one back, deleting the account or changing its owner leaves them with the owner.</Text> : null}
-          {keepable.length && room ? (
+          {keepable.length && left ? (
             <>
-              <Text style={styles.dim}>Hand it one of {sa.owner?.name || "its owner"}&apos;s Bots to manage:</Text>
-              <Chips options={keepable.map((b) => ({ value: b.id, label: b.keptBy ? `${b.name} (from ${b.keptBy.name})` : b.name }))} value={handing} onChange={setHanding} disabled={busy} />
+              <Text style={styles.dim}>
+                Hand it {left > 1 ? `up to ${left}` : "one"} of {sa.owner?.name || "its owner"}&apos;s Bots to manage:
+              </Text>
+              {keepable.map((b) => {
+                const on = handing.includes(b.id);
+                const off = busy || (!on && handing.length >= left);
+                return (
+                  <Pressable
+                    key={b.id}
+                    style={styles.perm}
+                    disabled={off}
+                    onPress={() => setHanding(on ? handing.filter((id) => id !== b.id) : [...handing, b.id])}
+                    accessibilityRole="checkbox"
+                    accessibilityState={{ checked: on, disabled: off }}
+                    accessibilityLabel={`Hand over ${b.name}`}
+                  >
+                    <Text style={[styles.check, on && styles.checkOn]}>{on ? "✓" : ""}</Text>
+                    <Text style={styles.text}>{b.keptBy ? `${b.name} (from ${b.keptBy.name})` : b.name}</Text>
+                  </Pressable>
+                );
+              })}
               <View style={styles.row}>
-                <Button label="Hand it over" primary disabled={busy || !handing} onPress={() => void handOver()} />
+                <Button label={handLabel} primary disabled={busy || !picked.length} onPress={() => void handOver()} />
               </View>
             </>
           ) : null}

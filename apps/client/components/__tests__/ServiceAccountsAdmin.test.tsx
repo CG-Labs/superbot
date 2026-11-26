@@ -75,6 +75,7 @@ function mockApi(view: ServiceAccountsView = VIEW) {
     rotateServiceToken: jest.fn(async () => minted(ROTATED, {}, { id: "st1", endsAt: Date.now() + 60 * 60_000 })),
     revokeServiceToken: jest.fn(async () => {}),
     keepBot: jest.fn(async () => ({})),
+    keepBots: jest.fn(async () => ({})),
     releaseKeptBot: jest.fn(async () => ({})),
   };
 }
@@ -148,6 +149,31 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     await u.press(screen.getByLabelText("Hand it over"));
     await waitFor(() => expect(api.keepBot).toHaveBeenCalledWith("b2", "sa1"));
     expect(confirmAsync).toHaveBeenLastCalledWith("Let HR sync keep Notes?", expect.stringMatching(/owner's keys and memory.*Nightly stops keeping it/), "Hand it over");
+  });
+
+  it("hands it several Bots in one request, no more than it has room for (ADR 0324)", async () => {
+    const api = mockApi({ ...VIEW, maxKeptBots: 3 });
+    api.serviceAccount.mockImplementation(async () => ({
+      ...SA,
+      tokenList: [TOKEN],
+      keptBotList: [{ id: "b1", name: "Ledger", visibility: "private" as const }],
+      keepable: [
+        { id: "b2", name: "Notes", visibility: "private" as const, keptBy: { id: "sa9", name: "Nightly" } },
+        { id: "b3", name: "Wiki", visibility: "shared" as const, keptBy: null },
+        { id: "b4", name: "Extra", visibility: "private" as const, keptBy: null },
+      ],
+    }));
+    const u = userEvent.setup();
+    await open(api, u);
+    expect(screen.getByText(/Hand it up to 2 of/)).toBeTruthy();
+
+    await u.press(screen.getByLabelText("Hand over Notes"));
+    await u.press(screen.getByLabelText("Hand over Wiki"));
+    expect(screen.getByLabelText("Hand over Extra")).toBeDisabled();
+    await u.press(screen.getByLabelText("Hand over 2 Bots"));
+    await waitFor(() => expect(api.keepBots).toHaveBeenCalledWith("sa1", ["b2", "b3"]));
+    expect(api.keepBot).not.toHaveBeenCalled();
+    expect(confirmAsync).toHaveBeenLastCalledWith("Let HR sync keep 2 Bots?", expect.stringMatching(/^Notes, Wiki\..*Nightly stops keeping Notes\.$/), "Hand over 2 Bots");
   });
 
   it("doesn't take a Bot back when they say no, and offers none past the limit", async () => {

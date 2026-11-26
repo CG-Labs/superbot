@@ -1,4 +1,4 @@
-import { botAccess, hasAccess, keeperChoices, keeperQuestion, keptBy, sharingLabel, whereItRuns, whoseKeys } from "../access";
+import { botAccess, hasAccess, keeperChoices, keeperQuestion, keepersQuestion, keptBy, sharingLabel, whereItRuns, whoseKeys } from "../access";
 
 describe("Bot access", () => {
   it("follows what the server says", () => {
@@ -75,5 +75,12 @@ describe("Bot access", () => {
     expect(keeperQuestion("Ledger", "CI", null)).toEqual({ title: "Let CI keep Ledger?", body: expect.stringMatching(/^CI can rename it.*The Bot stays the owner's\.$/) });
     expect(keeperQuestion("Ledger", "CI", "Nightly").body).toMatch(/Nightly stops keeping it\.$/);
     expect(keeperQuestion("Ledger", null, "CI")).toEqual({ title: "Take Ledger back from CI?", body: expect.stringMatching(/its run there stops/) });
+  });
+
+  it("asks once before handing several Bots over, naming each and where it moves from (ADR 0324)", () => {
+    expect(keepersQuestion([{ name: "Ledger", from: null }], "CI")).toEqual(keeperQuestion("Ledger", "CI", null));
+    const q = keepersQuestion([{ name: "Ledger", from: null }, { name: "Notes", from: "Nightly" }], "CI");
+    expect(q.title).toBe("Let CI keep 2 Bots?");
+    expect(q.body).toMatch(/^Ledger, Notes\. CI can rename them.*All of them are handed over, or none\. Nightly stops keeping Notes\.$/);
   });
 });

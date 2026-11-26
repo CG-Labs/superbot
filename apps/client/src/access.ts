@@ -57,6 +57,23 @@ export function keeperQuestion(botName: string, to: string | null, from: string 
   };
 }
 
+/**
+ * The question before handing several Bots to a service account at once (ADR 0324), each
+ * `{name, from}` with the account keeping it now, if any. One Bot asks `keeperQuestion`'s.
+ */
+export function keepersQuestion(bots: { name: string; from: string | null }[], to: string): { title: string; body: string } {
+  if (bots.length === 1) return keeperQuestion(bots[0].name, to, bots[0].from);
+  const moving = bots.filter((b) => b.from).map((b) => `${b.from} stops keeping ${b.name}.`);
+  return {
+    title: `Let ${to} keep ${bots.length} Bots?`,
+    body: [
+      `${bots.map((b) => b.name).join(", ")}.`,
+      `${to} can rename them, change their settings, run them and delete them, within its role and tokens. Their runs use the owner's keys and memory. The Bots stay the owner's. All of them are handed over, or none.`,
+      ...moving,
+    ].join(" "),
+  };
+}
+
 /** What a run for someone other than its owner gets, when the server isolates them.
  *  With `teammateLogins` (ADR 0062) that includes their own harness login. */
 export function whoseKeys(bot: Pick<BotView, "sharedBots" | "owner" | "visibility" | "teammateLogins">, meId?: string | null): string | null {
