@@ -22,6 +22,8 @@ const PUBLIC: &[(&str, &str)] = &[
     ("POST", "/api/auth/login"),
     ("GET", "/api/auth/sso"),
     ("GET", "/api/auth/sso/{id}/start"),
+    // A discovery service's pick, passed on to the start, which checks it (ADR 0314).
+    ("GET", "/api/auth/sso/{id}/discovery"),
     ("GET", "/api/auth/sso/{id}/callback"),
     ("POST", "/api/auth/sso/{id}/callback"),
     ("POST", "/api/auth/sso/{id}/acs"),

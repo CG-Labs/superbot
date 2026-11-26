@@ -60,6 +60,8 @@ pub enum Kind {
     /// several of a federation's from its MDQ server (ADR 0282), one chosen at each sign-in;
     /// each person's identity is stored under the IdP that signed them in. With `every_idp`
     /// it is empty: every IdP in the federation's aggregate is, as of its last read (ADR 0308).
+    /// With several, `discovery` is the federation's discovery service, where people pick
+    /// their IdP instead of botd's chooser (ADR 0314).
     SamlSp {
         entity_ids: Vec<String>,
         every_idp: Option<EveryIdp>,
@@ -79,6 +81,7 @@ pub enum Kind {
         idp_initiated: IdpInitiated,
         authn_context: Option<AuthnContext>,
         freshness: Freshness,
+        discovery: Option<String>,
     },
 }
 
@@ -661,7 +664,7 @@ impl Provider {
             Kind::Entra { authority, .. } => vec![(key("AUTHORITY"), authority.clone(), "authority")],
             Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::Saml { issuer, .. } => vec![(key("ISSUER"), issuer.clone(), "issuer")],
             Kind::GitHub { web, api, .. } => vec![(key("URL"), web.clone(), "sign-in page"), (key("API_URL"), api.clone(), "API")],
-            Kind::SamlSp { entity_ids, source, response_binding, .. } => {
+            Kind::SamlSp { entity_ids, source, response_binding, discovery, .. } => {
                 let (mut out, from) = match source {
                     IdpSource::Url(url) => (vec![(key("IDP_METADATA_URL"), url.clone(), "metadata")], key("IDP_METADATA_URL")),
                     IdpSource::Mdq(_) => (entity_ids.iter().filter_map(|e| source.url_for(e)).map(|u| (key("IDP_MDQ_URL"), u, "MDQ metadata")).collect(), key("IDP_MDQ_URL")),
@@ -677,6 +680,9 @@ impl Provider {
                         out.extend(m.artifact_resolution.iter().map(|(_, u)| (from.clone(), u.clone(), "artifact resolution")));
                     }
                 }
+                // Last: the first is where the metadata comes from. The browser goes here
+                // before any IdP when no IdP is picked yet (ADR 0314).
+                out.extend(discovery.iter().map(|u| (key("DISCOVERY_URL"), u.clone(), "discovery service")));
                 out
             }
         }
@@ -971,6 +977,14 @@ impl Provider {
     /// sign-in says which.
     pub fn several_idps(&self) -> bool {
         self.every_idp().is_some() || self.idps().len() > 1
+    }
+
+    /// Native SAML with several IdPs: the federation's discovery service, if set (ADR 0314).
+    pub fn discovery_service(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::SamlSp { discovery, .. } => discovery.as_deref(),
+            _ => None,
+        }
     }
 
     /// Native SAML: whether `entity_id` is one of the provider's IdPs. With every IdP of a

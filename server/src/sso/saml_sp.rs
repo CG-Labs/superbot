@@ -377,6 +377,9 @@ const MAX_NAME: usize = 100;
 const MDUI: &str = "urn:oasis:names:tc:SAML:metadata:ui";
 const SHIBMD: &str = "urn:mace:shibboleth:metadata:1.0";
 const MDATTR: &str = "urn:oasis:names:tc:SAML:metadata:attribute";
+/// The Identity Provider Discovery Service Protocol: its metadata extension's namespace, and
+/// the binding of a `DiscoveryResponse` (ADR 0314).
+pub const IDP_DISCOVERY: &str = "urn:oasis:names:tc:SAML:profiles:SSO:idp-discovery-protocol";
 /// The entity attributes whose values are categories (ADR 0308).
 pub const ENTITY_CATEGORY: &str = "http://macedir.org/entity-category";
 pub const ENTITY_CATEGORY_SUPPORT: &str = "http://macedir.org/entity-category-support";
@@ -806,11 +809,15 @@ fn encryption_methods(aes_cbc: AesCbc) -> String {
 /// be signed; with an SP key, also its certificates and where to send logout messages; with
 /// encryption certificates (`encryption`, base64 DER), the keys to encrypt assertions to and
 /// the ciphers taken (`aes_cbc`). During a rollover each use lists the key in use first, then
-/// the next one (ADR 0181). The ACS takes responses over `response` only (ADR 0268).
-pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc, response: ResponseBinding) -> String {
+/// the next one (ADR 0181). The ACS takes responses over `response` only (ADR 0268). With
+/// several IdPs, `discovery` is where a discovery service sends the browser back (ADR 0314).
+pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc, response: ResponseBinding, discovery: Option<&str>) -> String {
     let signed = signing.is_some_and(|s| s.sign_requests);
     let key_info = |cert: &str| format!(r#"<ds:KeyInfo xmlns:ds="{}"><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#, xmldsig::DSIG);
-    let mut keys = String::new();
+    // Extensions come first in a role descriptor.
+    let mut keys = discovery
+        .map(|d| format!("\n    <md:Extensions><idpdisc:DiscoveryResponse xmlns:idpdisc=\"{IDP_DISCOVERY}\" Binding=\"{IDP_DISCOVERY}\" Location=\"{}\" index=\"0\" isDefault=\"true\"/></md:Extensions>", escape(d)))
+        .unwrap_or_default();
     for cert in signing.map_or(&[][..], |s| s.certs) {
         keys += &format!("\n    <md:KeyDescriptor use=\"signing\">{}</md:KeyDescriptor>", key_info(cert));
     }
@@ -1082,6 +1089,15 @@ pub fn chooser_match(m: &IdpMetadata, words: &[String]) -> bool {
     let name = m.name.as_deref().unwrap_or_default().to_lowercase();
     let entity = m.entity_id.to_lowercase();
     words.iter().all(|w| name.contains(w.as_str()) || entity.contains(w.as_str()) || m.scopes.iter().any(|s| s.contains(w.as_str())))
+}
+
+/// The discovery service request (Identity Provider Discovery Service Protocol 2.4.1) to
+/// service `ds`, for SP `sp_entity_id`, to come back to `back`: it names the IdP picked in
+/// `entityID`, the protocol's default, and nothing is asked passively, so the person picks.
+pub fn discovery_request(ds: &str, sp_entity_id: &str, back: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("entityID", sp_entity_id).append_pair("return", back);
+    with_redirect_query(ds, &query.finish())
 }
 
 /// `base` with `query` after any query it has.
@@ -2281,7 +2297,7 @@ pub(crate) mod tests {
         let slo = "https://bot.example.com/api/auth/sso/okta/slo";
         let slo_soap = "https://bot.example.com/api/auth/sso/okta/slo/soap";
         for sign_requests in [false, true] {
-            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off, ResponseBinding::Post);
+            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off, ResponseBinding::Post, None);
             let doc = roxmltree::Document::parse(&md).unwrap();
             let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
             assert_eq!(spsso.attribute("AuthnRequestsSigned"), Some(if sign_requests { "true" } else { "false" }));
@@ -2292,13 +2308,36 @@ pub(crate) mod tests {
             let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
             assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         }
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post).contains("SingleLogoutService"), "no key, no logout");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None).contains("SingleLogoutService"), "no key, no logout");
+    }
+
+    #[test]
+    fn sp_metadata_names_where_a_discovery_service_answers() {
+        let sp = Sp { entity_id: SP, acs: ACS };
+        let back = "https://bot.example.com/api/auth/sso/fed/discovery";
+        let (key, _) = SpKey::generate("sp").unwrap();
+        let signing = SpSigning { certs: &[&key.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false };
+        let md = sp_metadata(&sp, Some(&signing), &[], AesCbc::Off, ResponseBinding::Post, Some(back));
+        let doc = roxmltree::Document::parse(&md).unwrap();
+        let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
+        let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
+        assert_eq!(order[..2], ["Extensions", "KeyDescriptor"], "Extensions first, as the schema says");
+        let r = doc.descendants().find(|n| is(*n, IDP_DISCOVERY, "DiscoveryResponse")).unwrap();
+        assert_eq!((r.attribute("Binding"), r.attribute("Location"), r.attribute("index"), r.attribute("isDefault")), (Some(IDP_DISCOVERY), Some(back), Some("0"), Some("true")));
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None).contains("Extensions"), "one IdP: nothing to discover");
+
+        let to = url::Url::parse(&discovery_request("https://service.seamlessaccess.org/ds/", SP, &format!("{back}?session=token&state=s&1"))).unwrap();
+        let q: Vec<(String, String)> = to.query_pairs().into_owned().collect();
+        assert_eq!(q, [("entityID".into(), SP.into()), ("return".into(), format!("{back}?session=token&state=s&1"))], "the return URL travels whole, encoded");
+        assert_eq!(to.path(), "/ds/");
+        let to = discovery_request("https://wayf.example.org/DS?lang=en", SP, back);
+        assert!(to.starts_with("https://wayf.example.org/DS?lang=en&entityID="), "{to}");
     }
 
     #[test]
     fn writes_sp_metadata_and_a_redirect_authn_request() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post);
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let root = doc.root_element();
         assert_eq!(root.attribute("entityID"), Some(SP));
@@ -2328,7 +2367,7 @@ pub(crate) mod tests {
     #[test]
     fn artifact_responses_are_asked_for_and_offered_alone() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Artifact);
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Artifact, None);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let acs: Vec<_> = doc.descendants().filter(|n| is(*n, METADATA, "AssertionConsumerService")).map(|n| (n.attribute("Binding"), n.attribute("Location"), n.attribute("index"))).collect();
         assert_eq!(acs, [(Some(ARTIFACT), Some(ACS), Some("0"))], "one ACS, so the IdP can't fall back to posting");
@@ -3203,7 +3242,7 @@ pub(crate) mod tests {
         let sp = Sp { entity_id: SP, acs: ACS };
         let (sign, _) = SpKey::generate("sp").unwrap();
         let enc = &enc_keys()[0];
-        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off, ResponseBinding::Post);
+        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off, ResponseBinding::Post, None);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<String> = elements(spsso).iter().map(|n| format!("{}{}", n.tag_name().name(), n.attribute("use").map(|u| format!("/{u}")).unwrap_or_default())).collect();
@@ -3218,10 +3257,10 @@ pub(crate) mod tests {
         let mut r = encrypted();
         r.encrypt = Some(ok);
         assert_eq!(enc_reason(&r.xml()), "ok");
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post).contains("encryption"), "off: nothing to encrypt to");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None).contains("encryption"), "off: nothing to encrypt to");
 
         // With AES-CBC taken (ADR 0218), it's offered after GCM, so an IdP that picks the first keeps GCM.
-        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse, ResponseBinding::Post);
+        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse, ResponseBinding::Post, None);
         let doc = roxmltree::Document::parse(&md).unwrap();
         let methods: Vec<&str> = doc.descendants().filter(|n| is(*n, METADATA, "EncryptionMethod")).filter_map(|n| n.attribute("Algorithm")).collect();
         assert_eq!(&methods[..4], [AES256_GCM, AES128_GCM, AES256_CBC, AES128_CBC]);
