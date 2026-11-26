@@ -167,7 +167,9 @@ pub fn certificates(app: &AppState, p: &Provider) -> Vec<InUse> {
     if *encryption != Encryption::Off {
         sp_certs(app, p, KeyUse::Encryption, Role::SpEncryption, &mut out);
     }
-    for m in p.idps().iter().filter_map(|e| p.idp_loaded_for(e)) {
+    // With every IdP of a federation (ADR 0308), each IdP's certificates are its own and the
+    // federation's to look after; thousands of them would bury the warnings that are ours.
+    for m in p.idps().iter().filter(|_| p.every_idp().is_none()).filter_map(|e| p.idp_loaded_for(e)) {
         out.extend(m.certs.iter().map(|c| InUse { role: Role::IdpSigning, stage: None, from: source.name(), idp: Some(m.entity_id.clone()), cert: c.clone() }));
     }
     if let Some(t) = metadata_trust {
@@ -242,6 +244,7 @@ pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::
     let mut n = 0;
     for p in providers.iter().filter(|p| p.saml_sp()) {
         if matches!(&p.kind, Kind::SamlSp { source, .. } if source.fetched()) {
+            p.every_idp_read(gap).await;
             for entity in p.idps() {
                 if let Err(e) = p.idp_metadata_for(http, gap, entity).await {
                     crate::obs::log::log_warn!("SSO {}: IdP {entity} metadata: {e}", p.id);

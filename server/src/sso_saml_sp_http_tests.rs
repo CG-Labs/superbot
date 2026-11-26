@@ -3165,6 +3165,135 @@ async fn a_federation_aggregate_signs_people_in_at_its_listed_idps() {
 }
 
 #[tokio::test]
+async fn every_idp_of_a_federation_in_a_category_signs_in_found_by_search() {
+    use crate::sso::saml_sp::test_idp::{aggregate, signed_aggregate, with_categories, with_ui};
+    use crate::sso::saml_sp::{ENTITY_CATEGORY, HIDE_FROM_DISCOVERY};
+    let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
+    let week = db::now() + 7 * 86_400_000;
+    let rs = "http://refeds.org/category/research-and-scholarship";
+    let idp = |id: &str, key: usize, host: &str, name: &str, scope: &str, cats: &[(&str, &str)]| {
+        let xml = with_ui(&test_idp::metadata_with(id, &[signer(key)], ""), name, &[scope]).replace("https://idp.example/", host);
+        with_categories(&xml, cats)
+    };
+    let r_and_s = [(ENTITY_CATEGORY, rs)];
+    const GAMMA: &str = "https://idp.gamma.example/idp";
+    const HIDDEN: &str = "https://idp.hidden.example/idp";
+    let mut members: Vec<String> = (0..60).map(|i| idp(&format!("https://idp{i}.member.example/idp"), 0, &format!("https://idp{i}.member.example/"), &format!("Member College {i}"), "member.example", &r_and_s)).collect();
+    members.push(idp(IDP, 0, "https://idp.example/", "University A", "example.com", &r_and_s));
+    members.push(idp(GAMMA, 0, "https://idp.gamma.example/", "Gamma College", "gamma.example", &[]));
+    members.push(idp(HIDDEN, 0, "https://idp.hidden.example/", "Hidden University", "hidden.example", &[(ENTITY_CATEGORY, rs), (ENTITY_CATEGORY, HIDE_FROM_DISCOVERY)]));
+    members.push(idp("https://idp.pipe.example/a|b", 0, "https://idp.pipe.example/", "Pipe University", "pipe.example", &r_and_s));
+    members.push(test_idp::metadata_with("https://sp.member.example/sp", &[signer(0)], "").replace("IDPSSODescriptor", "SPSSODescriptor"));
+    let without_b = members.clone();
+    members.push(idp(IDP_B, 2, "https://login.uni-b.example/", "Beta Institute", "uni-b.example", &r_and_s));
+    let served = Arc::new(std::sync::Mutex::new(signed_aggregate(&aggregate(&members, week), signer(1), "#_agg")));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let md_port = listener.local_addr().unwrap().port();
+    let s = served.clone();
+    let app = axum::Router::new().fallback(move || std::future::ready(s.lock().unwrap().clone()));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = std::env::temp_dir().join(format!("saml-every-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let anchor = dir.join("federation.pem");
+    std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signer(1).cert)).unwrap();
+    let id = format!("n{}", random_hex(4));
+    let up = id.to_ascii_uppercase();
+    let vars = HashMap::from([
+        ("SSO_PROVIDERS".into(), id.clone()),
+        (format!("SSO_{up}_TYPE"), "saml".into()),
+        (format!("SSO_{up}_LABEL"), "Uni Federation".into()),
+        (format!("SSO_{up}_IDP_ENTITY_IDS"), "all".into()),
+        (format!("SSO_{up}_IDP_ENTITY_CATEGORIES"), rs.into()),
+        (format!("SSO_{up}_IDP_INITIATED"), "restart".into()),
+        (format!("SSO_{up}_IDP_AGGREGATE_URL"), format!("http://127.0.0.1:{md_port}/federation.xml")),
+        (format!("SSO_{up}_METADATA_SIGNING_CERT_FILE"), anchor.to_string_lossy().into_owned()),
+    ]);
+    let mut provider = None;
+    let (port, app, admin) = serve_vars_with(vars, |a| provider = a.sso.providers.first().cloned()).await;
+    let (sp, provider) = (Sp { port, app, admin, id, sp_entity: None }, provider.unwrap());
+    let chooser = |query: &str| {
+        let path = format!("/api/auth/sso/{}/start?session=cookie&q={}", sp.id, url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>());
+        async move { crate::tests::call_with(sp.port, "GET", &path, "", "", "").await }
+    };
+
+    // Straight after a restart nothing is read yet: B's tile waits for the aggregate, then
+    // restarts at B rather than failing as an unknown IdP.
+    let mut tile = sp.unsolicited();
+    from_b(&mut tile);
+    let (code, to, _) = sp.post(Some(&tile.posted()), None, "").await;
+    let start_b = format!("http://127.0.0.1:{}/api/auth/sso/{}/start?idp={}", sp.port, sp.id, url::form_urlencoded::byte_serialize(IDP_B.as_bytes()).collect::<String>());
+    assert_eq!((code, to.as_str()), (303, start_b.as_str()));
+
+    // The chooser is a search box, a plain form back here: thousands of IdPs don't fit a list.
+    let (code, head, page) = chooser("").await;
+    assert_eq!(code, 200, "{head}");
+    let csp = header(&head, "content-security-policy").unwrap();
+    assert!(csp.contains("form-action 'self'") && !csp.contains("script-src"), "{csp}");
+    assert!(page.contains(&format!(r#"<form method="get" action="/api/auth/sso/{}/start">"#, sp.id)) && page.contains(r#"name="session" value="cookie""#), "{page}");
+    assert!(!page.contains("<li>") && !page.contains("<script"), "nothing listed before a search: {page}");
+    let (_, _, page) = chooser("  BETA  ").await;
+    assert!(page.contains(">Beta Institute<") && page.contains(r#"value="BETA""#), "{page}");
+    let b_link = format!("session=cookie&amp;idp={}", url::form_urlencoded::byte_serialize(IDP_B.as_bytes()).collect::<String>());
+    assert!(page.contains(&b_link) && !page.contains("q=BETA"), "{page}");
+    let (_, _, page) = chooser("uni-b.example").await;
+    assert!(page.contains(">Beta Institute<") && !page.contains(">University A<"), "by email domain: {page}");
+    let (_, _, page) = chooser("member college").await;
+    assert_eq!((page.matches("<li>").count(), page.contains("10 more match")), (50, true), "{page}");
+    for absent in ["gamma", "hidden", "pipe", "sp.member"] {
+        let (_, _, page) = chooser(absent).await;
+        assert!(page.contains("No organization matches") && !page.contains("<li>"), "{absent}: {page}");
+    }
+
+    // Not in the category, not an IdP, or not in the aggregate: unknown (audited once, as
+    // failures nobody vouched for are).
+    for other in [GAMMA, "https://sp.member.example/sp", "https://idp.other.example", "https://idp.pipe.example/a|b"] {
+        let path = format!("/api/auth/sso/{}/start?idp={}", sp.id, url::form_urlencoded::byte_serialize(other.as_bytes()).collect::<String>());
+        let (code, head, _) = crate::tests::call_with(sp.port, "GET", &path, "", "", "").await;
+        assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_failed")), "{other}");
+    }
+    assert_eq!((sp.last_failure().await["reason"].as_str(), sp.last_failure().await["entityId"].as_str()), (Some("unknown_idp"), Some(GAMMA)));
+
+    // Signed in at B, as the aggregate says, with B's key.
+    let bob = sp.app.db.create_user(None, Some("bob@uni-b.example"), "Bob", Role::Member).unwrap();
+    sp.app.db.link_identity(&bob.id, &NewIdentity { provider: &sp.id, issuer: IDP_B, subject: STORED, tenant: None, email: None, created_by: Some("test") }).unwrap();
+    let (code, _, head) = sp.sign_in_at(IDP_B, from_b).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(bob.id.clone()));
+    let (code, to, _) = sp.sign_in_at(IDP_B, |r| r.issuer = IDP_B.into()).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_failed"), "A's key doesn't sign for B");
+    assert_eq!(sp.start_at(HIDDEN).await.3, "https://idp.hidden.example/saml/sso", "hidden from the chooser, not from sign-in");
+
+    // Linking and role mappings name an IdP it takes.
+    let link = |body: Value| {
+        let (port, admin) = (sp.port, sp.admin.clone());
+        async move { call(port, "POST", "/api/users/bob@uni-b.example/identities", &admin, &body.to_string()).await }
+    };
+    let (code, e) = link(json!({ "provider": sp.id, "subject": "bob-a" })).await;
+    assert!(code == 400 && e.contains("--idp"), "{code} {e}");
+    let (code, e) = link(json!({ "provider": sp.id, "subject": "bob-a", "idp": GAMMA })).await;
+    assert!(code == 400 && e.contains("aggregate"), "{code} {e}");
+    assert_eq!(link(json!({ "provider": sp.id, "subject": "bob-a", "idp": IDP })).await.0, 201);
+
+    // What the admin sees: how many, not each.
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((&v["everyIdp"]["idps"], &v["everyIdp"]["hidden"], &v["everyIdp"]["categories"], &v["idps"]), (&json!(63), &json!(1), &json!([rs]), &json!([])), "{v}");
+    assert!(v["certificateWarnings"].as_array().unwrap().iter().all(|w| w["role"] != "idp_signing"));
+
+    // The federation drops B: gone at the next read.
+    *served.lock().unwrap() = signed_aggregate(&aggregate(&without_b, week), signer(1), "#_agg");
+    provider.age_idp(std::time::Duration::from_secs(25 * 3600));
+    assert_eq!(sp.start_at(IDP).await.3, SSO_URL, "a sign-in goes on with the copy it has");
+    provider.idp_refreshed().await;
+    assert!(provider.idp_loaded_for(IDP_B).is_none() && provider.idp_loaded_for(IDP).is_some());
+    let path = format!("/api/auth/sso/{}/start?idp={}", sp.id, url::form_urlencoded::byte_serialize(IDP_B.as_bytes()).collect::<String>());
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &path, "", "", "").await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_failed")));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn one_provider_signs_people_in_at_each_idp_of_a_federation() {
     let (sp, dir, _) = serve_federation(&[], 2).await;
 

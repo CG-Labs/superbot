@@ -56,6 +56,7 @@ pub mod screens;
 pub mod server_data;
 pub mod settings_check;
 pub mod chat_store_copies;
+pub mod chat_store_move;
 pub mod chat_store_restore;
 pub mod chat_stores;
 #[cfg(test)]

@@ -326,9 +326,19 @@ pub struct IdpMetadata {
     /// The email domains the metadata says the IdP speaks for (`shibmd:Scope`, ADR 0282).
     /// Regular-expression scopes are left out.
     pub scopes: Vec<String>,
+    /// The entity's categories, from its `mdattr:EntityAttributes` (ADR 0308): the values of
+    /// `ENTITY_CATEGORY`, `ENTITY_CATEGORY_SUPPORT` and `ASSURANCE_CERTIFICATION`, as REFEDS
+    /// Research and Scholarship, Sirtfi and hide-from-discovery are published.
+    pub categories: Vec<String>,
 }
 
 impl IdpMetadata {
+    /// The federation asks that the IdP not be offered for people to choose (REFEDS
+    /// hide-from-discovery): it is left off the chooser, though `idp=` still reaches it.
+    pub fn hidden(&self) -> bool {
+        self.categories.iter().any(|c| c == HIDE_FROM_DISCOVERY)
+    }
+
     /// Whether this copy may still be trusted at `now_ms`.
     pub fn valid_at(&self, now_ms: i64) -> bool {
         self.valid_until.is_none_or(|u| u > now_ms)
@@ -366,6 +376,15 @@ const MAX_SCOPES: usize = 64;
 const MAX_NAME: usize = 100;
 const MDUI: &str = "urn:oasis:names:tc:SAML:metadata:ui";
 const SHIBMD: &str = "urn:mace:shibboleth:metadata:1.0";
+const MDATTR: &str = "urn:oasis:names:tc:SAML:metadata:attribute";
+/// The entity attributes whose values are categories (ADR 0308).
+pub const ENTITY_CATEGORY: &str = "http://macedir.org/entity-category";
+pub const ENTITY_CATEGORY_SUPPORT: &str = "http://macedir.org/entity-category-support";
+pub const ASSURANCE_CERTIFICATION: &str = "urn:oasis:names:tc:SAML:attribute:assurance-certification";
+pub const HIDE_FROM_DISCOVERY: &str = "http://refeds.org/category/hide-from-discovery";
+/// The most categories read from one entity, and the longest.
+const MAX_CATEGORIES: usize = 64;
+pub const MAX_CATEGORY: usize = 256;
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// Where the IdP takes logout messages: requests at `location`, our responses at `response`,
@@ -626,7 +645,25 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: Reques
     if response == ResponseBinding::Artifact && artifact_resolution.is_empty() {
         return Err("the metadata has no SOAP ArtifactResolutionService on https: set SSO_<ID>_RESPONSE_BINDING=post for this provider, or turn on artifact resolution at the IdP".into());
     }
-    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution, valid_until: None, name: idp_name(entity, idp), scopes: scopes(entity, idp) })
+    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution, valid_until: None, name: idp_name(entity, idp), scopes: scopes(entity, idp), categories: categories(entity) })
+}
+
+/// The entity's categories: each value of its `ENTITY_CATEGORY`, `ENTITY_CATEGORY_SUPPORT`
+/// and `ASSURANCE_CERTIFICATION` entity attributes, trimmed, once each.
+fn categories(entity: Node) -> Vec<String> {
+    let names = [ENTITY_CATEGORY, ENTITY_CATEGORY_SUPPORT, ASSURANCE_CERTIFICATION];
+    let mut out: Vec<String> = Vec::new();
+    let attributes = extensions(entity).into_iter().filter(|n| is(*n, MDATTR, "EntityAttributes")).flat_map(elements).filter(|n| is(*n, ASSERTION, "Attribute") && n.attribute("Name").is_some_and(|a| names.contains(&a)));
+    for value in attributes.flat_map(elements).filter(|n| is(*n, ASSERTION, "AttributeValue")) {
+        let v = all_text(value).trim().to_string();
+        if !v.is_empty() && v.len() <= MAX_CATEGORY && !out.contains(&v) {
+            out.push(v);
+        }
+        if out.len() == MAX_CATEGORIES {
+            break;
+        }
+    }
+    out
 }
 
 /// The `Extensions` children of `n`.
@@ -991,24 +1028,60 @@ pub fn post_csp(url: &str) -> String {
 }
 
 /// The one style sheet the IdP chooser has. `chooser_csp` allows only it, by hash.
-const CHOOSER_STYLE: &str = "body{font:16px system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem}ul{list-style:none;padding:0}li{margin:.5rem 0}a{display:block;padding:.75rem 1rem;border:1px solid #ccc;border-radius:.5rem;text-decoration:none;color:inherit}a:hover,a:focus{border-color:#555}";
+const CHOOSER_STYLE: &str = "body{font:16px system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem}ul{list-style:none;padding:0}li{margin:.5rem 0}a{display:block;padding:.75rem 1rem;border:1px solid #ccc;border-radius:.5rem;text-decoration:none;color:inherit}a:hover,a:focus{border-color:#555}form{display:flex;gap:.5rem}input{flex:1;font:inherit;padding:.5rem}button{font:inherit;padding:.5rem 1rem}";
+
+/// The chooser's search box, for every IdP of a federation (ADR 0308), too many to list: a
+/// plain GET form back to the start URL `action`, carrying `carry` (the app's `session`,
+/// `redirect`, `challenge`, `state`, `label`) as hidden fields, with `query` as typed.
+/// `more` matches weren't shown.
+pub struct ChooserSearch<'a> {
+    pub action: &'a str,
+    pub carry: &'a [(String, String)],
+    pub query: &'a str,
+    pub more: usize,
+}
 
 /// The page that asks which of a provider's IdPs to sign in at (ADR 0282): `choices` are
-/// each IdP's name and the start URL that signs in there, in the order shown. No script.
-pub fn chooser_page(label: &str, choices: &[(String, String)]) -> String {
+/// each IdP's name and the start URL that signs in there, in the order shown. With `search`,
+/// a search box first, and the matches. No script.
+pub fn chooser_page(label: &str, choices: &[(String, String)], search: Option<&ChooserSearch>) -> String {
     let items: String = choices.iter().map(|(name, href)| format!(r#"<li><a href="{}">{}</a></li>"#, escape(href), escape(name))).collect();
-    format!(
-        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>SuperBot</title><style>{CHOOSER_STYLE}</style><h1>Sign in with {}</h1><p>Choose your organization.</p><ul>{items}</ul>"#,
-        escape(label)
-    )
+    let body = match search {
+        None => format!("<p>Choose your organization.</p><ul>{items}</ul>"),
+        Some(s) => {
+            let hidden: String = s.carry.iter().map(|(k, v)| format!(r#"<input type="hidden" name="{}" value="{}">"#, escape(k), escape(v))).collect();
+            let note = match (s.query.is_empty(), choices.is_empty(), s.more) {
+                (true, _, _) => "<p>Type part of your organization's name, or its email domain.</p>".to_string(),
+                (false, true, _) => "<p>No organization matches that. Try another part of its name.</p>".to_string(),
+                (false, false, 0) => String::new(),
+                (false, false, n) => format!("<p>{n} more match. Type more of the name to find yours.</p>"),
+            };
+            format!(
+                r#"<form method="get" action="{}">{hidden}<input name="q" type="search" value="{}" maxlength="{MAX_NAME}" aria-label="Your organization" placeholder="Your organization" autofocus required><button type="submit">Search</button></form><ul>{items}</ul>{note}"#,
+                escape(s.action),
+                escape(s.query)
+            )
+        }
+    };
+    format!(r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>SuperBot</title><style>{CHOOSER_STYLE}</style><h1>Sign in with {}</h1>{body}"#, escape(label))
 }
 
 /// The Content-Security-Policy of the IdP chooser: its style sheet, and nothing else loads or
-/// runs. Its links are plain navigation.
-pub fn chooser_csp() -> String {
+/// runs. Its links are plain navigation; with a search box (`search`), its form goes only
+/// back to SuperBot.
+pub fn chooser_csp(search: bool) -> String {
     use sha2::{Digest, Sha256};
     let hash = STANDARD.encode(Sha256::digest(CHOOSER_STYLE.as_bytes()));
-    format!("default-src 'none'; style-src 'sha256-{hash}'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'")
+    let form = if search { "'self'" } else { "'none'" };
+    format!("default-src 'none'; style-src 'sha256-{hash}'; form-action {form}; base-uri 'none'; frame-ancestors 'none'")
+}
+
+/// Whether IdP `m` matches every word of `query` (lowercase), in its name, entity ID or email
+/// domains, for the chooser's search (ADR 0308).
+pub fn chooser_match(m: &IdpMetadata, words: &[String]) -> bool {
+    let name = m.name.as_deref().unwrap_or_default().to_lowercase();
+    let entity = m.entity_id.to_lowercase();
+    words.iter().all(|w| name.contains(w.as_str()) || entity.contains(w.as_str()) || m.scopes.iter().any(|s| s.contains(w.as_str())))
 }
 
 /// `base` with `query` after any query it has.
@@ -1658,6 +1731,14 @@ pub mod test_idp {
         xml.replacen("<md:KeyDescriptor", &format!("{ext}<md:KeyDescriptor"), 1)
     }
 
+    /// `xml` (an EntityDescriptor) with entity attributes, as a federation tags its IdPs
+    /// (ADR 0308): each `(name, value)` an `mdattr:EntityAttributes` attribute value.
+    pub fn with_categories(xml: &str, attrs: &[(&str, &str)]) -> String {
+        let attrs: String = attrs.iter().map(|(n, v)| format!(r#"<saml:Attribute Name="{n}"><saml:AttributeValue>{v}</saml:AttributeValue></saml:Attribute>"#)).collect();
+        let ext = format!(r#"<md:Extensions><mdattr:EntityAttributes xmlns:mdattr="{MDATTR}" xmlns:saml="{ASSERTION}">{attrs}</mdattr:EntityAttributes></md:Extensions>"#);
+        xml.replacen("<md:IDPSSODescriptor", &format!("{ext}<md:IDPSSODescriptor"), 1)
+    }
+
     pub const SLO_URL: &str = "https://idp.example/saml/slo";
 
     /// `xml` with an HTTP-Redirect SingleLogoutService added.
@@ -2147,15 +2228,50 @@ pub(crate) mod tests {
     #[test]
     fn the_idp_chooser_is_escaped_and_runs_nothing() {
         use sha2::{Digest, Sha256};
-        let page = chooser_page("Uni <SSO>", &[("A & <b>".into(), "/api/auth/sso/fed/start?idp=https%3A%2F%2Fa&x=\"1".into()), ("B".into(), "/api/auth/sso/fed/start?idp=b".into())]);
+        let page = chooser_page("Uni <SSO>", &[("A & <b>".into(), "/api/auth/sso/fed/start?idp=https%3A%2F%2Fa&x=\"1".into()), ("B".into(), "/api/auth/sso/fed/start?idp=b".into())], None);
         assert!(page.contains("Sign in with Uni &lt;SSO&gt;") && page.contains("A &amp; &lt;b&gt;"), "{page}");
         assert!(page.contains(r#"href="/api/auth/sso/fed/start?idp=https%3A%2F%2Fa&amp;x=&quot;1""#), "{page}");
         assert!(page.find(">A &amp;").unwrap() < page.find(">B<").unwrap(), "in the order given");
         assert!(!page.contains("<script") && !page.contains("<form"));
         let style = page.split("<style>").nth(1).unwrap().split("</style>").next().unwrap();
-        let csp = chooser_csp();
+        let csp = chooser_csp(false);
         assert!(csp.starts_with("default-src 'none';") && csp.contains(&format!("style-src 'sha256-{}';", STANDARD.encode(Sha256::digest(style.as_bytes())))), "{csp}");
         assert!(csp.contains("form-action 'none'") && csp.contains("frame-ancestors 'none'") && !csp.contains("script-src"), "{csp}");
+    }
+
+    #[test]
+    fn the_chooser_search_is_a_plain_form_back_to_superbot() {
+        let carry = [("session".to_string(), "token".to_string()), ("state".to_string(), "s\"><x".to_string())];
+        fn search<'a>(carry: &'a [(String, String)], query: &'a str, more: usize) -> ChooserSearch<'a> {
+            ChooserSearch { action: "/api/auth/sso/fed/start", carry, query, more }
+        }
+        let page = chooser_page("Uni", &[], Some(&search(&carry, "", 0)));
+        assert!(page.contains(r#"<form method="get" action="/api/auth/sso/fed/start">"#) && page.contains("Type part of your organization"), "{page}");
+        assert!(page.contains(r#"<input type="hidden" name="state" value="s&quot;&gt;&lt;x">"#) && page.contains(r#"name="session" value="token""#), "{page}");
+        assert!(!page.contains("<script") && !page.contains("<li>"));
+        let page = chooser_page("Uni", &[("Uni A".into(), "/a".into())], Some(&search(&carry, "<uni>", 3)));
+        assert!(page.contains(r#"value="&lt;uni&gt;""#) && page.contains(r#"<li><a href="/a">Uni A</a></li>"#) && page.contains("3 more match"), "{page}");
+        assert!(chooser_page("Uni", &[], Some(&search(&carry, "zzz", 0))).contains("No organization matches"));
+        let csp = chooser_csp(true);
+        assert!(csp.contains("form-action 'self'") && !csp.contains("script-src"), "{csp}");
+
+        let m = parse_idp_metadata(&with_ui(&metadata(), "Universität Ä", &["uni-a.example"]), IDP, false).unwrap();
+        let words = |q: &str| q.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>();
+        assert!(chooser_match(&m, &words("universität")) && chooser_match(&m, &words("UNI-A.example")) && chooser_match(&m, &words("idp.example ä")));
+        assert!(!chooser_match(&m, &words("universität b")), "every word");
+    }
+
+    #[test]
+    fn reads_an_entitys_categories_from_its_entity_attributes() {
+        let attrs = format!(
+            r#"<md:Extensions><mdattr:EntityAttributes xmlns:mdattr="{MDATTR}" xmlns:saml="{ASSERTION}"><saml:Attribute Name="{ENTITY_CATEGORY_SUPPORT}"><saml:AttributeValue> http://refeds.org/category/research-and-scholarship </saml:AttributeValue></saml:Attribute><saml:Attribute Name="{ASSURANCE_CERTIFICATION}"><saml:AttributeValue>https://refeds.org/sirtfi</saml:AttributeValue></saml:Attribute><saml:Attribute Name="urn:example:other"><saml:AttributeValue>urn:example:not-a-category</saml:AttributeValue></saml:Attribute><saml:Attribute Name="{ENTITY_CATEGORY}"><saml:AttributeValue>{HIDE_FROM_DISCOVERY}</saml:AttributeValue><saml:AttributeValue>https://refeds.org/sirtfi</saml:AttributeValue></saml:Attribute></mdattr:EntityAttributes></md:Extensions>"#
+        );
+        let xml = metadata().replacen("<md:IDPSSODescriptor", &format!("{attrs}<md:IDPSSODescriptor"), 1);
+        let m = parse_idp_metadata(&xml, IDP, false).unwrap();
+        assert_eq!(m.categories, ["http://refeds.org/category/research-and-scholarship", "https://refeds.org/sirtfi", HIDE_FROM_DISCOVERY], "trimmed, once each, only categories");
+        assert!(m.hidden());
+        let plain = parse_idp_metadata(&metadata(), IDP, false).unwrap();
+        assert!(plain.categories.is_empty() && !plain.hidden());
     }
 
     #[test]

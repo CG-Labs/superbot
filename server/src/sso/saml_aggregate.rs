@@ -10,8 +10,9 @@
 //! nothing that reads one way here and another way there gets past the signature.
 
 use super::jwt::Invalid;
-use super::saml_sp::{MDQ_MAX_VALIDITY_MS, METADATA, MetadataRefused, instant, time};
+use super::saml_sp::{MDQ_MAX_VALIDITY_MS, METADATA, MetadataRefused, PROTOCOL, instant, time};
 use super::xmldsig::{self, Cert, Hasher, Signature, escape_attr, escape_text, prefix};
+use std::collections::HashSet;
 use std::io::Read;
 use std::ops::Range;
 use std::rc::Rc;
@@ -29,6 +30,9 @@ const MAX_SIGNATURE: usize = 64 * 1024;
 const MAX_HELD: usize = 64 * 1024;
 const MAX_DEPTH: usize = 128;
 const MAX_ATTRIBUTES: usize = 256;
+/// The most IdPs kept from one aggregate with `Wanted::Every` (ADR 0308). eduGAIN, the
+/// largest, has about 5,000.
+pub const MAX_EVERY: usize = 10_000;
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
@@ -58,12 +62,23 @@ pub struct Found {
     pub valid_until: i64,
 }
 
-/// What a verified aggregate holds for the IdPs asked for. An IdP in neither list isn't in it.
+/// What a verified aggregate holds for the IdPs asked for, each as `read_each` took it. An
+/// IdP in neither list isn't in it.
 #[derive(Debug)]
-pub struct Aggregate {
-    pub found: Vec<Found>,
+pub struct Aggregate<T = Found> {
+    pub found: Vec<T>,
     /// IdPs listed but not usable, with why: listed twice, or too big.
     pub problems: Vec<(String, String)>,
+}
+
+/// Which `EntityDescriptor`s of an aggregate to keep.
+#[derive(Clone, Copy, Debug)]
+pub enum Wanted<'a> {
+    /// These IdPs' (ADR 0301).
+    Listed(&'a [String]),
+    /// Every IdP's: each entity with a SAML 2.0 `IDPSSODescriptor`, at most `MAX_EVERY` (ADR
+    /// 0308). Service providers and other entities are passed over.
+    Every,
 }
 
 enum Tok {
@@ -598,8 +613,9 @@ impl C14n {
 enum Copying {
     /// The root's `ds:Signature`, which the digest leaves out.
     Signature,
-    /// A listed IdP's `EntityDescriptor`, canonicalized on its own as well.
-    Entity { entity_id: String, side: Box<C14n>, wrapper: String, valid_until: Option<i64> },
+    /// A listed IdP's `EntityDescriptor`, canonicalized on its own as well. `idp`: it has a SAML
+    /// 2.0 `IDPSSODescriptor`, which `Wanted::Every` keeps it for.
+    Entity { entity_id: String, side: Box<C14n>, wrapper: String, valid_until: Option<i64>, idp: bool },
 }
 
 /// The text of one element as it streams by, opened at depth `depth`.
@@ -653,7 +669,16 @@ enum Held {
 /// It must be an `EntitiesDescriptor` signed by an enveloped signature that is its first
 /// child, as metadata's schema has it, over its `ID` or the whole document (`URI=""`), with a
 /// `validUntil` no more than `MDQ_MAX_VALIDITY_MS` ahead, as an MDQ answer's.
+#[cfg(test)]
 pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Result<Aggregate, Error> {
+    read_each(r, Wanted::Listed(wanted), certs, now_ms, |f| f)
+}
+
+/// `read`, handing each `EntityDescriptor` kept to `take` as soon as it closes, so only what
+/// `take` makes of it is held until the end: with `Wanted::Every`, thousands of copies would
+/// otherwise be. What `take` returns is only for the caller once the whole aggregate verifies;
+/// a copy's `valid_until` already counts the root's.
+pub fn read_each<T>(r: impl Read, wanted: Wanted, certs: &[Cert], now_ms: i64, mut take: impl FnMut(Found) -> T) -> Result<Aggregate<T>, Error> {
     let mut lx = Lexer::new(r);
     let mut scope = Scope::default();
     // Each open element's name, and the validUntil of each EntitiesDescriptor among them.
@@ -665,8 +690,7 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
     let mut signature: Option<Signature> = None;
     let mut copy: Option<Copy> = None;
     let mut closed = false;
-    let mut found: Vec<Found> = Vec::new();
-    let mut problems: Vec<(String, String)> = Vec::new();
+    let mut found = Kept { wanted, take: &mut take, found: Vec::new(), problems: Vec::new(), seen: HashSet::new() };
     let unsigned = || refused("unsigned", "the aggregate isn't signed at its root: every one must be, by the certificate in SSO_<ID>_METADATA_SIGNING_CERT_FILE");
 
     while let Some((tok, range)) = lx.next()? {
@@ -735,19 +759,24 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
                 if let Some(m) = main.as_mut().filter(|_| !in_signature) {
                     m.start(&e);
                 }
+                if let Some(Copy { what: Copying::Entity { idp, .. }, depth: d, .. }) = copy.as_mut()
+                    && depth == *d + 1
+                    && e.is(METADATA, "IDPSSODescriptor")
+                    && e.attr("protocolSupportEnumeration").is_some_and(|p| p.split_ascii_whitespace().any(|p| p == PROTOCOL))
+                {
+                    *idp = true;
+                }
                 if copy.is_none() && e.is(METADATA, "EntityDescriptor") {
                     let entity_id = e.attr("entityID").unwrap_or_default().to_string();
-                    if wanted.contains(&entity_id) {
-                        if found.iter().any(|f| f.entity_id == entity_id) || problems.iter().any(|(p, _)| *p == entity_id) {
-                            found.retain(|f| f.entity_id != entity_id);
-                            problems.retain(|(p, _)| *p != entity_id);
-                            problems.push((entity_id, "the aggregate lists it twice".into()));
-                        } else {
-                            let valid_until = open.iter().filter_map(|(_, u)| *u).min();
-                            let side = Box::new(C14n::new(Vec::new(), xmldsig::DigestAlg::Sha256.hasher()));
-                            let wrapper = wrap(&e.scope, "");
-                            copy = Some(Copy { what: Copying::Entity { entity_id, side, wrapper, valid_until }, depth, raw: Vec::new(), too_big: false });
-                        }
+                    let keep = match wanted {
+                        Wanted::Listed(l) => l.contains(&entity_id),
+                        Wanted::Every => !entity_id.is_empty(),
+                    };
+                    if keep {
+                        let valid_until = open.iter().filter_map(|(_, u)| *u).min();
+                        let side = Box::new(C14n::new(Vec::new(), xmldsig::DigestAlg::Sha256.hasher()));
+                        let wrapper = wrap(&e.scope, "");
+                        copy = Some(Copy { what: Copying::Entity { entity_id, side, wrapper, valid_until, idp: false }, depth, raw: Vec::new(), too_big: false });
                     }
                 }
                 let max = if in_signature { MAX_SIGNATURE } else { MAX_ENTITY };
@@ -763,7 +792,7 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
                 };
                 open.push((e.qname.clone(), until));
                 if empty {
-                    close(&mut open, &mut scope, &mut main, &mut copy, &mut found, &mut problems, &mut signature, &mut held, root.as_ref())?;
+                    close(&mut open, &mut scope, &mut main, &mut copy, &mut found, &mut signature, &mut held, root.as_ref())?;
                     closed = open.is_empty();
                 }
             }
@@ -775,7 +804,7 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
                     let max = if matches!(c.what, Copying::Signature) { MAX_SIGNATURE } else { MAX_ENTITY };
                     c.push(lx.raw(range), max);
                 }
-                close(&mut open, &mut scope, &mut main, &mut copy, &mut found, &mut problems, &mut signature, &mut held, root.as_ref())?;
+                close(&mut open, &mut scope, &mut main, &mut copy, &mut found, &mut signature, &mut held, root.as_ref())?;
                 closed = open.is_empty();
             }
         }
@@ -796,22 +825,54 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
     if valid_until > now_ms.saturating_add(MDQ_MAX_VALIDITY_MS) {
         return Err(refused("valid_too_long", format!("the aggregate is valid until {}, more than {} days ahead", instant(valid_until), MDQ_MAX_VALIDITY_MS / 86_400_000)));
     }
-    for f in &mut found {
-        f.valid_until = f.valid_until.min(valid_until);
+    Ok(Aggregate { found: found.found.into_iter().map(|(_, t)| t).collect(), problems: found.problems })
+}
+
+/// The IdPs kept so far, each as `take` made it, by entity ID, and those that can't be used.
+struct Kept<'a, T> {
+    wanted: Wanted<'a>,
+    take: &'a mut dyn FnMut(Found) -> T,
+    found: Vec<(String, T)>,
+    problems: Vec<(String, String)>,
+    /// Every IdP met, found or a problem, so one listed twice is used from neither.
+    seen: HashSet<String>,
+}
+
+impl<T> Kept<'_, T> {
+    /// A copy of `entity_id` closed: kept, or a problem. With `Wanted::Every`, only an IdP's.
+    fn add(&mut self, entity_id: String, idp: bool, got: Result<Found, String>) -> Result<(), Error> {
+        if matches!(self.wanted, Wanted::Every) && !idp {
+            return Ok(());
+        }
+        if !self.seen.insert(entity_id.clone()) {
+            self.found.retain(|(e, _)| *e != entity_id);
+            self.problems.retain(|(p, _)| *p != entity_id);
+            self.problems.push((entity_id, "the aggregate lists it twice".into()));
+            return Ok(());
+        }
+        if self.seen.len() > MAX_EVERY {
+            return Err(bad(format!("the aggregate lists more than {MAX_EVERY} IdPs: name the ones wanted in SSO_<ID>_IDP_ENTITY_IDS")));
+        }
+        match got {
+            Ok(f) => {
+                let t = (self.take)(f);
+                self.found.push((entity_id, t));
+            }
+            Err(why) => self.problems.push((entity_id, why)),
+        }
+        Ok(())
     }
-    Ok(Aggregate { found, problems })
 }
 
 /// Closes the innermost open element: in the digest, in the copy being made, and when that is
 /// the root's signature or a listed IdP, finishes it.
 #[allow(clippy::too_many_arguments)]
-fn close(
+fn close<T>(
     open: &mut Vec<(String, Option<i64>)>,
     scope: &mut Scope,
     main: &mut Option<C14n>,
     copy: &mut Option<Copy>,
-    found: &mut Vec<Found>,
-    problems: &mut Vec<(String, String)>,
+    found: &mut Kept<'_, T>,
     signature: &mut Option<Signature>,
     held: &mut Vec<Held>,
     root: Option<&Element>,
@@ -857,14 +918,14 @@ fn close(
         side.end(&qname);
     }
     if matches!(copy, Some(Copy { what: Copying::Entity { .. }, depth: d, .. }) if *d == depth) {
-        let Some(Copy { what: Copying::Entity { entity_id, side, wrapper, valid_until }, raw, too_big, .. }) = copy.take() else { unreachable!() };
+        let Some(Copy { what: Copying::Entity { entity_id, side, wrapper, valid_until, idp }, raw, too_big, .. }) = copy.take() else { unreachable!() };
         if too_big {
-            problems.push((entity_id, format!("its EntityDescriptor is over {} MB", MAX_ENTITY >> 20)));
-            return Ok(());
+            return found.add(entity_id, idp, Err(format!("its EntityDescriptor is over {} MB", MAX_ENTITY >> 20)));
         }
         let raw = String::from_utf8(raw).map_err(|_| bad("the aggregate isn't UTF-8"))?;
         let xml = format!("{}{raw}</w>", wrapper.trim_end_matches("</w>"));
-        found.push(Found { entity_id, xml, sha256: side.out.finish(), valid_until: valid_until.unwrap_or(i64::MAX) });
+        let f = Found { entity_id: entity_id.clone(), xml, sha256: side.out.finish(), valid_until: valid_until.unwrap_or(i64::MAX) };
+        return found.add(entity_id, idp, Ok(f));
     }
     Ok(())
 }
@@ -1150,6 +1211,50 @@ mod tests {
         };
         assert_eq!(own(NOW + DAY), Ok(Some(NOW + DAY)));
         assert_eq!(own(NOW - 1), Err("expired"));
+    }
+
+    fn read_every(xml: &str) -> Result<Aggregate, String> {
+        read_each(xml.as_bytes(), Wanted::Every, &[anchor().cert()], NOW, |f| f).map_err(|e| match e {
+            Error::Refused(r) => r.reason.to_string(),
+            Error::Io(m) => format!("io: {m}"),
+        })
+    }
+
+    #[test]
+    fn every_saml_idp_of_an_aggregate_in_the_order_it_lists_them() {
+        let sp = entity("https://sp.member.example/sp", 0).replace("IDPSSODescriptor", "SPSSODescriptor");
+        let saml1 = entity("https://old.member.example/idp", 0).replacen(PROTOCOL, "urn:oasis:names:tc:SAML:1.1:protocol", 1);
+        let both = entity("https://both.member.example/idp", 0).replacen(PROTOCOL, &format!("urn:oasis:names:tc:SAML:1.1:protocol {PROTOCOL}"), 1);
+        let nested = format!(r#"<md:EntitiesDescriptor>{}</md:EntitiesDescriptor>"#, entity(B, 2).trim_start_matches(r#"<?xml version="1.0"?>"#));
+        let xml = signed_aggregate(&aggregate(&[sp, entity(A, 0), saml1, nested, both], NOW + DAY), anchor(), "#_agg");
+        let agg = read_every(&xml).unwrap();
+        assert_eq!((ids(&agg), agg.problems.len()), (vec![A, B, "https://both.member.example/idp"], 0), "SPs and SAML 1 IdPs aren't IdPs to sign in at");
+        assert_eq!(load(&agg.found[1]).unwrap().certs[0].sha256, signer(2).cert().sha256);
+        let mut seen = Vec::new();
+        let counted = read_each(xml.as_bytes(), Wanted::Every, &[anchor().cert()], NOW, |f| {
+            seen.push(f.entity_id.clone());
+            f.xml.len()
+        })
+        .unwrap();
+        assert_eq!((seen.len(), counted.found.iter().all(|&n| n > 0)), (3, true), "each handed over as it closes");
+
+        let twice = signed_aggregate(&aggregate(&[entity(A, 0), entity(B, 0), entity(A, 2)], NOW + DAY), anchor(), "#_agg");
+        let agg = read_every(&twice).unwrap();
+        assert_eq!((ids(&agg), &agg.problems[..]), (vec![B], &[(A.to_string(), "the aggregate lists it twice".to_string())][..]));
+        let changed = xml.replacen("https://idp.example/saml/sso", "https://evil.example/sso", 1);
+        assert_eq!(read_every(&changed).err().as_deref(), Some("bad_signature"), "nothing is used unless the whole aggregate verifies");
+    }
+
+    #[test]
+    fn at_most_max_every_idps() {
+        let mut take = |f: Found| f;
+        let mut kept = Kept { wanted: Wanted::Every, take: &mut take, found: Vec::new(), problems: Vec::new(), seen: HashSet::new() };
+        for i in 0..MAX_EVERY {
+            kept.add(format!("https://idp{i}.example"), true, Err("broken".into())).unwrap();
+        }
+        kept.add("https://sp.example".into(), false, Err("an SP".into())).unwrap();
+        assert_eq!(kept.problems.len(), MAX_EVERY, "SPs aren't counted");
+        assert!(matches!(kept.add("https://one-more.example".into(), true, Err("broken".into())), Err(Error::Refused(r)) if r.reason == "bad_metadata"));
     }
 
     #[test]
