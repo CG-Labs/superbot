@@ -3945,6 +3945,64 @@ async fn one_idp_publishes_no_discovery_response() {
     assert!(code == 303 && header(&head, "location").unwrap().starts_with(SSO_URL), "{head}");
 }
 
+// How our metadata describes SuperBot to a federation (ADR 0323)
+
+#[tokio::test]
+async fn sp_metadata_lists_superbot_for_a_federation_and_the_admin_sees_what_is_missing() {
+    use crate::sso::saml_registration::{CODE_OF_CONDUCT, MAIL, RESEARCH_AND_SCHOLARSHIP, SECURITY_CONTACT, SIRTFI, SIRTFI2};
+    let sp = serve(&[
+        ("SP_DISPLAY_NAME", "SuperBot at Example University"),
+        ("SP_INFORMATION_URL", "https://superbot.example.edu/"),
+        ("SP_ORGANIZATION", "Example University"),
+        ("SP_ORGANIZATION_URL", "https://www.example.edu/"),
+        ("SP_CONTACT_TECHNICAL", "Platform Team <platform@example.edu>"),
+        ("SP_CONTACT_SECURITY", "CSIRT <csirt@example.edu>"),
+        ("SP_SIRTFI", "v2"),
+        ("ALLOWED_DOMAINS", "example.edu"),
+    ])
+    .await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    let doc = roxmltree::Document::parse(&md).unwrap();
+    let text = |tag: &str| doc.descendants().find(|n| n.tag_name().name() == tag).and_then(|n| n.text()).map(String::from);
+    assert_eq!(text("DisplayName").as_deref(), Some("SuperBot at Example University"), "{md}");
+    assert_eq!(text("ServiceName").as_deref(), Some("SuperBot at Example University"), "{md}");
+    assert_eq!(text("OrganizationURL").as_deref(), Some("https://www.example.edu/"));
+    let mail = doc.descendants().find(|n| n.tag_name().name() == "RequestedAttribute" && n.attribute("Name") == Some(MAIL)).unwrap();
+    assert_eq!(mail.attribute("isRequired"), Some("true"), "only listed domains get in, so the email is needed");
+    let security = doc.descendants().find(|n| n.attribute(("http://refeds.org/metadata", "contactType")) == Some(SECURITY_CONTACT)).unwrap();
+    assert_eq!(security.attribute("contactType"), Some("other"));
+    assert!(md.contains(&format!("<saml:AttributeValue>{SIRTFI2}</saml:AttributeValue><saml:AttributeValue>{SIRTFI}</saml:AttributeValue>")), "{md}");
+
+    let about = &sp.view().await["about"];
+    assert_eq!((about["displayName"].as_str(), about["sirtfi"].as_str()), (Some("SuperBot at Example University"), Some("v2")));
+    assert_eq!(about["contacts"], json!([{ "type": "technical", "name": "Platform Team", "email": "platform@example.edu" }, { "type": "security", "name": "CSIRT", "email": "csirt@example.edu" }]));
+    assert_eq!(
+        about["categories"],
+        json!([
+            { "category": RESEARCH_AND_SCHOLARSHIP, "name": "Research and Scholarship", "missing": [] },
+            { "category": CODE_OF_CONDUCT, "name": "Code of Conduct v2", "missing": ["SP_DESCRIPTION", "SP_PRIVACY_URL"] },
+        ])
+    );
+
+    // Sign-ins are as before.
+    let u = sp.app.db.create_user(None, Some("ada@example.edu"), "Ada", Role::Member).unwrap();
+    call(sp.port, "POST", &format!("/api/users/{}/identities", u.id), &sp.admin, &json!({ "provider": sp.id, "subject": NAME_ID }).to_string()).await;
+    let (code, _, head) = sp.sign_in(|r| r.attributes = vec![("email".into(), "ada@example.edu".into())]).await;
+    assert_eq!(code, 200, "{head}");
+}
+
+#[tokio::test]
+async fn sp_metadata_without_a_listing_is_as_before() {
+    let sp = serve(&[]).await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    for absent in ["UIInfo", "AttributeConsumingService", "ContactPerson", "Organization", "EntityAttributes"] {
+        assert!(!md.contains(absent), "{absent}: {md}");
+    }
+    let about = &sp.view().await["about"];
+    assert_eq!((&about["displayName"], &about["requestedAttributes"]), (&Value::Null, &json!([])));
+    assert_eq!(about["categories"][0]["missing"], json!(["SP_DISPLAY_NAME", "SP_INFORMATION_URL", "SP_CONTACT_TECHNICAL"]));
+}
+
 // Subject identifier attributes (ADR 0319)
 
 const TRANSIENT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:transient";

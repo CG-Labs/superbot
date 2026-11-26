@@ -54,6 +54,7 @@
 
 use super::jwt::Invalid;
 use super::provider::Claims;
+use super::saml_registration::About;
 use super::xmldsig::{self, Cert, elements, is};
 use super::xmlenc::Cbc;
 use crate::db::SamlLogin;
@@ -127,7 +128,7 @@ pub const SUBJECT_ID: &str = "urn:oasis:names:tc:SAML:attribute:subject-id";
 pub const PAIRWISE_ID: &str = "urn:oasis:names:tc:SAML:attribute:pairwise-id";
 /// The entity attribute an SP's metadata says which one it requires with.
 pub const SUBJECT_ID_REQ: &str = "urn:oasis:names:tc:SAML:profiles:subject-id:req";
-const ATTRNAME_URI: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:uri";
+pub(super) const ATTRNAME_URI: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:uri";
 
 impl Subject {
     pub fn parse(s: &str) -> Option<Subject> {
@@ -445,7 +446,7 @@ pub const MAX_IDPS: usize = 100;
 const MAX_SCOPES: usize = 64;
 /// The longest IdP name shown, in characters.
 const MAX_NAME: usize = 100;
-const MDUI: &str = "urn:oasis:names:tc:SAML:metadata:ui";
+pub(super) const MDUI: &str = "urn:oasis:names:tc:SAML:metadata:ui";
 const SHIBMD: &str = "urn:mace:shibboleth:metadata:1.0";
 const MDATTR: &str = "urn:oasis:names:tc:SAML:metadata:attribute";
 /// The Identity Provider Discovery Service Protocol: its metadata extension's namespace, and
@@ -883,24 +884,36 @@ fn encryption_methods(aes_cbc: AesCbc) -> String {
 /// the next one (ADR 0181). The ACS takes responses over `response` only (ADR 0268). With
 /// several IdPs, `discovery` is where a discovery service sends the browser back (ADR 0314).
 /// With a subject identifier attribute (ADR 0319), the entity says it requires that one
-/// (`subject-id:req`), and asks for transient NameIDs, which only logout uses.
-pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc, response: ResponseBinding, discovery: Option<&str>, subject: Subject) -> String {
-    let (entity_extensions, name_id_format) = match subject.attribute() {
-        None => (String::new(), PERSISTENT),
-        Some(_) => (
-            format!(
-                "\n  <md:Extensions><mdattr:EntityAttributes xmlns:mdattr=\"{MDATTR}\"><saml:Attribute xmlns:saml=\"{ASSERTION}\" Name=\"{SUBJECT_ID_REQ}\" NameFormat=\"{ATTRNAME_URI}\"><saml:AttributeValue>{}</saml:AttributeValue></saml:Attribute></mdattr:EntityAttributes></md:Extensions>",
+/// (`subject-id:req`), and asks for transient NameIDs, which only logout uses. `about` adds how
+/// a federation lists the service, whom to contact, Sirtfi and the attributes read (ADR 0323).
+pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], aes_cbc: AesCbc, response: ResponseBinding, discovery: Option<&str>, subject: Subject, about: &About) -> String {
+    let mut entity_attributes = String::new();
+    let name_id_format = match subject.attribute() {
+        None => PERSISTENT,
+        Some(_) => {
+            entity_attributes += &format!(
+                "<saml:Attribute xmlns:saml=\"{ASSERTION}\" Name=\"{SUBJECT_ID_REQ}\" NameFormat=\"{ATTRNAME_URI}\"><saml:AttributeValue>{}</saml:AttributeValue></saml:Attribute>",
                 subject.as_str()
-            ),
-            TRANSIENT,
-        ),
+            );
+            TRANSIENT
+        }
+    };
+    entity_attributes += &about.entity_attributes();
+    let entity_extensions = match entity_attributes.is_empty() {
+        true => String::new(),
+        false => format!("\n  <md:Extensions><mdattr:EntityAttributes xmlns:mdattr=\"{MDATTR}\">{entity_attributes}</mdattr:EntityAttributes></md:Extensions>"),
     };
     let signed = signing.is_some_and(|s| s.sign_requests);
     let key_info = |cert: &str| format!(r#"<ds:KeyInfo xmlns:ds="{}"><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#, xmldsig::DSIG);
     // Extensions come first in a role descriptor.
-    let mut keys = discovery
-        .map(|d| format!("\n    <md:Extensions><idpdisc:DiscoveryResponse xmlns:idpdisc=\"{IDP_DISCOVERY}\" Binding=\"{IDP_DISCOVERY}\" Location=\"{}\" index=\"0\" isDefault=\"true\"/></md:Extensions>", escape(d)))
+    let mut role_extensions = discovery
+        .map(|d| format!("<idpdisc:DiscoveryResponse xmlns:idpdisc=\"{IDP_DISCOVERY}\" Binding=\"{IDP_DISCOVERY}\" Location=\"{}\" index=\"0\" isDefault=\"true\"/>", escape(d)))
         .unwrap_or_default();
+    role_extensions += &about.ui_info();
+    let mut keys = match role_extensions.is_empty() {
+        true => String::new(),
+        false => format!("\n    <md:Extensions>{role_extensions}</md:Extensions>"),
+    };
     for cert in signing.map_or(&[][..], |s| s.certs) {
         keys += &format!("\n    <md:KeyDescriptor use=\"signing\">{}</md:KeyDescriptor>", key_info(cert));
     }
@@ -920,13 +933,15 @@ pub fn sp_metadata(sp: &Sp, signing: Option<&SpSigning>, encryption: &[&str], ae
 <md:EntityDescriptor xmlns:md="{METADATA}" entityID="{}">{entity_extensions}
   <md:SPSSODescriptor AuthnRequestsSigned="{signed}" WantAssertionsSigned="true" protocolSupportEnumeration="{PROTOCOL}">{keys}
     <md:NameIDFormat>{name_id_format}</md:NameIDFormat>
-    <md:AssertionConsumerService Binding="{}" Location="{}" index="0" isDefault="true"/>
-  </md:SPSSODescriptor>
+    <md:AssertionConsumerService Binding="{}" Location="{}" index="0" isDefault="true"/>{}
+  </md:SPSSODescriptor>{}
 </md:EntityDescriptor>
 "#,
         escape(sp.entity_id),
         response.uri(),
-        escape(sp.acs)
+        escape(sp.acs),
+        about.attribute_consuming_service(),
+        about.organization_and_contacts()
     )
 }
 
@@ -2410,7 +2425,7 @@ pub(crate) mod tests {
         let slo = "https://bot.example.com/api/auth/sso/okta/slo";
         let slo_soap = "https://bot.example.com/api/auth/sso/okta/slo/soap";
         for sign_requests in [false, true] {
-            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
+            let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&key.cert], slo, slo_soap, sign_requests }), &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &About::default());
             let doc = roxmltree::Document::parse(&md).unwrap();
             let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
             assert_eq!(spsso.attribute("AuthnRequestsSigned"), Some(if sign_requests { "true" } else { "false" }));
@@ -2421,7 +2436,7 @@ pub(crate) mod tests {
             let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
             assert_eq!(order, ["KeyDescriptor", "SingleLogoutService", "SingleLogoutService", "SingleLogoutService", "NameIDFormat", "AssertionConsumerService"], "schema order");
         }
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId).contains("SingleLogoutService"), "no key, no logout");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &About::default()).contains("SingleLogoutService"), "no key, no logout");
     }
 
     #[test]
@@ -2430,14 +2445,14 @@ pub(crate) mod tests {
         let back = "https://bot.example.com/api/auth/sso/fed/discovery";
         let (key, _) = SpKey::generate("sp").unwrap();
         let signing = SpSigning { certs: &[&key.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false };
-        let md = sp_metadata(&sp, Some(&signing), &[], AesCbc::Off, ResponseBinding::Post, Some(back), Subject::NameId);
+        let md = sp_metadata(&sp, Some(&signing), &[], AesCbc::Off, ResponseBinding::Post, Some(back), Subject::NameId, &About::default());
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
         assert_eq!(order[..2], ["Extensions", "KeyDescriptor"], "Extensions first, as the schema says");
         let r = doc.descendants().find(|n| is(*n, IDP_DISCOVERY, "DiscoveryResponse")).unwrap();
         assert_eq!((r.attribute("Binding"), r.attribute("Location"), r.attribute("index"), r.attribute("isDefault")), (Some(IDP_DISCOVERY), Some(back), Some("0"), Some("true")));
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId).contains("Extensions"), "one IdP: nothing to discover");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &About::default()).contains("Extensions"), "one IdP: nothing to discover");
 
         let to = url::Url::parse(&discovery_request("https://service.seamlessaccess.org/ds/", SP, &format!("{back}?session=token&state=s&1"))).unwrap();
         let q: Vec<(String, String)> = to.query_pairs().into_owned().collect();
@@ -2450,7 +2465,7 @@ pub(crate) mod tests {
     #[test]
     fn writes_sp_metadata_and_a_redirect_authn_request() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &About::default());
         let doc = roxmltree::Document::parse(&md).unwrap();
         let root = doc.root_element();
         assert_eq!(root.attribute("entityID"), Some(SP));
@@ -2480,7 +2495,7 @@ pub(crate) mod tests {
     #[test]
     fn artifact_responses_are_asked_for_and_offered_alone() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Artifact, None, Subject::NameId);
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Artifact, None, Subject::NameId, &About::default());
         let doc = roxmltree::Document::parse(&md).unwrap();
         let acs: Vec<_> = doc.descendants().filter(|n| is(*n, METADATA, "AssertionConsumerService")).map(|n| (n.attribute("Binding"), n.attribute("Location"), n.attribute("index"))).collect();
         assert_eq!(acs, [(Some(ARTIFACT), Some(ACS), Some("0"))], "one ACS, so the IdP can't fall back to posting");
@@ -2693,10 +2708,10 @@ pub(crate) mod tests {
     #[test]
     fn sp_metadata_says_which_subject_identifier_it_requires() {
         let sp = Sp { entity_id: SP, acs: ACS };
-        let plain = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
+        let plain = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &About::default());
         assert!(!plain.contains(SUBJECT_ID_REQ) && plain.contains(&format!("<md:NameIDFormat>{PERSISTENT}</md:NameIDFormat>")));
         for s in [Subject::SubjectId, Subject::PairwiseId] {
-            let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, Some("https://bot.example.com/api/auth/sso/okta/discovery"), s);
+            let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, Some("https://bot.example.com/api/auth/sso/okta/discovery"), s, &About::default());
             let doc = roxmltree::Document::parse(&md).unwrap();
             let kids = elements(doc.root_element());
             assert!(is(kids[0], METADATA, "Extensions") && is(kids[1], METADATA, "SPSSODescriptor"), "the entity's Extensions come first");
@@ -2707,6 +2722,83 @@ pub(crate) mod tests {
             assert!(md.contains(&format!("<md:NameIDFormat>{TRANSIENT}</md:NameIDFormat>")) && !md.contains(PERSISTENT), "only for logout");
             assert!(md.contains("idpdisc:DiscoveryResponse"), "the role's own Extensions stay");
         }
+    }
+
+    #[test]
+    fn sp_metadata_describes_the_service_for_a_federation() {
+        use super::super::saml_registration::{self as reg, Contact, ContactType, Organization, Sirtfi};
+        let sp = Sp { entity_id: SP, acs: ACS };
+        let contact = |kind, name: Option<&str>, email: &str| Contact { kind, name: name.map(String::from), email: email.into() };
+        let about = About {
+            display_name: Some("SuperBot & Co".into()),
+            description: Some("AI teammates <with> their own computer".into()),
+            information_url: Some("https://superbot.example.edu/about?a=1&b=2".into()),
+            privacy_url: Some("https://superbot.example.edu/privacy".into()),
+            organization: Some(Organization { name: "Example University".into(), url: "https://www.example.edu/".into() }),
+            contacts: vec![contact(ContactType::Technical, Some("Platform Team"), "platform@example.edu"), contact(ContactType::Support, None, "help@example.edu"), contact(ContactType::Security, Some("CSIRT"), "csirt@example.edu")],
+            sirtfi: Sirtfi::V2,
+            requested: reg::requested(&Attributes { groups: Some("urn:oid:1.3.6.1.4.1.5923.1.1.1.9".into()), ..Attributes::default() }, true, false),
+        };
+        let back = "https://bot.example.com/api/auth/sso/uni/discovery";
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, Some(back), Subject::PairwiseId, &about);
+        let doc = roxmltree::Document::parse(&md).unwrap();
+        let root = doc.root_element();
+        let kids: Vec<&str> = elements(root).iter().map(|n| n.tag_name().name()).collect();
+        assert_eq!(kids, ["Extensions", "SPSSODescriptor", "Organization", "ContactPerson", "ContactPerson", "ContactPerson"], "schema order");
+
+        // One EntityAttributes: what the subject is, then Sirtfi v2 with v1.
+        let attrs: Vec<(&str, Vec<&str>)> = doc.descendants().filter(|n| is(*n, MDATTR, "EntityAttributes")).flat_map(elements).map(|a| (a.attribute("Name").unwrap(), elements(a).iter().filter_map(|v| v.text()).collect())).collect();
+        assert_eq!(attrs, [(SUBJECT_ID_REQ, vec!["pairwise-id"]), (ASSURANCE_CERTIFICATION, vec![reg::SIRTFI2, reg::SIRTFI])]);
+
+        let spsso = elements(root)[1];
+        let order: Vec<&str> = elements(spsso).iter().map(|n| n.tag_name().name()).collect();
+        assert_eq!(order, ["Extensions", "NameIDFormat", "AssertionConsumerService", "AttributeConsumingService"], "schema order");
+        let ext: Vec<&str> = elements(elements(spsso)[0]).iter().map(|n| n.tag_name().name()).collect();
+        assert_eq!(ext, ["DiscoveryResponse", "UIInfo"]);
+        let ui: Vec<(&str, Option<&str>, &str)> = doc.descendants().filter(|n| is(*n, MDUI, "UIInfo")).flat_map(elements).map(|n| (n.tag_name().name(), n.attribute((XML_NS, "lang")), n.text().unwrap())).collect();
+        assert_eq!(
+            ui,
+            [
+                ("DisplayName", Some("en"), "SuperBot & Co"),
+                ("Description", Some("en"), "AI teammates <with> their own computer"),
+                ("InformationURL", Some("en"), "https://superbot.example.edu/about?a=1&b=2"),
+                ("PrivacyStatementURL", Some("en"), "https://superbot.example.edu/privacy")
+            ],
+            "escaped, and read back as set"
+        );
+
+        let service = elements(spsso)[3];
+        assert_eq!((service.attribute("index"), elements(service)[0].text()), (Some("0"), Some("SuperBot & Co")));
+        let wanted: Vec<(Option<&str>, &str, Option<&str>, &str)> = elements(service)[1..].iter().map(|r| (r.attribute("FriendlyName"), r.attribute("Name").unwrap(), r.attribute("NameFormat"), r.attribute("isRequired").unwrap())).collect();
+        assert_eq!(
+            wanted,
+            [
+                (Some("mail"), reg::MAIL, Some(ATTRNAME_URI), "true"),
+                (Some("displayName"), reg::DISPLAY_NAME, Some(ATTRNAME_URI), "false"),
+                (None, "urn:oid:1.3.6.1.4.1.5923.1.1.1.9", Some(ATTRNAME_URI), "false")
+            ]
+        );
+
+        let org: Vec<&str> = elements(elements(root)[2]).iter().map(|n| n.text().unwrap()).collect();
+        assert_eq!(org, ["Example University", "Example University", "https://www.example.edu/"]);
+        let contacts: Vec<(Option<&str>, Option<&str>, Vec<&str>)> = elements(root)[3..]
+            .iter()
+            .map(|c| (c.attribute("contactType"), c.attribute(("http://refeds.org/metadata", "contactType")), elements(*c).iter().map(|n| n.text().unwrap()).collect()))
+            .collect();
+        assert_eq!(
+            contacts,
+            [
+                (Some("technical"), None, vec!["Platform Team", "mailto:platform@example.edu"]),
+                (Some("support"), None, vec!["mailto:help@example.edu"]),
+                (Some("other"), Some(reg::SECURITY_CONTACT), vec!["CSIRT", "mailto:csirt@example.edu"])
+            ],
+            "the REFEDS security contact"
+        );
+
+        // No display name: no service to name the requested attributes by.
+        let unnamed = About { display_name: None, description: None, information_url: None, privacy_url: None, ..about };
+        let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &unnamed);
+        assert!(!md.contains("UIInfo") && !md.contains("AttributeConsumingService") && md.contains("<md:ContactPerson"));
     }
 
     const MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
@@ -3464,7 +3556,7 @@ pub(crate) mod tests {
         let sp = Sp { entity_id: SP, acs: ACS };
         let (sign, _) = SpKey::generate("sp").unwrap();
         let enc = &enc_keys()[0];
-        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
+        let md = sp_metadata(&sp, Some(&SpSigning { certs: &[&sign.cert], slo: "https://bot.example.com/slo", slo_soap: "https://bot.example.com/slo/soap", sign_requests: false }), &[&enc.cert], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &About::default());
         let doc = roxmltree::Document::parse(&md).unwrap();
         let spsso = doc.descendants().find(|n| is(*n, METADATA, "SPSSODescriptor")).unwrap();
         let order: Vec<String> = elements(spsso).iter().map(|n| format!("{}{}", n.tag_name().name(), n.attribute("use").map(|u| format!("/{u}")).unwrap_or_default())).collect();
@@ -3479,10 +3571,10 @@ pub(crate) mod tests {
         let mut r = encrypted();
         r.encrypt = Some(ok);
         assert_eq!(enc_reason(&r.xml()), "ok");
-        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId).contains("encryption"), "off: nothing to encrypt to");
+        assert!(!sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId, &About::default()).contains("encryption"), "off: nothing to encrypt to");
 
         // With AES-CBC taken (ADR 0218), it's offered after GCM, so an IdP that picks the first keeps GCM.
-        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse, ResponseBinding::Post, None, Subject::NameId);
+        let md = sp_metadata(&sp, None, &[&enc.cert], AesCbc::SignedResponse, ResponseBinding::Post, None, Subject::NameId, &About::default());
         let doc = roxmltree::Document::parse(&md).unwrap();
         let methods: Vec<&str> = doc.descendants().filter(|n| is(*n, METADATA, "EncryptionMethod")).filter_map(|n| n.attribute("Algorithm")).collect();
         assert_eq!(&methods[..4], [AES256_GCM, AES128_GCM, AES256_CBC, AES128_CBC]);
