@@ -703,8 +703,9 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
         c.execute("ATTACH DATABASE ?1 AS botd KEY ?2", rusqlite::params![db_path, place.db_key.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
         let lost = crate::db::audit_lost_in_copy(&c, "botd", &place.region, at);
         c.execute("DETACH DATABASE botd", []).map_err(err)?;
-        let (erased, lost) = lost.map_err(err)?;
+        let (erased, elsewhere, lost) = lost.map_err(err)?;
         plan.erased.audit_events += erased;
+        plan.dropped.audit_events += elsewhere;
         plan.audit_lost = lost;
     }
     c.execute_batch("VACUUM").map_err(err)?;

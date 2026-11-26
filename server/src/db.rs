@@ -19,7 +19,7 @@ pub use chats::{
     kept_in_region, places, sign_ins_from, upgrade_copy, user_place,
 };
 pub use chats::{StoreMoved, moved_to, remove_store_files};
-pub use chats::{audit_lost_in_copy, audit_person, audit_placeholder, audit_store_for, insert_audit_details};
+pub use chats::{audit_left_in_copy, audit_lost_in_copy, audit_people, audit_placeholder, audit_store_for, insert_audit_details};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 
