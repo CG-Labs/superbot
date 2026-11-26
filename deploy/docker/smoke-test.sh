@@ -393,6 +393,8 @@ grep -Fq "Settings: botd from $image would start with this stack's settings (bot
   || { cat "$WORK/check-compose.log" >&2; fail "check-compose didn't judge the stack's settings"; }
 grep -Eq "License: botd from .* would run Bots|Bots don't run on this stack now either" "$WORK/check-compose.log" \
   || { cat "$WORK/check-compose.log" >&2; fail "check-compose didn't judge the stack's license"; }
+grep -Fq "Database: no release newer than botd in $image has run on this stack's database (botd support check)" "$WORK/check-compose.log" \
+  || { cat "$WORK/check-compose.log" >&2; fail "check-compose didn't ask the image's botd support check about the stack's database"; }
 cid=$(dc ps -q botd)
 echo "SERVER_BACKUP_OFF_HOST=sometimes" >>"$SUPERBOT_ENV_FILE"
 if check_compose >"$WORK/check-compose.log" 2>&1; then fail "check-compose passed a setting botd refuses at start"; fi
@@ -402,5 +404,23 @@ grep -v '^SERVER_BACKUP_OFF_HOST=' "$SUPERBOT_ENV_FILE" >"$WORK/env.tmp"
 install -m 0600 "$WORK/env.tmp" "$SUPERBOT_ENV_FILE"
 [[ $(dc ps -q botd) == "$cid" ]] || fail "check-compose recreated botd's container"
 [[ $(curl -fsS "$BASE/healthz") == '{"ok":true}' ]] || fail "botd isn't healthy after check-compose"
+
+log "Compose upgrades keep a way back (ADR 0327): backup-compose takes a rollback point, rollback-compose restores it on its image"
+way_back() { "$DIR/../offline-bundle.sh" "$@" -- "${COMPOSE_FILES[@]}" -p "$PROJECT" --env-file "$SUPERBOT_ENV_FILE"; }
+way_back backup-compose --dir "$WORK/rollback" >"$WORK/backup-compose.log" 2>&1 || { cat "$WORK/backup-compose.log" >&2; fail "backup-compose failed"; }
+point=$(sed -n 's/^archive=//p' "$WORK/rollback/record")
+[[ "$point" == *.tar.gz.age && $(head -c 21 "$WORK/rollback/$point") == age-encryption.org/v1 ]] || fail "the rollback point isn't encrypted to the stack's backup key: $point"
+grep -Eq '^key_check=[0-9a-f]{64}$' "$WORK/rollback/record" || { cat "$WORK/rollback/record" >&2; fail "backup-compose didn't record which master key sealed the saved secret"; }
+curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"AfterRollbackPoint"}' "$BASE/api/bots" >/dev/null
+way_back rollback-compose --dir "$WORK/rollback" --identity "$WORK/identity.txt" >"$WORK/rollback-compose.log" 2>&1 \
+  || { cat "$WORK/rollback-compose.log" >&2; fail "rollback-compose failed"; }
+grep -Fq "Master key: the one that sealed the rollback point's saved secrets seals the stack's database now" "$WORK/rollback-compose.log" \
+  || { cat "$WORK/rollback-compose.log" >&2; fail "rollback-compose didn't compare the master key with the stack's database"; }
+[[ $(curl -fsS "$BASE/healthz") == '{"ok":true}' ]] || fail "botd isn't healthy after rollback-compose"
+bots=$(curl -fsS "${AUTH[@]}" "$BASE/api/bots")
+grep -q '"name":"KeepMe"' <<<"$bots" || fail "rollback-compose lost KeepMe, saved before the rollback point"
+if grep -q '"name":"AfterRollbackPoint"' <<<"$bots"; then fail "rollback-compose didn't take the data back to the rollback point"; fi
+grep -q '"name":"SMOKE_API_KEY"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")" || fail "the saved secret is missing after rollback-compose"
+[[ ! -e "$WORK/rollback/record" && ! -e "$WORK/rollback/$point" ]] || fail "rollback-compose kept the rollback point it used"
 
 log "Smoke test passed"

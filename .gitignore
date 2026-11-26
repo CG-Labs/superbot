@@ -7,6 +7,8 @@
 secrets/
 # The backup age identity deploy/docker/init.sh makes (docs/adr/0114-backups-encrypted-by-default.md).
 backup-identity.txt
+# Compose rollback points from deploy/offline-bundle.sh backup-compose (docs/adr/0327-compose-upgrades-keep-a-way-back.md).
+superbot-rollback/
 # Source code, not secrets.
 !server/src/secrets/
 
