@@ -1015,6 +1015,8 @@ pub(crate) mod tests {
         assert_eq!(get(&x, "EVENTS_ROTATED_TOKEN").as_deref(), Some("events-rotated-1"));
         f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_ROTATED_TOKEN"));
         wait_for(|| get(&x, "EVENTS_ROTATED_TOKEN").as_deref() == Some("events-rotated-2"));
+        // Audited once the folder is listed again too.
+        wait_for(|| audited("EVENTS_ROTATED_TOKEN").iter().any(|e| e.action == "secret.cache_refreshed"));
         assert!(f.events.indexes.lock().unwrap().contains(&"djE6c3RhbmQtaW4=".to_string()), "read at the event's index");
         assert!(f.events.list_indexes.lock().unwrap().contains(&"djE6c3RhbmQtaW4=".to_string()), "and its folder listed at it");
 
