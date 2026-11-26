@@ -4079,3 +4079,58 @@ async fn each_federation_idp_vouches_only_for_its_own_scopes() {
     assert_eq!((code, signed_in_as(sp.port, &head).await.as_deref()), (200, u["id"].as_str()));
     std::fs::remove_dir_all(dir).ok();
 }
+
+impl Sp {
+    /// A live session of `user` as a sign-in made it, under whatever `SUBJECT` the provider had
+    /// then: its identity, and the NameID and SessionIndex it kept, if any.
+    fn made_before(&self, user: &str, subject: &str, kept: Option<(&str, &str)>) -> String {
+        let new = db::NewSession { user_id: user, token_hash: &random_hex(16), kind: "cookie", method: "sso", idp_subject: Some(subject), idp_provider: Some(&self.id), label: None, ip: None, user_agent: None, expires_at: db::now() + 3_600_000, mfa: None };
+        let s = self.app.db.create_session(&new);
+        if let Some((name_id, index)) = kept {
+            self.app.db.add_saml_session(&s.id, &db::SamlLogin { name_id: name_id.into(), session_index: Some(index.into()), ..Default::default() });
+        }
+        s.id
+    }
+
+    fn live(&self, user: &str, session: &str) -> bool {
+        let cfg = crate::users::SessionConfig::default();
+        self.app.db.live_sessions(Some(user), db::now(), cfg.idle_ms, cfg.max_ms).iter().any(|s| s.id == session)
+    }
+
+    /// The IdP's LogoutRequest for `name_id` (in every IdP session): how many sessions it revoked.
+    async fn idp_logout(&self, name_id: &str) -> u64 {
+        assert_eq!(self.slo_get(&Logout::request(&self.slo(), name_id, None, db::now()).redirect()).await.0, 303);
+        self.audit("auth.slo").await[0]["details"]["revoked"].as_u64().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn idp_logout_ends_sessions_made_under_an_earlier_subject_setting() {
+    let xml = test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata(), "University A", &["uni.example"]));
+    let by_attribute = format!("{IDP}|8f2a91c4@uni.example");
+    let by_name_id = format!("{IDP}|{STORED}");
+
+    // Back to SUBJECT=nameid: a session made with subject-id is found by the NameID it kept.
+    let sp = serve_importing(&[], |_| {}, &xml).await;
+    let u = sp.app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+    let old = sp.made_before(&u.id, &by_attribute, Some(("_T1x", "_s1")));
+    assert_eq!(sp.idp_logout("_t1x").await, 0, "a kept NameID is matched exactly");
+    assert!(sp.live(&u.id, &old));
+    assert_eq!(sp.idp_logout("_T1x").await, 1);
+    assert!(!sp.live(&u.id, &old));
+    let d = &sp.audit("auth.slo").await[0]["details"];
+    assert_eq!((d["subject"].as_str(), d["nameId"].as_str()), (Some("8f2a91c4@uni.example"), Some("_T1x")));
+
+    // Now SUBJECT=subject-id: sessions NameIDs made are found by the NameID they kept, or
+    // without one (made before botd kept it) by that identity, in any case, as before.
+    let sp = serve_importing(&[("SUBJECT", "subject-id")], |_| {}, &xml).await;
+    let u = sp.app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+    let kept = sp.made_before(&u.id, &by_name_id, Some((NAME_ID, "_s1")));
+    let unkept = sp.made_before(&u.id, &by_name_id, None);
+    let other = sp.made_before(&u.id, &by_attribute, Some(("_t2", "_s2")));
+    assert_eq!(sp.idp_logout(NAME_ID).await, 2);
+    assert!(!sp.live(&u.id, &kept) && !sp.live(&u.id, &unkept) && sp.live(&u.id, &other));
+    let unkept = sp.made_before(&u.id, &by_name_id, None);
+    assert_eq!(sp.idp_logout(&NAME_ID.to_uppercase()).await, 1);
+    assert!(!sp.live(&u.id, &unkept) && sp.live(&u.id, &other));
+}
