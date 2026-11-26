@@ -177,6 +177,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0295-tam-cadence-across-accounts.md"));
     files.push(repo().join("docs/adr/0307-health-score-alerts.md"));
     files.push(repo().join("docs/adr/0313-runbooks-for-scim-backups-and-the-license.md"));
+    files.push(repo().join("docs/adr/0322-runbooks-for-the-secrets-store-and-the-audit-trail.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -842,5 +843,139 @@ fn the_support_bundle_page_lists_every_file_in_it() {
     for f in files {
         assert!(page.contains(&format!("| `{f}` |")), "support-bundle.md doesn't list {f}");
         assert!(f == "README.txt" || readme.contains(&format!("  {f}")), "the bundle's README.txt doesn't list {f}");
+    }
+}
+
+/// The quoted code after each `marker` in `code`: `Err(("delivery_failed", ...` gives
+/// `delivery_failed`.
+fn quoted_after(code: &str, marker: &str) -> Vec<String> {
+    code.split(marker).skip(1).filter_map(|r| r.split('"').next()).filter(|c| !c.is_empty() && c.chars().all(|c| c.is_ascii_lowercase() || c == '_')).map(String::from).collect()
+}
+
+/// ADR 0322: every reason botd records when the audit export fails or stops, when a check
+/// of the chain fails (with its checkpoints' and timestamps' reasons), and when timestamps
+/// fail, is in the audit trail runbook's section for it; triage and the rules point there.
+#[test]
+fn the_audit_trail_runbook_explains_every_reason_botd_records() {
+    let page = read("runbook-audit-trail.md");
+    let mut export: HashSet<String> = HashSet::new();
+    for f in ["audit_export.rs", "audit_azure.rs", "audit_secops.rs", "audit_datadog.rs", "audit_archive.rs"] {
+        let code = source(f);
+        export.extend(quoted_after(&code, "Err((\""));
+        export.extend(quoted_after(&code, "|e| (\""));
+    }
+    export.extend(quoted_after(&source("audit_archive.rs"), "pub const NOT_WRITE_ONCE: &str = \""));
+    assert!(export.len() >= 5 && ["delivery_failed", "sign_in_failed", "unreadable", "cursor_unsaved", "not_write_once"].iter().all(|r| export.contains(*r)), "the export's reasons: {export:?}");
+    let table = codes_in(&page, "## The export is failing");
+    let mut missing: Vec<&String> = export.iter().filter(|r| !table.contains(*r)).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "runbook-audit-trail.md's export section doesn't explain {missing:?}");
+
+    let stopped = source("audit_export.rs");
+    assert!(stopped.contains(r#"d["reason"] = json!(if sinks.is_empty() { "export_off" } else { "removed" });"#), "the stop's reasons moved: update this test and the runbook");
+    let table = codes_in(&page, "## A sink was stopped");
+    for r in ["export_off", "removed", "audit.export_stopped", "audit.export_resumed", "audit.export_started"] {
+        assert!(table.contains(r), "runbook-audit-trail.md's stopped section doesn't explain {r}");
+    }
+
+    let chain = source("audit_chain.rs");
+    let mut reasons: HashSet<String> = quoted_after(&chain, "Some(\"").into_iter().collect();
+    reasons.extend(quoted_after(&chain, ".broke(id, \""));
+    reasons.extend(quoted_after(&chain, ".broke(p.id, \""));
+    reasons.extend(quoted_after(&chain, "self.broke(id, \""));
+    let checkpoint = source("audit_checkpoint.rs");
+    reasons.extend(quoted_after(&checkpoint, "Some(\""));
+    let line = source("audit_line.rs");
+    let check = line.split("pub fn check_checkpoint").nth(1).expect("audit_line's check_checkpoint").split("\n}\n").next().unwrap();
+    reasons.extend(quoted_after(check, "Err((\""));
+    reasons.extend(quoted_after(&checkpoint, "fault(id, \""));
+    reasons.extend(quoted_after(&checkpoint, "reason: \""));
+    for r in ["contents", "link", "unsealed", "erased", "pin", "checkpoint", "timestamp", "archive", "unreadable", "broken", "head", "key", "signature", "record", "malformed"] {
+        assert!(reasons.contains(r), "botd no longer records {r} for a broken chain: update this test and the runbook ({reasons:?})");
+    }
+    let table = codes_in(&page, "## The chain check failed");
+    let mut missing: Vec<&String> = reasons.iter().filter(|r| !table.contains(*r)).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "runbook-audit-trail.md's chain section doesn't explain {missing:?}");
+
+    let tsa = source("tsa.rs");
+    let mut stamps: HashSet<String> = quoted_after(&tsa, "bad(\"").into_iter().collect();
+    let stamp = checkpoint.split("async fn stamp(").nth(1).expect("audit_checkpoint's stamp").split("\n}\n").next().unwrap();
+    stamps.extend(quoted_after(stamp, "Err((\""));
+    stamps.extend(quoted_after(stamp, "| (\""));
+    assert!(stamps.len() >= 9 && stamps.contains("unreachable") && stamps.contains("unsaved") && stamps.contains("untrusted"), "the timestamps' reasons: {stamps:?}");
+    let table = codes_in(&page, "## Timestamps are failing");
+    let mut missing: Vec<&String> = stamps.iter().filter(|r| !table.contains(*r)).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "runbook-audit-trail.md's timestamps section doesn't explain {missing:?}");
+
+    let triage = source("support_triage.rs");
+    assert!(triage.contains(r#""audit" => ("audit_trail", "audit trail failures and stopped sinks", Some("support/runbook-audit-trail.md")),"#), "triage's audit.audit_trail points at the runbook");
+    let rules = fs::read_to_string(repo().join("deploy/prometheus/superbot-audit-trail.rules.yml")).unwrap();
+    let headings = anchors(&page);
+    let linked: Vec<&str> = rules.split("docs/support/runbook-audit-trail.md#").skip(1).map(|r| r.split(|c: char| !(c.is_ascii_lowercase() || c == '-')).next().unwrap()).collect();
+    assert_eq!(linked.len(), rules.matches("- alert:").count(), "every audit trail alert links its section");
+    for a in linked {
+        assert!(headings.contains(a), "the rules link runbook-audit-trail.md#{a}, which isn't a heading");
+    }
+    assert!(page.contains("superbot-audit-trail.rules.yml"), "the runbook names its alert rules");
+    let guide = fs::read_to_string(repo().join("docs/ops/audit-export.md")).unwrap();
+    assert!(guide.contains("(../support/runbook-audit-trail.md") && guide.contains("superbot-audit-trail.rules.yml"), "the audit export guide points at the runbook and the rules");
+}
+
+/// ADR 0322: every `secret.*` action the external store, its sign-ins and per-run
+/// credentials record, and every `error` kind they carry, is in the secrets runbook, as
+/// is the refusal runs get; triage and the guides point there.
+#[test]
+fn the_secrets_runbook_names_every_failure_botd_records() {
+    let page = read("runbook-secrets.md");
+    let mut files: Vec<String> = Vec::new();
+    for dir in ["secrets", "secrets/vault"] {
+        for e in fs::read_dir(repo().join("server/src").join(dir)).unwrap() {
+            let p = e.unwrap().path();
+            // The sealed store is botd's own database, not the external store.
+            if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("sealed.rs") {
+                files.push(format!("{dir}/{}", p.file_name().unwrap().to_string_lossy()));
+            }
+        }
+    }
+    files.sort();
+    let mut actions: HashSet<String> = HashSet::new();
+    let mut errors: HashSet<String> = HashSet::new();
+    for f in &files {
+        let code = source(f);
+        for (i, _) in code.match_indices("\"secret.") {
+            let a = code[i + 1..].split('"').next().unwrap();
+            if a.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.') {
+                actions.insert(a.to_string());
+            }
+        }
+        errors.extend(quoted_after(&code, "d[\"error\"] = json!(\""));
+    }
+    assert!(actions.len() >= 10 && actions.contains("secret.read") && actions.contains("secret.lease_renewed") && actions.contains("secret.read_events_dropped"), "the actions: {actions:?}");
+    let mut missing: Vec<&String> = actions.iter().filter(|a| !page.contains(&format!("`{a}`"))).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "runbook-secrets.md doesn't name {missing:?}");
+
+    let kinds = source("secrets/mod.rs");
+    let kinds = kinds.split("pub fn kind(&self) -> &'static str {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let kinds: Vec<String> = kinds.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap().to_string()).collect();
+    assert_eq!(kinds, ["read-only", "invalid", "store error", "unavailable"], "secrets::Error's kinds");
+    errors.extend(kinds);
+    assert!(errors.len() >= 9 && errors.contains("narrowing") && errors.contains("missing_fields") && errors.contains("expired"), "the error kinds: {errors:?}");
+    let reading = codes_in(&page, "## Reading and signing in");
+    let leases = codes_in(&page, "## Short-lived credentials for each run");
+    let mut missing: Vec<&String> = errors.iter().filter(|e| !reading.contains(*e) && !leases.contains(*e)).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "runbook-secrets.md's tables don't explain {missing:?}");
+
+    let runner = source("runner.rs");
+    assert!(runner.contains(r#""reason": "secrets_unavailable""#), "runs are refused secrets_unavailable");
+    assert!(codes_in(&page, "## Runs refused").contains("secrets_unavailable"), "runbook-secrets.md's runs refused section names the reason");
+    let triage = source("support_triage.rs");
+    assert!(triage.contains(r#""secret" => ("secrets", "secrets store failures", Some("support/runbook-secrets.md")),"#), "triage's audit.secrets points at the runbook");
+    assert!(triage.contains(r#"f.runbook("support/runbook-secrets.md#runs-refused")"#), "runs refused secrets_unavailable point at the runbook");
+    for guide in ["docs/ops/vault.md", "docs/ops/cloud-secrets.md"] {
+        assert!(fs::read_to_string(repo().join(guide)).unwrap().contains("(../support/runbook-secrets.md"), "{guide} doesn't point at the secrets runbook");
     }
 }

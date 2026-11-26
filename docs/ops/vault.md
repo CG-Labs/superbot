@@ -408,6 +408,8 @@ botd fails closed. Within the cache time, cached answers stand. After that:
 
 Runs work again as soon as Vault answers. A longer `SECRETS_CACHE_SECONDS` rides out longer outages but delays rotations; `botctl secrets refresh` lands a rotation at once whatever the cache time.
 
+Support works through the [secrets store runbook](../support/runbook-secrets.md): every `secret.*` failure and `error` kind botd records, and what to do for each.
+
 ## Turning it off
 
 Copy any keys you still need into `.env` or `botctl secret set`, remove `SECRETS_BACKEND` (or set `local`), and restart.
