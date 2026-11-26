@@ -25,6 +25,7 @@ mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_aggregate;
 pub(crate) mod saml_artifact;
 pub(crate) mod saml_expiry;
 pub(crate) mod saml_keys;
