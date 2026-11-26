@@ -9,6 +9,7 @@ import { themedStyles, type } from "../src/theme";
 import type { Role, SignupApproval, SignupRequest } from "../src/types";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
+import { useModalAnimation } from "./Shell";
 import { kit, usePlaceholder } from "./ui";
 
 interface Props {
@@ -169,6 +170,7 @@ export function SignupRequests({ api, onApproved }: Props) {
   // Opened once the code closes, so the user's panel never covers it.
   const approved = useRef<string | null>(null);
   const busy = useRef(false);
+  const modalAnimation = useModalAnimation();
   const setBusy = useCallback((b: boolean) => {
     busy.current = b;
   }, []);
@@ -222,7 +224,7 @@ export function SignupRequests({ api, onApproved }: Props) {
       ) : null}
       <Modal
         visible={!!open}
-        animationType="slide"
+        animationType={modalAnimation}
         transparent
         onRequestClose={() => {
           if (!busy.current) close();

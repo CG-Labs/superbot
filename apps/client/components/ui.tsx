@@ -21,14 +21,18 @@ const build = (t: Theme) =>
     back: {
       flexDirection: "row",
       alignItems: "center",
+      minHeight: 36,
       paddingVertical: t.space.xs,
       paddingHorizontal: t.space.md,
       marginLeft: -t.space.sm,
       borderRadius: t.radius.pill,
     },
     backPressed: { backgroundColor: t.c.hover },
-    backText: { color: t.c.accentText, ...type(t, "md"), fontWeight: t.font.weight.medium },
-    title: { flex: 1, color: t.c.text, ...type(t, "xl"), fontWeight: t.font.weight.semibold, letterSpacing: -0.2 },
+    backText: { color: t.c.text, ...type(t, "md"), fontWeight: t.font.weight.medium },
+    headerTitles: { flex: 1, minWidth: 0, gap: t.space.xxs },
+    title: { color: t.c.text, ...type(t, "xl"), fontWeight: t.font.weight.semibold, letterSpacing: -0.2 },
+    subtitle: { color: t.c.textMuted, ...type(t, "sm") },
+    headerActions: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
     body: { padding: t.space.lg, paddingBottom: t.space.xxxl, gap: t.space.lg, width: "100%", maxWidth: 720, alignSelf: "center" },
     bodyWide: { maxWidth: 1080 },
 
@@ -174,7 +178,10 @@ export function kit(t: Theme): ReturnType<typeof build> {
 }
 
 interface HeaderProps {
-  title: string;
+  /** Left out where the content below names itself, as in a detail sheet. */
+  title?: string;
+  /** A quiet line under the title. */
+  subtitle?: string;
   onBack?: () => void;
   backText?: string;
   backLabel?: string;
@@ -183,28 +190,49 @@ interface HeaderProps {
   right?: React.ReactNode;
 }
 
-/** A screen's top bar: a back pill, the title, and its actions. */
-export function PageHeader({ title, onBack, backText = "‹ Bots", backLabel = "Back to Bots", backDisabled, right }: HeaderProps) {
+/**
+ * Every screen's top bar (ADR 0340): a back pill named for where it goes, the title as the
+ * screen's header, and its actions on the right.
+ */
+export function PageHeader({ title, subtitle, onBack, backText = "‹ Bots", backLabel = "Back to Bots", backDisabled, right }: HeaderProps) {
   const ui = useUi();
   return (
     <View style={ui.header}>
-      {onBack ? (
-        <Pressable
-          onPress={onBack}
-          disabled={backDisabled}
-          accessibilityState={backDisabled === undefined ? undefined : { disabled: backDisabled }}
-          accessibilityRole="button"
-          accessibilityLabel={backLabel}
-          style={({ pressed }) => [ui.back, pressed && ui.backPressed, backDisabled && ui.disabled]}
-        >
-          <Text style={ui.backText}>{backText}</Text>
-        </Pressable>
-      ) : null}
-      <Text style={ui.title} accessibilityRole="header" numberOfLines={1}>
-        {title}
-      </Text>
-      {right}
+      {onBack ? <BackButton onPress={onBack} text={backText} label={backLabel} disabled={backDisabled} /> : null}
+      <View style={ui.headerTitles}>
+        {title ? (
+          <Text style={ui.title} accessibilityRole="header" numberOfLines={1}>
+            {title}
+          </Text>
+        ) : null}
+        {subtitle ? (
+          <Text style={ui.subtitle} numberOfLines={1}>
+            {subtitle}
+          </Text>
+        ) : null}
+      </View>
+      {right ? <View style={ui.headerActions}>{right}</View> : null}
     </View>
+  );
+}
+
+/** A header's back pill. Without a `label`, screen readers read its text. */
+export function BackButton({ onPress, text, label, disabled }: { onPress: () => void; text: string; label?: string; disabled?: boolean }) {
+  const ui = useUi();
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      accessibilityState={disabled === undefined ? undefined : { disabled }}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      hitSlop={8}
+      style={({ pressed }) => [ui.back, pressed && ui.backPressed, disabled && ui.disabled]}
+    >
+      <Text style={ui.backText} numberOfLines={1}>
+        {text}
+      </Text>
+    </Pressable>
   );
 }
 

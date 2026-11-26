@@ -15,6 +15,7 @@ import { botColorNames, botColors, botShapes, HARNESS_NAMES, themedStyles, type 
 import { InlineError } from "./ErrorState";
 import { kit, usePlaceholder } from "./ui";
 import { BotAvatar } from "./BotAvatar";
+import { useModalAnimation } from "./Shell";
 
 interface Props {
   visible: boolean;
@@ -33,6 +34,7 @@ export function CreateBotModal({ visible, onClose, onCreated }: Props) {
   const [picked, setPicked] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const modalAnimation = useModalAnimation();
 
   const submit = async () => {
     const n = name.trim();
@@ -56,7 +58,7 @@ export function CreateBotModal({ visible, onClose, onCreated }: Props) {
   const harness = picked ?? defaultHarness;
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+    <Modal visible={visible} animationType={modalAnimation} transparent onRequestClose={onClose}>
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
           <Text style={styles.title} role="heading">

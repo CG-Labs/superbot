@@ -9,6 +9,7 @@ import { ChatView } from "../components/ChatView";
 import { ConnectionBanner, useConnectionStatus } from "../components/ConnectionBanner";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
+import { PaneTransition } from "../components/Shell";
 import { Sidebar } from "../components/Sidebar";
 import { useToast } from "../components/Toast";
 import { isAdmin, openConsole, openSetup, watchSetup } from "../src/admin";
@@ -140,7 +141,7 @@ export default function HomeScreen() {
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
       {focused ? <StatusBar style={t.scheme === "dark" ? "light" : "dark"} /> : null}
       <ConnectionBanner status={connection} />
-      <View style={styles.row}>
+      <PaneTransition style={styles.row} paneKey={mobilePane} from={mobilePane === "chat" ? "right" : "left"}>
         {showSidebar ? (
           <Sidebar
             compact={!wide}
@@ -175,7 +176,7 @@ export default function HomeScreen() {
           />
         ) : null}
         {wide && viewer ? <View style={styles.screenPanel}>{viewer}</View> : null}
-      </View>
+      </PaneTransition>
       {!wide ? (
         <Modal visible={!!viewer} animationType={reduceMotion ? "none" : "slide"} onRequestClose={() => setScreen(null)}>
           <SafeAreaView style={styles.screenModal}>{viewer}</SafeAreaView>

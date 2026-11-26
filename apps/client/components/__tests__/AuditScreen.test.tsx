@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen } from "@testing-library/react-native";
+import { fireEvent, render, screen } from "@testing-library/react-native";
 import AuditScreen from "../../app/audit";
 
 jest.mock("expo-router", () => ({
@@ -39,6 +39,16 @@ describe("audit route", () => {
     await render(<AuditScreen />);
     expect(screen.getByText("Only admins can see the audit log.")).toBeOnTheScreen();
     expect(screen.queryByText(/^Audit log component/)).toBeNull();
+  });
+
+  it("keeps the screen's header for anyone else, whose back goes home after a reload", async () => {
+    const { router } = jest.requireMock("expo-router");
+    router.replace.mockClear();
+    Object.assign(mockCtx, { ready: true, api: {}, bots: [], me: { name: "Alex", role: "member", permissions: ["read"] } });
+    await render(<AuditScreen />);
+    expect(screen.getByRole("header", { name: "Audit log" })).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("button", { name: "Back to Bots" }));
+    expect(router.replace).toHaveBeenCalledWith("/home");
   });
 
   it("waits for the saved session on a reload instead of sending people home", async () => {

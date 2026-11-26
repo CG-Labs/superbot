@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { keeperQuestion, keepersQuestion } from "../src/access";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
@@ -34,6 +34,7 @@ import { EmptyState } from "./EmptyState";
 import { ErrorState, InlineError } from "./ErrorState";
 import { ListSkeleton } from "./Skeleton";
 import { Chips } from "./Chips";
+import { DetailSheet, PaneTransition } from "./Shell";
 import { kit, PageHeader, Spinner } from "./ui";
 
 interface Props {
@@ -746,19 +747,16 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
         </View>
         {wide ? (
           <ScrollView style={styles.detailPane} contentContainerStyle={styles.detailBody}>
-            {detail ?? <Text style={styles.empty}>{manage ? "Pick a service account to see its tokens, or make a new one." : "Pick a service account to see its tokens and what it can use."}</Text>}
+            <PaneTransition paneKey={picked ? `${picked.kind}:${"id" in picked ? picked.id : ""}` : ""}>
+              {detail ?? <Text style={styles.empty}>{manage ? "Pick a service account to see its tokens, or make a new one." : "Pick a service account to see its tokens and what it can use."}</Text>}
+            </PaneTransition>
           </ScrollView>
         ) : null}
       </View>
       {!wide ? (
-        <Modal visible={!!detail} animationType="slide" onRequestClose={() => pick(null)}>
-          <View style={styles.modalRoot}>
-            <Pressable style={styles.modalHeader} onPress={() => pick(null)} accessibilityRole="button">
-              <Text style={styles.back}>‹ Service accounts</Text>
-            </Pressable>
-            <ScrollView contentContainerStyle={styles.modalBody}>{detail}</ScrollView>
-          </View>
-        </Modal>
+        <DetailSheet visible={!!detail} onClose={() => pick(null)} backText="‹ Service accounts" backLabel="Back to service accounts">
+          {detail}
+        </DetailSheet>
       ) : null}
     </View>
   );
@@ -768,7 +766,6 @@ const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
     root: k.root,
-    back: k.backText,
     body: { flex: 1, flexDirection: "row" },
     listPane: { flex: 1, padding: t.space.md },
     listPaneWide: { width: 400, padding: t.space.md, backgroundColor: t.c.surface, borderRightWidth: hairline, borderRightColor: t.c.border },
@@ -826,8 +823,5 @@ const useStyles = themedStyles((t) => {
     dangerBtn: k.danger,
     dangerText: k.dangerText,
     disabled: k.disabled,
-    modalRoot: { flex: 1, backgroundColor: t.c.bg, paddingTop: t.space.xxl },
-    modalHeader: { ...k.header, minHeight: 0 },
-    modalBody: { padding: t.space.lg, paddingBottom: t.space.xxxl },
   });
 });

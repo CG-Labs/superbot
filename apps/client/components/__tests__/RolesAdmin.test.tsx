@@ -81,6 +81,18 @@ describe("RolesAdmin (ADR 0132)", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
+  it("opens a role over the list on a phone, with a back pill to the roles", async () => {
+    const api = mockApi();
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Role Support"));
+    const back = await screen.findByRole("button", { name: "Back to roles" });
+    expect(back).toHaveTextContent("‹ Roles");
+    await u.press(back);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Back to roles" })).toBeNull());
+    expect(screen.getByRole("header", { name: "Roles" })).toBeOnTheScreen();
+  });
+
   it("builds a role from the fixed permissions and shows what it adds up to", async () => {
     const api = mockApi();
     const u = userEvent.setup();

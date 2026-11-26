@@ -22,6 +22,7 @@ import type { AdminUser, CustomRole } from "../src/types";
 import { InviteUserForm } from "./InviteUserForm";
 import { SignupRequests } from "./SignupRequests";
 import { UserDetail } from "./UserDetail";
+import { DetailSheet, PaneTransition, useModalAnimation } from "./Shell";
 import { kit, PageHeader, Spinner } from "./ui";
 
 interface Props {
@@ -89,6 +90,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
   const t = useTheme();
   const { width } = useWindowDimensions();
   const wide = width >= 900;
+  const modalAnimation = useModalAnimation();
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -180,23 +182,20 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
         </View>
         {wide ? (
           <ScrollView style={styles.detailPane} contentContainerStyle={styles.detailBody}>
-            {detail ?? <Text style={styles.empty}>Pick someone to manage their role, sign-ins, and access.</Text>}
+            <PaneTransition paneKey={selected?.id ?? ""}>
+              {detail ?? <Text style={styles.empty}>Pick someone to manage their role, sign-ins, and access.</Text>}
+            </PaneTransition>
           </ScrollView>
         ) : null}
       </View>
       {!wide ? (
-        <Modal visible={!!selected} animationType="slide" onRequestClose={() => setSelectedId(null)}>
-          <View style={styles.modalRoot}>
-            <Pressable style={styles.modalHeader} onPress={() => setSelectedId(null)} accessibilityRole="button">
-              <Text style={styles.back}>‹ Users</Text>
-            </Pressable>
-            <ScrollView contentContainerStyle={styles.modalBody}>{detail}</ScrollView>
-          </View>
-        </Modal>
+        <DetailSheet visible={!!selected} onClose={() => setSelectedId(null)} backText="‹ Users" backLabel="Back to users">
+          {detail}
+        </DetailSheet>
       ) : null}
       <Modal
         visible={inviting}
-        animationType="slide"
+        animationType={modalAnimation}
         transparent
         onRequestClose={() => {
           if (!inviteBusy.current) closeInvite();
@@ -230,7 +229,6 @@ const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
     root: k.root,
-    back: k.backText,
     primaryBtn: { ...k.btn, ...k.btnSmall, ...k.primary },
     primaryText: { ...k.btnText, ...k.primaryText },
     body: { flex: 1, flexDirection: "row" },
@@ -254,9 +252,6 @@ const useStyles = themedStyles((t) => {
     codeTag: k.tagWarn,
     empty: k.empty,
     error: { ...k.error, padding: t.space.sm },
-    modalRoot: { flex: 1, backgroundColor: t.c.bg, paddingTop: t.space.xxl },
-    modalHeader: { ...k.header, minHeight: 0 },
-    modalBody: { padding: t.space.lg },
     backdrop: k.backdrop,
     sheet: k.sheet,
     sheetBody: k.sheetBody,
