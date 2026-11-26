@@ -632,7 +632,7 @@ fn check_backups(s: &Settings, now_ms: i64, before_upgrade: bool, copies: Option
 
 /// A setting as botd's license loader reads it, with `LICENSE_KEY_FILE` taken from where
 /// the service runs.
-fn license_setting(s: &Settings, k: &str) -> String {
+pub(crate) fn license_setting(s: &Settings, k: &str) -> String {
     let v = s.get(k);
     if k == "LICENSE_KEY_FILE" && !v.is_empty() { s.resolve(&v).display().to_string() } else { v }
 }

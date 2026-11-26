@@ -101,6 +101,14 @@ ROLLBACK_DIR=${ROLLBACK_DIR:-}
 # Set by prepare_offline: the release this host runs, and whether this run restores ROLLBACK_DIR.
 OFFLINE_INSTALLED=""
 ROLLBACK_RESTORE=false
+# Set by offline_license_check (docs/adr/0305-the-license-through-offline-upgrades.md): the key
+# the bundle's botd judged and what it is, and on a rollback the license installed now, kept.
+LICENSE_JUDGED=""
+LICENSE_WHAT=""
+LICENSE_ENV=""
+ROLLBACK_LICENSE=""
+ROLLBACK_LICENSE_DEST=""
+ROLLBACK_LICENSE_WHAT=""
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
@@ -1107,11 +1115,23 @@ check_license_file() {
     || die "--license-file: $LICENSE_FILE isn't a SuperBot license key (three parts separated by dots)"
 }
 
-# Saved where PUT /api/license saves it, DATA_DIR/license.key, written by the service
-# user (DATA_DIR is theirs) so root never writes through a path they control.
+# The key in SRC, whitespace dropped, as DEST, written whole by the service user (DATA_DIR is
+# theirs) so root never writes through a path they control.
 # shellcheck disable=SC2016
+write_license_key() {
+  tr -d '[:space:]' <"$1" | sudo -u "$SUPERBOT_USER" env DEST="$2" sh -c '
+    set -eu
+    umask 077
+    mkdir -p "$(dirname "$DEST")"
+    tmp=$(mktemp "$DEST.XXXXXX")
+    cat >"$tmp"
+    printf "\n" >>"$tmp"
+    mv -f "$tmp" "$DEST"'
+}
+
+# Saved where PUT /api/license saves it, DATA_DIR/license.key.
 install_license() {
-  [[ -n "$LICENSE_FILE" ]] || return 0
+  [[ -n "$LICENSE_FILE" && -z "$ROLLBACK_LICENSE_DEST" ]] || return 0
   local home repo_path env_file dest
   home=$(user_home)
   repo_path="$home/superbot"
@@ -1121,14 +1141,7 @@ install_license() {
     log "[dry-run] would install the license key from $LICENSE_FILE as $dest (0600, $SUPERBOT_USER)"
     return
   fi
-  tr -d '[:space:]' <"$LICENSE_FILE" | sudo -u "$SUPERBOT_USER" -H env DEST="$dest" sh -c '
-    set -eu
-    umask 077
-    mkdir -p "$(dirname "$DEST")"
-    tmp=$(mktemp "$DEST.XXXXXX")
-    cat >"$tmp"
-    printf "\n" >>"$tmp"
-    mv -f "$tmp" "$DEST"'
+  write_license_key "$LICENSE_FILE" "$dest"
   log "License key installed as $dest. botd checks it when it starts: journalctl -u superbot | grep License"
   if grep -Eq '^LICENSE_KEY(_FILE)?=.' "$env_file" 2>/dev/null; then
     warn "$env_file sets LICENSE_KEY or LICENSE_KEY_FILE, which wins over $dest. Remove it to use this key."
@@ -1822,6 +1835,178 @@ machine_settings_check() {
       die "Nothing has changed. If it names MACHINE_HERMES_BUNDLE or MACHINE_HARNESS_BUNDLE, carry in this release's Hermes or harness bundles for your machines' arches, put them on this server where $SUPERBOT_USER can read them, and re-run with --machine-hermes-bundle or --machine-harness-bundle naming them; else change $env_file ($doc)"
       ;;
     *) warn "botd machines check didn't run (status $rc), so machines' settings weren't checked before the upgrade: $(head -n 1 <<<"$out")" ;;
+  esac
+}
+
+# --- The license through offline upgrades and rollbacks (docs/adr/0305-the-license-through-offline-upgrades.md)
+
+# Whether BOTD has `botd license check`: an older one would take the subcommand for a start.
+botd_checks_license() { [[ -x "$1" ]] && grep -qaF "Usage: botd license check" "$1"; }
+
+# BOTD's `botd license check` as botd's user, over the server's .env, or over ENV_FILE (root's,
+# handed over as a copy botd's user owns, read in the folder the unit runs botd in). KEY, a file
+# root reads, is judged as DATA_DIR/license.key, whitespace dropped as write_license_key installs
+# it; an empty one judges none. Prints what it said, and returns its status: 0 Bots would run,
+# 1 they wouldn't, else it didn't run.
+license_verdict() {
+  local botd=$1 key=${2:-} env_file=${3:-} home copy rc=0
+  local -a args=(license check)
+  home=$(user_home)
+  [[ -z "$key" ]] || args+=(--key-file -)
+  if [[ -n "$env_file" ]]; then
+    copy=$(cat -- "$env_file" | (cd / && sudo -u "$SUPERBOT_USER" sh -c 'f=$(mktemp) && cat >"$f" && echo "$f"')) || return 3
+    tr -d '[:space:]' <"${key:-/dev/null}" | (cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$botd" "${args[@]}" --env-file "$copy") 2>&1 || rc=$?
+    rm -f -- "$copy"
+  else
+    tr -d '[:space:]' <"${key:-/dev/null}" | (cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$botd" "${args[@]}" --home "$home") 2>&1 || rc=$?
+  fi
+  return "$rc"
+}
+
+license_mode() { sed -n 's/^License: \([a-z]*\),.*/\1/p;T;q' <<<"$1"; }
+license_detail() { sed -n '/^License: /{n;s/^  //p;q}' <<<"$1"; }
+same_license() { [[ "$(tr -d '[:space:]' <"$1")" == "$(tr -d '[:space:]' <"$2")" ]]; }
+
+# A 0700 folder of root's for the keys a rollback's license check reads.
+rollback_license_dir() {
+  install -d -m 0700 "$OFFLINE_TMP/license"
+  echo "$OFFLINE_TMP/license"
+}
+
+# MEMBER of the rollback's backup into OUT, as root, decrypted with the backup key; empty if
+# it isn't there.
+backup_member() {
+  local dir archive
+  dir=$(rollback_dir)
+  archive="$dir/$(manifest_value "$dir/record" archive)"
+  if [[ "$archive" == *.age ]]; then
+    { age -d -i "$BACKUP_IDENTITY_FILE" -- "$archive" | tar -xzOf - "$1" >"$2"; } 2>/dev/null || : >"$2"
+  else
+    tar -xzOf "$archive" "$1" >"$2" 2>/dev/null || : >"$2"
+  fi
+}
+
+# On a rollback whose .env sets LICENSE_KEY_FILE to a file in DATA_DIR, the restore puts back
+# that file too, and it wins over DATA_DIR/license.key: the backup's copy, or the key in
+# --license-file, written there once the backup is restored, is judged in its place, over a copy
+# of ENV_FILE without it. Sets LICENSE_JUDGED, LICENSE_WHAT and LICENSE_ENV.
+rollback_license_key_file() {
+  local env_file=$1 home data_dir file lic
+  home=$(user_home)
+  file=$(env_value "$env_file" LICENSE_KEY_FILE)
+  # With LICENSE_KEY too, botd refuses both as ambiguous: judged over the .env as it is.
+  [[ -n "$file" && -z "$(env_value "$env_file" LICENSE_KEY)" ]] || return 1
+  [[ "$file" == /* ]] || file="$home/superbot/$file"
+  data_dir=$(realpath -m -- "$(env_data_dir "$env_file" "$home")")
+  file=$(realpath -m -- "$file")
+  [[ "$file" == "$data_dir"/* ]] || return 1
+  lic=$(rollback_license_dir)
+  grep -v '^LICENSE_KEY_FILE=' "$env_file" >"$lic/env" || true
+  LICENSE_ENV="$lic/env"
+  if [[ -n "$LICENSE_FILE" ]]; then
+    LICENSE_JUDGED=$LICENSE_FILE LICENSE_WHAT="the key in --license-file, as LICENSE_KEY_FILE ($file)"
+    ROLLBACK_LICENSE=$LICENSE_FILE ROLLBACK_LICENSE_DEST=$file ROLLBACK_LICENSE_WHAT="the key in --license-file, which LICENSE_KEY_FILE names,"
+    return 0
+  fi
+  backup_member "./${file#"$data_dir"/}" "$lic/key-file"
+  LICENSE_JUDGED="$lic/key-file"
+  LICENSE_WHAT="the license in LICENSE_KEY_FILE ($file) from before the upgrade, which the rollback puts back"
+}
+
+# On a rollback, the license it leaves, unless --license-file names one: the key installed now,
+# if the older release takes it, so a renewal installed since the upgrade outlives it
+# (ROLLBACK_LICENSE, written back once the backup is restored); else the backup's. Root reads
+# the backup, and botd's user its own DATA_DIR, so a link there can't read root's files. Sets
+# LICENSE_JUDGED and LICENSE_WHAT.
+rollback_license_choice() {
+  local botd=$1 env_file=$2 lic now out
+  lic=$(rollback_license_dir)
+  backup_member ./license.key "$lic/backup"
+  LICENSE_JUDGED="$lic/backup" LICENSE_WHAT="the license from before the upgrade, which the rollback puts back"
+  now="$(user_home)/superbot/data/license.key"
+  (cd / && sudo -u "$SUPERBOT_USER" sh -c 'if [ -f "$1" ]; then head -c 9000 -- "$1"; fi' _ "$now") >"$lic/now" 2>/dev/null || : >"$lic/now"
+  if [[ -z "$(tr -d '[:space:]' <"$lic/now")" ]] || same_license "$lic/now" "$lic/backup"; then
+    return 0
+  fi
+  out=$(license_verdict "$botd" "$lic/now" "$env_file") || true
+  case $(license_mode "$out") in
+    active | grace)
+      ROLLBACK_LICENSE="$lic/now" ROLLBACK_LICENSE_WHAT="the license installed since the upgrade"
+      LICENSE_JUDGED="$lic/now" LICENSE_WHAT="the license installed now, which the rollback keeps"
+      log "Rollback: keeping the license installed since the upgrade to $OFFLINE_INSTALLED, which $OFFLINE_VERSION takes"
+      ;;
+    *) warn "The license installed since the upgrade to $OFFLINE_INSTALLED isn't one $OFFLINE_VERSION takes ($(license_detail "$out")), so the rollback puts back the one from before" ;;
+  esac
+}
+
+# Offline installs: whether Bots will run with the server's license on the release being
+# installed, before anything changes (docs/adr/0305-the-license-through-offline-upgrades.md). A
+# release can stop trusting the key a license was signed with, --license-file can bring a key it
+# doesn't take, and a rollback puts back the license from before the upgrade. The running
+# release and the bundle's each judge the license as their start would. The install stops when
+# Bots run now but wouldn't after; otherwise it says what it found.
+offline_license_check() {
+  [[ -n "$OFFLINE_BUNDLE" ]] || return 0
+  local botd="$OFFLINE_DIR/bin/botd" home env_file="" out rc=0 now_rc=2 why doc="docs/ops/air-gapped.md#the-license-through-upgrades"
+  LICENSE_JUDGED="$LICENSE_FILE" LICENSE_WHAT="the key in --license-file"
+  if ! id "$SUPERBOT_USER" &>/dev/null || [[ ! -f "$(user_home)/superbot/.env" ]]; then
+    # A new server: Bots don't run yet, so a key the bundle's botd doesn't take is only said.
+    [[ -n "$LICENSE_FILE" ]] && botd_checks_license "$botd" || return 0
+    out=$(tr -d '[:space:]' <"$LICENSE_FILE" | (cd / && env -i PATH=/usr/bin:/bin "$botd" license check --key-file -) 2>&1) || true
+    case $(license_mode "$out") in
+      active | grace) log "License: $OFFLINE_VERSION takes the key in --license-file: $(license_detail "$out")" ;;
+      *) warn "The key in --license-file isn't a license $OFFLINE_VERSION takes: $(license_detail "$out") Install one it takes before Bots can run (botctl license install, $doc)" ;;
+    esac
+    return 0
+  fi
+  home=$(user_home)
+  if ! botd_checks_license "$botd"; then
+    warn "The bundle's botd ($OFFLINE_VERSION) can't check licenses (botd license check), so the license wasn't checked before the $([[ "$ROLLBACK_RESTORE" == true ]] && echo rollback || echo upgrade)"
+    return 0
+  fi
+  if [[ "$ROLLBACK_RESTORE" == true ]]; then
+    env_file="$(rollback_dir)/$(manifest_value "$(rollback_dir)/record" env)"
+    if rollback_license_key_file "$env_file"; then
+      env_file=$LICENSE_ENV
+    elif [[ -z "$LICENSE_FILE" ]]; then
+      rollback_license_choice "$botd" "$env_file"
+    fi
+  elif [[ -z "$LICENSE_FILE" ]]; then
+    LICENSE_WHAT="this server's license"
+  fi
+  if [[ "$TESTING_MODE_ON" == true ]]; then
+    log "License: --testing-mode sets TESTING_MODE=on, so $OFFLINE_VERSION runs Bots with or without a license (test servers only)"
+    return 0
+  fi
+  if botd_checks_license "$BIN_DIR/botd"; then
+    now_rc=0
+    license_verdict "$BIN_DIR/botd" >/dev/null || now_rc=$?
+    ((now_rc <= 1)) || now_rc=2
+  fi
+  out=$(license_verdict "$botd" "$LICENSE_JUDGED" "$env_file") || rc=$?
+  case $rc in
+    0)
+      log "License: $OFFLINE_VERSION would run Bots with $LICENSE_WHAT: $(license_detail "$out")"
+      sed -n 's/^Warning: //p' <<<"$out" | while IFS= read -r w; do warn "License with $OFFLINE_VERSION: $w"; done
+      ;;
+    1)
+      why="$OFFLINE_VERSION wouldn't run Bots with $LICENSE_WHAT: $(license_detail "$out")"
+      case $now_rc in
+        0) ;;
+        1) warn "$why Bots don't run on this server now either ($doc)"; return 0 ;;
+        *) warn "$why The running release can't say whether Bots run now (botd license check) ($doc)"; return 0 ;;
+      esac
+      if [[ "$DRY_RUN" == true ]]; then
+        warn "[dry-run] would stop here, as Bots run now: $why"
+        return 0
+      fi
+      warn "Bots run now, but $why"
+      grep -E '^  ' <<<"$out" | sed -n '2,$p' >&2 || true
+      [[ "$ROLLBACK_RESTORE" != true ]] \
+        || die "Nothing has changed. Roll back with --license-file naming a license key $OFFLINE_VERSION takes, which the rollback installs; check one first with the bundle's botd: sudo -u $SUPERBOT_USER <bundle>/bin/botd license check --home $home --key-file <file> ($doc)"
+      die "Nothing has changed. Ask CG-Labs for a license key $OFFLINE_VERSION takes and re-run with --license-file naming it; check one first with the bundle's botd: sudo -u $SUPERBOT_USER <bundle>/bin/botd license check --home $home --key-file <file> ($doc)"
+      ;;
+    *) warn "botd license check didn't run (status $rc), so the license wasn't checked: $(head -n 1 <<<"$out")" ;;
   esac
 }
 
@@ -2745,6 +2930,15 @@ rollback_restore() {
   record_offline_release
   rm -f -- "$record" "$archive" "$env"
   log "Put back DATA_DIR and .env from before the upgrade to $OFFLINE_INSTALLED"
+  if [[ -n "$ROLLBACK_LICENSE" ]]; then
+    local dest=${ROLLBACK_LICENSE_DEST:-$data_dir/license.key}
+    # The backup's license wasn't judged, so the older release must not start without this one.
+    if ! write_license_key "$ROLLBACK_LICENSE" "$dest"; then
+      install -m 0600 -- "$ROLLBACK_LICENSE" "$dir/license.key" || true
+      die "Couldn't write $ROLLBACK_LICENSE_WHAT as $dest. superbot is left stopped, on the data from before the upgrade. The key is kept in $dir/license.key (root's): as $SUPERBOT_USER, copy it to $dest, then run the same command again (docs/ops/air-gapped.md#going-back)"
+    fi
+    log "Kept $ROLLBACK_LICENSE_WHAT as $dest"
+  fi
   grep -F 'Previous data kept' <<<"$out" | sed 's/^superbot-restore: /    /' || true
   log "The .env $OFFLINE_INSTALLED ran with is kept as $kept"
 }
@@ -2770,6 +2964,7 @@ main() {
     prepare_harness_bundle
     prepare_rollback
     machine_settings_check
+    offline_license_check
   else
     detect_source_dir
   fi

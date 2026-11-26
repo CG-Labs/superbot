@@ -5878,7 +5878,11 @@ impl Db {
     }
 
     fn seats_used(c: &Connection) -> u32 {
-        c.query_row("SELECT COUNT(*) FROM users WHERE status = 'active' AND kind = 'person' AND id != ?", [crate::users::OPERATOR], |r| r.get(0)).unwrap_or(0)
+        Self::count_seats(c).unwrap_or(0)
+    }
+
+    pub(crate) fn count_seats(c: &Connection) -> rusqlite::Result<u32> {
+        c.query_row("SELECT COUNT(*) FROM users WHERE status = 'active' AND kind = 'person' AND id != ?", [crate::users::OPERATOR], |r| r.get(0))
     }
 
     /// Whether one more active user fits under `cap`. Callers hold the one connection

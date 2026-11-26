@@ -24,6 +24,9 @@ name: offline
 # (docs/adr/0232-harness-cli-bundle-for-air-gapped-servers.md).
 # The upgrade backs up the database and .env first, and --rollback with the older bundle puts
 # them back, undoing what was saved since (docs/adr/0300-offline-upgrades-keep-a-way-back.md).
+# Before the upgrade and the rollback change anything, the bundle's botd judges the server's
+# license as its start would, and botd license check counts seats in the encrypted database
+# (docs/adr/0305-the-license-through-offline-upgrades.md).
 # release-bundle: for every v* tag, once the docker workflow has published and signed that tag's
 # images (or by hand, for a published release), bundles them for each arch, with a Hermes bundle
 # and a harness bundle for each arch, signs each bundle with cosign keylessly under this
@@ -284,6 +287,7 @@ jobs:
             --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC \
             | tee /tmp/offline-upgrade.log
           grep -Fq "Offline upgrade: $OLD -> $NEW" /tmp/offline-upgrade.log
+          grep -Fq "License: $NEW would run Bots with this server's license" /tmp/offline-upgrade.log
           grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
           # The backup --rollback goes back to, encrypted to the server's backup key (ADR 0300).
           grep -Fq "Rollback point: /usr/local/share/superbot/rollback/superbot-pre-upgrade-$OLD-" /tmp/offline-upgrade.log
@@ -473,6 +477,33 @@ jobs:
           [[ $(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot) == "$before" ]]
           sudo cp -p /tmp/offline-env.bak "$home/superbot/.env"
           sudo systemctl is-active --quiet superbot
+      # The installed botd judges the server's license as its start would, as botd's user, counting
+      # seats in the encrypted database with the master key (ADR 0305). Release builds trust no
+      # signing key here, so a key given is invalid, and only testing mode runs Bots.
+      - name: botd license check judges the server's license, and a key given, with no network
+        run: |
+          set -euo pipefail
+          home=$(getent passwd superbot | cut -d: -f6)
+          check() {
+            sudo ip netns exec offline sudo -u superbot env -i PATH=/usr/bin:/bin HOME="$home" /usr/local/bin/botd license check "$@"
+          }
+          check --home "$home" | tee /tmp/offline-license.log
+          grep -Fqx "Settings: $home/superbot/.env, over botd's environment" /tmp/offline-license.log
+          grep -Fq "License: testing, from nothing: no license is set" /tmp/offline-license.log
+          grep -Eq '^Seats: [0-9]+ (of [0-9]+ in use|in use)' /tmp/offline-license.log
+          grep -Eqx 'Bots would run with this license \(botd [^)]+\)\.' /tmp/offline-license.log
+          check --home "$home" --json | jq -e '.usable == true and .seatsCounted == true' >/dev/null
+          printf 'eyJhbGciOiJFZERTQSIsImtpZCI6Im5vbmUifQ.eyJzdWIiOiJ4In0.c2ln\n' | check --home "$home" --key-file - | tee /tmp/offline-license-key.log
+          grep -Fq "License: invalid, from the key given with --key-file, as $home/superbot/data/license.key" /tmp/offline-license-key.log
+          if sudo test -e "$home/superbot/data/license.key"; then echo "botd license check installed the key it was given" >&2; exit 1; fi
+          plain=$(mktemp) && chmod 0644 "$plain"
+          echo "DATA_DIR=$home/superbot/data" >"$plain"
+          if check --env-file "$plain" >/tmp/offline-license-none.log; then
+            echo "botd license check ran Bots with no license and no testing mode" >&2; exit 1
+          fi
+          grep -Fq "License: unlicensed, from nothing: no license is set" /tmp/offline-license-none.log
+          grep -Fq "Bots wouldn't run with this license (botd " /tmp/offline-license-none.log
+          rm -f "$plain"
       # The backup the upgrade from $OLD took puts back the database and .env from then (ADR 0300):
       # a secret saved since and the machine bundle written since are gone. Then forward again.
       - name: Roll back to the older bundle with the backup the upgrade took, with no network
@@ -500,6 +531,7 @@ jobs:
           grep -Fq "Offline rollback: $NEW -> $OLD, with the backup taken before the upgrade to $NEW" /tmp/offline-rollback.log
           grep -Fq "Rollback: the backup taken before the upgrade to $NEW unpacks and checks out" /tmp/offline-rollback.log
           grep -Fq "Put back DATA_DIR and .env from before the upgrade to $NEW" /tmp/offline-rollback.log
+          grep -Fq "License: $OLD would run Bots with the license from before the upgrade, which the rollback puts back" /tmp/offline-rollback.log
           grep -qx "version=$OLD" /usr/local/share/superbot/offline-release
           [[ -z $(sudo ls -A /usr/local/share/superbot/rollback) ]]
           healthy
