@@ -34,7 +34,7 @@ A TAM doesn't replace support: tickets still go to `<support-email>` or `<suppor
 
 `botctl tam-cadence` checks this cadence across every account from the CRM's export: each kickoff, check-in, health check, business review, restore drill and Severity 1 walk-through overdue or due soon, and each renewal coming up, by account and by TAM ([TAM cadence check](tam-cadence.md)). Record each step's date in the customer's record as it happens, so the check reads what was done.
 
-The health score is a prompt, not a verdict: a TAM who sees a signal at risk calls the customer before the next scheduled check-in, and a TAM who knows something the score can't (a reorganisation, a merger, a champion leaving) acts on that too.
+The health score is a prompt, not a verdict: a TAM who sees a signal at risk calls the customer before the next scheduled check-in (botd [alerts](health-score.md#alerts) when the band falls, a signal goes at risk or the score falls 10 points below the last check, and the Provider's Prometheus can route the same to the TAM), and a TAM who knows something the score can't (a reorganisation, a merger, a champion leaving) acts on that too.
 
 ## Kickoff agenda
 

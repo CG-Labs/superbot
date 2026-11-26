@@ -2,12 +2,14 @@
 //! (ADR 0144) once a UTC day, keeps `HEALTH_SCORE_HISTORY_DAYS` of them (400 by default,
 //! 0 to stop), and shows the trend: `GET /api/support/health-score/history` (admins),
 //! `botctl health-score history`, the console's Support tab, and
-//! `health-score-history.json` in the support bundle.
+//! `health-score-history.json` in the support bundle. Each recorded day is compared with
+//! the one before for health score alerts (`health_alert`, ADR 0307).
 //!
 //! Each day keeps only the score, its band and each signal's status, never the counts or
 //! reason codes behind them, so a review deck can quote it as it is.
 
 use crate::db::{HealthScoreDay, now};
+use crate::health_alert;
 use crate::health_score::{self, Status};
 use crate::runner::App;
 use crate::{AppState, Res, bad};
@@ -86,19 +88,25 @@ pub fn day_of(report: &Value, at: i64) -> HealthScoreDay {
     }
 }
 
-/// Records today's score unless today has one. True if it recorded one.
-pub fn record(app: &App, now_ms: i64) -> rusqlite::Result<bool> {
+/// Records today's score unless today has one, and tells the admins' alert channels what
+/// got worse since the day recorded before it (ADR 0307). True if it recorded one.
+pub fn record(app: &Arc<App>, now_ms: i64) -> rusqlite::Result<bool> {
     let today = date_of(now_ms);
-    if app.db.health_scores_since(&today)?.iter().any(|d| d.day == today) {
+    let before = app.db.health_scores_newest(1)?.into_iter().next();
+    if before.as_ref().is_some_and(|d| d.day >= today) {
         return Ok(false);
     }
     let report = health_score::build(app, now_ms, health_score::DEFAULT_DAYS);
-    app.db.health_score_record(&day_of(&report, now_ms))
+    let recorded = app.db.health_score_record(&day_of(&report, now_ms))?;
+    if let Some(a) = recorded.then(|| health_alert::watch(app, before.as_ref(), &report, &today)).flatten() {
+        crate::notify::alert(app, a, health_alert::PAGE);
+    }
+    Ok(recorded)
 }
 
 /// One pass: today's score, then the days past `keep_days` go. Failures are logged, so a
 /// day missed for a full disk or a broken database says so.
-pub fn tick(app: &App, s: Settings, now_ms: i64) -> (bool, usize) {
+pub fn tick(app: &Arc<App>, s: Settings, now_ms: i64) -> (bool, usize) {
     let Some(keep) = s.keep_days else { return (false, 0) };
     let recorded = record(app, now_ms).unwrap_or_else(|e| {
         crate::obs::log::log_warn!("Health score history: couldn't record today's score: {e}");
