@@ -6062,8 +6062,11 @@ impl Db {
     /// server, in the same transaction; returns those whose built-in role changed.
     /// `max_days` Some(Some(n)) makes it time-bound (ADR 0197), refused while anyone holds it
     /// longer than that or a group is mapped to it; Some(None) lifts the limit. A
-    /// requestable role (ADR 0209) must keep one, checked once both are written.
-    pub fn update_custom_role(&self, id: &str, name: Option<&str>, description: Option<&str>, base: Option<Role>, permissions: Option<&[&str]>, max_days: Option<Option<i64>>, requestable: Option<bool>) -> Result<Vec<String>, RoleError> {
+    /// requestable role (ADR 0209) must keep one, checked once both are written. `approvals`
+    /// (ADR 0320) is written with the rest, so no request is approved under new permissions
+    /// with the old count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_custom_role(&self, id: &str, name: Option<&str>, description: Option<&str>, base: Option<Role>, permissions: Option<&[&str]>, max_days: Option<Option<i64>>, requestable: Option<bool>, approvals: Option<i64>) -> Result<Vec<String>, RoleError> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| RoleError::Db(e.to_string()))?;
         let at = now();
@@ -6123,6 +6126,7 @@ impl Db {
             if let Some(v) = permissions { set("permissions", &serde_json::to_string(v).unwrap_or_else(|_| "[]".into()))?; }
             if let Some(v) = max_days { set("max_days", &v)?; }
             if let Some(v) = requestable { set("requestable", &v)?; }
+            if let Some(v) = approvals { set("approvals", &v)?; }
             if tx.query_row("SELECT requestable = 1 AND max_days IS NULL FROM roles WHERE id = ?", [id], |r| r.get::<_, bool>(0))? {
                 return Ok(Err(RoleError::Requestable));
             }
@@ -12278,6 +12282,19 @@ mod tests {
     }
 
     #[test]
+    fn a_roles_approvals_are_saved_with_its_other_fields_or_not_at_all() {
+        let db = Db::open(&temp_path("approvals-tx").join("app.sqlite")).unwrap();
+        let r = db.create_custom_role("Root", "", Role::Member, &["audit.view"], None, None).unwrap();
+        // Refused as a whole (requestable with no limit), so the count isn't saved either.
+        assert_eq!(db.update_custom_role(&r.id, None, None, None, Some(&["machines.manage"]), None, Some(true), Some(2)), Err(RoleError::Requestable));
+        let same = db.custom_role(&r.id).unwrap();
+        assert_eq!((same.perms().names(), same.approvals), (vec!["audit.view"], 1));
+        db.update_custom_role(&r.id, None, None, None, Some(&["machines.manage"]), Some(Some(1)), Some(true), Some(2)).unwrap();
+        let after = db.custom_role(&r.id).unwrap();
+        assert_eq!((after.perms().names(), after.requestable, after.approvals), (vec!["machines.manage"], true, 2));
+    }
+
+    #[test]
     fn a_first_approval_is_saved_and_its_erased_approver_no_longer_counts() {
         let db = Db::open(&temp_path("two-approvers").join("app.sqlite")).unwrap();
         let r = db.create_custom_role("Root", "", Role::Member, &["machines.manage"], Some(1), None).unwrap();
@@ -12317,7 +12334,7 @@ mod tests {
         assert!(matches!(db.create_saml_role_mapping("corp", None, "Auditors", &hand.id, None), Err(ScimRoleMapError::Taken)), "one role per group");
         let okta = db.create_saml_role_mapping("okta", None, "Auditors", &r.id, None).unwrap();
         assert!(matches!(db.delete_custom_role(&r.id), Err(RoleError::Mapped(2))));
-        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "machines.manage"]), None, None), Err(RoleError::Reaches { via: "saml", .. })), "checked as it's saved");
+        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "machines.manage"]), None, None, None), Err(RoleError::Reaches { via: "saml", .. })), "checked as it's saved");
 
         assert!(db.grant_saml_role(&m, &a.id));
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
@@ -12433,7 +12450,7 @@ mod tests {
         let r = db.create_custom_role("Break glass", "", Role::Member, &["users.manage"], None, None).unwrap();
         let sa = db.create_service_account("CI", "", Role::Member, None, None, &owner.id, None).unwrap();
         // The handler checked `r` while it had no limit; one is set before the write.
-        db.update_custom_role(&r.id, None, None, None, None, Some(Some(7)), None).unwrap();
+        db.update_custom_role(&r.id, None, None, None, None, Some(Some(7)), None, None).unwrap();
         assert_eq!(db.create_service_account("X", "", Role::Member, Some(&r.id), None, &owner.id, None).err().as_deref(), Some(SA_TIME_BOUND));
         assert_eq!(db.create_service_account("X", "", Role::Member, None, Some((&team.id, Some(&r.id))), &owner.id, None).err().as_deref(), Some(SA_TIME_BOUND));
         let org = ServiceAccountPatch { role: Some((Role::Member, Some(r.id.clone()))), ..Default::default() };
@@ -12466,11 +12483,11 @@ mod tests {
 
         // Held with no end, it can't be made time-bound.
         db.give_user_custom_role_until(&a.id, &r.id, None).unwrap();
-        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week, None), Err(RoleError::Standing { held: 1, mapped: 0 }));
+        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week, None, None), Err(RoleError::Standing { held: 1, mapped: 0 }));
         db.give_user_custom_role_until(&a.id, &r.id, Some(now() + 8 * crate::roles::DAY)).unwrap();
-        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week, None), Err(RoleError::Standing { held: 1, mapped: 0 }), "nor held longer than it allows");
+        assert_eq!(db.update_custom_role(&r.id, None, None, None, None, week, None, None), Err(RoleError::Standing { held: 1, mapped: 0 }), "nor held longer than it allows");
         db.give_user_custom_role_until(&a.id, &r.id, Some(now() + 6 * crate::roles::DAY)).unwrap();
-        assert!(db.update_custom_role(&r.id, None, None, None, None, week, None).is_ok());
+        assert!(db.update_custom_role(&r.id, None, None, None, None, week, None, None).is_ok());
         assert_eq!(db.custom_role(&r.id).unwrap().max_days, Some(7));
 
         // Once it is, it's given only with an end within its limit, checked as it's written.
@@ -12485,9 +12502,9 @@ mod tests {
         let plain = db.create_custom_role("Plain", "", Role::Member, &["users.manage"], None, None).unwrap();
         let g = db.declare_scim_role_group("okta", "org", "Helpdesk", None, &plain.id, None).unwrap();
         assert!(matches!(db.set_scim_role_group_role(&g.id, &r.id), Err(ScimRoleGroupError::TimeBound)));
-        assert_eq!(db.update_custom_role(&plain.id, None, None, None, None, week, None), Err(RoleError::Standing { held: 0, mapped: 1 }));
+        assert_eq!(db.update_custom_role(&plain.id, None, None, None, None, week, None, None), Err(RoleError::Standing { held: 0, mapped: 1 }));
         // The limit lifted, it's a role like any other.
-        assert!(db.update_custom_role(&r.id, None, None, None, None, Some(None), None).is_ok());
+        assert!(db.update_custom_role(&r.id, None, None, None, None, Some(None), None, None).is_ok());
         assert!(db.give_user_custom_role_until(&a.id, &r.id, None).is_some());
         assert!(db.create_saml_role_mapping("corp", None, "Admins", &r.id, None).is_ok());
     }
@@ -12515,8 +12532,8 @@ mod tests {
         assert!(!db.grant_scim_role(&org, &a.id), "once");
         assert!(db.give_user_custom_role(&b.id, &hand.id).is_some());
         assert!(!db.grant_scim_role(&org, &b.id), "never over a role given by hand");
-        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"]), None, None), Err(RoleError::Reaches { .. })), "checked as it's saved");
-        assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"]), None, None).is_ok());
+        assert!(matches!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view", "bots.manage"]), None, None, None), Err(RoleError::Reaches { .. })), "checked as it's saved");
+        assert!(db.update_custom_role(&r.id, None, None, None, Some(&["audit.view"]), None, None, None).is_ok());
         assert!(db.revoke_scim_role(&org, &a.id, true).is_none(), "a leave that a rejoin overtook keeps the server-wide grant");
         assert_eq!((db.user(&a.id).unwrap().role, db.user(&a.id).unwrap().role_id), (Role::Member, Some(r.id.clone())));
         assert_eq!(db.scim_role_grants(&org.id).len(), 1);

@@ -318,14 +318,15 @@ pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, 
         two_approvers_exist(&app)?;
     }
     let mut r = app.db.create_custom_role(&name, &description, base, &perms, max_days, by.actor.id.as_deref()).map_err(role_error)?;
-    if requestable {
-        if !app.db.set_role_requestable(&r.id, true) {
+    // Before it's requestable, so nobody asks for it while it still needs one approver.
+    if approvals != r.approvals {
+        if !app.db.set_role_approvals(&r.id, approvals) {
             return Err(gone_or_changed(&app, &r.id));
         }
         r = need_role(&app, &r.id)?;
     }
-    if approvals != r.approvals {
-        if !app.db.set_role_approvals(&r.id, approvals) {
+    if requestable {
+        if !app.db.set_role_requestable(&r.id, true) {
             return Err(gone_or_changed(&app, &r.id));
         }
         r = need_role(&app, &r.id)?;
@@ -381,12 +382,7 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
     if approvals == Some(2) {
         two_approvers_exist(&app)?;
     }
-    let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref(), max_days, requestable).map_err(role_error)?;
-    if let Some(n) = approvals {
-        if !app.db.set_role_approvals(&before.id, n) {
-            return Err(gone_or_changed(&app, &before.id));
-        }
-    }
+    let moved = app.db.update_custom_role(&before.id, name.as_deref(), description.as_deref(), base, perms.as_deref(), max_days, requestable, approvals).map_err(role_error)?;
     let after = need_role(&app, &before.id)?;
     let mut changes = serde_json::Map::new();
     if before.name != after.name {

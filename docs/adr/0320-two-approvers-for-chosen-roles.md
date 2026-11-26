@@ -25,7 +25,7 @@ We chose option 1.
 
 ## Decision
 
-**Per role.** A custom role has `approvals`, 1 (the default, as before) or 2, set by an admin on create or edit (`POST`/`PATCH /api/roles`, the roles editors in the console and the app, `botctl role add|edit --approvals 1|2`). It's stored on the role (`roles.approvals`, `CHECK (approvals IN (1, 2))`) and only requests read it: giving the role by hand, SCIM and SAML group rules are unchanged. `role.created` and `role.updated` record it.
+**Per role.** A custom role has `approvals`, 1 (the default, as before) or 2, set by an admin on create or edit (`POST`/`PATCH /api/roles`, the roles editors in the console and the app, `botctl role add|edit --approvals 1|2`). It's stored on the role (`roles.approvals`, `CHECK (approvals IN (1, 2))`), written in the same transaction as the role's other fields on edit and before the role becomes requestable on create, so no request is approved under new permissions with the old count. Only requests read it: giving the role by hand, SCIM and SAML group rules are unchanged. `role.created` and `role.updated` record it.
 
 **Only when it can be met.** Setting `approvals: 2` is refused (409) while fewer than two active admins who aren't service accounts exist, as no request for it could then be given across the server. The operator's break-glass account counts: it's an admin who can approve. Lowering it is always allowed.
 
@@ -78,7 +78,7 @@ We chose option 1.
   - `team_owners_and_admins_give_either_approval_within_their_team`: a team owner first and an admin second, or the other way round; not both by one person; a team admin who has since become the team's plain member no longer counts and is replaced.
   - unit `a_first_approval_counts_for_admins_and_the_teams_deciders_only`: `first_counts` across roles, team roles, IdP-managed team roles, disabled, service and asker.
 - `team_role_requests_http_tests.rs`: `a_first_approval_tells_the_others_who_may_give_the_second` (the team's other deciders are told by email and push, the first approver isn't).
-- `db` unit test: `a_first_approval_is_saved_and_its_erased_approver_no_longer_counts`.
+- `db` unit tests: `a_first_approval_is_saved_and_its_erased_approver_no_longer_counts`, and `a_roles_approvals_are_saved_with_its_other_fields_or_not_at_all`.
 - `evidence_http_tests.rs`: custom roles carry `approvals`.
 - `botctl` unit tests: `--approvals` on `role add|edit`, and the first-approval message.
-- Client: `roles.test.ts` (draft, cap, labels), `RolesAdmin.test.tsx` (the checkbox, first and second approval, the first approver can't give the second), `RoleRequestsCard.test.tsx` (the asker sees two approvers are needed and where a request is).
+- Client: `roles.test.ts` (draft, cap, labels), `RolesAdmin.test.tsx` (the checkbox, first and second approval, the first approver can't give the second, the picked hours capped again when a reload brings a shorter first approval), `RoleRequestsCard.test.tsx` (the asker sees two approvers are needed and where a request is).
