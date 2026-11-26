@@ -328,8 +328,9 @@ impl NoticeKind {
 }
 
 /// Something admins need to act on, such as a machine past its RPO (ADR 0074). It goes
-/// to the global email list and webhook, never to a Bot's deciders or own webhook.
-#[derive(Clone, Debug, Serialize)]
+/// to the global email list and webhook, never to a Bot's deciders or own webhook; and to
+/// its `audience`, when it has one.
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Alert {
     /// The audit action it reports, e.g. `machine.rpo_breached`.
@@ -340,6 +341,28 @@ pub struct Alert {
     pub target_id: String,
     /// The console page it's about; the notifier fills it in from PUBLIC_URL.
     pub link: Option<String>,
+    /// The app page its audience acts on it in; the notifier fills it in from PUBLIC_URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_link: Option<String>,
+    #[serde(skip)]
+    pub audience: Option<Audience>,
+}
+
+/// People who can act on an alert themselves, beside the global list and webhook (ADR
+/// 0302): email reaches them while email and `email.deciders` are on, and push their phones
+/// that want approvals.
+#[derive(Clone, Debug, Default)]
+pub struct Audience {
+    pub people: Vec<User>,
+    /// Who they are, for the notice's link: "the team's owners and admins".
+    pub who: String,
+    /// The app page they act on it in: `team`.
+    pub page: &'static str,
+    /// What their phones show, which a lock screen may too: no names, no reasons.
+    pub push_title: String,
+    pub push_body: String,
+    /// The push's `type`, which the app opens `page` for.
+    pub push_type: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -390,10 +413,17 @@ impl Notice {
             for l in &a.lines {
                 out.push_str(&format!("  {}\n", clip(l)));
             }
+            if let (Some(l), Some(who)) = (&a.app_link, a.audience.as_ref().map(|w| &w.who)) {
+                out.push_str(&format!("\n  Open it in SuperBot ({who}): {l}"));
+            }
             if let Some(l) = &a.link {
                 out.push_str(&format!("\n  Console (admins): {l}\n"));
             }
-            out.push_str("\n--\nSuperBot sends alerts like this to the notification email list and webhook set in the console's Settings.\n");
+            out.push_str("\n--\nSuperBot sends alerts like this to the notification email list and webhook set in the console's Settings");
+            match &a.audience {
+                Some(w) => out.push_str(&format!(", and to {} when email also goes to the people who can answer.\n", w.who)),
+                None => out.push_str(".\n"),
+            }
             return out;
         }
         match self.kind {
@@ -441,6 +471,11 @@ pub struct Links {
 impl Links {
     pub fn app(&self) -> Option<String> {
         self.base.as_ref().map(|b| format!("{b}/app/"))
+    }
+
+    /// An app page: `team`.
+    pub fn page(&self, page: &str) -> Option<String> {
+        self.base.as_ref().map(|b| format!("{b}/app/{page}"))
     }
 
     pub fn approval(&self, id: &str) -> Option<String> {
@@ -806,16 +841,38 @@ impl Notifier {
         Ok(self.deliver(app, &n, &plan, true).await)
     }
 
-    /// An alert to the global email list and webhook, now. `page`: the console page it
-    /// links to. Nothing when neither is on.
+    /// Where an alert goes: the global email list and webhook, and its audience (ADR 0302):
+    /// their addresses while email and `email.deciders` are on, and their phones that want
+    /// approvals. Read-only people, service accounts and disabled people are never in it.
+    pub fn alert_plan(&self, db: &Db, a: &Alert, s: &Settings) -> Plan {
+        let mut plan = self.plan(db, None, s);
+        let Some(w) = &a.audience else { return plan };
+        let people: Vec<User> = w.people.iter().filter(|u| !u.service && u.active() && rbac::allows(Principal::User(u.role), Perm::Approve)).cloned().collect();
+        if self.smtp.is_some() && s.email.enabled && s.email.deciders {
+            for e in people.iter().filter_map(|u| u.email.clone()).filter(|e| smtp::address_ok(e)) {
+                if !plan.email.iter().any(|x| x.eq_ignore_ascii_case(&e)) {
+                    plan.email.push(e);
+                }
+            }
+        }
+        if let Some(p) = &self.push {
+            plan.push = p.devices(db, &people.iter().map(|u| u.id.clone()).collect::<Vec<_>>(), PushKind::Approvals);
+        }
+        plan.deciders = people;
+        plan
+    }
+
+    /// An alert to the global email list and webhook, and its audience, now. `page`: the
+    /// console page it links to. Nothing when none of them is on.
     pub async fn alert(&self, app: &App, mut a: Alert, page: &str) -> Vec<Value> {
-        let plan = self.plan(&app.db, None, &load(&app.db));
+        let plan = self.alert_plan(&app.db, &a, &load(&app.db));
         if plan.is_empty() {
             return Vec::new();
         }
         a.title = secrets::redact::text(&a.title).into_owned();
         a.lines = a.lines.iter().map(|l| secrets::redact::text(l).into_owned()).collect();
         a.link = self.links.console(page);
+        a.app_link = a.audience.as_ref().and_then(|w| self.links.page(w.page));
         let n = Notice { kind: NoticeKind::Alert, bot_id: String::new(), bot_name: String::new(), items: Vec::new(), more: 0, alert: Some(a) };
         self.deliver(app, &n, &plan, false).await
     }

@@ -196,3 +196,113 @@ async fn not_their_own_nor_a_team_admins_nor_over_the_identity_provider() {
     assert_eq!(call(port, "POST", &at(&gus_q, "approve"), &ada_auth, "{}").await.0, 404);
     assert_eq!(call(port, "POST", &at(&gus_q, "deny"), &ada_auth, "{}").await.0, 404);
 }
+
+async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..500 {
+        if let Some(v) = f() {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A notifier with a stand-in mail server and push provider, and email on to `ops@example.com`.
+async fn notices(app: &App) -> (notify::smtp::fake::Server, notify::push::fake::Recorder) {
+    use notify::{push, smtp};
+    let mail = smtp::fake::start(Default::default()).await;
+    let rec = push::fake::Recorder::default();
+    let p = push::Push::new(Box::new(rec.clone()), users::SessionConfig::default());
+    let n = notify::Notifier::new(Some(smtp::Smtp::for_test("127.0.0.1", mail.port, smtp::Tls::None, None, None)), Some("https://bots.example.com".into())).with_push(p);
+    assert!(app.notifier.set(Arc::new(n)).is_ok());
+    let email = notify::EmailSettings { enabled: true, to: vec!["ops@example.com".into()], deciders: true };
+    notify::save(&app.db, &notify::Settings { email, ..Default::default() });
+    (mail, rec)
+}
+
+fn mailed(mail: &notify::smtp::fake::Server) -> Vec<String> {
+    let mut to: Vec<String> = mail.got.lock().unwrap().iter().flat_map(|m| m.to.clone()).collect();
+    to.sort();
+    to
+}
+
+fn pushed(rec: &notify::push::fake::Recorder) -> Vec<String> {
+    let mut to: Vec<String> = rec.sent.lock().unwrap().iter().map(|m| m.to.clone()).collect();
+    to.sort();
+    to
+}
+
+#[tokio::test]
+async fn team_owners_and_admins_hear_of_requests_they_may_decide() {
+    let (port, app, admin, _) = serve_app().await;
+    let (mail, rec) = notices(&app).await;
+    let (ada, ada_auth) = user_with(port, &admin, "notice-ada@example.com", "member").await;
+    let (eve, eve_auth) = user_with(port, &admin, "notice-eve@example.com", "member").await;
+    let (rae, _) = user_with(port, &admin, "notice-rae@example.com", "readonly").await;
+    let (dot, dot_auth) = user_with(port, &admin, "notice-dot@example.com", "member").await;
+    let (cy, cy_auth) = user_with(port, &admin, "notice-cy@example.com", "member").await;
+    let (dee, dee_auth) = user_with(port, &admin, "notice-dee@example.com", "member").await;
+    let (bea, bea_auth) = user_with(port, &admin, "notice-bea@example.com", "member").await;
+    team(port, &admin, "Alpha", &ada, &[(&eve, "admin"), (&rae, "admin"), (&dot, "admin"), (&cy, "member"), (&dee, "member")]).await;
+    team(port, &admin, "Beta", &bea, &[]).await;
+    requestable(port, &admin, "Team helpdesk", &["users.manage", "audit.view"], 7).await;
+    requestable(port, &admin, "On-call", &["machines.manage"], 1).await;
+    let phone = |who: &str| format!("ExponentPushToken[{who}-phone]");
+    for (who, auth) in [("ada", &ada_auth), ("eve", &eve_auth), ("dot", &dot_auth), ("cy", &cy_auth), ("dee", &dee_auth), ("bea", &bea_auth)] {
+        let body = json!({ "token": phone(who), "platform": "ios" }).to_string();
+        assert_eq!(call(port, "PUT", "/api/me/push", auth, &body).await.0, 200, "{who}");
+    }
+    // A team admin who's since been disabled hears nothing.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{dot}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+
+    // A plain member's request reaches the team's active owners and admins who may decide it,
+    // besides the notification list: never a read-only one, the asker, or another team.
+    let cy_q = asked(port, &cy_auth, json!({ "role": "Team helpdesk", "scope": "team", "hours": 8, "reason": "Ticket 4242" })).await;
+    let want = ["notice-ada@example.com", "notice-eve@example.com", "ops@example.com"];
+    assert_eq!(until("three emails", || Some(mailed(&mail)).filter(|m| m.len() >= 3)).await, want);
+    assert_eq!(until("two pushes", || Some(pushed(&rec)).filter(|p| p.len() >= 2)).await, [phone("ada"), phone("eve")]);
+    let m = mail.got.lock().unwrap()[0].clone();
+    assert!(m.headers.contains("Subject: [SuperBot] notice-cy@example.com asks for Team helpdesk for 8 hours"), "{}", m.headers);
+    for line in ["Why: Ticket 4242", "In the team Alpha.", "or the team's owners and admins in Team", "Open it in SuperBot (the team's owners and admins): https://bots.example.com/app/team", "Console (admins): https://bots.example.com/console/#roles"] {
+        assert!(m.body.contains(line), "{line}: {}", m.body);
+    }
+    for p in rec.sent.lock().unwrap().iter() {
+        assert_eq!((p.title.as_str(), p.body.as_str(), &p.data), ("Request for a team role", "Someone on Alpha is waiting for your decision.", &json!({ "type": "role_request", "url": "/team" })));
+    }
+    let sent = until("both audit events", || Some(events_now(&app, "notification.sent")).filter(|e| e.len() >= 2)).await;
+    let push = sent.iter().find(|e| e.details["channel"] == "push").unwrap();
+    assert_eq!((push.details["event"].as_str(), push.target_id.as_deref()), (Some("role.requested"), app.db.role_request(&cy_q).map(|q| q.role_id).as_deref()));
+    let mut users: Vec<&str> = push.details["users"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    users.sort();
+    let mut both = [ada.as_str(), eve.as_str()];
+    both.sort();
+    assert_eq!(users, both);
+    let email = sent.iter().find(|e| e.details["channel"] == "email").unwrap();
+    assert_eq!(email.details["to"].as_array().map(Vec::len), Some(3), "{}", email.details);
+
+    // Requests the team can't decide reach only the notification list: one from a team admin,
+    // and one across the server.
+    asked(port, &eve_auth, json!({ "role": "Team helpdesk", "scope": "team", "hours": 8, "reason": "Cover" })).await;
+    asked(port, &dee_auth, json!({ "role": "On-call", "hours": 8, "reason": "Incident 42" })).await;
+    until("two more emails", || Some(mailed(&mail)).filter(|m| m.len() >= 5)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(mailed(&mail)[3..], ["ops@example.com", "ops@example.com"]);
+    assert_eq!(pushed(&rec).len(), 2, "no phone heard of them");
+    let m = mail.got.lock().unwrap()[3].clone();
+    assert!(!m.body.contains("/app/team") && !m.body.contains("in Team"), "{}", m.body);
+
+    // With email kept to the list, owners and admins still hear on their phones.
+    let email = notify::EmailSettings { enabled: true, to: vec!["ops@example.com".into()], deciders: false };
+    notify::save(&app.db, &notify::Settings { email, ..Default::default() });
+    asked(port, &dee_auth, json!({ "role": "Team helpdesk", "scope": "team", "hours": 4, "reason": "Invites" })).await;
+    until("two more pushes", || Some(pushed(&rec)).filter(|p| p.len() >= 4)).await;
+    until("one more email", || Some(mailed(&mail)).filter(|m| m.len() >= 6)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(mailed(&mail).iter().filter(|t| t.as_str() == "ops@example.com").count(), 4, "only the list's address");
+    assert_eq!(mailed(&mail).len(), 6);
+}
+
+fn events_now(app: &App, action: &str) -> Vec<db::AuditEvent> {
+    let f = audit::Filter::from_query(&HashMap::from([("action".to_string(), action.to_string())])).unwrap();
+    app.db.audit_events(&f, 50, true)
+}

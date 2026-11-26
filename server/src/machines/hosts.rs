@@ -159,7 +159,7 @@ fn record(app: &App, by: &Who, action: &str, host: &str, outcome: Outcome, detai
 }
 
 fn alert(app: &AppState, action: &str, host: &str, title: String, lines: Vec<String>) {
-    let a = Alert { event: action.into(), title, lines, target_type: "host".into(), target_id: host.into(), link: None };
+    let a = Alert { event: action.into(), title, lines, target_type: "host".into(), target_id: host.into(), link: None, ..Default::default() };
     notify::alert(app, a, PAGE);
 }
 

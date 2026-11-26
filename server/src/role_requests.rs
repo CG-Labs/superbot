@@ -10,7 +10,8 @@
 //! is checked when it's asked for and again, in one transaction, when it's approved.
 //!
 //! A request within a team can also be decided by that team's own owners and admins (ADR
-//! 0263), for its plain members, never over a role their identity provider gives them.
+//! 0263), for its plain members, never over a role their identity provider gives them; they
+//! hear of new ones by email and push themselves (ADR 0302).
 
 use crate::audit::Who;
 use crate::db::{CustomRole, RoleRequest, RoleRequestError, TeamMember, User};
@@ -269,21 +270,57 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
     let q = app.db.create_role_request(&u.id, &r.id, team.as_deref(), hours, &reason, lapses, MAX_PENDING, MAX_DAILY).map_err(|e| request_error(&app, e, None, true))?;
     let d = json!({ "request": q.id, "name": r.name, "user": u.id, "scope": scope(&q), "team": q.team_id, "hours": hours, "reason": reason, "lapsesAt": q.expires_at });
     app.db.record(&by.event("role.requested").target("role", &r.id).details(d));
+    crate::notify::alert(&app, requested_alert(&app, u, &r, &q), "roles");
+    Ok((StatusCode::CREATED, Json(view(&app, &q))))
+}
+
+/// The people who may decide `q` themselves, beside server admins (ADR 0263, 0302): the
+/// owners and admins of its team, active, never read-only, never the asker. None across the
+/// server, nor when the team can't decide it: the asker is one of its owners or admins, or
+/// their role in it comes from their identity provider.
+pub fn team_deciders(app: &AppState, q: &RoleRequest) -> Vec<User> {
+    let Some(team) = q.team_id.as_deref() else { return Vec::new() };
+    let asker = app.db.team_member(&q.user_id).filter(|m| m.team_id == team);
+    if asker.is_none_or(|m| m.role != crate::teams::MEMBER) || crate::roles::scim_source(app, &q.user_id, "team").is_some() {
+        return Vec::new();
+    }
+    app.db
+        .team_members(team)
+        .into_iter()
+        .filter(|m| crate::teams::manages(&m.role) && m.user_id != q.user_id)
+        .filter_map(|m| app.db.user(&m.user_id))
+        .filter(|u| !u.service && u.active() && u.role != Role::Readonly)
+        .collect()
+}
+
+/// What a new request sends: to the notification email list and webhook, and, for a request
+/// within a team, to the team's owners and admins who may decide it (`team_deciders`).
+fn requested_alert(app: &AppState, u: &User, r: &CustomRole, q: &RoleRequest) -> crate::notify::Alert {
     let who = u.email.clone().unwrap_or_else(|| u.name.clone());
-    let (place, where_) = match &q.team_id {
-        Some(t) => (format!("In the team {}.", app.db.team(t).map(|t| t.name).unwrap_or_default()), "in Roles, or the team's owners and admins in Team"),
+    let team = q.team_id.as_deref().map(|t| app.db.team(t).map(|t| t.name).unwrap_or_default());
+    let deciders = team_deciders(app, q);
+    let (place, where_) = match &team {
+        Some(t) if !deciders.is_empty() => (format!("In the team {t}."), "in Roles, or the team's owners and admins in Team"),
+        Some(t) => (format!("In the team {t}."), "in Roles"),
         None => ("Across the server.".into(), "in Roles"),
     };
-    let alert = crate::notify::Alert {
+    let audience = team.filter(|_| !deciders.is_empty()).map(|t| crate::notify::Audience {
+        people: deciders,
+        who: "the team's owners and admins".into(),
+        page: "team",
+        push_title: "Request for a team role".into(),
+        push_body: format!("Someone on {t} is waiting for your decision."),
+        push_type: "role_request",
+    });
+    crate::notify::Alert {
         event: "role.requested".into(),
-        title: format!("{who} asks for {} for {}", r.name, duration(hours)),
-        lines: vec![format!("Why: {reason}"), place, format!("Approve or deny it {where_}. It lapses in {PENDING_DAYS} days.")],
+        title: format!("{who} asks for {} for {}", r.name, duration(q.hours)),
+        lines: vec![format!("Why: {}", q.reason), place, format!("Approve or deny it {where_}. It lapses in {PENDING_DAYS} days.")],
         target_type: "role".into(),
         target_id: r.id.clone(),
-        link: None,
-    };
-    crate::notify::alert(&app, alert, "roles");
-    Ok((StatusCode::CREATED, Json(view(&app, &q))))
+        audience,
+        ..Default::default()
+    }
 }
 
 /// `POST /api/me/role-requests/{id}/cancel`: withdraws your pending request.
