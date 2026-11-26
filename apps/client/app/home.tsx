@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Modal, StyleSheet, useWindowDimensions, View } from "react-native";
 import { Redirect, router, useIsFocused, useLocalSearchParams } from "expo-router";
 import { StatusBar } from "expo-status-bar";
@@ -6,12 +6,14 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { ApprovalsInbox } from "../components/ApprovalsInbox";
 import { BotDetailsPanel } from "../components/BotDetailsPanel";
 import { ChatView } from "../components/ChatView";
+import { ConnectionBanner, useConnectionStatus } from "../components/ConnectionBanner";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
+import { useToast } from "../components/Toast";
 import { isAdmin, openConsole, openSetup, watchSetup } from "../src/admin";
 import { planAvailable } from "../src/billing";
-import { showError } from "../src/dialogs";
+import { useReducedMotion } from "../src/motion";
 import { approvalParam } from "../src/notifications";
 import { botParam } from "../src/push";
 import { isStarter, starterText } from "../src/prompts";
@@ -27,11 +29,15 @@ const SCREEN_PANEL_SHARE = 0.46;
 const CHAT_MIN = 360;
 
 export default function HomeScreen() {
-  const { api, me, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion, sendText } = useSuperBot();
+  const { api, me, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion, sendText, connected } = useSuperBot();
   const { width } = useWindowDimensions();
   const t = useTheme();
   const styles = useStyles();
   const focused = useIsFocused();
+  const toast = useToast();
+  const reduceMotion = useReducedMotion();
+  const connection = useConnectionStatus(connected);
+  const lastConnection = useRef(connection);
   const wide = width >= 800;
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("list");
   const [createOpen, setCreateOpen] = useState(false);
@@ -49,6 +55,11 @@ export default function HomeScreen() {
   const [teamLink, setTeamLink] = useState(false);
   const [prefill, setPrefill] = useState<string | null>(null);
 
+  useEffect(() => {
+    const was = lastConnection.current;
+    lastConnection.current = connection;
+    if (was !== "online" && connection === "online") toast.show({ message: "Back online", tone: "success" });
+  }, [connection, toast]);
   useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
   useEffect(() => (api ? watchTeamLink(api, setTeamLink) : undefined), [api]);
   useEffect(() => {
@@ -95,7 +106,7 @@ export default function HomeScreen() {
   const runPrompt = (prompt: string) => {
     if (!wide) setMobilePane("chat");
     if (isStarter(prompt)) setPrefill(starterText(prompt));
-    else void sendText(prompt).catch((err) => showError(err, "Couldn't send it"));
+    else void sendText(prompt).catch((err) => toast.error(err, "Couldn't send it"));
   };
 
   const toggleScreen = (takeOver?: boolean) => {
@@ -128,6 +139,7 @@ export default function HomeScreen() {
   return (
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
       {focused ? <StatusBar style={t.scheme === "dark" ? "light" : "dark"} /> : null}
+      <ConnectionBanner status={connection} />
       <View style={styles.row}>
         {showSidebar ? (
           <Sidebar
@@ -145,15 +157,16 @@ export default function HomeScreen() {
             onOpenAccessReview={() => router.push("/access-review")}
             onOpenRoles={() => router.push("/roles")}
             onOpenServiceAccounts={() => router.push("/service-accounts")}
-            onOpenConsole={() => void openConsole(api.baseUrl).catch((err) => showError(err, "Couldn't open the admin console"))}
+            onOpenConsole={() => void openConsole(api.baseUrl).catch((err) => toast.error(err, "Couldn't open the admin console"))}
             onOpenSetup={
-              setupWaiting ? () => void openSetup(api.baseUrl).catch((err) => showError(err, "Couldn't open the setup wizard")) : undefined
+              setupWaiting ? () => void openSetup(api.baseUrl).catch((err) => toast.error(err, "Couldn't open the setup wizard")) : undefined
             }
           />
         ) : null}
         {wide || mobilePane === "chat" ? (
           <ChatView
             onOpenDetails={() => setDetailsOpen(true)}
+            onNewBot={() => setCreateOpen(true)}
             onBack={wide ? undefined : () => setMobilePane("list")}
             onToggleScreen={toggleScreen}
             screenOpen={!!screen}
@@ -164,7 +177,7 @@ export default function HomeScreen() {
         {wide && viewer ? <View style={styles.screenPanel}>{viewer}</View> : null}
       </View>
       {!wide ? (
-        <Modal visible={!!viewer} animationType="slide" onRequestClose={() => setScreen(null)}>
+        <Modal visible={!!viewer} animationType={reduceMotion ? "none" : "slide"} onRequestClose={() => setScreen(null)}>
           <SafeAreaView style={styles.screenModal}>{viewer}</SafeAreaView>
         </Modal>
       ) : null}

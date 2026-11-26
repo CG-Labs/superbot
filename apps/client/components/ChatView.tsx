@@ -1,6 +1,5 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   FlatList,
   Platform,
   Pressable,
@@ -11,20 +10,30 @@ import {
   type TextInputInstance,
 } from "react-native";
 import { copyText, COPY_LABEL } from "../src/clipboard";
-import { showError } from "../src/dialogs";
+import { friendlyError } from "../src/errors";
 import { isOpenHandoff } from "../src/handoff";
+import { useReducedMotion } from "../src/motion";
 import { isQueued, workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
 import { HARNESS_NAMES, hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { Message } from "../src/types";
 import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
+import { EmptyState } from "./EmptyState";
+import { ErrorState } from "./ErrorState";
 import { HandoffBanner } from "./HandoffBanner";
 import { Markdown } from "./Markdown";
 import { ModelBar, PlanBar } from "./ModelBar";
+import { ChatSkeleton, ThinkingDots } from "./Skeleton";
+import { useToast } from "./Toast";
+
+/** Glyph buttons keep their size at large text settings; their names are read out instead. */
+const GLYPH_SCALE = 1.3;
 
 interface Props {
   onOpenDetails: () => void;
+  /** Opens the new-Bot form, offered when there are no Bots yet. */
+  onNewBot?: () => void;
   onBack?: () => void;
   /** Opens the Bot's live screen; `takeOver` starts with control (from a handoff). */
   onToggleScreen: (takeOver?: boolean) => void;
@@ -46,7 +55,7 @@ function formatTime(ts: number): string {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
-export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, prefill, onPrefilled }: Props) {
+export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, screenOpen, prefill, onPrefilled }: Props) {
   const {
     bots,
     activeId,
@@ -64,21 +73,40 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
   } = useSuperBot();
   const t = useTheme();
   const styles = useStyles();
+  const toast = useToast();
+  const reduceMotion = useReducedMotion();
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [composing, setComposing] = useState(false);
   const listRef = useRef<FlatList>(null);
   const inputRef = useRef<TextInputInstance>(null);
+  const loadRef = useRef(loadMessages);
+  loadRef.current = loadMessages;
 
   const bot = bots.find((b) => b.id === activeId);
   const canOperate = canOnBot(bot, "operate");
   const avatarEdge = t.scheme === "light" ? t.c.borderStrong : undefined;
 
+  /** Loads the open chat's history; a load for a Bot that's no longer open is dropped. */
+  const shownRef = useRef(activeId);
+  shownRef.current = activeId;
+  const load = useCallback(async (id: string) => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      await loadRef.current(id);
+    } catch (err) {
+      if (shownRef.current === id) setLoadError(friendlyError(err));
+    } finally {
+      if (shownRef.current === id) setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!activeId) return;
-    setLoading(true);
-    void loadMessages(activeId).finally(() => setLoading(false));
-  }, [activeId, loadMessages]);
+    void load(activeId);
+  }, [activeId, load]);
 
   useEffect(() => {
     if (prefill == null) return;
@@ -91,8 +119,20 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
   if (!bot) {
     return (
       <View style={styles.empty}>
-        <Text style={styles.emptyTitle}>Pick a bot to start chatting</Text>
-        <Text style={styles.emptyHint}>Your Bots are in the list. Each one has its own computer to work on.</Text>
+        {bots.length ? (
+          <EmptyState glyph="☰" title="Pick a bot to start chatting" message="Your Bots are in the list. Each one has its own computer to work on." />
+        ) : (
+          <EmptyState
+            glyph="+"
+            title="No Bots yet"
+            message={
+              canWrite && onNewBot
+                ? "Make your first Bot to start chatting. Each one has its own computer to work on."
+                : "Bots shared with you show up here."
+            }
+            action={canWrite && onNewBot ? { label: "New Bot", onPress: onNewBot } : undefined}
+          />
+        )}
       </View>
     );
   }
@@ -102,14 +142,30 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
   const handoff = handoffs[bot.id];
   const hasText = text.trim().length > 0;
 
-  const answer = (m: Message, option: number) => void answerQuestion(m, option).catch(showError);
+  const answer = (m: Message, option: number) =>
+    void answerQuestion(m, option).catch((err) => toast.error(err, "Couldn't send your answer"));
+
+  const send = (body: string) =>
+    void sendText(body).catch((err) => {
+      // Gives the words back unless something new was typed meanwhile.
+      setText((cur) => cur || body);
+      toast.error(err, "Couldn't send your message", {
+        label: "Retry",
+        onPress: () => {
+          setText((cur) => (cur === body ? "" : cur));
+          send(body);
+        },
+      });
+    });
 
   const onSend = () => {
     const body = text.trim();
     if (!body) return;
     setText("");
-    void sendText(body);
+    send(body);
   };
+
+  const stop = () => void stopBot(bot.id).catch((err) => toast.error(err, isQueued(bot) ? "Couldn't cancel it" : "Couldn't stop it"));
 
   const renderItem = ({ item, index }: { item: Message; index: number }) => {
     const prev = list[index - 1];
@@ -161,6 +217,8 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
                       key={k}
                       role="button"
                       aria-label={opt}
+                      aria-selected={item.question?.picked === k}
+                      aria-disabled={!canOperate || item.question?.picked != null}
                       style={({ pressed }) => [styles.opt, item.question?.picked === k && styles.optOn, pressed && styles.optPressed]}
                       disabled={!canOperate || item.question?.picked != null}
                       onPress={() => answer(item, k)}
@@ -195,10 +253,17 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
       ) : null}
       {bot.working ? (
         <View style={styles.working}>
-          <ActivityIndicator color={t.c.accent} />
-          <Text style={styles.workingText}>{workingLabel(bot)}…</Text>
+          <ThinkingDots />
+          <Text style={styles.workingText} aria-live="polite">
+            {workingLabel(bot)}…
+          </Text>
           {canOperate ? (
-            <Pressable style={({ pressed }) => [styles.stopBtn, pressed && styles.pressed]} onPress={() => void stopBot(bot.id)}>
+            <Pressable
+              role="button"
+              aria-label={isQueued(bot) ? `Cancel ${bot.name}'s queued run` : `Stop ${bot.name}`}
+              style={({ pressed }) => [styles.stopBtn, pressed && styles.pressed]}
+              onPress={stop}
+            >
               <Text style={styles.stop}>{isQueued(bot) ? "Cancel" : "Stop"}</Text>
             </Pressable>
           ) : null}
@@ -209,30 +274,40 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
 
   const welcome =
     !draft && !bot.working ? (
-      <View style={styles.welcome}>
-        <BotAvatar color={bot.color} shape={bot.shape} size={64} outline={avatarEdge} />
-        <Text style={styles.welcomeTitle}>Say hello to {bot.name}</Text>
-        <Text style={styles.welcomeHint}>
-          {canOperate ? `Ask ${bot.name} anything. It works on its own computer and tells you when it needs you.` : `${bot.name} hasn't said anything yet.`}
-        </Text>
-      </View>
+      <EmptyState
+        art={<BotAvatar color={bot.color} shape={bot.shape} size={64} outline={avatarEdge} />}
+        title={`Say hello to ${bot.name}`}
+        message={
+          canOperate ? `Ask ${bot.name} anything. It works on its own computer and tells you when it needs you.` : `${bot.name} hasn't said anything yet.`
+        }
+      />
     ) : null;
+
+  const harnessName = HARNESS_NAMES[bot.harness] ?? bot.harness;
 
   return (
     <View style={styles.chat}>
       <View style={styles.header}>
         {onBack ? (
-          <Pressable onPress={onBack} style={({ pressed }) => [styles.backBtn, pressed && styles.pressed]} aria-label="Back to Bots">
-            <Text style={styles.backText}>‹</Text>
+          <Pressable onPress={onBack} style={({ pressed }) => [styles.backBtn, pressed && styles.pressed]} role="button" aria-label="Back to Bots">
+            <Text style={styles.backText} maxFontSizeMultiplier={GLYPH_SCALE}>
+              ‹
+            </Text>
           </Pressable>
         ) : null}
-        <Pressable style={({ pressed }) => [styles.pill, pressed && styles.pressed]} onPress={onOpenDetails}>
+        <Pressable
+          role="button"
+          aria-label={`${bot.name}, ${harnessName}`}
+          accessibilityHint="Opens the Bot's details"
+          style={({ pressed }) => [styles.pill, pressed && styles.pressed]}
+          onPress={onOpenDetails}
+        >
           <BotAvatar color={bot.color} shape={bot.shape} size={30} outline={avatarEdge} />
           <Text style={styles.pillName} numberOfLines={1}>
             {bot.name}
           </Text>
           <View style={styles.harnessChip}>
-            <Text style={styles.harness}>{HARNESS_NAMES[bot.harness] ?? bot.harness}</Text>
+            <Text style={styles.harness}>{harnessName}</Text>
           </View>
         </Pressable>
         {canOperate ? (
@@ -252,8 +327,10 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
           <HandoffBanner botName={bot.name} handoff={handoff} onOpenScreen={() => onToggleScreen(true)} />
         </View>
       ) : null}
-      {loading ? (
-        <ActivityIndicator style={styles.loading} color={t.c.textMuted} />
+      {loadError && !messages[bot.id] ? (
+        <ErrorState title="Couldn't load this chat" message={loadError} onRetry={() => load(bot.id)} />
+      ) : loading && !messages[bot.id] ? (
+        <ChatSkeleton />
       ) : (
         <FlatList
           ref={listRef}
@@ -264,7 +341,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
           contentContainerStyle={[styles.messages, !list.length && styles.messagesEmpty]}
           ListEmptyComponent={welcome ?? undefined}
           ListFooterComponent={footer}
-          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: !reduceMotion })}
         />
       )}
       <View style={styles.dock}>
@@ -298,10 +375,13 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
               <Pressable
                 role="button"
                 aria-label="Send"
+                aria-disabled={!hasText}
                 style={({ pressed }) => [styles.send, !hasText && styles.sendIdle, pressed && styles.pressed]}
                 onPress={onSend}
               >
-                <Text style={[styles.sendText, !hasText && styles.sendTextIdle]}>↑</Text>
+                <Text style={[styles.sendText, !hasText && styles.sendTextIdle]} maxFontSizeMultiplier={GLYPH_SCALE}>
+                  ↑
+                </Text>
               </Pressable>
             </View>
           ) : (
@@ -316,16 +396,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
 const useStyles = themedStyles((t) =>
   StyleSheet.create({
     chat: { flex: 1, backgroundColor: t.c.bg },
-    empty: {
-      flex: 1,
-      alignItems: "center",
-      justifyContent: "center",
-      gap: t.space.sm,
-      padding: t.space.xxl,
-      backgroundColor: t.c.bg,
-    },
-    emptyTitle: { color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold },
-    emptyHint: { color: t.c.textMuted, ...type(t, "md"), textAlign: "center", maxWidth: 360 },
+    empty: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: t.c.bg },
     header: {
       flexDirection: "row",
       alignItems: "center",
@@ -378,7 +449,6 @@ const useStyles = themedStyles((t) =>
     screenBtnTextOn: { color: t.c.accentText },
     pressed: { opacity: 0.6 },
     column: { width: "100%", maxWidth: t.layout.chatColumn, alignSelf: "center" },
-    loading: { marginTop: t.space.xl },
     list: { flex: 1 },
     messages: {
       width: "100%",
@@ -389,9 +459,6 @@ const useStyles = themedStyles((t) =>
       paddingBottom: t.space.xl,
     },
     messagesEmpty: { flexGrow: 1, justifyContent: "center" },
-    welcome: { alignItems: "center", gap: t.space.sm, paddingVertical: t.space.xxxl },
-    welcomeTitle: { color: t.c.text, ...type(t, "xl"), fontWeight: t.font.weight.semibold, marginTop: t.space.sm },
-    welcomeHint: { color: t.c.textMuted, ...type(t, "md"), textAlign: "center", maxWidth: 380 },
     ts: { color: t.c.textFaint, textAlign: "center", marginTop: t.space.md, marginBottom: t.space.lg, ...type(t, "xs") },
     routineRow: { alignItems: "center", marginVertical: t.space.sm },
     routine: {

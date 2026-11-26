@@ -1,9 +1,12 @@
 import React, { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { showError } from "../src/dialogs";
-import { colors } from "../src/theme";
+import { friendlyError } from "../src/errors";
+import { colors, ThemeScope } from "../src/theme";
 import type { Message } from "../src/types";
+import { ErrorState } from "./ErrorState";
 import { ScreenFrame } from "./ScreenFrame";
+import { Skeleton, SkeletonGroup } from "./Skeleton";
 
 /** The server stops idle screens; re-asking for the link while watching keeps this one up. */
 export const SCREEN_REFRESH_MS = 60_000;
@@ -42,6 +45,8 @@ export function ScreenViewer({
   const [error, setError] = useState<string | null>(null);
   const [control, setControl] = useState(initialControl);
   const [finishing, setFinishing] = useState(false);
+  /** Bumped by "Try again" to ask for the link now instead of at the next automatic retry. */
+  const [attempt, setAttempt] = useState(0);
   const fetchRef = useRef(fetchUrl);
   fetchRef.current = fetchUrl;
   const controlChangeRef = useRef(onControlChange);
@@ -71,7 +76,7 @@ export function ScreenViewer({
       } catch (err) {
         if (!alive) return;
         setUrl(null);
-        setError(err instanceof Error ? err.message : "Can't open the screen");
+        setError(friendlyError(err, "Can't open the screen."));
         wait = Math.min(retryMs, refreshMs);
       }
       timer = setTimeout(() => void load(), wait);
@@ -81,7 +86,7 @@ export function ScreenViewer({
       alive = false;
       clearTimeout(timer);
     };
-  }, [botId, refreshMs, retryMs]);
+  }, [botId, refreshMs, retryMs, attempt]);
 
   const title = `${botName}'s screen`;
 
@@ -126,7 +131,9 @@ export function ScreenViewer({
           <Text style={control ? styles.pillTextOn : styles.pillText}>{control ? "Give back" : "Take over"}</Text>
         </Pressable>
         <Pressable role="button" aria-label="Close screen" style={styles.close} onPress={onClose}>
-          <Text style={styles.closeText}>✕</Text>
+          <Text style={styles.closeText} maxFontSizeMultiplier={1.3}>
+            ✕
+          </Text>
         </Pressable>
       </View>
       {handoff ? (
@@ -143,11 +150,20 @@ export function ScreenViewer({
             style={StyleSheet.absoluteFill}
           />
         ) : null}
-        {!url && !error ? <ActivityIndicator style={styles.center} color={colors.textDim} /> : null}
+        {!url && !error ? (
+          <ThemeScope scheme="dark">
+            <SkeletonGroup label={`Starting ${title}`} style={styles.center}>
+              <Skeleton width="70%" height="auto" radius={12} style={styles.placeholder} />
+              <Text style={styles.msg}>Starting {title}…</Text>
+            </SkeletonGroup>
+          </ThemeScope>
+        ) : null}
         {error ? (
-          <View style={styles.center}>
-            <Text style={styles.msg}>{error}</Text>
-          </View>
+          <ThemeScope scheme="dark">
+            <View style={styles.center}>
+              <ErrorState title={`Can't show ${title}`} message={error} onRetry={() => setAttempt((n) => n + 1)} />
+            </View>
+          </ThemeScope>
         ) : null}
       </View>
     </View>
@@ -175,5 +191,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#000",
   },
   center: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, alignItems: "center", justifyContent: "center", padding: 24 },
-  msg: { color: colors.textDim, textAlign: "center" },
+  msg: { color: colors.textDim, textAlign: "center", marginTop: 16 },
+  placeholder: { maxWidth: 420, aspectRatio: 16 / 10 },
 });

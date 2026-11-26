@@ -339,6 +339,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
           // A revoked session closes the stream; a quick request tells that apart from a network drop.
           if (client.hasSession) void client.verify().catch(() => {});
         },
+        () => setConnected(true),
       );
       setConnected(true);
     },

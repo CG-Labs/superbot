@@ -1,12 +1,11 @@
 import { useEffect } from "react";
 import { Redirect, router, useLocalSearchParams } from "expo-router";
-import { ActivityIndicator, View } from "react-native";
 import { LoginScreen } from "../components/LoginScreen";
+import { AppSkeleton } from "../components/Skeleton";
 import { codeFromHash } from "../src/invite";
 import { approvalParam } from "../src/notifications";
 import { botParam } from "../src/push";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
 
 export default function Index() {
   const { ready, api, inviteCode, offerInviteCode } = useSuperBot();
@@ -24,13 +23,7 @@ export default function Index() {
     router.replace("/");
   }, [hash, offerInviteCode]);
 
-  if (!ready) {
-    return (
-      <View style={{ flex: 1, justifyContent: "center", backgroundColor: colors.bgMain }}>
-        <ActivityIndicator color={colors.textDim} />
-      </View>
-    );
-  }
+  if (!ready) return <AppSkeleton />;
 
   if (!api) {
     return <LoginScreen key={inviteCode ?? ""} inviteCode={inviteCode} />;

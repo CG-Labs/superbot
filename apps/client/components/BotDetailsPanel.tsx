@@ -11,17 +11,22 @@ import {
 } from "react-native";
 import { keptBy, sharingLabel, whereItRuns, whoseKeys } from "../src/access";
 import { confirmAsync, showError } from "../src/dialogs";
+import { errorText } from "../src/errors";
+import { useReducedMotion } from "../src/motion";
 import { promptsFor } from "../src/prompts";
 import { cronLabel } from "../src/routines";
 import { workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors, HARNESS_NAMES } from "../src/theme";
+import { colors, HARNESS_NAMES, ThemeScope } from "../src/theme";
 import type { Routine } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
+import { EmptyState } from "./EmptyState";
+import { InlineError } from "./ErrorState";
 import { KeeperPanel } from "./KeeperPanel";
 import { PromptsEditor } from "./PromptsEditor";
 import { RoutineEditor } from "./RoutineEditor";
+import { ListSkeleton } from "./Skeleton";
 import { SuggestedPrompts } from "./SuggestedPrompts";
 import { TeammateLoginPanel } from "./TeammateLoginPanel";
 
@@ -69,6 +74,9 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
   const botId = bot?.id;
   const [name, setName] = useState(bot?.name || "");
   const [routines, setRoutines] = useState<Routine[]>([]);
+  /** Whether the shown Bot's routines are still loading, or why they couldn't. */
+  const [routinesState, setRoutinesState] = useState<{ loading: boolean; error: string | null }>({ loading: false, error: null });
+  const reduceMotion = useReducedMotion();
   const [editing, setEditingState] = useState<Editing>(null);
   /** Bumped whenever the form changes, so a save that finishes late can't close a newer one. */
   const sessionRef = useRef(0);
@@ -80,7 +88,17 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
   const shownRef = useRef<string | null>(null);
 
   const showRoutines = (id: string, list: Routine[]) => {
-    if (shownRef.current === id) setRoutines(list.filter((r) => r.bot_id === id));
+    if (shownRef.current !== id) return;
+    setRoutines(list.filter((r) => r.bot_id === id));
+    setRoutinesState({ loading: false, error: null });
+  };
+  const loadRoutines = (id: string) => {
+    setRoutinesState({ loading: true, error: null });
+    return fetchRoutines(id)
+      .then((list) => showRoutines(id, list))
+      .catch((err) => {
+        if (shownRef.current === id) setRoutinesState({ loading: false, error: errorText(err, "Couldn't load routines") });
+      });
   };
 
   useEffect(() => {
@@ -91,11 +109,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
     setEditing(null);
     setRoutines([]);
     shownRef.current = botId && visible ? botId : null;
-    if (botId && visible) {
-      void fetchRoutines(botId)
-        .then((list) => showRoutines(botId, list))
-        .catch(() => showRoutines(botId, []));
-    }
+    if (botId && visible) void loadRoutines(botId);
     // fetchRoutines changes identity on every provider render; reload only when the Bot or visibility changes.
   }, [botId, visible]);
 
@@ -153,11 +167,13 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
     );
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={close}>
+    <Modal visible={visible} animationType={reduceMotion ? "none" : "slide"} transparent onRequestClose={close}>
       <View style={styles.backdrop}>
         <ScrollView style={styles.panel} contentContainerStyle={styles.panelContent}>
           <Pressable style={styles.close} role="button" aria-label="Close details" onPress={close}>
-            <Text style={styles.closeText}>✕</Text>
+            <Text style={styles.closeText} maxFontSizeMultiplier={1.3}>
+              ✕
+            </Text>
           </Pressable>
           {editor ?? (
           <>
@@ -191,7 +207,19 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
               </Pressable>
             ) : null}
           </View>
-          {routines.length ? (
+          {routinesState.loading && !routines.length ? (
+            <ThemeScope scheme="dark">
+              <View style={styles.state}>
+                <ListSkeleton label="Loading routines" rows={2} />
+              </View>
+            </ThemeScope>
+          ) : routinesState.error ? (
+            <ThemeScope scheme="dark">
+              <View style={styles.state}>
+                <InlineError message={routinesState.error} onRetry={() => loadRoutines(bot.id)} />
+              </View>
+            </ThemeScope>
+          ) : routines.length ? (
             routines.map((r) => (
               <View key={r.id} style={styles.row}>
                 <Pressable
@@ -213,7 +241,9 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
               </View>
             ))
           ) : (
-            <Text style={styles.dim}>No routines yet</Text>
+            <ThemeScope scheme="dark">
+              <EmptyState compact title="No routines yet" message={`Routines run on a schedule, like a morning summary from ${bot.name}.`} />
+            </ThemeScope>
           )}
           <Text style={styles.section}>Computer</Text>
           <View style={styles.row}>
@@ -373,6 +403,7 @@ const styles = StyleSheet.create({
   dim: { color: colors.textDim, flex: 1 },
   policyLink: { color: colors.blueDot, flex: 1 },
   harnessPick: { width: "100%", paddingVertical: 8 },
+  state: { width: "100%", paddingVertical: 8 },
   delete: { marginTop: 16, padding: 12 },
   deleteText: { color: colors.danger },
 });
