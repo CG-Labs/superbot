@@ -4,7 +4,7 @@ import { act, fireEvent, render, renderHook, screen } from "@testing-library/rea
 import { ConnectionBanner, RECONNECT_GRACE_MS, useConnectionStatus } from "../ConnectionBanner";
 import { EmptyState } from "../EmptyState";
 import { ErrorState, InlineError } from "../ErrorState";
-import { PillButton, Spinner } from "../ui";
+import { PillButton } from "../ui";
 import { AppSkeleton, BusyDots, ChatSkeleton, ListSkeleton, PageSkeleton, ThinkingDots } from "../Skeleton";
 import { TOAST_LONG_MS, TOAST_MS, ToastProvider, useToast, type ToastApi } from "../Toast";
 import { ApiError } from "../../src/api";
@@ -131,8 +131,8 @@ describe("skeletons", () => {
     expect(running).toBe(0);
   });
 
-  it("stand in for the old spinner while a screen waits for the saved session (ADR 0345)", async () => {
-    await render(<Spinner />);
+  it("stand in for a screen waiting for the saved session (ADR 0345)", async () => {
+    await render(<PageSkeleton />);
     expect(screen.getByRole("progressbar", { name: "Loading" })).toBeBusy();
   });
 

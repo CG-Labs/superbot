@@ -35,7 +35,7 @@ import { ErrorState, InlineError } from "./ErrorState";
 import { ListSkeleton } from "./Skeleton";
 import { Chips } from "./Chips";
 import { DetailSheet, PaneTransition } from "./Shell";
-import { kit, PageHeader, Spinner } from "./ui";
+import { kit, PageHeader } from "./ui";
 
 interface Props {
   api: SuperBotApi;

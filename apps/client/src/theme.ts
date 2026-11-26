@@ -80,13 +80,6 @@ export function type(t: Theme, size: keyof typeof tokens.font.size): TextStyle {
 
 export const hairline = StyleSheet.hairlineWidth;
 
-const dark = tokens.color.dark;
-
-/** The root stack's backdrop, until the shell's motion between panes (ADR 0340) puts it on the tokens. */
-export const colors = {
-  bgMain: dark.bg,
-};
-
 export const botColors = [
   "#f5f5f5",
   "#9a6b3f",

@@ -6,7 +6,7 @@ import * as RN from "react-native";
 import { renderHook } from "@testing-library/react-native";
 import { kit } from "../../components/ui";
 import tokens from "../tokens.json";
-import { botColorNames, botColors, colors, themes, ThemeScope, useTheme, type Palette } from "../theme";
+import { botColorNames, botColors, themes, ThemeScope, useTheme, type Palette } from "../theme";
 
 function luminance(hex: string): number {
   const n = parseInt(hex.slice(1), 16);
@@ -72,10 +72,6 @@ describe("design tokens", () => {
       expect(contrast(c.text, c.raised)).toBeGreaterThanOrEqual(4.5);
       expect(contrast(c.onAccent, c.accent)).toBeGreaterThanOrEqual(4.5);
     });
-  });
-
-  it("keeps the root stack's backdrop on the dark palette until ADR 0340's shell replaces it", () => {
-    expect(colors).toEqual({ bgMain: tokens.color.dark.bg });
   });
 });
 
@@ -176,9 +172,6 @@ describe("every screen follows light and dark (ADR 0345)", () => {
   const read = (f: string) => fs.readFileSync(path.join(root, f), "utf8");
 
   it("leaves no screen on the dark-only colours", () => {
-    // The root stack's backdrop moves to the tokens with ADR 0340's shell.
-    const users = sources.filter((f) => /import \{[^}]*\bcolors\b[^}]*\} from "\.\.\/src\/theme"/.test(read(f)));
-    expect(users.filter((f) => f !== "app/_layout.tsx")).toEqual([]);
     expect(sources.filter((f) => /<ThemeScope scheme="dark">/.test(read(f)))).toEqual([]);
   });
 
@@ -189,7 +182,6 @@ describe("every screen follows light and dark (ADR 0345)", () => {
       "components/ScreenFrame.tsx", // The remote display's letterbox.
       "components/ScreenFrame.web.tsx",
       "components/ScreenViewer.tsx",
-      "app/+not-found.tsx", // The Expo template page that ADR 0340 replaces.
     ]);
     const hex = /["'`]#[0-9a-fA-F]{3,8}["'`]/;
     expect(sources.filter((f) => !allowed.has(f) && hex.test(read(f)))).toEqual([]);

@@ -27,7 +27,7 @@ import { AuditChainPanel } from "./AuditChainPanel";
 import { AuditEventDetail } from "./AuditEventDetail";
 import { Chips } from "./Chips";
 import { DetailSheet, PaneTransition } from "./Shell";
-import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
+import { kit, PageHeader, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;

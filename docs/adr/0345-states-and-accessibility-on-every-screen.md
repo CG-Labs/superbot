@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (26 Nov 2026). Finishes two slices of the UI overhaul workstream ([roadmap](../ROADMAP.md#ui-overhaul-grok-bot-aligned)), "Empty, loading and error states" and "Accessibility and dark-mode polish", which [ADR 0339](0339-empty-loading-and-error-states.md) did for the chat screen and the shell. This ADR takes the same components and rules to every other screen of the Expo app, on the design system of [ADR 0335](0335-design-system-for-the-app-and-the-console.md) and the settings kit of [ADR 0337](0337-a-shared-kit-for-settings-and-admin-screens.md). Behaviour doesn't change. Screen headers, back navigation and motion between panes belong to ADR 0340 (open beside this change); the console's sign-in and setup wizard and the landing page have their own slices.
+Accepted (26 Nov 2026). Finishes two slices of the UI overhaul workstream ([roadmap](../ROADMAP.md#ui-overhaul-grok-bot-aligned)), "Empty, loading and error states" and "Accessibility and dark-mode polish", which [ADR 0339](0339-empty-loading-and-error-states.md) did for the chat screen and the shell. This ADR takes the same components and rules to every other screen of the Expo app, on the design system of [ADR 0335](0335-design-system-for-the-app-and-the-console.md) and the settings kit of [ADR 0337](0337-a-shared-kit-for-settings-and-admin-screens.md). Behaviour doesn't change. Screen headers, back navigation and motion between panes belong to [ADR 0340](0340-navigation-headers-and-motion-between-panes.md); the console's sign-in and setup wizard and the landing page have their own slices.
 
 ## Context
 
@@ -15,7 +15,7 @@ After ADR 0339, settings, plan, secrets, team, the approval policy, the admin sc
 - **`PageSkeleton`** (`Skeleton.tsx`) stands in for a settings or admin screen while it loads: a heading and a card or two of rows in the screen's column, one busy element with a name ("Loading your plan"). Lists and cards use `ListSkeleton` ("Loading users", "Loading push notifications", "Loading tokens").
 - **`BusyDots`** is a small busy mark with a name for an action that's running, such as a save on the team screen; it replaces the spinner in that screen's header.
 - Busy buttons keep their label and say what's running ("Adding…", "Approving…", "Creating…"), disabled and marked busy, instead of swapping the label for a spinner. Sign-in's primary button keeps its label and is marked busy.
-- **`Spinner`** in `components/ui.tsx` now renders `PageSkeleton`. Only the route files use it, while a screen waits for the saved session; those files belong to ADR 0340's change, so they keep the name until it lands, and it is marked deprecated.
+- **`Spinner`** is gone from `components/ui.tsx`: the route files show `PageSkeleton` while a screen waits for the saved session.
 - The keeper panel in Bot settings still shows nothing while it loads, as before: most Bots have no service account to hand over to, and a skeleton that then disappears would only flash.
 
 ### Errors
@@ -32,7 +32,7 @@ Empty lists use `EmptyState` (compact) with a monochrome glyph and the next step
 
 - Bot settings (with its routine and prompt editors, the keeper and teammate-login panels and suggested prompts), the new-Bot sheet, the approvals sheet and the screen viewer's chrome move onto `themedStyles`, `kit(t)` and the tokens, and lose their dark `ThemeScope`s. Sheets sit on the sidebar's surface over the scheme's overlay; primary buttons use the accent, destructive ones the soft red pill; the picked schedule preset is filled with the text colour, like `Chips`.
 - The full-screen screen viewer on phones and the web page's background before the app draws use the tokens' canvas colour in each scheme.
-- The old `colors` object keeps only `bgMain`, for the root stack's backdrop, which ADR 0340's shell replaces; then it can go. `ThemeScope` stays for parts that must hold one scheme, and no screen uses it.
+- The old `colors` object is deleted; ADR 0340 put the root stack's backdrop on the tokens. `ThemeScope` stays for parts that must hold one scheme, and no screen uses it.
 - Fixed colours remain only where they aren't the app's: a Bot's avatar art, Apple's black or white sign-in button, the two-factor QR code's white ground (ADR 0337) and the black letterbox around a Bot's remote screen, which frames that screen's own pixels.
 
 ### Accessibility
@@ -45,19 +45,18 @@ Empty lists use `EmptyState` (compact) with a monochrome glyph and the next step
 
 ## Alternatives considered
 
-- **Editing the route files and the screen headers here**: the route files' spinner and the screens' headers are in ADR 0340's change, which is open beside this one. Turning `Spinner` into the page skeleton changes what those files show without touching them. The `Spinner` imports left unused in four admin screens sit on lines that change too; they go when the two changes meet.
+- **Restyling the screen headers here**: headers, back navigation and pane motion are ADR 0340's, so this change leaves them as that ADR set them and only touches the screens' bodies.
 - **`ErrorState` for every failed load**: simpler, but it would hide forms and lists that still work (adding a secret, the audit log's filters, a list loaded before a refresh failed). A full-screen error only where there's nothing else to show keeps every screen as useful as it was.
 - **A skeleton for the keeper panel and the sign-up requests**: they show nothing when there's nothing to do; a skeleton first would flash on most Bots and for most admins.
 - **New colour tokens for the remote screen's letterbox**: a token is a CSS custom property in the console too, for a colour that is black by definition.
 
 ## Tests
 
-- `src/__tests__/theme.test.tsx`: for light and dark, a table of every screen and the token pairs its text, tags, notices and buttons use, each at 4.5:1 (3:1 for faint hints); every text style in `kit(t)` checked against the grounds it sits on or its own fill; skeleton blocks visible on raised cards; no file in `app/` or `components/` imports the dark-only colours (except the root layout, until ADR 0340) or holds a dark `ThemeScope`; fixed hex colours only in the files named above; every Bot colour has a name.
-- `components/__tests__/StateViews.test.tsx`: `PageSkeleton` and `BusyDots` are one busy element with a name, the page skeleton holds still under reduced motion, and `Spinner` renders the page skeleton.
+- `src/__tests__/theme.test.tsx`: for light and dark, a table of every screen and the token pairs its text, tags, notices and buttons use, each at 4.5:1 (3:1 for faint hints); every text style in `kit(t)` checked against the grounds it sits on or its own fill; skeleton blocks visible on raised cards; no file in `app/` or `components/` holds a dark `ThemeScope`; fixed hex colours only in the files named above; every Bot colour has a name.
+- `components/__tests__/StateViews.test.tsx`: `PageSkeleton` and `BusyDots` are one busy element with a name, the page skeleton holds still under reduced motion, and the page skeleton stands in for a screen waiting for the saved session.
 - Each screen's tests cover its skeleton by name, its error with "Try again" reloading, kept data beside a failed refresh, failed actions as alerts without a retry, its empty state's heading, and the new names, headings and states. Bot settings, its editors and panels, the new-Bot sheet, the approvals sheet and the screen viewer are rendered in light and dark and checked against `themes.light` and `themes.dark`. Every existing test passes, with text expectations updated where a message gained "Couldn't load …" or an empty line became a heading.
 
 ## Consequences
 
 - Every screen of the app follows the device's light or dark setting; there are no dark-only screens left.
 - New screens use `PageSkeleton`, `ListSkeleton`, `ErrorState`, `InlineError`, `EmptyState` and `friendlyError`, and the contrast table in `theme.test.tsx` gains a row for each new screen.
-- When ADR 0340's change and this one have both merged, the route files move from `Spinner` to `PageSkeleton`, the four unused `Spinner` imports go, and `colors` is deleted.

@@ -1,7 +1,6 @@
 import React from "react";
 import { Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import { hairline, type Theme, themedStyles, type, useTheme } from "../src/theme";
-import { PageSkeleton } from "./Skeleton";
 
 const build = (t: Theme) =>
   StyleSheet.create({
@@ -303,11 +302,6 @@ export function PillButton({ label, onPress, tone = "secondary", busy, busyLabel
       <Text style={[ui.btnText, tone === "primary" && ui.primaryText]}>{text}</Text>
     </Pressable>
   );
-}
-
-/** @deprecated A screen waiting for the saved session; use `PageSkeleton` (ADR 0345). */
-export function Spinner() {
-  return <PageSkeleton />;
 }
 
 /** The placeholder colour for text fields. */

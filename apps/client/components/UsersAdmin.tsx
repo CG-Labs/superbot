@@ -23,7 +23,7 @@ import { InviteUserForm } from "./InviteUserForm";
 import { SignupRequests } from "./SignupRequests";
 import { UserDetail } from "./UserDetail";
 import { DetailSheet, PaneTransition, useModalAnimation } from "./Shell";
-import { kit, PageHeader, Spinner } from "./ui";
+import { kit, PageHeader } from "./ui";
 
 interface Props {
   api: SuperBotApi;

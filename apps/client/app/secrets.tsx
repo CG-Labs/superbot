@@ -3,7 +3,8 @@ import { Redirect } from "expo-router";
 import { StyleSheet, View } from "react-native";
 import { SecretsView } from "../components/SecretsView";
 import { RouteScreen, useGoBack } from "../components/Shell";
-import { kit, Spinner } from "../components/ui";
+import { PageSkeleton } from "../components/Skeleton";
+import { kit } from "../components/ui";
 import { useSuperBot } from "../src/SuperBotContext";
 import { themedStyles } from "../src/theme";
 
@@ -16,7 +17,7 @@ export default function SecretsScreen() {
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <Spinner />
+        <PageSkeleton />
       </View>
     );
   }
