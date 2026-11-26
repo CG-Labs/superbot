@@ -250,6 +250,7 @@ mod slots_http_tests;
 mod signups;
 #[cfg(test)]
 mod signups_http_tests;
+mod settings_check;
 mod sso;
 mod status;
 #[cfg(test)]
@@ -447,6 +448,9 @@ async fn main() {
     }
     if args.first().is_some_and(|a| a == "license") {
         std::process::exit(license::check::cli(&args[1..]));
+    }
+    if args.first().is_some_and(|a| a == "settings") {
+        std::process::exit(settings_check::cli(&args[1..]));
     }
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");

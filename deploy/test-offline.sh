@@ -1110,7 +1110,7 @@ mcheck() {
     sudo() { [[ $1 == -u ]] || { echo "sudo $*"; return 9; }; echo "$2" >"$T/mbundle/as"; shift 2; "$@"; }
     local a
     for a in "$@"; do declare "$a"; done
-    machine_settings_check
+    offline_settings_start_check
   ) 2>&1
 }
 : >"$T/mbundle/args"
@@ -1139,8 +1139,83 @@ echo "not run" >"$T/mbundle/args"
 out=$(mcheck ok) || fail "a bundle's botd from before the check stopped the install: $out"
 grep -Fq "The bundle's botd (0.2.0) can't check machines' settings" <<<"$out" || fail "an older botd wasn't said: $out"
 [[ $(cat "$T/mbundle/args") == "not run" ]] || fail "an older botd was run, which would start as the server"
-[[ -z $( (OFFLINE_BUNDLE=''; machine_settings_check) 2>&1) ]] || fail "an online install checked machines' settings"
+[[ -z $( (OFFLINE_BUNDLE=''; offline_settings_start_check) 2>&1) ]] || fail "an online install checked machines' settings"
 ok "an offline upgrade stops before changing anything when the bundle's botd wouldn't start with machines' settings (botd machines check)"
+
+# A bundle's botd with botd settings check judges every setting botd refuses at start, over what
+# this run writes into .env (ADR 0310), as botd's user, with only the .env, from /.
+cat >"$T/mbundle/bin/botd" <<EOF
+#!/bin/sh
+# Usage: botd settings check
+[ "\$1 \$2 \$3 \$4" = "settings check --home $MH" ] || { echo "botd \$*"; exit 2; }
+[ -z "\${LEAK:-}" ] || { echo "the installer's environment reached botd"; exit 3; }
+[ "\$(pwd)" = / ] || { echo "botd ran in \$(pwd)"; exit 3; }
+shift 4
+printf '%s\n' "\$@" >"$T/mbundle/args"
+case \$(cat "$T/mbundle/mode") in
+  ok) printf '  ok       SSO\nMachines: incus, enrolling at https://10.0.0.5:8443\nbotd would start with these settings.\n'; exit 0 ;;
+  sso) printf '  refused  SSO   SSO: SSO_PUBLIC_URL is required with SSO_PROVIDERS\nbotd wouldn'"'"'t start with these settings: SSO: SSO_PUBLIC_URL is required with SSO_PROVIDERS\nbotd wouldn'"'"'t start with these settings: STATUS_PAGE must be on or off, not "maybe"\n'; exit 1 ;;
+  isolation) printf 'botd wouldn'"'"'t start with these settings: Isolation: ISOLATION_DIR /var/lib/superbot-users: No such file or directory. Run deploy/install.sh --isolation.\n'; exit 1 ;;
+  isolation-and) printf 'botd wouldn'"'"'t start with these settings: Isolation: ISOLATION_DIR /var/lib/superbot-users: No such file. Run deploy/install.sh --isolation.\nbotd wouldn'"'"'t start with these settings: Sessions: SESSION_MAX_AGE must be a number of minutes\n'; exit 1 ;;
+  isolation-files) printf 'botd wouldn'"'"'t start with these settings: Isolation: superbot-userctl isn'"'"'t at /usr/local/sbin/superbot-userctl. Run deploy/install.sh --isolation.\nbotd wouldn'"'"'t start with these settings: Isolation: ISOLATION_TEAMMATE_FILES must be archive or delete, not "sometimes"\n'; exit 1 ;;
+  *) echo "no such subcommand"; exit 2 ;;
+esac
+EOF
+chmod 0755 "$T/mbundle/bin/botd"
+printf 'AUTH_PASSWORD=pw\nMACHINE_CONTROL_URL=https://10.0.0.5:8443\n' >"$MH/superbot/.env"
+out=$(mcheck ok) || fail "a good settings check stopped the install: $out"
+for want in "Settings: the bundle's botd would start with them (botd settings check)" "    Machines: incus, enrolling at"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a good settings check didn't say $want: $out"
+done
+[[ $(cat "$T/mbundle/as") == sb ]] || fail "the settings check didn't run as botd's user"
+want="--set HOST=127.0.0.1 --set PORT=3000 --set DATA_DIR=$MH/superbot/data --set WORKSPACE_DIR=$MH/superbot/workspace"
+[[ $(tr '\n' ' ' <"$T/mbundle/args") == "$want " ]] || fail "the settings check wasn't given what every install writes: $(cat "$T/mbundle/args")"
+out=$(SERVER_BACKUP_S3_SECRET_ACCESS_KEY=s3-secret-9f1c mcheck ok DOMAIN=bot.corp.example TESTING_MODE_ON=true BACKUP_S3_BUCKET=sb-backups \
+  BACKUP_S3_ENDPOINT=https://s3.corp.example BACKUP_S3_REGION=eu-west-2 BACKUP_OFF_HOST=on BACKUP_ENCRYPTION=required BACKUP_AGE_GENERATE=true \
+  DATABASE_ENCRYPTION=required ISOLATION_MODE=off MACHINE_HERMES_BUNDLE_VALUE=/srv/b/hermes.tar.gz) || fail "a good settings check with flags stopped the install: $out"
+given=$(cat "$T/mbundle/args")
+for want in ALLOWED_HOSTS=bot.corp.example CORS_ORIGINS=https://bot.corp.example TESTING_MODE=on SERVER_BACKUP_S3_ENDPOINT=https://s3.corp.example \
+  SERVER_BACKUP_S3_BUCKET=sb-backups SERVER_BACKUP_S3_REGION=eu-west-2 SERVER_BACKUP_S3_SECRET_ACCESS_KEY=given-to-the-installer \
+  SERVER_BACKUP_S3_SECRET_ACCESS_KEY_FILE= SERVER_BACKUP_OFF_HOST=on SUPERBOT_BACKUP_ENCRYPTION=required \
+  SUPERBOT_BACKUP_AGE_RECIPIENTS=made-by-the-installer SUPERBOT_DATABASE_ENCRYPTION=required ISOLATION=off MACHINE_HERMES_BUNDLE=/srv/b/hermes.tar.gz; do
+  grep -qxF -- "$want" <<<"$given" || fail "the settings check wasn't given $want: $given"
+done
+if grep -Fq s3-secret-9f1c <<<"$given"; then fail "an S3 key from the installer's environment reached botd's command line: $given"; fi
+if grep -q '^AUTH_PASSWORD=' <<<"$given"; then fail "a .env with a password was given a stand-in: $given"; fi
+if grep -q 'ACCESS_KEY_ID' <<<"$given"; then fail "a key not given to the installer was set: $given"; fi
+mcheck ok BACKUP_AGE_GENERATE=true BACKUP_AGE_RECIPIENTS=age1given >/dev/null || fail "the settings check with recipients stopped the install"
+grep -qxF SUPERBOT_BACKUP_AGE_RECIPIENTS=age1given "$T/mbundle/args" || fail "given recipients weren't judged as given: $(cat "$T/mbundle/args")"
+if grep -q made-by-the-installer "$T/mbundle/args"; then fail "a stand-in was set beside given recipients: $(cat "$T/mbundle/args")"; fi
+mcheck ok BACKUP_AGE_GENERATE=true BACKUP_ENCRYPTION=off >/dev/null || fail "the settings check for plain backups stopped the install"
+if grep -q RECIPIENTS=made "$T/mbundle/args"; then fail "a key was assumed for plain backups"; fi
+echo 'MACHINE_CONTROL_URL=https://10.0.0.5:8443' >"$MH/superbot/.env"
+mcheck ok >/dev/null || fail "the settings check with no password stopped the install"
+grep -qxF AUTH_PASSWORD=made-by-the-installer "$T/mbundle/args" || fail "a .env with no password wasn't judged with the one the installer makes"
+if out=$(mcheck sso); then fail "an upgrade went on though its botd would refuse SSO: $out"; fi
+for want in "!! The bundle's botd (0.2.0) wouldn't start with $MH/superbot/.env: SSO: SSO_PUBLIC_URL is required" \
+  '    and: STATUS_PAGE must be on or off, not "maybe"' "Nothing has changed" "else change $MH/superbot/.env as it says" \
+  "sudo -u sb <bundle>/bin/botd settings check --home $MH" "docs/ops/air-gapped.md#upgrading"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a refused settings check didn't say $want: $out"
+done
+out=$(mcheck sso DRY_RUN=true) || fail "a dry run stopped on the settings check: $out"
+grep -Fq "[dry-run] would stop here: The bundle's botd (0.2.0) wouldn't start with $MH/superbot/.env: SSO:" <<<"$out" || fail "a dry run didn't say it would stop: $out"
+grep -Fq "and: STATUS_PAGE" <<<"$out" || fail "a dry run didn't list every refusal: $out"
+if out=$(mcheck isolation); then fail "an Isolation refusal with isolation already on went on: $out"; fi
+out=$(mcheck isolation ISOLATION_MODE=users) || fail "per-user accounts this run sets up stopped the install: $out"
+grep -Fq "once this run has set up per-user accounts" <<<"$out" || fail "a check passed once accounts are set up wasn't said: $out"
+if out=$(mcheck isolation-and ISOLATION_MODE=users); then fail "a refusal beside isolation's went on: $out"; fi
+grep -Fq "wouldn't start with $MH/superbot/.env: Sessions: SESSION_MAX_AGE" <<<"$out" || fail "the refusal beside isolation's wasn't said: $out"
+if grep -Fq "and: Isolation" <<<"$out"; then fail "isolation this run sets up was listed as refused: $out"; fi
+if out=$(mcheck isolation-files ISOLATION_MODE=users); then fail "a bad isolation setting went on because this run sets up per-user accounts: $out"; fi
+grep -Fq "wouldn't start with $MH/superbot/.env: Isolation: ISOLATION_TEAMMATE_FILES must be archive or delete" <<<"$out" || fail "a bad isolation setting wasn't said: $out"
+if grep -Fq "superbot-userctl" <<<"$out"; then fail "a helper this run installs was listed as refused: $out"; fi
+mcheck ok ISOLATION_MODE=users ISOLATION_DIR=/srv/u >/dev/null || fail "a good settings check turning on isolation stopped the install"
+for want in ISOLATION=users ISOLATION_DIR=/srv/u; do
+  grep -qxF "$want" "$T/mbundle/args" || fail "the settings check wasn't given $want, which this run writes: $(cat "$T/mbundle/args")"
+done
+mcheck ok ISOLATION_MODE=users >/dev/null || fail "a good settings check turning on isolation in the default folder stopped the install"
+grep -qxF ISOLATION_DIR=/srv/superbot/users "$T/mbundle/args" || fail "the settings check wasn't given the default users' folder: $(cat "$T/mbundle/args")"
+ok "an offline upgrade stops before changing anything when the bundle's botd would refuse any setting at start, judged over what the install writes (botd settings check)"
 
 flags() { (parse_args "$@"; check_offline_flags) 2>&1; }
 if out=$(flags --machine-hermes-bundle /srv/b/h.tar.gz); then fail "--machine-hermes-bundle was taken online: $out"; fi
@@ -1389,16 +1464,48 @@ grep -q old.tar.gz "$RB/checked" && { echo "Machines: incus, enrolling at https:
 echo "botd wouldn't start with these settings: Machine enrollment: MACHINE_HARNESS_BUNDLE: can't read it"; exit 1
 EOF
 chmod 0755 "$RB/bundle/bin/botd"
-out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; machine_settings_check") || fail "a rollback's machine check failed: $out"
+out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; offline_settings_start_check") || fail "a rollback's machine check failed: $out"
 grep -Fq "Machines' settings: the bundle's botd would start with them" <<<"$out" || fail "a rollback's machine check wasn't said: $out"
 cmp -s "$RB/checked" "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")" || fail "the rollback's machine check didn't read the .env from before the upgrade"
 [[ ! -e $(cat "$RB/copy") ]] || fail "the rollback's machine check left botd's user's copy of the .env behind"
 sed -i 's/old.tar.gz/gone.tar.gz/' "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")"
-if out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; machine_settings_check"); then fail "a rollback went on with machine settings its botd refuses: $out"; fi
+if out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; offline_settings_start_check"); then fail "a rollback went on with machine settings its botd refuses: $out"; fi
 grep -Fq "Nothing has changed. The .env from before the upgrade names something $VERSION's botd can't use now" <<<"$out" \
   || fail "a rollback's refused machine check didn't say why: $out"
 cp "$T/bin/botd" "$RB/bundle/bin/botd"
 ok "a rollback checks machines' settings in the .env it puts back, read by botd's user from a copy it removes"
+
+# With botd settings check, a rollback judges every setting in the .env it puts back, over what
+# the install then writes, from a copy botd's user owns (ADR 0310).
+rb_host
+rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "the backup before an upgrade failed"
+rb_upgraded
+cat >"$RB/bundle/bin/botd" <<EOF
+#!/bin/sh
+# Usage: botd settings check
+[ "\$1 \$2 \$3" = "settings check --env-file" ] || { echo "botd \$*"; exit 2; }
+case "\$4" in "$RB/dir/"*) echo "botd read root's copy"; exit 2 ;; esac
+[ "\$(pwd)" = "$RH/superbot" ] || { echo "botd ran in \$(pwd)"; exit 2; }
+cat -- "\$4" >"$RB/checked"
+shift 4
+printf '%s\n' "\$@" >"$RB/args"
+grep -q old.tar.gz "$RB/checked" && { echo "botd would start with these settings."; exit 0; }
+echo "botd wouldn't start with these settings: Server backups: SERVER_BACKUP_OFF_HOST must be auto, on or off, not \"sometimes\""; exit 1
+EOF
+chmod 0755 "$RB/bundle/bin/botd"
+out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; offline_settings_start_check") || fail "a rollback's settings check failed: $out"
+grep -Fq "Settings: the bundle's botd would start with them (botd settings check)" <<<"$out" || fail "a rollback's settings check wasn't said: $out"
+cmp -s "$RB/checked" "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")" || fail "the rollback's settings check didn't read the .env from before the upgrade"
+for want in "DATA_DIR=$RH/superbot/data" PORT=3000; do
+  grep -qxF "$want" "$RB/args" || fail "the rollback's settings check wasn't given $want, which the install writes: $(cat "$RB/args")"
+done
+sed -i 's/old.tar.gz/gone.tar.gz/' "$RB/dir/$(sed -n 's/^env=//p' "$RB/dir/record")"
+if out=$(rb "ROLLBACK_RESTORE=true OFFLINE_VERSION=$VERSION; offline_settings_start_check"); then fail "a rollback went on with settings its botd refuses: $out"; fi
+for want in "wouldn't start with $RB/dir/" "Server backups: SERVER_BACKUP_OFF_HOST must be auto, on or off" "Nothing has changed. The .env from before the upgrade names something $VERSION's botd can't use now"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a rollback's refused settings check didn't say $want: $out"
+done
+cp "$T/bin/botd" "$RB/bundle/bin/botd"
+ok "with botd settings check, a rollback judges every setting in the .env it puts back, over what the install writes"
 
 # Before an offline upgrade or rollback changes anything, the running release's botd and the
 # bundle's judge the license as their start would (ADR 0305). Stand-in botds take the keys in
