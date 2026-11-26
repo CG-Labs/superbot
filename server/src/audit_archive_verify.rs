@@ -692,13 +692,18 @@ fn objects(prefix: &str, listed: Vec<ObjectVersion>, w: &mut Walker) -> Vec<Obje
     out
 }
 
-/// One query, so an erasure can't land between reading a row's salt and its fields.
+/// One query, so an erasure can't land between reading a row's salt and its fields, nor
+/// retention between reading a row and botd's record of sending it sealed (ADR 0330).
 /// `details` is read as stored: the export redacted it with the secrets known then.
 fn local(app: &App, sink: &str, lo: i64, hi: i64) -> rusqlite::Result<Local> {
     use crate::audit_chain::{ERASABLE, FIXED};
     let cols: Vec<&str> = FIXED.iter().chain(ERASABLE.iter()).copied().collect();
     let fields: Vec<&str> = FIXED_FIELDS.iter().chain(ERASABLE_FIELDS.iter()).copied().collect();
-    let sql = format!("SELECT chain_hash, chain_salt IS NULL, chain_prev, {} FROM audit_events WHERE id BETWEEN ?1 AND ?2", cols.join(", "));
+    let sql = format!(
+        "SELECT chain_hash, chain_salt IS NULL, chain_prev, (SELECT h.region FROM audit_export_held h WHERE h.sink = ?3 AND h.id = audit_events.id), {}
+         FROM audit_events WHERE id BETWEEN ?1 AND ?2",
+        cols.join(", ")
+    );
     let json = |col: &str, v: Sql| match (col, v) {
         ("details", Sql::Text(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
         (_, Sql::Integer(n)) => Value::from(n),
@@ -708,13 +713,13 @@ fn local(app: &App, sink: &str, lo: i64, hi: i64) -> rusqlite::Result<Local> {
     };
     app.db.with_conn(|c| {
         let mut s = c.prepare(&sql)?;
-        let mut rows = s.query([lo, hi])?;
+        let mut rows = s.query(rusqlite::params![lo, hi, sink])?;
         let mut out = Local::default();
         while let Some(r) = rows.next()? {
             let mut event = serde_json::Map::new();
             event.insert("chainPrev".into(), json("chain_prev", r.get(2)?));
             for (i, (col, field)) in cols.iter().zip(&fields).enumerate() {
-                event.insert(field.to_string(), json(col, r.get(3 + i)?));
+                event.insert(field.to_string(), json(col, r.get(4 + i)?));
             }
             let Some(id) = event["id"].as_i64() else { continue };
             let hash = match r.get::<_, Sql>(0)? {
@@ -722,15 +727,7 @@ fn local(app: &App, sink: &str, lo: i64, hi: i64) -> rusqlite::Result<Local> {
                 _ => None,
             };
             out.hashes.insert(id, hash);
-            out.rows.insert(id, Row { event: Value::Object(event), erased: r.get(1)?, held: None });
-        }
-        Ok(out)
-    })
-    .and_then(|mut out| {
-        for (id, region) in app.db.audit_export_held(sink, lo, hi)? {
-            if let Some(r) = out.rows.get_mut(&id) {
-                r.held = Some(region);
-            }
+            out.rows.insert(id, Row { event: Value::Object(event), erased: r.get(1)?, held: r.get(3)? });
         }
         Ok(out)
     })
