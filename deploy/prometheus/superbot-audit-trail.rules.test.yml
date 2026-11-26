@@ -31,13 +31,26 @@ tests:
         alertname: SuperBotAuditExportFailing
         exp_alerts: []
 
-  # A sink taken out: a ticket for the hour after, not for one stopped long before.
+  # A sink taken out: a ticket for the hour after, not for one stopped long before. On c, an
+  # admin swapped back to a sink stopped earlier and took out the current one: the number
+  # stopped stays 1, but the restarted botd counted a new audit.export_stopped. On d, a stop
+  # counted from the seeded zero.
   - interval: 1m
     input_series:
       - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="a:8080"}'
         values: '0x30 1x150'
       - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="b:8080"}'
         values: '1x180'
+      - series: 'superbot_events_total{job="superbot",instance="b:8080",event="audit.export_stopped",outcome="success"}'
+        values: '1x180'
+      - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="c:8080"}'
+        values: '1x180'
+      - series: 'superbot_events_total{job="superbot",instance="c:8080",event="audit.export_stopped",outcome="success"}'
+        values: '2x30 1x150'
+      - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="d:8080"}'
+        values: '2x180'
+      - series: 'superbot_events_total{job="superbot",instance="d:8080",event="audit.export_stopped",outcome="success"}'
+        values: '0x30 1x150'
     alert_rule_test:
       - eval_time: 20m
         alertname: SuperBotAuditSinkStopped
@@ -49,6 +62,20 @@ tests:
               severity: ticket
               job: superbot
               instance: a:8080
+            exp_annotations:
+              summary: An audit sink was taken out of the export
+              description: "botd started without a sink it was sending audit events to, so that SIEM or archive gets nothing from now on. Find who changed AUDIT_EXPORT and why; if nobody can say, treat it as a security incident. See docs/support/runbook-audit-trail.md#a-sink-was-stopped."
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: c:8080
+            exp_annotations:
+              summary: An audit sink was taken out of the export
+              description: "botd started without a sink it was sending audit events to, so that SIEM or archive gets nothing from now on. Find who changed AUDIT_EXPORT and why; if nobody can say, treat it as a security incident. See docs/support/runbook-audit-trail.md#a-sink-was-stopped."
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: d:8080
             exp_annotations:
               summary: An audit sink was taken out of the export
               description: "botd started without a sink it was sending audit events to, so that SIEM or archive gets nothing from now on. Find who changed AUDIT_EXPORT and why; if nobody can say, treat it as a security incident. See docs/support/runbook-audit-trail.md#a-sink-was-stopped."
@@ -78,7 +105,7 @@ tests:
               instance: a:8080
             exp_annotations:
               summary: The audit log's hash chain check failed
-              description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; copy app.sqlite, tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
+              description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; take a copy with botd database backup (not app.sqlite by itself, which can miss events in its WAL), tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
 
   # Timestamps: a ticket after an hour of failing, none for a short outage.
   - interval: 1m

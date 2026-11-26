@@ -433,8 +433,9 @@ impl Metrics {
         // From zero, so an alert's increase() sees the first refusal for want of room (ADR 0106).
         let mut events = m.events.clone();
         events.entry(("machine.placement_failed", "failure")).or_default();
-        // And the first failed check of the audit chain (ADR 0322).
+        // And the first failed check of the audit chain, and the first stopped sink (ADR 0322).
         events.entry(("audit.verified", "failure")).or_default();
+        events.entry(("audit.export_stopped", "success")).or_default();
         for ((a, o), n) in &events {
             sample(out, "superbot_events_total", &[("event", a), ("outcome", o)], *n as f64);
         }
@@ -548,8 +549,8 @@ mod tests {
     fn alerted_failures_start_at_zero() {
         let mut out = String::new();
         Metrics::default().render(&mut out);
-        for event in ["machine.placement_failed", "audit.verified"] {
-            assert!(out.contains(&format!(r#"superbot_events_total{{event="{event}",outcome="failure"}} 0"#)), "{event}: {out}");
+        for (event, outcome) in [("machine.placement_failed", "failure"), ("audit.verified", "failure"), ("audit.export_stopped", "success")] {
+            assert!(out.contains(&format!(r#"superbot_events_total{{event="{event}",outcome="{outcome}"}} 0"#)), "{event}: {out}");
         }
     }
 

@@ -27,8 +27,14 @@ groups:
           description: "botd has failed to deliver audit events to its {{ $labels.kind }} sink for 15 minutes. They wait in its database and nothing is lost yet. botctl audit siem shows the last error. See docs/support/runbook-audit-trail.md#the-export-is-failing."
 
       # A sink taken out of AUDIT_EXPORT (audit.export_stopped): from then on it gets nothing.
+      # Counted by its event, since swapping back to a stopped sink while taking out the
+      # current one leaves the number stopped the same; the number rising is kept for a
+      # Prometheus that never saw the counter before the stop.
       - alert: SuperBotAuditSinkStopped
-        expr: max by (job, instance) (delta(superbot_audit_export_stopped_sinks{job="superbot"}[1h])) > 0
+        expr: |
+          (max by (job, instance) (increase(superbot_events_total{job="superbot",event="audit.export_stopped"}[1h])) > 0)
+          or
+          (max by (job, instance) (delta(superbot_audit_export_stopped_sinks{job="superbot"}[1h])) > 0)
         labels:
           severity: ticket
         annotations:
@@ -42,7 +48,7 @@ groups:
           severity: page
         annotations:
           summary: The audit log's hash chain check failed
-          description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; copy app.sqlite, tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
+          description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; take a copy with botd database backup (not app.sqlite by itself, which can miss events in its WAL), tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
 
       # Checkpoints wait as pending while the TSA fails; they're stamped once it answers.
       - alert: SuperBotAuditTimestampsFailing

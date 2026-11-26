@@ -22,7 +22,7 @@ Constraints: Rust first, no new dependencies, nothing that changes what botd rec
 ### Two runbooks in the shape of the others
 
 - [`runbook-secrets.md`](../support/runbook-secrets.md): runs refused; every `secret.*` action botd records for reads and sign-ins, with every `error` kind (`secrets::Error::kind` and the lease code's own); per-run credentials and their leases. Severity 1 when runs are refused for everyone, 2 for many or a rotation after a leak that didn't land, 3 for one user or one entry.
-- [`runbook-audit-trail.md`](../support/runbook-audit-trail.md): the export failing (each reason the sinks record), a sink stopped, the chain check failed (each reason, with the checkpoint's and timestamp's), timestamps failing. Severity 3 for export and timestamps, since events wait in botd's database; 2 for a failed chain check until it's explained; 1 when it isn't, which is a suspected security incident. It says not to restart or restore before copying `app.sqlite`, since that's the evidence.
+- [`runbook-audit-trail.md`](../support/runbook-audit-trail.md): the export failing (each reason the sinks record), a sink stopped, the chain check failed (each reason, with the checkpoint's and timestamp's), timestamps failing. Severity 3 for export and timestamps, since events wait in botd's database; 2 for a failed chain check until it's explained; 1 when it isn't, which is a suspected security incident. It says not to restart or restore before taking a copy with `botd database backup`, since that's the evidence: SQLite's online backup holds what's still in the WAL, which copying `app.sqlite` by itself while botd runs can miss.
 
 Both link the setup guides for detail rather than repeat them.
 
@@ -30,12 +30,14 @@ Both link the setup guides for detail rather than repeat them.
 
 - Two audit groups: `audit.secrets` (`secret.*`) and `audit.audit_trail` (`audit.*`), each naming its runbook.
 - `audit.export_stopped` counts in its group though it's recorded as a success: the SIEM gets nothing from then on.
-- `audit.audit_trail` is always a warning, not only at 10. A failed `audit.verified` suggests Severity 2 (so `botctl support-triage` exits 1) and adds the chain section with "copy `app.sqlite` first" as its next step.
+- `audit.audit_trail` is always a warning, not only at 10. A failed `audit.verified` suggests Severity 2 (so `botctl support-triage` exits 1) and adds the chain section with "take a copy with `botd database backup` first" as its next step.
 - Runs refused `secrets_unavailable` add the secrets runbook's runs refused section to `audit.run_limits`.
 
 ### Prometheus rules for the audit trail
 
-[`superbot-audit-trail.rules.yml`](../../deploy/prometheus/superbot-audit-trail.rules.yml), tested with promtool in CI: a sink failing for 15 minutes, a sink stopped in the last hour, timestamps failing for an hour (tickets), and a failed chain check in the last day (a page). Each links its runbook section. botd now writes `superbot_events_total{event="audit.verified",outcome="failure"} 0` from start, like `machine.placement_failed`, so the first failure is an increase.
+[`superbot-audit-trail.rules.yml`](../../deploy/prometheus/superbot-audit-trail.rules.yml), tested with promtool in CI: a sink failing for 15 minutes, a sink stopped in the last hour, timestamps failing for an hour (tickets), and a failed chain check in the last day (a page). Each links its runbook section. botd now writes `superbot_events_total{event="audit.verified",outcome="failure"} 0` and `{event="audit.export_stopped",outcome="success"} 0` from start, like `machine.placement_failed`, so the first of each is an increase.
+
+A stopped sink is alerted on by its event, not by `superbot_audit_export_stopped_sinks` rising, which the audit export guide suggested: swapping back to a sink stopped before while taking out the current one leaves the number the same, though a sink just stopped. The stop is recorded as botd starts, so the counter goes from the old process's value to 1, which Prometheus counts as an increase either way. The gauge rising is kept with `or`, for a Prometheus that never scraped the counter before the stop. The guide now points at the rule.
 
 ## Alternatives
 
