@@ -2105,6 +2105,35 @@ fn license_summary(l: &Value) -> String {
     out
 }
 
+/// How the SP metadata describes SuperBot to a federation, and what each entity category a
+/// registrar can add still needs (ADR 0323). Nothing from a botd that doesn't say.
+fn about_lines(about: &Value) -> String {
+    if about.is_null() {
+        return String::new();
+    }
+    let mut out = match about["displayName"].as_str() {
+        None => "  Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)\n".to_string(),
+        Some(name) => {
+            let contacts: Vec<&str> = about["contacts"].as_array().into_iter().flatten().filter_map(|c| c["type"].as_str()).collect();
+            let contacts = if contacts.is_empty() { "none".to_string() } else { contacts.join(", ") };
+            let sirtfi = match about["sirtfi"].as_str() {
+                Some(v @ ("v1" | "v2")) => format!("; Sirtfi {v}"),
+                _ => String::new(),
+            };
+            format!("  Federation listing:       {name}; contacts: {contacts}{sirtfi}\n")
+        }
+    };
+    for c in about["categories"].as_array().into_iter().flatten() {
+        let missing: Vec<&str> = c["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let label = format!("{}:", c["name"].as_str().unwrap_or_default());
+        out += &match missing.is_empty() {
+            true => format!("    {label:<25} metadata ready, ask the federation to add it\n"),
+            false => format!("    {label:<25} set {}\n", missing.join(", ")),
+        };
+    }
+    out
+}
+
 /// `GET /api/sso/{id}/saml`, for a terminal (ADR 0127, 0137): what the IdP admin enters, then what the IdP said.
 fn saml_summary(v: &Value) -> String {
     let s = |k: &str| v[k].as_str().unwrap_or("-").to_string();
@@ -2261,6 +2290,7 @@ fn saml_summary(v: &Value) -> String {
             v["roleMappings"].as_u64().unwrap_or(0)
         );
     }
+    out += &about_lines(&v["about"]);
     let from = v["from"].as_str().map(|f| format!(" ({f})")).unwrap_or_default();
     out += &format!("  IdP metadata from {}{from}", s("source"));
     if several.len() > 1 {
@@ -4989,6 +5019,26 @@ mod tests {
         v["roleMappings"] = json!(2);
         let out = saml_summary(&v);
         assert!(out.contains("Required groups:          SuperBot Users, Admins\n  Group role mappings:      2 "), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_the_federation_listing_and_what_each_category_needs() {
+        let mut v = json!({ "provider": "uni", "idpEntityId": "https://idp.example/saml", "source": "botctl" });
+        assert!(!saml_summary(&v).contains("Federation listing"), "an older botd says nothing of it");
+        let rs = json!({ "category": "http://refeds.org/category/research-and-scholarship", "name": "Research and Scholarship", "missing": [] });
+        let coco = json!({ "category": "https://refeds.org/category/code-of-conduct/v2", "name": "Code of Conduct v2", "missing": ["SP_DESCRIPTION", "SP_PRIVACY_URL"] });
+        let unset = json!({ "category": "http://refeds.org/category/research-and-scholarship", "name": "Research and Scholarship", "missing": ["SP_DISPLAY_NAME", "SP_INFORMATION_URL", "SP_CONTACT_TECHNICAL"] });
+        v["about"] = json!({ "displayName": null, "contacts": [], "sirtfi": "off", "categories": [unset] });
+        let out = saml_summary(&v);
+        assert!(
+            out.contains("  Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)\n    Research and Scholarship: set SP_DISPLAY_NAME, SP_INFORMATION_URL, SP_CONTACT_TECHNICAL\n"),
+            "the checklist is there before anything is set: {out}"
+        );
+        v["about"] = json!({ "displayName": "SuperBot", "contacts": [{ "type": "technical" }, { "type": "security" }], "sirtfi": "v2", "categories": [rs, coco] });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Federation listing:       SuperBot; contacts: technical, security; Sirtfi v2\n"), "{out}");
+        assert!(out.contains("    Research and Scholarship: metadata ready, ask the federation to add it\n"), "{out}");
+        assert!(out.contains("    Code of Conduct v2:       set SP_DESCRIPTION, SP_PRIVACY_URL\n"), "{out}");
     }
 
     #[test]

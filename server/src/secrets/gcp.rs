@@ -15,7 +15,14 @@
 //! revoke one, so it is let go at its expiry. An entry with `boundary=` (ADR 0240) trades
 //! that token at Google's Security Token Service for one limited by its Credential Access
 //! Boundary, and the run gets only that one.
+//!
+//! With `GCP_SECRET_MANAGER_EVENTS`, it pulls the notifications Secret Manager publishes to
+//! Pub/Sub when SuperBot's secrets change, and reads each name again as it changes (`events`,
+//! ADR 0325).
 
+pub(crate) mod events;
+
+use super::changes;
 use super::external::{Provider, Scope};
 use super::http::{self, Bearer, Worker};
 use super::leases::{Field, Issuer, Lease, Narrowed};
@@ -35,6 +42,7 @@ const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 pub(crate) const IAM_CREDENTIALS: &str = "https://iamcredentials.googleapis.com";
 const STS: &str = "https://sts.googleapis.com";
+const PUBSUB: &str = "https://pubsub.googleapis.com";
 const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 /// The longest downscoped token taken: Google's are at most 12 KB.
@@ -72,6 +80,37 @@ pub struct Config {
     /// The Security Token Service, for `GCP_RUN_CREDENTIALS` entries with `boundary=`; no
     /// trailing slash.
     pub sts_endpoint: String,
+    /// `GCP_SECRET_MANAGER_EVENTS`: the Pub/Sub subscription to pull change notifications
+    /// from, `projects/<project>/subscriptions/<id>` (ADR 0325).
+    pub events: Option<String>,
+    /// Pub/Sub, for `events`; no trailing slash.
+    pub pubsub_endpoint: String,
+}
+
+/// `GCP_SECRET_MANAGER_EVENTS`: a Pub/Sub subscription, as `projects/<project>/subscriptions/<id>`
+/// or just its id in `project`; empty for none. The id is Pub/Sub's: 3 to 255 letters, digits
+/// and `-_.~+%`, starting with a letter and not with `goog`.
+fn events_setting(raw: &str, project: &str) -> Result<Option<String>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let (project, id) = match raw.strip_prefix("projects/") {
+        Some(rest) => match rest.split_once("/subscriptions/") {
+            Some((p, id)) => (p, id),
+            None => return Err(format!("GCP_SECRET_MANAGER_EVENTS must be a Pub/Sub subscription, like \"projects/my-project-123/subscriptions/superbot-secrets\" or just \"superbot-secrets\", not {raw:?}")),
+        },
+        None => (project, raw),
+    };
+    let project = name_setting("GCP_SECRET_MANAGER_EVENTS's project", project, "my-project-123")?;
+    let ok = (3..=255).contains(&id.len())
+        && id.starts_with(|c: char| c.is_ascii_alphabetic())
+        && !id.to_ascii_lowercase().starts_with("goog")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.~+%".contains(&b));
+    if !ok {
+        return Err(format!("GCP_SECRET_MANAGER_EVENTS: {id:?} isn't a Pub/Sub subscription id: 3 to 255 letters, digits and -_.~+%, starting with a letter and not with goog"));
+    }
+    Ok(Some(format!("projects/{project}/subscriptions/{id}")))
 }
 
 fn prefix_setting(raw: &str) -> Result<String, String> {
@@ -303,6 +342,7 @@ struct Endpoints {
     endpoint: String,
     iam_endpoint: String,
     sts_endpoint: String,
+    pubsub_endpoint: String,
 }
 
 fn endpoints(var: &dyn Fn(&str) -> String) -> Result<Endpoints, String> {
@@ -323,7 +363,11 @@ fn endpoints(var: &dyn Fn(&str) -> String) -> Result<Endpoints, String> {
         "" => STS.to_string(),
         e => http::base_url("GCP_STS_ENDPOINT", e, STS)?,
     };
-    Ok(Endpoints { location, endpoint, iam_endpoint, sts_endpoint })
+    let pubsub_endpoint = match var("GCP_PUBSUB_ENDPOINT").trim() {
+        "" => PUBSUB.to_string(),
+        e => http::base_url("GCP_PUBSUB_ENDPOINT", e, PUBSUB)?,
+    };
+    Ok(Endpoints { location, endpoint, iam_endpoint, sts_endpoint, pubsub_endpoint })
 }
 
 /// Where signing in to Google as `method_var` says reaches, as `(setting, URL, what)`, for
@@ -348,11 +392,15 @@ pub fn sign_in_reaches(var: &dyn Fn(&str) -> String, method_var: &str, method: &
 }
 
 /// What Secret Manager reaches with these settings, as `(setting, URL, what)`, for `botd
-/// offline check` (ADR 0257): its endpoint, sign-in, and IAM Credentials and STS for runs.
+/// offline check` (ADR 0257): its endpoint, sign-in, IAM Credentials and STS for runs, and
+/// Pub/Sub for change events.
 pub fn reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String, &'static str)>, String> {
     let e = endpoints(var)?;
     let mut out = vec![("GCP_SECRET_MANAGER_ENDPOINT", e.endpoint, "Google Secret Manager")];
     out.extend(sign_in_reaches(var, "GCP_SECRET_MANAGER_AUTH", &var("GCP_SECRET_MANAGER_AUTH"))?);
+    if !var("GCP_SECRET_MANAGER_EVENTS").trim().is_empty() {
+        out.push(("GCP_PUBSUB_ENDPOINT", e.pubsub_endpoint, "Google Pub/Sub, for Secret Manager's change events"));
+    }
     let runs = var("GCP_RUN_CREDENTIALS");
     if !runs.trim().is_empty() {
         out.push(("GCP_IAM_CREDENTIALS_ENDPOINT", e.iam_endpoint, "IAM Credentials, for runs' credentials"));
@@ -373,12 +421,18 @@ impl Config {
             (p, _) => p.to_string(),
         };
         let project = name_setting("GCP_SECRET_MANAGER_PROJECT", &project, "my-project-123")?;
-        let Endpoints { location, endpoint, iam_endpoint, sts_endpoint } = endpoints(var)?;
+        let Endpoints { location, endpoint, iam_endpoint, sts_endpoint, pubsub_endpoint } = endpoints(var)?;
         let parent = match &location {
             None => format!("projects/{project}"),
             Some(l) => format!("projects/{project}/locations/{l}"),
         };
-        Ok(Config { endpoint, parent, prefix: prefix_setting(&var("GCP_SECRET_MANAGER_PREFIX"))?, auth, iam_endpoint, sts_endpoint })
+        let events = events_setting(&var("GCP_SECRET_MANAGER_EVENTS"), &project)?;
+        Ok(Config { endpoint, parent, prefix: prefix_setting(&var("GCP_SECRET_MANAGER_PREFIX"))?, auth, iam_endpoint, sts_endpoint, events, pubsub_endpoint })
+    }
+
+    /// The region of regional secrets (`GCP_SECRET_MANAGER_LOCATION`), if they are.
+    fn location(&self) -> Option<&str> {
+        self.parent.split_once("/locations/").map(|(_, l)| l)
     }
 }
 
@@ -400,6 +454,8 @@ struct Inner {
     /// For the metadata server: link-local, so never through a proxy.
     local: reqwest::Client,
     token: Mutex<Option<Bearer>>,
+    /// What the change events' subscription is doing (ADR 0325).
+    events: Arc<changes::Status>,
 }
 
 #[derive(Clone)]
@@ -416,7 +472,7 @@ impl SecretManager {
     pub fn new(cfg: Config) -> Result<SecretManager, String> {
         let http = http::client("GCP Secret Manager", None, false)?;
         let local = http::client("GCP Secret Manager", None, true)?;
-        Ok(SecretManager { inner: Arc::new(Inner { cfg, http, local, token: Mutex::new(None) }), worker: Arc::new(Worker::new("GCP Secret Manager", "gcp-secrets")?) })
+        Ok(SecretManager { inner: Arc::new(Inner { cfg, http, local, token: Mutex::new(None), events: Arc::default() }), worker: Arc::new(Worker::new("GCP Secret Manager", "gcp-secrets")?) })
     }
 }
 
@@ -661,7 +717,8 @@ impl Provider for SecretManager {
     fn describe(&self) -> String {
         let c = &self.inner.cfg;
         let auth = signs_in_as(&c.auth);
-        format!("GCP Secret Manager at {}, {}/secrets/{}-{{bots,server}}-<NAME>, {auth}", c.endpoint, c.parent, c.prefix)
+        let events = c.events.as_ref().map(|s| format!(", following change events from {s}")).unwrap_or_default();
+        format!("GCP Secret Manager at {}, {}/secrets/{}-{{bots,server}}-<NAME>, {auth}{events}", c.endpoint, c.parent, c.prefix)
     }
 
     fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error> {
@@ -672,6 +729,18 @@ impl Provider for SecretManager {
     fn list(&self, scope: Scope) -> Result<Vec<String>, Error> {
         let inner = Arc::clone(&self.inner);
         self.worker.run(async move { inner.list(scope).await })
+    }
+
+    fn watch(&self, store: std::sync::Weak<super::external::ExternalStore>) -> Result<bool, Error> {
+        if self.inner.cfg.events.is_none() {
+            return Ok(false);
+        }
+        events::start(self, store)?;
+        Ok(true)
+    }
+
+    fn watch_status(&self) -> Option<super::external::WatchStatus> {
+        self.inner.events.view()
     }
 }
 
@@ -702,7 +771,7 @@ impl Issuer for SecretManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::env::EnvStore;
     use super::super::external::{tests::audited, ExternalStore, Shared};
     use super::super::http::tests::{serve, settings};
@@ -721,13 +790,13 @@ mod tests {
     /// A stand-in for Secret Manager, Google's token endpoint and the metadata server:
     /// no real Google Cloud, account or network.
     #[derive(Default)]
-    struct Fake {
+    pub(crate) struct Fake {
         /// `<parent>/secrets/<id>` → latest version's bytes.
-        secrets: Mutex<HashMap<String, Vec<u8>>>,
-        tokens: Mutex<Vec<String>>,
-        sign_ins: AtomicUsize,
-        reads: AtomicUsize,
-        down: AtomicBool,
+        pub secrets: Mutex<HashMap<String, Vec<u8>>>,
+        pub tokens: Mutex<Vec<String>>,
+        pub sign_ins: AtomicUsize,
+        pub reads: AtomicUsize,
+        pub down: AtomicBool,
         corrupt: AtomicBool,
         /// 1: no checksum, 2: a checksum that isn't a number.
         checksum: AtomicUsize,
@@ -743,9 +812,11 @@ mod tests {
         run_tokens: Mutex<Vec<String>>,
         /// Each token exchange at STS: the subject token, the options as sent, the token made.
         downscoped: Mutex<Vec<(String, String, String)>>,
+        /// Pub/Sub's subscription for change events.
+        pub pubsub: super::events::tests::PubSub,
     }
 
-    type F = Arc<Fake>;
+    pub(crate) type F = Arc<Fake>;
 
     fn issue(f: &Fake) -> Json<Value> {
         let n = f.sign_ins.fetch_add(1, Ordering::SeqCst);
@@ -780,7 +851,7 @@ mod tests {
         (StatusCode::OK, issue(&f))
     }
 
-    fn authorized(f: &Fake, h: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    pub(crate) fn authorized(f: &Fake, h: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
         if f.down.load(Ordering::SeqCst) {
             return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": { "code": 503, "status": "UNAVAILABLE", "message": "x" } }))));
         }
@@ -831,6 +902,15 @@ mod tests {
             return (StatusCode::OK, Json(json!({})));
         }
         (StatusCode::OK, Json(json!({ "secrets": page, "nextPageToken": next, "totalSize": ids.len() })))
+    }
+
+    /// POSTs under `/v1/`: Pub/Sub's calls on a subscription, else IAM Credentials'.
+    async fn post_v1(State(f): State<F>, Path(rest): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match super::events::tests::pubsub(&f, &rest, &h, &body).await {
+            Some(answer) => answer,
+            None => iam(State(f), Path(rest), h, Json(body)).await.into_response(),
+        }
     }
 
     /// IAM Credentials' `projects/-/serviceAccounts/<email>:generateAccessToken`. Accounts
@@ -899,19 +979,19 @@ mod tests {
         }
     }
 
-    fn stand_in() -> (String, F) {
+    pub(crate) fn stand_in() -> (String, F) {
         let f = F::default();
         f.expires_in.store(3599, Ordering::SeqCst);
         let app = axum::Router::new()
             .route("/computeMetadata/v1/instance/service-accounts/default/token", axum::routing::get(metadata_token))
             .route("/token", axum::routing::post(oauth_token))
             .route("/v1/token", axum::routing::post(sts))
-            .route("/v1/{*rest}", axum::routing::get(api).post(iam))
+            .route("/v1/{*rest}", axum::routing::get(api).post(post_v1))
             .with_state(Arc::clone(&f));
         (serve(app), f)
     }
 
-    fn put(f: &Fake, path: &str, value: &str) {
+    pub(crate) fn put(f: &Fake, path: &str, value: &str) {
         f.secrets.lock().unwrap().insert(format!("projects/proj-1/{path}"), value.as_bytes().to_vec());
     }
 

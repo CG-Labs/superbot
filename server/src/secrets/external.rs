@@ -551,7 +551,7 @@ impl ExternalStore {
     }
 
     /// Has the backend tell this store of changes as they happen, if it is set to
-    /// (`VAULT_EVENTS`, ADR 0306): whether it does. An error stops botd at startup.
+    /// (`VAULT_EVENTS`, ADR 0306; `GCP_SECRET_MANAGER_EVENTS`, ADR 0325): whether it does. An error stops botd at startup.
     pub fn watch(self: &Arc<Self>) -> Result<bool, Error> {
         self.provider.watch(Arc::downgrade(self))
     }
@@ -983,7 +983,7 @@ pub fn user_folders(raw: &str) -> Result<bool, String> {
 
 /// The settings of backends other than `chosen` that are set: probably a mistake.
 pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'static str> {
-    const KEYS: [(&str, &str); 13] = [
+    const KEYS: [(&str, &str); 14] = [
         ("vault", "VAULT_ADDR"),
         ("vault", "VAULT_RUN_CREDENTIALS"),
         ("vault", "VAULT_EVENTS"),
@@ -994,6 +994,7 @@ pub fn unused_settings(var: &dyn Fn(&str) -> String, chosen: &str) -> Vec<&'stat
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_AUTH"),
         ("gcp-secret-manager", "GCP_SECRET_MANAGER_LOCATION"),
         ("gcp-secret-manager", "GCP_RUN_CREDENTIALS"),
+        ("gcp-secret-manager", "GCP_SECRET_MANAGER_EVENTS"),
         ("aws", "AWS_SECRETS_MANAGER_REGION"),
         ("aws", "AWS_SECRETS_MANAGER_AUTH"),
         ("aws", "AWS_RUN_CREDENTIALS"),
@@ -1083,7 +1084,7 @@ fn render_watch(x: Option<&ExternalStore>, out: &mut String) {
     use crate::obs::metrics::{family, sample};
     let Some((x, w)) = x.and_then(|x| Some((x, x.watch_status()?))) else { return };
     let b = [("backend", x.kind())];
-    family(out, "superbot_secrets_change_events_following", "gauge", "1 while botd follows the external secrets store's change events (VAULT_EVENTS, ADR 0306), 0 while it is subscribing again (ADR 0318).");
+    family(out, "superbot_secrets_change_events_following", "gauge", "1 while botd follows the external secrets store's change events (VAULT_EVENTS, ADR 0306; GCP_SECRET_MANAGER_EVENTS, ADR 0325), 0 while it is subscribing again (ADR 0318).");
     sample(out, "superbot_secrets_change_events_following", &b, w.following as u8 as f64);
     family(out, "superbot_secrets_change_events_changes_total", "counter", "Changes the external secrets store announced that botd read again.");
     sample(out, "superbot_secrets_change_events_changes_total", &b, w.changes as f64);
