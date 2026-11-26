@@ -283,6 +283,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("PATCH", ["service-accounts", _]) | ("DELETE", ["service-accounts", _, "tokens", _]) => Account,
         ("POST", ["service-accounts"]) | ("DELETE", ["service-accounts", _]) => ManageUsers,
         ("POST", ["service-accounts", _, "tokens"] | ["service-accounts", _, "tokens", _, "rotate"]) => ManageUsers,
+        // Several Bots handed to one at once (ADR 0324), as `PUT .../keeper` hands one: the
+        // handler keeps it to the account's and the Bots' owner, or an admin.
+        ("POST", ["service-accounts", _, "kept-bots"]) => Write,
         ("GET", ["users", _, "bots" | "routines"]) | ("POST", ["users", _, "routines", "resume"]) => ManageBots,
         // Handing a disabled person's Bots on (ADR 0315). The handler keeps a delegate off
         // admins, the owner, custom-role holders, the primary Bot and themselves.
@@ -493,6 +496,7 @@ mod tests {
             ("DELETE", "/api/bots/b1/grants/a%40example.com", Perm::Write),
             ("PUT", "/api/bots/b1/keeper", Perm::Write),
             ("DELETE", "/api/bots/b1/keeper", Perm::Account),
+            ("POST", "/api/service-accounts/sa1/kept-bots", Perm::Write),
             ("GET", "/api/policy", Perm::Read),
             ("GET", "/api/policy/rules", Perm::Read),
             ("GET", "/api/approvals", Perm::Review),

@@ -268,8 +268,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl bot grant <bot> <user> <viewer|operator>  viewer: read its chat; operator: also run it. <user> may be
                                                    a service account's id: never more than its owner can do
   botctl bot revoke <bot> <user>
-  botctl bot keep <bot> <service-account>          One of the Bot owner's service accounts keeps and manages it
-                                                   (owner or admin); it stays the owner's. Takes over from another
+  botctl bot keep <bot>... <service-account>       One of the Bot owner's service accounts keeps and manages it
+                                                   (owner or admin); it stays the owner's. Takes over from another.
+                                                   Several Bots go together or not at all
   botctl bot release <bot>                         The service account keeping it stops; it stays the owner's
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
@@ -1253,7 +1254,9 @@ fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), S
         ["revoke", bot, user] => ("DELETE", grant(bot, user), None),
         // ADR 0229: the account's id, as `bot grant` takes it.
         ["keep", bot, account] => ("PUT", keeper(bot), Some(json!({ "serviceAccount": account }).to_string())),
-        ["keep", ..] => return Err("Usage: botctl bot keep <bot> <service-account>".into()),
+        // ADR 0324: several at once, all or none.
+        ["keep", bots @ .., account] if bots.len() > 1 => ("POST", format!("/api/service-accounts/{}/kept-bots", encode(account)), Some(json!({ "bots": bots }).to_string())),
+        ["keep", ..] => return Err("Usage: botctl bot keep <bot>... <service-account>".into()),
         ["release", bot] => ("DELETE", keeper(bot), None),
         _ => return Err("Unknown bot command. See botctl admin.".into()),
     })
@@ -4747,6 +4750,7 @@ mod tests {
         assert_eq!(req(&["keep", "b1", "sa1"]), Ok(("PUT", "/api/bots/b1/keeper".into(), Some(json!({ "serviceAccount": "sa1" })))));
         assert_eq!(req(&["release", "b/1"]), Ok(("DELETE", "/api/bots/b%2F1/keeper".into(), None)));
         assert!(req(&["keep", "b1"]).unwrap_err().starts_with("Usage: botctl bot keep"));
+        assert_eq!(req(&["keep", "b1", "b/2", "sa 1"]), Ok(("POST", "/api/service-accounts/sa%201/kept-bots".into(), Some(json!({ "bots": ["b1", "b/2"] })))));
         assert!(req(&["share"]).is_err());
         assert!(req(&[]).is_err());
     }

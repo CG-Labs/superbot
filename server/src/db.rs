@@ -2735,6 +2735,30 @@ fn kept_in(c: &Connection, account: &str) -> rusqlite::Result<Vec<String>> {
     s.query_map([account], |r| r.get(0))?.collect()
 }
 
+/// `Db::keep_bot`'s change inside the caller's transaction (ADR 0229): the owner, the
+/// account and its `max_kept` are checked in the same statement as the update.
+fn keep_in(tx: &Connection, bot: &str, owner: &str, account: &str, max_kept: u32) -> rusqlite::Result<Result<Handed, KeepRefusal>> {
+    let Some(from) = tx.query_row("SELECT service_account_id FROM bots WHERE id = ?1 AND owner_id = ?2", [bot, owner], |r| r.get::<_, Option<String>>(0)).optional()? else {
+        return Ok(Err(KeepRefusal::Bot));
+    };
+    if from.as_deref() == Some(account) {
+        return Ok(Ok(Handed { from, grant: None }));
+    }
+    let n = tx.execute(
+        "UPDATE bots SET service_account_id = ?3 WHERE id = ?1 AND owner_id = ?2
+           AND EXISTS (SELECT 1 FROM service_accounts WHERE user_id = ?3 AND owner_id = ?2 AND deleted_at IS NULL)
+           AND (SELECT COUNT(*) FROM bots WHERE service_account_id = ?3 AND id <> ?1) < ?4",
+        params![bot, owner, account, max_kept],
+    )?;
+    if n == 0 {
+        let live: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM service_accounts WHERE user_id = ?1 AND owner_id = ?2 AND deleted_at IS NULL)", [account, owner], |r| r.get(0))?;
+        return Ok(Err(if live { KeepRefusal::Limit } else { KeepRefusal::Account }));
+    }
+    let grant = tx.query_row("SELECT * FROM bot_grants WHERE bot_id = ?1 AND user_id = ?2", [bot, account], grant_row).optional()?.map(|g| g.level);
+    tx.execute("DELETE FROM bot_grants WHERE bot_id = ?1 AND user_id = ?2", [bot, account])?;
+    Ok(Ok(Handed { from, grant }))
+}
+
 /// Requests for a role (ADR 0209): a person asks for a requestable, time-bound role for
 /// some hours, across the server or in their team, and an admin approves or denies it.
 /// One pending request per person, role and scope. A request goes with its role, team
@@ -5177,35 +5201,31 @@ impl Db {
     pub fn keep_bot(&self, bot: &str, owner: &str, account: &str, max_kept: u32) -> Result<Handed, KeepRefusal> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|_| KeepRefusal::Bot)?;
-        let res = (|| {
-            let Some(from) = tx.query_row("SELECT service_account_id FROM bots WHERE id = ?1 AND owner_id = ?2", [bot, owner], |r| r.get::<_, Option<String>>(0)).optional()? else {
-                return Ok(Err(KeepRefusal::Bot));
-            };
-            if from.as_deref() == Some(account) {
-                return Ok(Ok(Handed { from, grant: None }));
-            }
-            let n = tx.execute(
-                "UPDATE bots SET service_account_id = ?3 WHERE id = ?1 AND owner_id = ?2
-                   AND EXISTS (SELECT 1 FROM service_accounts WHERE user_id = ?3 AND owner_id = ?2 AND deleted_at IS NULL)
-                   AND (SELECT COUNT(*) FROM bots WHERE service_account_id = ?3 AND id <> ?1) < ?4",
-                params![bot, owner, account, max_kept],
-            )?;
-            if n == 0 {
-                let live: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM service_accounts WHERE user_id = ?1 AND owner_id = ?2 AND deleted_at IS NULL)", [account, owner], |r| r.get(0))?;
-                return Ok(Err(if live { KeepRefusal::Limit } else { KeepRefusal::Account }));
-            }
-            let grant = tx
-                .query_row("SELECT * FROM bot_grants WHERE bot_id = ?1 AND user_id = ?2", [bot, account], grant_row)
-                .optional()?
-                .map(|g| g.level);
-            tx.execute("DELETE FROM bot_grants WHERE bot_id = ?1 AND user_id = ?2", [bot, account])?;
-            Ok::<_, rusqlite::Error>(Ok(Handed { from, grant }))
-        })();
-        match res {
+        match keep_in(&tx, bot, owner, account, max_kept) {
             Ok(Ok(h)) => tx.commit().map(|_| h).map_err(|_| KeepRefusal::Bot),
             Ok(Err(why)) => Err(why),
             Err(_) => Err(KeepRefusal::Bot),
         }
+    }
+
+    /// Hands every Bot in `bots`, all `owner`'s, to their live service account `account`
+    /// (ADR 0324), or none: each goes through `keep_bot`'s statement in one transaction, so
+    /// the ones handed earlier count against `max_kept` for the later ones, and the first
+    /// refusal rolls back the rest. In `bots`' order, one `Handed` each; on refusal, the Bot
+    /// refused and why.
+    pub fn keep_bots(&self, bots: &[String], owner: &str, account: &str, max_kept: u32) -> Result<Vec<Handed>, (String, KeepRefusal)> {
+        let first = || bots.first().cloned().unwrap_or_default();
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|_| (first(), KeepRefusal::Bot))?;
+        let mut handed = Vec::with_capacity(bots.len());
+        for bot in bots {
+            match keep_in(&tx, bot, owner, account, max_kept) {
+                Ok(Ok(h)) => handed.push(h),
+                Ok(Err(why)) => return Err((bot.clone(), why)),
+                Err(_) => return Err((bot.clone(), KeepRefusal::Bot)),
+            }
+        }
+        tx.commit().map(|_| handed).map_err(|_| (first(), KeepRefusal::Bot))
     }
 
     /// Stops `account` keeping `bot` (ADR 0229); the Bot stays its owner's. False when it
@@ -12796,6 +12816,38 @@ mod tests {
         // A deleted account keeps nothing, and takes nothing.
         assert!(db.delete_service_account(&nightly, None).is_some());
         assert_eq!(db.keep_bot(&ledger, &ana.id, &nightly, 9), Err(KeepRefusal::Account));
+    }
+
+    #[test]
+    fn several_bots_are_handed_together_or_not_at_all() {
+        let db = Db::open(&temp_path("keep-bots").join("app.sqlite")).unwrap();
+        let ana = db.create_user(None, Some("ana@example.com"), "Ana", Role::Member).unwrap();
+        let bea = db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let ci = db.create_service_account("CI", "", Role::Member, None, None, &ana.id, None).unwrap().user.id;
+        let nightly = db.create_service_account("Nightly", "", Role::Member, None, None, &ana.id, None).unwrap().user.id;
+        let bot = |name: &str, owner: &str| db.create_bot_owned(name, "#fff", "waddle", "claude", None, false, owner, Visibility::Shared).id;
+        let (a, b, c, other) = (bot("A", &ana.id), bot("B", &ana.id), bot("C", &ana.id), bot("Bea's", &bea.id));
+        let keeper = |id: &str| db.bot(id).unwrap().service_account_id;
+
+        // Over the limit together, none is handed, though each alone would fit.
+        assert_eq!(db.keep_bots(&[a.clone(), b.clone(), c.clone()], &ana.id, &ci, 2), Err((c.clone(), KeepRefusal::Limit)));
+        assert_eq!((keeper(&a), keeper(&b), keeper(&c)), (None, None, None));
+        // A Bot that isn't the owner's rolls back the ones before it.
+        assert_eq!(db.keep_bots(&[a.clone(), other.clone()], &ana.id, &ci, 9), Err((other.clone(), KeepRefusal::Bot)));
+        assert_eq!(keeper(&a), None);
+
+        // Within it, all go at once; grants go; one it keeps already counts once and changes nothing.
+        db.set_grant(&b, &ci, Grant::Viewer, &ana.id);
+        assert_eq!(db.keep_bot(&a, &ana.id, &nightly, 9), Ok(Handed { from: None, grant: None }));
+        let handed = db.keep_bots(&[a.clone(), b.clone()], &ana.id, &ci, 2).unwrap();
+        assert_eq!(handed, [Handed { from: Some(nightly.clone()), grant: None }, Handed { from: None, grant: Some(Grant::Viewer) }]);
+        assert_eq!(db.keep_bots(&[b.clone(), a.clone()], &ana.id, &ci, 2).unwrap(), [Handed { from: Some(ci.clone()), grant: None }, Handed { from: Some(ci.clone()), grant: None }]);
+        assert_eq!((keeper(&a).as_deref(), keeper(&b).as_deref(), db.grant(&b, &ci)), (Some(ci.as_str()), Some(ci.as_str()), None));
+        assert_eq!(db.keep_bots(&[c.clone()], &ana.id, &ci, 2), Err((c.clone(), KeepRefusal::Limit)));
+
+        // A deleted account takes none.
+        assert!(db.delete_service_account(&nightly, None).is_some());
+        assert_eq!(db.keep_bots(&[c.clone()], &ana.id, &nightly, 9), Err((c.clone(), KeepRefusal::Account)));
     }
 
     #[test]
