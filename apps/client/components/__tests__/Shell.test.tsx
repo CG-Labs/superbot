@@ -185,15 +185,53 @@ describe("motion", () => {
     expect(flat("pane").transform).toBeUndefined();
   });
 
-  it("brings the first pane in when asked to appear", async () => {
-    reduceMotion(false);
+  it("keeps still while the device's setting is still on its way", async () => {
+    jest.spyOn(AccessibilityInfo, "isReduceMotionEnabled").mockReturnValue(new Promise(() => {}));
     const timing = jest.spyOn(Animated, "timing");
-    await render(
-      <PaneTransition appear testID="pane">
-        <RN.Text>Screen</RN.Text>
+    const motion = await renderHook(() => useMotion());
+    expect(motion.result.current.reduced).toBe(true);
+    expect(motion.result.current.duration("base")).toBe(0);
+    const { rerender } = await render(
+      <PaneTransition appear paneKey="list" testID="pane">
+        <RN.Text>List</RN.Text>
       </PaneTransition>,
     );
-    expect(timing).toHaveBeenCalledTimes(1);
+    await rerender(
+      <PaneTransition appear paneKey="chat" testID="pane">
+        <RN.Text>Chat</RN.Text>
+      </PaneTransition>,
+    );
+    expect(timing).not.toHaveBeenCalled();
+    expect(flat("pane").opacity).toBeUndefined();
+    await render(
+      <DetailSheet visible onClose={() => {}} backText="‹ Users">
+        <RN.Text>Detail</RN.Text>
+      </DetailSheet>,
+    );
+    expect(screen.getByTestId("detail-sheet").props.animationType).toBe("none");
+  });
+
+  it.each([
+    [false, 1],
+    [true, 0],
+  ] as const)("on web, reads prefers-reduced-motion (%s) at once, so a screen comes in or not from its first frame", async (matches, runs) => {
+    jest.replaceProperty(RN.Platform, "OS", "web");
+    const matchMedia = jest.fn(() => ({ matches }));
+    Object.defineProperty(globalThis, "matchMedia", { value: matchMedia, configurable: true, writable: true });
+    jest.spyOn(AccessibilityInfo, "isReduceMotionEnabled").mockReturnValue(new Promise(() => {}));
+    const timing = jest.spyOn(Animated, "timing").mockReturnValue({ start: jest.fn(), stop: jest.fn(), reset: jest.fn() } as unknown as RN.Animated.CompositeAnimation);
+    try {
+      await render(
+        <PaneTransition appear testID="pane">
+          <RN.Text>Screen</RN.Text>
+        </PaneTransition>,
+      );
+      expect(matchMedia).toHaveBeenCalledWith("(prefers-reduced-motion: reduce)");
+      expect(timing).toHaveBeenCalledTimes(runs);
+      expect(flat("pane").opacity).toBe(matches ? undefined : 0);
+    } finally {
+      delete (globalThis as { matchMedia?: unknown }).matchMedia;
+    }
   });
 });
 

@@ -31,7 +31,7 @@ After [ADR 0337](0337-a-shared-kit-for-settings-and-admin-screens.md) most scree
 
 - `PaneTransition` brings a pane in with a short fade and a 12-point shift over the tokens' `base` duration (200 ms), easing out. On phones, chat slides in from the right over the Bot list and the list from the left; on wide windows a picked user's, role's, service account's or audit event's detail fades up in its pane; and on web, where the native stack has no push animation, each pushed screen fades in. A pane at rest has no transform or opacity, so nothing positioned inside it is affected.
 - Native pushes keep the platform's own animation.
-- **Reduced motion**: `useReducedMotion` (`src/motion.ts`, shared with the empty, loading and error states slice) follows iOS's and Android's setting and `prefers-reduced-motion` on web. With it on, `useMotion` gives every token duration as 0, panes just appear, the stack's push becomes `none`, and the detail sheets, the new-Bot sheet and the sign-up request sheet appear without sliding.
+- **Reduced motion**: `useMotionPreference` follows iOS's and Android's setting and `prefers-reduced-motion` on web. With it on, `useMotion` gives every token duration as 0, panes just appear, the stack's push becomes `none`, and the detail sheets, the new-Bot sheet and the sign-up request sheet appear without sliding. Native settings arrive a moment after a screen mounts, so until then motion counts as reduced: a screen never starts to move for someone who asked it not to. On web, `prefers-reduced-motion` is read at once, so a screen's fade-in starts, or doesn't, from its first frame.
 
 ### Not in this slice
 
@@ -53,6 +53,7 @@ The chat header's back button and the approvals, Bot details and screen viewer s
   - the route frame in both schemes, at rest without motion styles;
   - the detail sheet's header, its back pill and the system back, and its slide, or none with reduced motion;
   - token durations, or 0 with reduced motion;
+  - nothing moving and sheets not sliding while the device's setting is still on its way, and on web a screen's fade-in following `prefers-reduced-motion` from its first frame;
   - a new pane coming in over the `base` duration with a fade and a shift, then resting without a transform; no animation at all with reduced motion; the first pane coming in only when asked;
   - the stack's canvas and status bar per scheme, and no push animation with reduced motion.
 - `AuditScreen.test.tsx`: the admins-only notice keeps the "Audit log" header, and its back goes home after a reload.
