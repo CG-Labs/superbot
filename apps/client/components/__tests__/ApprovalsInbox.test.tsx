@@ -1,6 +1,8 @@
 import React from "react";
+import * as RN from "react-native";
 import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
 import { ApprovalCard, ApprovalsInbox, runScopeText } from "../ApprovalsInbox";
+import { themes } from "../../src/theme";
 import type { Approval } from "../../src/types";
 
 const mockCtx: Record<string, unknown> = {};
@@ -43,7 +45,10 @@ beforeEach(() => {
   decideApproval.mockClear();
   jest.useFakeTimers();
 });
-afterEach(() => jest.useRealTimers());
+afterEach(() => {
+  jest.useRealTimers();
+  jest.restoreAllMocks();
+});
 
 describe("ApprovalCard: approve for this run (ADR 0051)", () => {
   it("approves calls like this one for the rest of the run, and says what that covers", async () => {
@@ -110,6 +115,24 @@ describe("ApprovalCard: approve for this run (ADR 0051)", () => {
     expect(screen.getByText(/Nothing is waiting for you/)).toBeOnTheScreen();
     await act(async () => fireEvent.press(screen.getByRole("button", { name: "Close approvals" })));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["light", "dark"] as const)("draws the sheet and its cards in the %s palette", async (scheme) => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    as("member");
+    Object.assign(mockCtx, { approvals: [PUSH], policy: { mode: "ask" }, setGlobalPolicy: jest.fn() });
+    await render(<ApprovalsInbox visible onClose={jest.fn()} />);
+    expect(screen.getByTestId("approvals-sheet")).toHaveStyle({ backgroundColor: themes[scheme].c.surface });
+    expect(screen.getByRole("heading", { name: "Approvals" })).toHaveStyle({ color: themes[scheme].c.text });
+    expect(screen.getByText("Pushes to a git remote")).toHaveStyle({ color: themes[scheme].c.warning });
+  });
+
+  it("names its switches", async () => {
+    as("admin");
+    Object.assign(mockCtx, { approvals: [PUSH], policy: { mode: "ask" }, setGlobalPolicy: jest.fn() });
+    await render(<ApprovalsInbox visible onClose={jest.fn()} />);
+    expect(screen.getByRole("switch", { name: "Remember for Scout" })).toBeOnTheScreen();
+    expect(screen.getByRole("switch", { name: "Ask before risky actions (all Bots)" })).toBeOnTheScreen();
   });
 
   it("puts a failed answer into plain words", async () => {

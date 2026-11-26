@@ -50,8 +50,8 @@ export const themes: Record<Scheme, Theme> = { light: theme("light"), dark: them
 const ForcedScheme = createContext<Scheme | null>(null);
 
 /**
- * Holds everything inside it to one scheme. Screens not yet on the design system (ADR 0335) are
- * dark-only, so they wrap the themed parts they show in a dark scope until they move over.
+ * Holds everything inside it to one scheme, for a part that must look the same whatever the
+ * device's setting. Every screen follows the device since ADR 0345, so none uses it today.
  */
 export function ThemeScope({ scheme, children }: { scheme: Scheme; children: React.ReactNode }) {
   return React.createElement(ForcedScheme.Provider, { value: scheme }, children);
@@ -82,22 +82,9 @@ export const hairline = StyleSheet.hairlineWidth;
 
 const dark = tokens.color.dark;
 
-/** Dark-only colours for screens not yet on the design system; their neutrals come from the dark palette. */
+/** The root stack's backdrop, until the shell's motion between panes (ADR 0340) puts it on the tokens. */
 export const colors = {
-  bgSidebar: dark.surface,
   bgMain: dark.bg,
-  bgBubble: dark.raised,
-  bgHover: dark.hover,
-  bgActive: dark.selected,
-  border: dark.border,
-  text: dark.text,
-  textDim: dark.textMuted,
-  textFaint: dark.textFaint,
-  blue: "#2f72e4",
-  blueDot: "#4b8df8",
-  danger: "#e5484d",
-  warning: "#e9a23b",
-  accent: "#4cc06a",
 };
 
 export const botColors = [
@@ -113,6 +100,9 @@ export const botColors = [
   "#e64a9c",
   "#7a7a7a",
 ];
+
+/** What screen readers call each of `botColors`, in the same order. */
+export const botColorNames = ["White", "Brown", "Red", "Orange", "Amber", "Green", "Teal", "Blue", "Purple", "Pink", "Grey"];
 
 export const botShapes = [
   "waddle",

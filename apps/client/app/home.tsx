@@ -227,6 +227,6 @@ const useStyles = themedStyles((t) =>
     root: { flex: 1, backgroundColor: t.c.bg },
     row: { flex: 1, flexDirection: "row" },
     screenPanel: { width: `${SCREEN_PANEL_SHARE * 100}%`, minWidth: SCREEN_PANEL_MIN, borderLeftWidth: hairline, borderLeftColor: t.c.border },
-    screenModal: { flex: 1, backgroundColor: "#111" },
+    screenModal: { flex: 1, backgroundColor: t.c.bg },
   }),
 );

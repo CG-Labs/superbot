@@ -2,11 +2,12 @@ import React, { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { showError } from "../src/dialogs";
 import { friendlyError } from "../src/errors";
-import { colors, ThemeScope } from "../src/theme";
+import { themedStyles, type } from "../src/theme";
 import type { Message } from "../src/types";
 import { ErrorState } from "./ErrorState";
 import { ScreenFrame } from "./ScreenFrame";
 import { Skeleton, SkeletonGroup } from "./Skeleton";
+import { kit } from "./ui";
 
 /** The server stops idle screens; re-asking for the link while watching keeps this one up. */
 export const SCREEN_REFRESH_MS = 60_000;
@@ -41,6 +42,7 @@ export function ScreenViewer({
   refreshMs = SCREEN_REFRESH_MS,
   retryMs = SCREEN_RETRY_MS,
 }: Props) {
+  const styles = useStyles();
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [control, setControl] = useState(initialControl);
@@ -109,14 +111,15 @@ export function ScreenViewer({
   return (
     <View style={styles.root}>
       <View style={styles.bar}>
-        <Text style={styles.title} numberOfLines={1}>
+        <Text style={styles.title} role="heading" numberOfLines={1}>
           {title}
         </Text>
         {handoff && onHandoffDone ? (
           <Pressable
             role="button"
             aria-label="Done, hand back to Bot"
-            style={[styles.pill, styles.done]}
+            aria-busy={finishing}
+            style={[styles.pill, styles.pillOn, finishing && styles.disabled]}
             disabled={finishing}
             onPress={() => void finish()}
           >
@@ -127,7 +130,7 @@ export function ScreenViewer({
           role="button"
           aria-label={control ? "Give back" : "Take over"}
           aria-pressed={control}
-          style={[styles.pill, control && styles.pillOn]}
+          style={[styles.pill, control && styles.pillOn, !url && styles.disabled]}
           disabled={!url}
           onPress={() => setControl((c) => !c)}
         >
@@ -154,46 +157,46 @@ export function ScreenViewer({
           />
         ) : null}
         {!url && !error ? (
-          <ThemeScope scheme="dark">
-            <SkeletonGroup label={`Starting ${title}`} style={styles.center}>
-              <Skeleton width="70%" height="auto" radius={12} style={styles.placeholder} />
-              <Text style={styles.msg}>Starting {title}…</Text>
-            </SkeletonGroup>
-          </ThemeScope>
+          <SkeletonGroup label={`Starting ${title}`} style={styles.cover}>
+            <Skeleton width="70%" height="auto" radius={12} style={styles.placeholder} />
+            <Text style={styles.msg}>Starting {title}…</Text>
+          </SkeletonGroup>
         ) : null}
         {error ? (
-          <ThemeScope scheme="dark">
-            <View style={styles.center}>
-              <ErrorState title={`Can't show ${title}`} message={error} onRetry={() => setAttempt((n) => n + 1)} />
-            </View>
-          </ThemeScope>
+          <View style={styles.cover}>
+            <ErrorState title={`Can't show ${title}`} message={error} onRetry={() => setAttempt((n) => n + 1)} />
+          </View>
         ) : null}
       </View>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#111" },
-  bar: { height: 60, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 16 },
-  title: { flex: 1, color: "#dcdcdc", fontSize: 16 },
-  pill: { backgroundColor: "#1f1f1f", paddingHorizontal: 16, paddingVertical: 8, borderRadius: 999 },
-  pillOn: { backgroundColor: colors.blue },
-  done: { backgroundColor: colors.accent },
-  pillText: { color: colors.text, fontSize: 15 },
-  pillTextOn: { color: "#fff", fontSize: 15, fontWeight: "600" },
-  close: { padding: 8 },
-  closeText: { color: colors.textDim, fontSize: 20 },
-  ask: { color: colors.textDim, paddingHorizontal: 16, paddingBottom: 10 },
-  view: {
-    flex: 1,
-    marginHorizontal: 16,
-    marginBottom: 16,
-    borderRadius: 12,
-    overflow: "hidden",
-    backgroundColor: "#000",
-  },
-  center: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, alignItems: "center", justifyContent: "center", padding: 24 },
-  msg: { color: colors.textDim, textAlign: "center", marginTop: 16 },
-  placeholder: { maxWidth: 420, aspectRatio: 16 / 10 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: { flex: 1, backgroundColor: t.c.bg },
+    bar: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: t.space.lg },
+    title: { flex: 1, color: t.c.text, ...type(t, "md"), fontWeight: t.font.weight.medium },
+    pill: k.btn,
+    pillOn: k.primary,
+    pillText: k.btnText,
+    pillTextOn: { ...k.btnText, ...k.primaryText },
+    disabled: k.disabled,
+    close: { padding: t.space.sm },
+    closeText: { color: t.c.textMuted, fontSize: 20 },
+    ask: { color: t.c.textMuted, ...type(t, "md"), paddingHorizontal: t.space.lg, paddingBottom: 10 },
+    view: {
+      flex: 1,
+      marginHorizontal: t.space.lg,
+      marginBottom: t.space.lg,
+      borderRadius: t.radius.md,
+      overflow: "hidden",
+      // The remote display's letterbox, black in both schemes like the screen it frames.
+      backgroundColor: "#000",
+    },
+    cover: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, alignItems: "center", justifyContent: "center", padding: t.space.xl, backgroundColor: t.c.surface },
+    msg: { color: t.c.textMuted, textAlign: "center", marginTop: t.space.lg },
+    placeholder: { maxWidth: 420, aspectRatio: 16 / 10 },
+  });
 });
