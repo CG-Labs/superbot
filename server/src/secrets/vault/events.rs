@@ -10,7 +10,8 @@
 //! - Before the token it was made with is due, or when botd's token changes, and at least
 //!   hourly, a new subscription is opened before the old one is closed and read to its end,
 //!   so no event falls between them. When the old token may have stopped events early (botd
-//!   has a new one, or the renewal came after the token's time), everything is read again.
+//!   has a new one, or the new subscription opened at or after the old token's lease ran
+//!   out), everything is read again.
 //! - Each change is read again where it is applied, one after another, after the store's
 //!   epoch moves, so neither a read in flight nor the change's own can cache over a newer one.
 //!   A name changed again before it is read waits once; too many waiting make way for one
@@ -388,6 +389,9 @@ struct Subscribed {
     /// The token may be past its time by `due` (a lease shorter than `MIN_RESUBSCRIBE`), so
     /// the next subscription reads everything again.
     late: bool,
+    /// When that token's lease runs out, if known: a stream that outlives it may stop
+    /// delivering events without a word.
+    expires: Option<Instant>,
 }
 
 impl Inner {
@@ -398,8 +402,8 @@ impl Inner {
         for fresh in [file, true] {
             let token = self.token(fresh).await?;
             if let Some(io) = self.subscribe_with(&token, fresh).await? {
-                let (due, late) = self.due_for(&token).await;
-                return Ok(Subscribed { io, token, due, late });
+                let (due, late, expires) = self.due_for(&token).await;
+                return Ok(Subscribed { io, token, due, late, expires });
             }
         }
         unreachable!("the second pass returns")
@@ -444,18 +448,18 @@ impl Inner {
     /// When to subscribe again with a new token: before `token` is due, as botd logs in
     /// again (two thirds of the way through its lease), or two thirds of the way through a
     /// given token's TTL; within `MIN_RESUBSCRIBE` and `RESUBSCRIBE` from now. True when
-    /// that is later than the token allows.
-    async fn due_for(&self, token: &str) -> (Instant, bool) {
+    /// that is later than the token allows. Then when the token runs out, if known.
+    async fn due_for(&self, token: &str) -> (Instant, bool, Option<Instant>) {
         let now = Instant::now();
-        let due = match &self.cfg.auth {
+        let (due, expires) = match &self.cfg.auth {
             Auth::Token { .. } => match self.token_life(token, "auth/token/lookup-self", reqwest::Method::GET, None, true).await {
-                Ok(Some((ttl, _))) if ttl > 0 => Some(now + Duration::from_secs(ttl) * 2 / 3),
-                _ => None,
+                Ok(Some((ttl, _))) if ttl > 0 => (Some(now + Duration::from_secs(ttl) * 2 / 3), Some(now + Duration::from_secs(ttl))),
+                _ => (None, None),
             },
-            _ => self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|t| t.value.as_str() == token).and_then(|t| t.renew_at),
+            _ => self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|t| t.value.as_str() == token).map_or((None, None), |t| (t.renew_at, t.expires)),
         };
         let due = due.unwrap_or(now + RESUBSCRIBE);
-        (due.clamp(now + MIN_RESUBSCRIBE, now + RESUBSCRIBE), due < now + MIN_RESUBSCRIBE)
+        (due.clamp(now + MIN_RESUBSCRIBE, now + RESUBSCRIBE), due < now + MIN_RESUBSCRIBE, expires)
     }
 
     /// Whether botd still uses `token`: when it has a new one (Vault refused the old, or Vault
@@ -496,6 +500,7 @@ struct Stream {
     token: Zeroizing<String>,
     due: Instant,
     late: bool,
+    expires: Option<Instant>,
     /// Vault answered a ping on this stream, so from then on it must keep doing so.
     answers: bool,
     /// Since when a ping has waited for its answer.
@@ -522,7 +527,7 @@ impl Stream {
                 }
             }
         });
-        Stream { writer, rx, task, token: s.token, due: s.due, late: s.late, answers: false, waiting: None }
+        Stream { writer, rx, task, token: s.token, due: s.due, late: s.late, expires: s.expires, answers: false, waiting: None }
     }
 
     /// Sends a frame, within `WRITE_WAIT`: a peer that stops reading can't hold botd here.
@@ -614,6 +619,9 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                 End::Lost(why) => break why,
                 End::Due { catch_up } => match inner.subscribe().await {
                     Ok(new) => {
+                        // Opened only after the old token ran out (a slow login or Vault): its
+                        // stream may have gone quiet before the new one began.
+                        let catch_up = catch_up || stream.expires.is_some_and(|at| Instant::now() >= at);
                         std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await;
                         if catch_up {
                             log_info!("Vault: subscribed to change events with a new token; reading every cached secret again, as the old token may have stopped them early (ADR 0306).");
@@ -750,6 +758,8 @@ pub(crate) mod tests {
         pub status: AtomicUsize,
         /// Stops answering pings.
         pub silent: AtomicBool,
+        /// How long each subscription waits for its answer, in milliseconds.
+        pub delay_ms: AtomicUsize,
         pub pongs: AtomicUsize,
         /// Close frames botd sent.
         pub closes: AtomicUsize,
@@ -815,6 +825,9 @@ pub(crate) mod tests {
         let h = req.headers().clone();
         if let Err(e) = check(&f, &h) {
             return e.into_response();
+        }
+        if let ms @ 1.. = f.events.delay_ms.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(ms as u64)).await;
         }
         if let s @ 1.. = f.events.status.load(Ordering::SeqCst) {
             return axum::http::StatusCode::from_u16(s as u16).unwrap().into_response();
@@ -1183,6 +1196,35 @@ pub(crate) mod tests {
         assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "the old stream never broke");
         redact::forget("events-late-1");
         redact::forget("events-late-2");
+    }
+
+    #[test]
+    fn a_new_subscription_that_opens_after_the_old_token_ran_out_reads_everything_again() {
+        let (url, f) = stand_in();
+        // A 6 s login: botd subscribes again at 4 s, well past MIN_RESUBSCRIBE, so not late.
+        f.lease.store(6, Ordering::SeqCst);
+        put(&f, "bots/EVENTS_EXPIRED_TOKEN", "events-expired-1");
+        let x = store(&url, &[("VAULT_AUTH", "approle"), ("VAULT_ROLE_ID", "role-1"), ("VAULT_SECRET_ID", "secret-id-1")], "3600");
+        x.check().unwrap();
+        x.watch().unwrap();
+        assert_eq!(get(&x, "EVENTS_EXPIRED_TOKEN").as_deref(), Some("events-expired-1"));
+
+        // Vault is slow to take the new subscription: it opens at 6.5 s, after the old token
+        // ran out, though the new token (renewed at 8 s) isn't late.
+        f.events.delay_ms.store(2500, Ordering::SeqCst);
+        put(&f, "bots/EVENTS_EXPIRED_TOKEN", "events-expired-2");
+        let until = Instant::now() + Duration::from_secs(15);
+        while f.events.subscriptions.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f.events.delay_ms.store(0, Ordering::SeqCst);
+        wait_for(|| caught_up("EVENTS_EXPIRED_TOKEN"));
+        assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 2, "with the subscription that opened late, not a later one");
+        assert_eq!(get(&x, "EVENTS_EXPIRED_TOKEN").as_deref(), Some("events-expired-2"), "a change with no event, read again");
+        assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "the old stream never broke");
+        redact::forget("events-expired-1");
+        redact::forget("events-expired-2");
     }
 
     #[test]

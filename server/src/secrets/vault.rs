@@ -441,6 +441,8 @@ struct Token {
     value: Zeroizing<String>,
     /// When to log in again (AppRole, Kubernetes, JWT), before the lease runs out.
     renew_at: Option<Instant>,
+    /// When its lease runs out, if it has one.
+    expires: Option<Instant>,
 }
 
 struct Inner {
@@ -594,14 +596,14 @@ impl Inner {
             return Ok(t.value.clone());
         }
         let t = match &self.cfg.auth {
-            Auth::Token { value: Some(v), .. } => Token { value: v.clone(), renew_at: None },
+            Auth::Token { value: Some(v), .. } => Token { value: v.clone(), renew_at: None, expires: None },
             Auth::Token { file: Some(path), .. } => {
                 let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| unavailable("VAULT_TOKEN_FILE", e))?);
                 let v = text.trim();
                 if v.is_empty() {
                     return Err(Error::Unavailable("Vault: VAULT_TOKEN_FILE is empty".into()));
                 }
-                Token { value: Zeroizing::new(v.to_string()), renew_at: None }
+                Token { value: Zeroizing::new(v.to_string()), renew_at: None, expires: None }
             }
             Auth::Token { .. } => return Err(Error::Unavailable("Vault: no token".into())),
             Auth::AppRole { mount, role_id, secret_id } => {
@@ -739,8 +741,10 @@ impl Inner {
             let value = v["auth"]["client_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable(format!("Vault: {what} gave no token")))?;
             // Log in again two thirds of the way through the lease, so a token never lapses mid-run.
             let lease = v["auth"]["lease_duration"].as_u64().unwrap_or(0);
-            let renew_at = (lease > 0).then(|| Instant::now() + Duration::from_secs(lease) * 2 / 3);
-            Ok(Token { value: Zeroizing::new(value.to_string()), renew_at })
+            let now = Instant::now();
+            let renew_at = (lease > 0).then(|| now + Duration::from_secs(lease) * 2 / 3);
+            let expires = (lease > 0).then(|| now + Duration::from_secs(lease));
+            Ok(Token { value: Zeroizing::new(value.to_string()), renew_at, expires })
         }
         .await;
         let mut details = json!({ "method": method });
