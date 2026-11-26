@@ -1634,6 +1634,14 @@ mod tests {
         let gcp = vault(&[("VAULT_AUTH", "gcp")]);
         assert_eq!(by(&gcp, "GCE_METADATA_HOST").status, Status::Ok);
         assert_eq!(by(&gcp, "GCP_IAM_CREDENTIALS_ENDPOINT").host.as_deref(), Some("iamcredentials.googleapis.com"), "signJwt is botd's");
+        // ADR 0298: the instance identity types reach only the metadata services.
+        let gce = vault(&[("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce"), ("VAULT_GCP_CREDENTIALS", "service-account-key")]);
+        assert_eq!(by(&gce, "GCE_METADATA_HOST").status, Status::Ok);
+        assert!(gce.iter().all(|x| x.setting.as_deref() != Some("GCP_IAM_CREDENTIALS_ENDPOINT") && x.setting.as_deref() != Some("GCP_SERVICE_ACCOUNT_KEY")), "the metadata server makes the gce type's token: {gce:?}");
+        let ec2 = vault(&[("VAULT_AUTH", "aws"), ("VAULT_AWS_TYPE", "ec2"), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://imds.example.com"), ("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token")]);
+        assert_eq!(by(&ec2, "AWS_EC2_METADATA_SERVICE_ENDPOINT").host.as_deref(), Some("imds.example.com"));
+        assert!(ec2.iter().all(|x| x.setting.as_deref() != Some("AWS_ENDPOINT_URL_STS")), "the ec2 type uses no AWS keys: {ec2:?}");
+        assert!(vault(&[("VAULT_AUTH", "aws"), ("VAULT_AWS_TYPE", "ec2")]).iter().all(|x| x.area != Area::Secrets || x.setting.as_deref() == Some("VAULT_ADDR")), "IMDS's own address is link-local");
         let aws = vault(&[("VAULT_AUTH", "aws"), ("VAULT_AWS_REGION", "eu-west-2"), ("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token"), ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/botd")]);
         assert_eq!(by(&aws, "AWS_ENDPOINT_URL_STS").host.as_deref(), Some("sts.eu-west-2.amazonaws.com"));
         assert!(vault(&[("VAULT_AUTH", "aws")]).iter().all(|x| x.setting.as_deref() != Some("AWS_ENDPOINT_URL_STS")), "Vault sends the login's STS request, not botd");
