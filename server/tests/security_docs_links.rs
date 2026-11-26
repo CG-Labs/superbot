@@ -178,6 +178,10 @@ fn policies() -> PathBuf {
     pack().join("policies")
 }
 
+fn training() -> PathBuf {
+    pack().join("training")
+}
+
 /// The Markdown files directly in `dir`, sorted.
 fn markdown_in(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
@@ -194,6 +198,7 @@ fn every_link_in_the_security_pack_resolves() {
     let mut files = markdown_in(&pack());
     assert!(files.iter().any(|f| f.ends_with("README.md")), "docs/security/README.md indexes the pack");
     files.extend(markdown_in(&policies()));
+    files.extend(markdown_in(&training()));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links in docs/security:\n{}", bad.join("\n"));
 }
@@ -206,7 +211,7 @@ fn linked_from(index: &Path) -> HashSet<String> {
 
 #[test]
 fn the_index_links_every_page_of_the_pack() {
-    for (index, dir) in [(pack().join("README.md"), pack()), (policies().join("README.md"), policies())] {
+    for (index, dir) in [(pack().join("README.md"), pack()), (policies().join("README.md"), policies()), (training().join("README.md"), training())] {
         let linked = linked_from(&index);
         for file in markdown_in(&dir) {
             let name = file.file_name().unwrap().to_string_lossy().into_owned();
@@ -216,6 +221,7 @@ fn the_index_links_every_page_of_the_pack() {
         }
     }
     assert!(linked_from(&pack().join("README.md")).contains("policies/README.md"), "docs/security/README.md must link the policy set's index");
+    assert!(linked_from(&pack().join("README.md")).contains("training/README.md"), "docs/security/README.md must link the training's index");
 }
 
 /// The AICPA 2017 Trust Services Criteria the SOC 2 mapping covers: Security (CC1-CC9),
@@ -493,6 +499,44 @@ fn the_policy_set_is_complete_and_well_formed() {
         assert!(cited.contains(adr), "the data classification and retention policy must cite ADR {adr}");
     }
     assert!(linked_from(&policies().join("data-classification-and-retention.md")).contains("../data-flows.md"), "the data classification policy must link data flows");
+}
+
+/// The courses the information security policy requires, by the id the register's training
+/// records name (ADR 0312).
+const COURSES: &[(&str, &str)] = &[("security-awareness.md", "security-awareness"), ("secure-development.md", "secure-development")];
+
+#[test]
+fn the_training_courses_are_complete_and_well_formed() {
+    let ids = checklist_ids();
+    let index = fs::read_to_string(training().join("README.md")).expect("docs/security/training/README.md indexes the courses");
+    assert!(index.to_lowercase().contains("drafts, not adopted"), "the training index must say the courses are drafts until adopted");
+    let files: Vec<String> = markdown_in(&training()).iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).filter(|n| n != "README.md").collect();
+    assert_eq!(files, { let mut want: Vec<String> = COURSES.iter().map(|(f, _)| f.to_string()).collect(); want.sort(); want }, "the training folder holds exactly the courses the register checks");
+    for name in std::iter::once("README.md").chain(COURSES.iter().map(|(f, _)| *f)) {
+        let md = fs::read_to_string(training().join(name)).unwrap();
+        assert_eq!(certification_claims(&md), Vec::<usize>::new(), "{name} must not claim a certification (lines listed)");
+        assert_eq!(emails(&md), Vec::<String>::new(), "{name} must name roles, never people: no email addresses");
+        assert!(md.contains("not SOC 2 certified"), "{name} must say plainly that SuperBot is not certified");
+    }
+    for (name, id) in COURSES {
+        let md = fs::read_to_string(training().join(name)).unwrap();
+        let h = header(&md);
+        let field = |f: &str| h.get(f).unwrap_or_else(|| panic!("{name}: its header table needs a `{f}` row"));
+        assert_eq!(field("Course"), id, "{name}: its Course row is the id the register's training records use");
+        assert!(index.contains(&format!("`{id}`")), "the training index must give the id {id}");
+        assert!(OWNERS.contains(&field("Owner").as_str()), "{name}: owner `{}` must be one of {OWNERS:?}", field("Owner"));
+        assert!(field("Review").to_lowercase().contains("yearly"), "{name}: the policy says yearly");
+        let status = field("Status");
+        assert!(status.starts_with("Draft") || status.starts_with("Approved"), "{name}: status `{status}` must start with Draft or Approved");
+        for c in field("Controls").split(',').map(str::trim) {
+            assert!(ids.contains(c), "{name}: `{c}` isn't a row of the readiness checklist");
+        }
+        assert!(anchors(&md).iter().any(|a| a.ends_with("knowledge-check")), "{name} ends with a knowledge check");
+    }
+    let infosec = linked_from(&policies().join("information-security.md"));
+    for (name, _) in COURSES {
+        assert!(infosec.contains(&format!("../training/{name}")), "the information security policy's People section must link {name}");
+    }
 }
 
 #[test]
