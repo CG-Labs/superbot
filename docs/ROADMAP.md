@@ -285,6 +285,50 @@ No certification claims until audits complete.
 
 ---
 
+## Finish line
+
+The minimum left on each open roadmap issue for a credible Enterprise v1, as of 26 Nov 2026. Anything not named here is a follow-up for an issue of its own, not another slice of these. An issue whose row has no slices left is done once its owner action, if any, is taken; it can then be closed. Estimates are PR-sized slices.
+
+| Issue | Status | Remaining slices | Blocked on | Slices |
+|-------|--------|------------------|------------|--------|
+| [#11](https://github.com/CG-Labs/superbot/issues/11) EAS `projectId` | Not done: `app.json` still has the placeholder | Run `eas init` and commit the real project id | Owner: CG-Labs Expo account | 1 |
+| [#13](https://github.com/CG-Labs/superbot/issues/13) Approvals follow-ups | Done: all ten items in [the list](approvals-followups.md) | None | — | 0 |
+| [#29](https://github.com/CG-Labs/superbot/issues/29) Control plane | Done in code: Linode and Incus providers, enrollment, backups, restores onto another host | Run the host-loss drill on production hardware and save its record; move the rest of "Remaining on #29" to follow-ups | Owner: production Incus hosts (spend) | 1 |
+| [#30](https://github.com/CG-Labs/superbot/issues/30) Per-user isolation | Done on per-user machines, with the red-team suite in CI ([ADR 0145](adr/0145-locked-down-run-users-and-red-team.md)); on one server, screens are off under `ISOLATION=users` ([ADR 0037](adr/0037-per-user-unix-accounts.md)) | Per-user screens on one server and Docker Compose | — | 1 |
+| [#31](https://github.com/CG-Labs/superbot/issues/31) Billing v0 | Built, off until Stripe keys are set: limits, webhook, checkout, portal, metering, storage, resizing, emails, team seats | 1. Yearly and team-only prices at checkout. 2. Server admins change a team's plan in the console, and members still paying for a personal plan are emailed | Going live: Stripe keys and prices (owner) | 2 |
+| [#36](https://github.com/CG-Labs/superbot/issues/36) Push notifications | Built ([ADR 0080](adr/0080-client-push-notifications.md)) | None in code; check on a real phone once #11 and #38 are done | Owner: EAS project, APNs and FCM keys | 0 |
+| [#38](https://github.com/CG-Labs/superbot/issues/38) TestFlight and Play internal | Not started; `eas.json` has build profiles | EAS build and submit to TestFlight and Play internal | Owner: #11, Apple Developer and Play Console accounts | 1 |
+| [#41](https://github.com/CG-Labs/superbot/issues/41) Sales/security pack | Written in M3 ([pack](security/README.md)); silent on most M5 work | Refresh the architecture, access control, data flows and FAQ for native SAML, external secret stores, residency pins, the SIEM export and air-gapped installs | — | 1 |
+| [#42](https://github.com/CG-Labs/superbot/issues/42) Published plans | `/pricing` and `/api/plans` built ([ADR 0121](adr/0121-published-plans.md)) | 1. The licensed self-host plan on `/pricing`, linked from the public site. 2. Published prices checked against Stripe's | Real prices: owner decision ([still open](#still-open)) | 2 |
+| [#43](https://github.com/CG-Labs/superbot/issues/43) Managed substrate | Evaluated; [ADR 0120](adr/0120-managed-substrate.md) proposed | Accept or change ADR 0120 and update this roadmap | Owner decision on ADR 0120 | 1 |
+| [#44](https://github.com/CG-Labs/superbot/issues/44) Site and docs portal | Generator built, checked in CI, never published ([ADR 0119](adr/0119-public-site-and-docs-portal.md)) | 1. Publish the site to the chosen host and domain. 2. A sales contact and prices on the landing page | Owner: hosting, the docs domain's DNS, sales contact, prices | 2 |
+| [#45](https://github.com/CG-Labs/superbot/issues/45) Store production release | Not started | 1. Store listings: text, screenshots, privacy and data-safety answers, `eas submit` settings. 2. Submit and fix what review finds | Slice 2, owner: #38, store accounts, legal review of the privacy policy, a public privacy URL (#44) | 2 |
+| [#52](https://github.com/CG-Labs/superbot/issues/52) Full SAML | Delivered: the roadmap says nothing required is left | None | — | 0 |
+| [#53](https://github.com/CG-Labs/superbot/issues/53) Advanced RBAC | Delivered ([ADR 0272](adr/0272-advanced-rbac-delivered.md)) | None | — | 0 |
+| [#55](https://github.com/CG-Labs/superbot/issues/55) Vault integrations | Delivered: HashiCorp Vault, Azure Key Vault, GCP Secret Manager and AWS | None | — | 0 |
+| [#57](https://github.com/CG-Labs/superbot/issues/57) SOC 2 Type II | Tooling done: policies drafted, evidence bundles, register, samples, deficiency log | None in code; the owner work in "Remaining on #57" | Owner: approve policies, name role holders, screening and training, branch protection, a penetration test, the observation period, an auditor (spend) | 0 |
+| [#58](https://github.com/CG-Labs/superbot/issues/58) Data residency | Done for v1: pins, in-region models, reports, and each pinned person's data in their region's store | None; accounts by region is an XL change ([ADR 0321](adr/0321-events-about-a-pinned-person-in-their-store.md)) and becomes a follow-up | Owner: accept that cut; legal review of the [DPA residency annex](security/dpa-template.md#annex-iv-data-residency) | 0 |
+| [#59](https://github.com/CG-Labs/superbot/issues/59) Air-gapped self-host | Twenty slices merged; Compose rollback in review ([PR #389](https://github.com/CG-Labs/superbot/pull/389)) | 1. Merge PR #389. 2. Fix what the first tagged release's check finds | Slice 2, owner: make the ghcr.io packages public, tag the first release | 2 |
+| [#60](https://github.com/CG-Labs/superbot/issues/60) Support playbooks | Done in code (twenty slices) | None in code | Owner: contacts, TAMs and on-call rota | 0 |
+| Close-out | — | One docs PR: delivered notes for #52, #58 and #60 in this roadmap, with their follow-ups listed | — | 1 |
+
+**Totals.** 9 engineering-only slices: #30 (1), #31 (2), #41 (1), #42 (2), #45 (1), #59 (1), close-out (1). 8 slices blocked on the owner: #11, #29, #38, #43, #44 (2), #45, #59. And 10 owner actions with no code:
+
+1. A CG-Labs Expo account for `eas init` (#11; unblocks #36, #38, #45).
+2. Apple Developer and Play Console accounts, with APNs and FCM keys (#36, #38, #45).
+3. Production Incus hosts for the host-loss drill (#29, #57).
+4. A decision on ADR 0120 (#43).
+5. Tier names, prices and Stripe keys (#31, #42, #44).
+6. Hosting and DNS for the site, and a sales contact (#44).
+7. Legal review of the privacy policy and the DPA residency annex (#45, #58).
+8. Public ghcr.io packages and the first release tag (#59).
+9. The SOC 2 programme: people, policies, a penetration test, an auditor (#57).
+10. Support contacts, TAMs and the on-call rota (#60).
+
+Closing #13, #52, #53 and #55 needs nothing more; #36, #57, #58 and #60 close once their owner actions are done.
+
+---
+
 ## Now / next / later
 
 | Horizon | Focus |
