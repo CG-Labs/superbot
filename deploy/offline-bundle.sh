@@ -762,6 +762,10 @@ compose_downgrade_check() {
     return 0
   fi
   why=$(grep -oE 'made by a newer botd \([^)]*\)|botd [^ ;]+ ran on it last; this is [^ ;]+' <<<"$line" | sed -n 1p) || true
+  if [[ -z "$why" && "$line" == fail* ]]; then
+    warn "botd from $image can't use this stack's database: $(sed -E 's/^fail +database +//' <<<"$line")"
+    die "Nothing in the stack has changed: keep it on the image it runs, fix what botd support check says (docs/support/runbook-server-restore.md for a damaged database, docs/ops/master-key-rotation.md for a key), then check again: $0 check-compose --image $image"
+  fi
   if [[ -z "$why" ]]; then
     log "Database: no release newer than botd in $image has run on this stack's database (botd support check)"
     return 0
@@ -1010,7 +1014,7 @@ compose_key_check() {
 
 cmd_rollback_compose() {
   local dir=$COMPOSE_ROLLBACK_DIR identity="" rec format project image image_id taken archive sha cid now_project running configured have
-  local before after out rc newest kc doc="docs/ops/air-gapped.md#going-back-with-compose"
+  local before after out rc newest kc was_up doc="docs/ops/air-gapped.md#going-back-with-compose"
   local -a mount=() rargs=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1070,14 +1074,19 @@ cmd_rollback_compose() {
   log "Rollback point: $archive, taken $taken on $image (its newest audit event: ${newest:-unknown}); superbot-restore --check passed"
   before=$(pre_restores "$image") || die "Couldn't look in botd's data volume: $(compose_err). Nothing has changed"
 
+  # A stack stopped before this run may be stopped on data an earlier restore left half swapped.
+  was_up=$(stack ps -q botd 2>/dev/null) || was_up=""
   warn "Going back to $image: everything saved in this stack since $taken is lost"
-  stack stop >/dev/null 2>"$COMPOSE_ERR" || { stack start >/dev/null 2>&1 || true; die "docker compose stop failed: $(compose_err). Nothing has changed"; }
+  stack stop >/dev/null 2>"$COMPOSE_ERR" || { [[ -z "$was_up" ]] || stack start >/dev/null 2>&1 || true; die "docker compose stop failed: $(compose_err). Nothing has changed"; }
   rc=0
   SUPERBOT_IMAGE=$image stack run --rm --no-deps -T "${mount[@]}" botd superbot-restore "${rargs[@]}" - <"$dir/$archive" >/dev/null 2>"$COMPOSE_ERR" || rc=$?
   if [[ $rc -ne 0 ]]; then
     local why
     why=$(compose_err)
     after=$(pre_restores "$image") || after=""
+    if [[ "$after" == "$before" && -z "$was_up" ]]; then
+      die "The restore failed before it changed botd's data: $why. botd wasn't running before this run, so the stack stays stopped: if an earlier restore failed while it swapped the data in, the data from before is in the newest .pre-restore-* folder in botd's data volume. The rollback point is kept: fix the cause and run this again ($doc)"
+    fi
     if [[ "$after" == "$before" ]]; then
       stack start >/dev/null 2>"$COMPOSE_ERR" || die "The restore failed before it changed botd's data ($why), and the stack didn't start again: $(compose_err). Start it with docker compose start"
       die "The restore failed before it changed botd's data: $why. The stack runs again as it was, on $running. The rollback point is kept"

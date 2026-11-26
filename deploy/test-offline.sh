@@ -1087,6 +1087,10 @@ if grep -q "args=settings" "$CS/log"; then fail "settings were checked after a d
 support_says 0 'warn  database    plain, 1.0 MB (WAL 0 B), schema 80 of 80, integrity ok; last started by botd 0.3.0 at 2026-11-25; botd 0.3.0 ran on it last; this is 0.2.0'
 if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose passed an image older than the botd that ran on the stack last"; fi
 grep -Fq "is older than the release that last ran on this stack's database: botd 0.3.0 ran on it last; this is 0.2.0" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "an older release than the last one to run wasn't said"; }
+support_says 1 'fail  database    encrypted, and the master key doesn'"'"'t open it (wrong key)'
+if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose passed a database botd support check fails"; fi
+grep -Fq "botd from new:2 can't use this stack's database: encrypted, and the master key doesn't open it (wrong key)" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "a failed database check wasn't said"; }
+if grep -q "args=settings" "$CS/log"; then fail "settings were checked after the database check failed"; fi
 csays new:2 support 2 ""
 if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose passed when botd support check didn't finish"; fi
 grep -Fq "botd support check didn't finish in new:2 (status 2), so the stack's database wasn't checked" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "a support check that didn't finish wasn't said"; }
@@ -1235,6 +1239,12 @@ echo 1 >"$CS/restore_rc"
 if cstack rollback-compose --identity "$T/identity.txt" >"$T/rc.log" 2>&1; then fail "rollback-compose passed a failed restore"; fi
 grep -Fq "The restore failed before it changed botd's data: superbot-restore: could not unpack the archive. The stack runs again as it was, on new:2" "$T/rc.log" || { cat "$T/rc.log" >&2; fail "a restore that failed first didn't say so"; }
 { grep -Fqx "start opts=" "$CS/log" && [[ "$(cat "$CS/running")" == new:2 && -f "$RB/record" ]]; } || fail "a restore that failed first didn't start the stack again as it was, keeping the rollback point"
+cback
+mv "$CS/running" "$CS/stopped"
+if cstack rollback-compose --identity "$T/identity.txt" >"$T/rc.log" 2>&1; then fail "rollback-compose passed a failed restore of a stopped stack"; fi
+grep -Fq "botd wasn't running before this run, so the stack stays stopped" "$T/rc.log" || { cat "$T/rc.log" >&2; fail "a failed restore of a stopped stack didn't say it stays stopped"; }
+if grep -q "^start\|^up" "$CS/log"; then fail "a failed restore started a stack that was stopped before it, maybe on half-swapped data"; fi
+[[ -f "$RB/record" && -f "$CS/stopped" ]] || fail "a failed restore of a stopped stack didn't keep it stopped with the rollback point"
 cback
 touch "$CS/swaps"
 if cstack rollback-compose --identity "$T/identity.txt" >"$T/rc.log" 2>&1; then fail "rollback-compose passed a restore that failed while swapping"; fi
