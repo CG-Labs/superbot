@@ -49,7 +49,8 @@ pub const MAX_RULES_BYTES: u64 = 1 << 20;
 const SHOWN_LABELS: [&str; 7] = ["alertname", "severity", "job", "harness", "route_class", "provider", "tier"];
 
 /// The rule files `deploy/prometheus/` ships, expected loaded unless `--rules` names others.
-pub const SHIPPED: [(&str, &str); 10] = [
+pub const SHIPPED: [(&str, &str); 11] = [
+    ("superbot-audit-trail.rules.yml", include_str!("../../../../deploy/prometheus/superbot-audit-trail.rules.yml")),
     ("superbot-backup-encryption.rules.yml", include_str!("../../../../deploy/prometheus/superbot-backup-encryption.rules.yml")),
     ("superbot-backups.rules.yml", include_str!("../../../../deploy/prometheus/superbot-backups.rules.yml")),
     ("superbot-capacity.rules.yml", include_str!("../../../../deploy/prometheus/superbot-capacity.rules.yml")),

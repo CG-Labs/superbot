@@ -1,0 +1,58 @@
+# Audit trail alerts for botd (docs/adr/0322-runbooks-for-the-secrets-store-and-the-audit-trail.md):
+# the SIEM export and write-once archive (ADR 0122, ADR 0264), the daily check of the hash
+# chain, and RFC 3161 timestamps of its checkpoints (ADR 0149), from the metrics in
+# docs/ops/audit-export.md.
+#
+# Load it from prometheus.yml, next to the SLO rules:
+#   rule_files: ["/etc/prometheus/superbot-slo.rules.yml", "/etc/prometheus/superbot-audit-trail.rules.yml"]
+# Check it with: promtool check rules superbot-audit-trail.rules.yml
+#                promtool test rules superbot-audit-trail.rules.test.yml
+#
+# It assumes the scrape job is named "superbot" (as in deploy/README.md), and alerts per
+# instance and sink. Events wait in botd's database while a sink fails, so only a failed
+# chain check pages: the log may have been changed. docs/support/runbook-audit-trail.md
+# is what to do for each.
+
+groups:
+  - name: superbot-audit-trail-alerts
+    rules:
+      # After 3 failures in a row botd marks the sink failing, and retries until it takes events.
+      - alert: SuperBotAuditExportFailing
+        expr: max by (job, instance, kind, name) (superbot_audit_export_failing{job="superbot"}) == 1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Audit events aren't reaching a sink
+          description: "botd has failed to deliver audit events to its {{ $labels.kind }} sink for 15 minutes. They wait in its database and nothing is lost yet. botctl audit siem shows the last error. See docs/support/runbook-audit-trail.md#the-export-is-failing."
+
+      # A sink taken out of AUDIT_EXPORT (audit.export_stopped): from then on it gets nothing.
+      # For the hour after the newest stop, from its time in the audit log, so a restart doesn't
+      # raise it again. Not the count of stopped sinks: switching back to a stopped sink while
+      # taking out another leaves that flat.
+      - alert: SuperBotAuditSinkStopped
+        expr: time() - max by (job, instance) (superbot_audit_export_last_stop_timestamp_seconds{job="superbot"} > 0) < 3600
+        labels:
+          severity: ticket
+        annotations:
+          summary: An audit sink was taken out of the export
+          description: "botd started without a sink it was sending audit events to, so that SIEM or archive gets nothing from now on. Find who changed AUDIT_EXPORT and why; if nobody can say, treat it as a security incident. See docs/support/runbook-audit-trail.md#a-sink-was-stopped."
+
+      # A check of the hash chain failed (audit.verified): an event may have been changed.
+      - alert: SuperBotAuditChainCheckFailed
+        expr: sum by (job, instance) (increase(superbot_events_total{job="superbot",event="audit.verified",outcome="failure"}[1d])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: The audit log's hash chain check failed
+          description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; save an online copy of its database (botd database backup, not a plain copy of app.sqlite, whose newest events may still be in app.sqlite-wal), tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
+
+      # Checkpoints wait as pending while the TSA fails; they're stamped once it answers.
+      - alert: SuperBotAuditTimestampsFailing
+        expr: max by (job, instance) (superbot_audit_timestamp_failing{job="superbot"}) == 1
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: Audit checkpoints aren't being timestamped
+          description: "botd has failed to get RFC 3161 timestamps for its audit checkpoints for an hour; they wait and are stamped once the TSA answers. botctl audit chain shows the last error. See docs/support/runbook-audit-trail.md#timestamps-are-failing."

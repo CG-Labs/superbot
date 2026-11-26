@@ -849,14 +849,19 @@ fn stopped_records(app: &App) -> Vec<(Value, i64, i64)> {
         .collect()
 }
 
+/// The `audit.export_stopped` event with this id, while retention keeps it.
+fn stop_event(app: &App, event: i64) -> Option<AuditEvent> {
+    let filter = Filter { actions: vec!["audit.export_stopped".into()], after: Some(event - 1), before: Some(event + 1), ..Default::default() };
+    app.db.audit_events(&filter, 1, true).pop()
+}
+
 /// Sinks recorded as stopped and not set now, with when and why from their
 /// `audit.export_stopped` (ADR 0273); both null once retention has deleted it.
 fn stopped(app: &App, head: i64) -> Vec<Value> {
     stopped_records(app)
         .into_iter()
         .map(|(r, delivered, event)| {
-            let filter = Filter { actions: vec!["audit.export_stopped".into()], after: Some(event - 1), before: Some(event + 1), ..Default::default() };
-            let stop = app.db.audit_events(&filter, 1, true).pop();
+            let stop = stop_event(app, event);
             json!({
                 "kind": r["kind"], "name": r["name"], "sink": r["sink"], "delivered": delivered, "pending": (head - delivered).max(0), "stoppedEvent": event,
                 "stoppedAt": stop.as_ref().map(|e| e.at), "reason": stop.as_ref().map(|e| e.details["reason"].clone()),
@@ -1312,12 +1317,23 @@ pub async fn get(axum::extract::State(app): axum::extract::State<Arc<App>>) -> a
     axum::Json(status(&app, app.db.audit_head()))
 }
 
-/// How many sinks are recorded as stopped, whether export is on or off (ADR 0273); then
-/// how far behind each running sink is, labelled by its kind and, for a named sink, its
-/// name (ADR 0191), so several SIEMs of one kind are each a series.
+/// How many sinks are recorded as stopped, and when the newest of them stopped, whether
+/// export is on or off (ADR 0273, ADR 0322); then how far behind each running sink is,
+/// labelled by its kind and, for a named sink, its name (ADR 0191), so several SIEMs of
+/// one kind are each a series. The count alone can stay flat while one sink comes back
+/// and another stops at the same start; the time moves with every stop.
 pub fn render(app: &App, out: &mut String) {
+    let records = stopped_records(app);
     metrics::family(out, "superbot_audit_export_stopped_sinks", "gauge", "Sinks taken out of AUDIT_EXPORT and recorded as audit.export_stopped, until set again (ADR 0264).");
-    metrics::sample(out, "superbot_audit_export_stopped_sinks", &[], stopped_records(app).len() as f64);
+    metrics::sample(out, "superbot_audit_export_stopped_sinks", &[], records.len() as f64);
+    let last_stop = records.iter().filter_map(|&(_, _, event)| stop_event(app, event)).map(|e| e.at).max().unwrap_or(0);
+    metrics::family(
+        out,
+        "superbot_audit_export_last_stop_timestamp_seconds",
+        "gauge",
+        "When the newest sink still stopped was recorded as audit.export_stopped; 0 when none is, or retention has deleted its stop (ADR 0322).",
+    );
+    metrics::sample(out, "superbot_audit_export_last_stop_timestamp_seconds", &[], last_stop as f64 / 1000.0);
     let Some(xs) = app.audit_export.get() else { return };
     let head = app.db.audit_head();
     let views: Vec<(Vec<(&str, &str)>, Value)> = xs
@@ -1840,6 +1856,40 @@ pub(crate) mod tests {
         assert_eq!(stopped(&app, app.db.audit_head()).iter().filter(|s| s["kind"] == "syslog").count(), 0, "no longer stopped");
         open(&app, settings(&[("AUDIT_EXPORT", soc)]).unwrap()).unwrap();
         assert_eq!(changes().len(), c.len() + 1, "only retention's gap is recorded again: the stop is cleared");
+    }
+
+    #[test]
+    fn switching_back_to_a_stopped_sink_still_shows_the_new_stop() {
+        let app = crate::runner::test_app();
+        let metric = |name: &str| -> f64 {
+            let mut m = String::new();
+            render(&app, &mut m);
+            m.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok()).unwrap_or_else(|| panic!("{name} in {m}"))
+        };
+        let stops = || app.db.audit_events(&Filter { actions: vec!["audit.export_stopped".into()], ..Default::default() }, 10, true);
+        let (a, b) = ("a=https://a.example.net/in", "b=https://b.example.net/in");
+        assert_eq!((metric("superbot_audit_export_stopped_sinks"), metric("superbot_audit_export_last_stop_timestamp_seconds")), (0.0, 0.0));
+
+        open(&app, settings(&[("AUDIT_EXPORT", a)]).unwrap()).unwrap();
+        open(&app, settings(&[("AUDIT_EXPORT", b)]).unwrap()).unwrap();
+        let first = stops();
+        assert_eq!((first.len(), &first[0].details["name"]), (1, &json!("a")));
+        assert_eq!(metric("superbot_audit_export_stopped_sinks"), 1.0);
+        assert_eq!(metric("superbot_audit_export_last_stop_timestamp_seconds"), first[0].at as f64 / 1000.0);
+
+        // Back to a, taking b out at the same start: still one stopped, but a newer stop.
+        std::thread::sleep(Duration::from_millis(5));
+        open(&app, settings(&[("AUDIT_EXPORT", a)]).unwrap()).unwrap();
+        let now = stops();
+        let second = now.iter().find(|e| e.id != first[0].id).expect("b's stop");
+        assert_eq!((now.len(), &second.details["name"], second.at > first[0].at), (2, &json!("b"), true));
+        assert_eq!(metric("superbot_audit_export_stopped_sinks"), 1.0, "the count alone doesn't move");
+        assert_eq!(metric("superbot_audit_export_last_stop_timestamp_seconds"), second.at as f64 / 1000.0, "the time does");
+
+        // Once retention deletes the stop, there's no time to show.
+        app.db.execute_raw("DROP TRIGGER IF EXISTS audit_events_no_delete").unwrap();
+        app.db.execute_raw(&format!("DELETE FROM audit_events WHERE id = {}", second.id)).unwrap();
+        assert_eq!(metric("superbot_audit_export_last_stop_timestamp_seconds"), 0.0);
     }
 
     #[test]

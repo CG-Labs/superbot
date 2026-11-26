@@ -79,6 +79,11 @@ const RESTART_SECONDS: i64 = 600;
 const TOP: usize = 5;
 /// Audit failures and denials of one kind in the bundle's 7 days that make a warning.
 const AUDIT_WARN: u64 = 10;
+/// Recorded as a success when an admin takes a sink out of `AUDIT_EXPORT` (ADR 0264), but
+/// the SIEM gets nothing from then on, so triage counts every one.
+const STOPPED_SINK: &str = "audit.export_stopped";
+/// A failed check of the audit log's hash chain: the log may have been changed.
+const CHAIN_CHECKED: &str = "audit.verified";
 
 /// The reason codes only SAML sign-in gives (runbook-saml.md's reasons table). Codes both
 /// runbooks have (`not_linked`, `idp_error`, `wrong_audience`, `unknown_state`) go to the
@@ -787,6 +792,8 @@ fn audit_group(action: &str) -> (&'static str, &'static str, Option<&'static str
         "approval" => ("approvals", "approval failures", Some("support/runbook-approvals-stuck.md")),
         "harness" => ("harness", "harness failures", Some("support/runbook-harness-outage.md")),
         "license" => ("license", "license refusals", Some("support/runbook-license.md")),
+        "secret" => ("secrets", "secrets store failures", Some("support/runbook-secrets.md")),
+        "audit" => ("audit_trail", "audit trail failures and stopped sinks", Some("support/runbook-audit-trail.md")),
         "machine" | "isolation" if action != "machine.run_limited" => ("machines", "machine failures", Some("support/runbook-machine-down.md")),
         _ if matches!(action, "bot.run_refused" | "routine.run_refused" | "machine.run_limited" | "usage.token_limit_reached") => {
             ("run_limits", "runs refused or held to limits", Some("support/runbook-run-limits-egress.md"))
@@ -807,7 +814,8 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
     let mut groups: BTreeMap<&'static str, Group> = BTreeMap::new();
     for a in audit["byAction"].as_array().into_iter().flatten() {
         let Some(action) = str_at(a, "action") else { continue };
-        let bad: u64 = a["outcomes"].as_object().into_iter().flatten().filter(|(o, _)| o.as_str() != "success").filter_map(|(_, n)| n.as_u64()).fold(0u64, u64::saturating_add);
+        let counts = a["outcomes"].as_object().into_iter().flatten().filter(|(o, _)| action == STOPPED_SINK || o.as_str() != "success");
+        let bad: u64 = counts.filter_map(|(_, n)| n.as_u64()).fold(0u64, u64::saturating_add);
         if bad == 0 {
             continue;
         }
@@ -834,11 +842,12 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
         let mut reasons: Vec<(String, u64)> = g.reasons.into_iter().collect();
         reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let why = if reasons.is_empty() { String::new() } else { format!(" (newest reasons: {})", counted(&reasons[..reasons.len().min(TOP)])) };
-        let lvl = if total >= AUDIT_WARN && key != "other" { Level::Warn } else { Level::Info };
+        let chain_failed = key == "audit_trail" && actions.iter().any(|(a, _)| a == CHAIN_CHECKED);
+        let lvl = if (total >= AUDIT_WARN && key != "other") || key == "audit_trail" { Level::Warn } else { Level::Info };
         let mut f = Finding::new(
             format!("audit.{key}"),
             lvl,
-            None,
+            chain_failed.then_some(2),
             format!("{total} {} in the {days} days to {to}: {}{why}", g.what, counted(&actions[..actions.len().min(TOP)])),
             "audit-summary.json byAction, recentProblems",
         );
@@ -850,6 +859,14 @@ fn audit_rules(audit: &Value, out: &mut Vec<Finding>) {
         }
         if let Some(b) = g.book {
             f = f.runbook(b);
+        }
+        if key == "run_limits" && reasons.iter().any(|(r, _)| r == "secrets_unavailable") {
+            f = f.runbook("support/runbook-secrets.md#runs-refused");
+        }
+        if chain_failed {
+            f = f.runbook("support/runbook-audit-trail.md#the-chain-check-failed").next(
+                "A failed chain check can mean the audit log was changed: don't restart or restore yet, save an online copy with `botd database backup` (a plain copy of app.sqlite misses events still in app.sqlite-wal), and tell the security owner.",
+            );
         }
         out.push(f);
     }
@@ -1537,6 +1554,65 @@ mod tests {
         assert_eq!(audit_group("machine.restore_failed").0, "machines", "restores are the machine runbook's");
         assert_eq!(audit_group("scim.request_failed").2, Some("support/runbook-scim.md#reasons-and-fixes"));
         assert_eq!(audit_group("license.seat_refused").2, Some("support/runbook-license.md"));
+    }
+
+    #[test]
+    fn secrets_and_audit_trail_failures_have_runbooks() {
+        for action in ["secret.read", "secret.vault_login", "secret.backend_login", "secret.lease_issued", "secret.lease_renewed", "secret.vault_events", "secret.read_events_dropped"] {
+            assert_eq!(audit_group(action), ("secrets", "secrets store failures", Some("support/runbook-secrets.md")), "{action}");
+        }
+        for action in ["audit.export_failing", "audit.export_stopped", "audit.verified", "audit.timestamp_failing"] {
+            assert_eq!(audit_group(action).0, "audit_trail", "{action}");
+            assert_eq!(audit_group(action).2, Some("support/runbook-audit-trail.md"), "{action}");
+        }
+
+        let summary = |by: Value, problems: Value| json!({ "days": 7, "to": "2026-11-24T05:00:00Z", "byAction": by, "recentProblems": problems });
+        let export = summary(
+            json!([
+                { "action": "audit.export_failing", "total": 1, "outcomes": { "failure": 1 } },
+                { "action": "audit.export_stopped", "total": 1, "outcomes": { "success": 1 } },
+                { "action": "audit.export_started", "total": 1, "outcomes": { "success": 1 } },
+            ]),
+            json!([{ "action": "audit.export_failing", "outcome": "failure", "reason": "delivery_failed" }]),
+        );
+        let t = triage(&online(vec![("audit-summary.json", export)]), &opts()).unwrap();
+        let trail = find(&t, "audit.audit_trail");
+        assert_eq!(
+            trail.summary,
+            "2 audit trail failures and stopped sinks in the 7 days to 2026-11-24T05:00:00Z: audit.export_failing ×1, audit.export_stopped ×1 (newest reasons: delivery_failed ×1)",
+            "a stopped sink counts though it's recorded as a success"
+        );
+        assert_eq!((trail.level, trail.severity), (Level::Warn, None), "one is enough to warn; the SIEM is missing events, nothing is down");
+        assert_eq!(trail.runbooks, ["support/runbook-audit-trail.md"]);
+        assert!(!t.failed());
+
+        let broken = summary(
+            json!([{ "action": "audit.verified", "total": 2, "outcomes": { "success": 1, "failure": 1 } }]),
+            json!([{ "action": "audit.verified", "outcome": "failure", "reason": "contents" }]),
+        );
+        let t = triage(&online(vec![("audit-summary.json", broken)]), &opts()).unwrap();
+        let trail = find(&t, "audit.audit_trail");
+        assert_eq!((trail.level, trail.severity), (Level::Warn, Some(2)), "the log may have been changed");
+        assert_eq!(trail.runbooks, ["support/runbook-audit-trail.md", "support/runbook-audit-trail.md#the-chain-check-failed"]);
+        assert!(trail.next.as_deref().is_some_and(|n| n.contains("don't restart or restore") && n.contains("security owner")), "{trail:?}");
+        assert!(t.failed(), "suggests Severity 2");
+
+        let refused = summary(
+            json!([
+                { "action": "bot.run_refused", "total": 4, "outcomes": { "denied": 4 } },
+                { "action": "secret.read", "total": 9, "outcomes": { "success": 5, "failure": 4 } },
+                { "action": "secret.vault_login", "total": 1, "outcomes": { "failure": 1 } },
+            ]),
+            json!([{ "action": "bot.run_refused", "outcome": "denied", "reason": "secrets_unavailable" }]),
+        );
+        let t = triage(&online(vec![("audit-summary.json", refused)]), &opts()).unwrap();
+        assert_eq!(find(&t, "audit.run_limits").runbooks, ["support/runbook-run-limits-egress.md", "support/runbook-secrets.md#runs-refused"]);
+        let secrets = find(&t, "audit.secrets");
+        assert_eq!(secrets.summary, "5 secrets store failures in the 7 days to 2026-11-24T05:00:00Z: secret.read ×4, secret.vault_login ×1");
+        assert_eq!((secrets.level, secrets.severity, secrets.runbooks.clone()), (Level::Info, None, vec!["support/runbook-secrets.md"]));
+        let other = summary(json!([{ "action": "bot.run_refused", "total": 1, "outcomes": { "denied": 1 } }]), json!([{ "action": "bot.run_refused", "outcome": "denied", "reason": "tier_limit" }]));
+        let t = triage(&online(vec![("audit-summary.json", other)]), &opts()).unwrap();
+        assert_eq!(find(&t, "audit.run_limits").runbooks, ["support/runbook-run-limits-egress.md"], "only secrets_unavailable");
     }
 
     #[test]
