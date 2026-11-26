@@ -1,8 +1,8 @@
 import React from "react";
-import { Redirect, router } from "expo-router";
-import { StyleSheet, Text, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { Redirect } from "expo-router";
+import { StyleSheet, View } from "react-native";
 import { ServiceAccountsAdmin } from "../components/ServiceAccountsAdmin";
+import { RouteNotice, RouteScreen, useGoBack } from "../components/Shell";
 import { kit, Spinner } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { canSeeServiceAccounts } from "../src/serviceAccounts";
@@ -16,6 +16,7 @@ import { themedStyles } from "../src/theme";
  */
 export default function ServiceAccountsScreen() {
   const styles = useStyles();
+  const back = useGoBack();
   const { ready, api, me } = useSuperBot();
   if (!ready) {
     return (
@@ -25,30 +26,20 @@ export default function ServiceAccountsScreen() {
     );
   }
   if (!api) return <Redirect href="/" />;
-  const back = () => (router.canGoBack() ? router.back() : router.replace("/home"));
   return (
-    <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
+    <RouteScreen>
       {canSeeServiceAccounts(me) ? (
         <ServiceAccountsAdmin api={api} onBack={back} admin={isAdmin(me)} />
       ) : (
-        <View style={styles.denied}>
-          <Text style={styles.text}>You own no service accounts. Admins, and people whose role lets them manage users, make them.</Text>
-          <Text style={styles.link} onPress={back}>
-            Back to Bots
-          </Text>
-        </View>
+        <RouteNotice title="Service accounts" message="You own no service accounts. Admins, and people whose role lets them manage users, make them." onBack={back} />
       )}
-    </SafeAreaView>
+    </RouteScreen>
   );
 }
 
 const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
-    root: k.root,
     loading: k.center,
-    denied: k.center,
-    text: k.text,
-    link: k.link,
   });
 });

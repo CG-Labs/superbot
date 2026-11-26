@@ -276,6 +276,8 @@ impl Site<'_> {
             }
         }
         html::push_html(&mut r.html, events.into_iter().map(|(e, _)| e));
+        // Wide tables scroll sideways on small screens, so keyboards must be able to reach them.
+        r.html = r.html.replace("<table>", "<table tabindex=\"0\">");
         r
     }
 }
@@ -383,6 +385,13 @@ mod tests {
         assert_eq!(r.headings, ["Entra", "Setup", "Setup"]);
         assert_eq!(r.assets, [("docs/images/superbot-hero.png".to_string(), "docs/images/superbot-hero.png".to_string())]);
         assert!(r.text.contains("See"));
+    }
+
+    #[test]
+    fn tables_can_be_reached_by_keyboard() {
+        let repo = repo();
+        let r = site(&repo).render("docs/slo.md", "docs/slo.html", "# T\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+        assert!(r.html.contains(r#"<table tabindex="0">"#), "{}", r.html);
     }
 
     #[test]

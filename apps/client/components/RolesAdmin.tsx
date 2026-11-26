@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { ApiError, type SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import {
@@ -30,6 +30,7 @@ import {
 import { hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { AdminUser, BuiltInRole, CustomRole, RoleDraft, RoleGiving, RoleRequest, RolesView, Team } from "../src/types";
 import { Chips } from "./Chips";
+import { DetailSheet, PaneTransition } from "./Shell";
 import { kit, PageHeader, Spinner } from "./ui";
 
 interface Props {
@@ -720,19 +721,16 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
         </View>
         {wide ? (
           <ScrollView style={styles.detailPane} contentContainerStyle={styles.detailBody}>
-            {detail ?? <Text style={styles.empty}>Pick a role to see what it can do, or make a new one.</Text>}
+            <PaneTransition paneKey={picked ? `${picked.kind}:${"id" in picked ? picked.id : ""}` : ""}>
+              {detail ?? <Text style={styles.empty}>Pick a role to see what it can do, or make a new one.</Text>}
+            </PaneTransition>
           </ScrollView>
         ) : null}
       </View>
       {!wide ? (
-        <Modal visible={!!detail} animationType="slide" onRequestClose={() => setPicked(null)}>
-          <View style={styles.modalRoot}>
-            <Pressable style={styles.modalHeader} onPress={() => setPicked(null)} accessibilityRole="button">
-              <Text style={styles.back}>‹ Roles</Text>
-            </Pressable>
-            <ScrollView contentContainerStyle={styles.modalBody}>{detail}</ScrollView>
-          </View>
-        </Modal>
+        <DetailSheet visible={!!detail} onClose={() => setPicked(null)} backText="‹ Roles" backLabel="Back to roles">
+          {detail}
+        </DetailSheet>
       ) : null}
     </View>
   );
@@ -742,7 +740,6 @@ const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
     root: k.root,
-    back: k.backText,
     body: { flex: 1, flexDirection: "row" },
     listPane: { flex: 1, padding: t.space.md },
     listPaneWide: { width: 400, padding: t.space.md, backgroundColor: t.c.surface, borderRightWidth: hairline, borderRightColor: t.c.border },
@@ -799,8 +796,5 @@ const useStyles = themedStyles((t) => {
     dangerBtn: k.danger,
     dangerText: k.dangerText,
     disabled: k.disabled,
-    modalRoot: { flex: 1, backgroundColor: t.c.bg, paddingTop: t.space.xxl },
-    modalHeader: { ...k.header, minHeight: 0 },
-    modalBody: { padding: t.space.lg, paddingBottom: t.space.xxxl },
   });
 });
