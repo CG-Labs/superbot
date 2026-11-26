@@ -207,9 +207,9 @@ const useStyles = themedStyles((t) =>
       borderRightColor: t.c.border,
       paddingHorizontal: t.space.md,
       paddingTop: t.space.md,
-      flex: 1,
+      flexShrink: 0,
     },
-    sidebarCompact: { width: "100%", borderRightWidth: 0, backgroundColor: t.c.bg },
+    sidebarCompact: { flex: 1, width: "100%", borderRightWidth: 0, backgroundColor: t.c.bg },
     topRow: { flexDirection: "row", alignItems: "center", gap: t.space.xs, paddingLeft: t.space.sm },
     brand: { flex: 1, color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold, letterSpacing: -0.2 },
     iconBtn: {

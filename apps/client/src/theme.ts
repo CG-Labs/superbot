@@ -15,6 +15,8 @@ export interface Theme {
     size: typeof tokens.font.size;
     lineHeight: typeof tokens.font.lineHeight;
     weight: Record<keyof typeof tokens.font.weight, Weight>;
+    /** The web font stack; native apps use the system font. */
+    sans: string;
     mono: string;
   };
   shadow: typeof tokens.shadow.light;
@@ -34,6 +36,7 @@ function theme(scheme: Scheme): Theme {
       size: tokens.font.size,
       lineHeight: tokens.font.lineHeight,
       weight: tokens.font.weight as Record<keyof typeof tokens.font.weight, Weight>,
+      sans: tokens.font.sans,
       mono,
     },
     shadow: tokens.shadow[scheme],

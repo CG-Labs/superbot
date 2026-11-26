@@ -40,7 +40,7 @@ export function ModelBar({ botId, harness, model, effort, tier }: Props) {
     borderColor: t.c.border,
     padding: "5px 12px",
     fontSize: t.font.size.sm,
-    fontFamily: "inherit",
+    fontFamily: t.font.sans,
     outline: "none",
   } as const;
   const [models, setModels] = useState<ModelOption[]>([]);
