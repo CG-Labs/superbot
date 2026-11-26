@@ -2694,17 +2694,17 @@ pub(crate) mod tests {
     fn sp_metadata_says_which_subject_identifier_it_requires() {
         let sp = Sp { entity_id: SP, acs: ACS };
         let plain = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, None, Subject::NameId);
-        assert!(!plain.contains(SUBJECT_ID_REQ) && plain.contains(&format!("<md:NameIDFormat>{PERSISTENT}</md:NameIDFormat>")), "{plain}");
+        assert!(!plain.contains(SUBJECT_ID_REQ) && plain.contains(&format!("<md:NameIDFormat>{PERSISTENT}</md:NameIDFormat>")));
         for s in [Subject::SubjectId, Subject::PairwiseId] {
             let md = sp_metadata(&sp, None, &[], AesCbc::Off, ResponseBinding::Post, Some("https://bot.example.com/api/auth/sso/okta/discovery"), s);
             let doc = roxmltree::Document::parse(&md).unwrap();
             let kids = elements(doc.root_element());
-            assert!(is(kids[0], METADATA, "Extensions") && is(kids[1], METADATA, "SPSSODescriptor"), "the entity's Extensions come first: {md}");
+            assert!(is(kids[0], METADATA, "Extensions") && is(kids[1], METADATA, "SPSSODescriptor"), "the entity's Extensions come first");
             let attr = kids[0].descendants().find(|n| is(*n, ASSERTION, "Attribute")).unwrap();
             assert!(is(attr.parent().unwrap(), MDATTR, "EntityAttributes"));
             assert_eq!((attr.attribute("Name"), attr.attribute("NameFormat")), (Some(SUBJECT_ID_REQ), Some(ATTRNAME_URI)));
             assert_eq!(attr.children().filter(|c| c.is_element()).map(|v| v.text().unwrap()).collect::<Vec<_>>(), vec![s.as_str()]);
-            assert!(md.contains(&format!("<md:NameIDFormat>{TRANSIENT}</md:NameIDFormat>")) && !md.contains(PERSISTENT), "only for logout: {md}");
+            assert!(md.contains(&format!("<md:NameIDFormat>{TRANSIENT}</md:NameIDFormat>")) && !md.contains(PERSISTENT), "only for logout");
             assert!(md.contains("idpdisc:DiscoveryResponse"), "the role's own Extensions stay");
         }
     }
