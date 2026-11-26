@@ -48,7 +48,7 @@ botctl scim token create uni-b --sso uni --idp https://login.uni-b.example/idp/s
 ```
 
 - **One IdP per tenant.** Give each institution that provisions its own tenant. Without `--idp` the token is refused, as is an IdP the provider doesn't list (`SSO_<ID>_IDP_ENTITY_IDS`). A tenant's first token fixes its IdP with its SSO link; its other tokens take it.
-- **The IdP must send its NameID as `externalId`**: the persistent NameID it signs people in with (the value `botctl user link … --idp` would take).
+- **The IdP must send its NameID as `externalId`**: the persistent NameID it signs people in with (the value `botctl user link … --idp` would take). With [`SSO_<ID>_SUBJECT`](saml-native.md#subject-identifiers-subject-id-and-pairwise-id) set, it sends that attribute's value instead (like `8f2a91c4@uni.example`); another value is refused with `invalidValue`. Its scope is checked at sign-in, not here.
 - **Emails only at the IdP's domains.** An email the tenant sets must be at one of the domains the federation lists for its IdP (`shibmd:Scope`, exactly), as at sign-in; another is refused with `invalidValue`, naming the domains. Only a new email is checked, so a deactivation or `DELETE` never waits on the federation's MDQ server.
 - **A native SAML provider with one IdP** records it when the tenant is made, so the tenant keeps working when the provider lists more. A tenant made before IdPs were recorded has none: once its provider lists several, name it with a new token (`botctl scim token create <tenant> --sso <provider> --idp <entity ID>`), which sets it for all the tenant's tokens.
 

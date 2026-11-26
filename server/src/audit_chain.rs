@@ -171,12 +171,12 @@ pub fn insert_with(c: &Connection, cols: &[(&str, Sql)], hook: impl FnOnce(&Conn
         _ => None,
     };
     let (kind, actor, behalf, target_type, target) = (text("actor_kind"), text("actor_id"), text("on_behalf_of"), text("target_type"), text("target_id"));
-    let person = crate::db::audit_person(kind.as_deref(), actor.as_deref(), behalf.as_deref(), target_type.as_deref(), target.as_deref());
+    let people = crate::db::audit_people(kind.as_deref(), actor.as_deref(), behalf.as_deref(), target_type.as_deref(), target.as_deref());
     // A pinned person's details go to their region's store; the row keeps its seal (ADR 0316).
-    let store = crate::db::audit_store_for(c, person)?;
+    let store = crate::db::audit_store_for(c, &people)?;
     let mut values = fixed;
-    match (store, person) {
-        (Some((region, schema)), Some(person)) => {
+    match store {
+        Some((person, region, schema)) => {
             values.extend(ERASABLE.iter().map(|n| if *n == "details" { Sql::Text(crate::db::audit_placeholder(&region)) } else { Sql::Null }));
             values.extend([Sql::Text(s.prev), Sql::Text(s.hash), Sql::Null, Sql::Text(s.digest)]);
             c.execute(&format!("INSERT INTO main.audit_events ({}) VALUES ({marks})", names.join(", ")), rusqlite::params_from_iter(values))?;

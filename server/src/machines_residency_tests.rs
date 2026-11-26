@@ -714,7 +714,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
     assert!(md.contains("## Chats") && md.contains("- **Messages in it:** 3"), "{md}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true, "auditAbout": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
     assert_eq!(lon_row["chatStore"]["messages"].as_i64(), Some(3), "{regions}");
@@ -765,7 +765,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
     assert_eq!(
         me["chats"],
-        json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true }),
+        json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true, "auditAbout": true }),
         "the move is done; only old backups are left: {me}"
     );
 
@@ -790,7 +790,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert!(!r["warnings"].to_string().contains("backups of gb-lon's chat store"), "{r}");
     assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()));
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true, "auditAbout": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(!regions["residency"]["warnings"].to_string().contains("may still hold the rows"), "{regions}");
 }
@@ -1306,9 +1306,15 @@ async fn a_pinned_persons_audit_details_are_kept_in_their_regions_chat_store_and
     // A pin moves her events' details into London's store, audited; the log reads them whole and still verifies.
     assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
     let held = count();
-    assert!(held >= 1, "{held}");
+    assert!(held >= 2, "{held}");
     let moved = audit(port, &admin, chat_stores::MOVED).await;
-    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["auditEvents"].as_i64()), (Some("gb-lon"), Some(held)), "{moved:?}");
+    // And the admin's pin, an event about her, is written there after the move (ADR 0321).
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["auditEvents"].as_i64()), (Some("gb-lon"), Some(held - 1)), "{moved:?}");
+    let pinned = audit(port, &admin, "user.residency_pinned").await;
+    let id = pinned[0]["id"].as_i64().unwrap();
+    assert_eq!(pinned[0]["targetId"].as_str(), Some(ada.as_str()), "{pinned:?}");
+    let kept_for: String = rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT user_id FROM audit_details WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert_eq!(kept_for, ada);
     acted("192.0.2.82");
     assert_eq!(count(), held + 1, "new ones are written there");
     let read = audit(port, &admin, "bot.updated").await;
@@ -1321,9 +1327,10 @@ async fn a_pinned_persons_audit_details_are_kept_in_their_regions_chat_store_and
     let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
     assert_eq!((r["status"].as_str(), r["chats"]["auditEvents"]["inStore"].as_i64(), r["chats"]["auditEvents"]["inServerDatabase"].as_i64()), (Some("kept"), Some(held + 1), Some(0)), "{r}");
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
-    assert!(md.contains(&format!("- **Audit events' details in it:** {}", held + 1)), "{md}");
+    // With the first report's own event, by the admin about her.
+    assert!(md.contains(&format!("- **Audit events' details in it:** {}", held + 2)), "{md}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"]["auditEvents"].as_bool(), Some(true), "{me}");
+    assert_eq!((me["chats"]["auditEvents"].as_bool(), me["chats"]["auditAbout"].as_bool()), (Some(true), Some(true)), "{me}");
 
     // Unpinned, they go back into botd's log, which reads and verifies as before.
     assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
