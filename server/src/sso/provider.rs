@@ -60,6 +60,8 @@ pub enum Kind {
     /// several of a federation's from its MDQ server (ADR 0282), one chosen at each sign-in;
     /// each person's identity is stored under the IdP that signed them in. With `every_idp`
     /// it is empty: every IdP in the federation's aggregate is, as of its last read (ADR 0308).
+    /// With several, `discovery` is the federation's discovery service, where people pick
+    /// their IdP instead of botd's chooser (ADR 0314).
     SamlSp {
         entity_ids: Vec<String>,
         every_idp: Option<EveryIdp>,
@@ -79,6 +81,7 @@ pub enum Kind {
         idp_initiated: IdpInitiated,
         authn_context: Option<AuthnContext>,
         freshness: Freshness,
+        discovery: Option<String>,
     },
 }
 
@@ -971,6 +974,14 @@ impl Provider {
     /// sign-in says which.
     pub fn several_idps(&self) -> bool {
         self.every_idp().is_some() || self.idps().len() > 1
+    }
+
+    /// Native SAML with several IdPs: the federation's discovery service, if set (ADR 0314).
+    pub fn discovery_service(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::SamlSp { discovery, .. } => discovery.as_deref(),
+            _ => None,
+        }
     }
 
     /// Native SAML: whether `entity_id` is one of the provider's IdPs. With every IdP of a

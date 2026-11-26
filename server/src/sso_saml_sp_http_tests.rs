@@ -3837,3 +3837,108 @@ async fn an_idps_missing_metadata_blocks_only_new_emails() {
     assert!(!sp.app.db.user(&bob).unwrap().active());
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn a_federations_discovery_service_picks_the_idp_and_botd_checks_the_pick() {
+    const DS: &str = "https://service.seamlessaccess.org/ds/";
+    let (sp, dir, _) = serve_federation(&[("DISCOVERY_URL", DS)], 2).await;
+    let get = |path: String| {
+        let port = sp.port;
+        async move { crate::tests::call_with(port, "GET", &path, "", "", "").await }
+    };
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+    let back = format!("http://127.0.0.1:{}/api/auth/sso/{}/discovery", sp.port, sp.id);
+    let bob = sp.app.db.create_user(None, Some("bob@uni-b.example"), "Bob", Role::Member).unwrap();
+    sp.app.db.link_identity(&bob.id, &NewIdentity { provider: &sp.id, issuer: IDP_B, subject: STORED, tenant: None, email: None, created_by: Some("test") }).unwrap();
+
+    // No IdP yet: off to the service as this SP, to come back with the app's own parameters.
+    let verifier = "v".repeat(64);
+    let app = format!("session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-1&label=Phone", s256(&verifier));
+    let (code, head, _) = get(format!("/api/auth/sso/{}/start?{app}", sp.id)).await;
+    assert_eq!((code, header(&head, "cache-control").as_deref()), (303, Some("no-store")), "{head}");
+    assert!(set_cookies(&head).is_empty(), "no binder before an IdP is picked: {head}");
+    let to_ds = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+    assert_eq!(format!("{}://{}{}", to_ds.scheme(), to_ds.host_str().unwrap(), to_ds.path()), DS);
+    let q: Vec<(String, String)> = to_ds.query_pairs().into_owned().collect();
+    let carried = format!("challenge={}&label=Phone&redirect=superbot%3A%2F%2Fauth&session=token&state=st-1", s256(&verifier));
+    assert_eq!(q, [("entityID".into(), sp.entity()), ("return".into(), format!("{back}?{carried}"))], "nothing passive, nothing else");
+
+    // An IdP this provider doesn't take: refused at the start, as from the chooser (first: failures
+    // after it are audited behind it).
+    let (code, head, _) = get(format!("/api/auth/sso/{}/discovery?entityID={}", sp.id, enc("https://idp.other.example"))).await;
+    assert_eq!(code, 303);
+    let (code, head, _) = get(header(&head, "location").unwrap()).await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_failed")));
+    assert_eq!((sp.last_failure().await["reason"].as_str(), sp.last_failure().await["entityId"].as_str()), (Some("unknown_idp"), Some("https://idp.other.example")));
+
+    // The service answers with B: on to B's start with the app's parameters, then B's own
+    // sign-in page, and only B's signed answer signs Bob in.
+    let (code, head, _) = get(format!("/api/auth/sso/{}/discovery?{carried}&entityID={}", sp.id, enc(IDP_B))).await;
+    let start_b = format!("/api/auth/sso/{}/start?{carried}&idp={}", sp.id, enc(IDP_B));
+    assert_eq!((code, header(&head, "location")), (303, Some(start_b.clone())));
+    let (code, head, _) = get(start_b).await;
+    assert_eq!(code, 303, "{head}");
+    let to_idp = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+    assert_eq!(format!("{}://{}{}", to_idp.scheme(), to_idp.host_str().unwrap(), to_idp.path()), "https://login.uni-b.example/saml/sso");
+    let q: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+    let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+    let request_id = request.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap();
+    let mut r = Response::new(&sp.acs(), &sp.entity(), request_id, db::now());
+    r.issuer = IDP.into();
+    let (code, to, _) = sp.post(Some(&r.posted()), Some(&q["RelayState"]), "").await;
+    assert_eq!((code, to.as_str()), (303, "superbot://auth?error=sso_failed&state=st-1"), "picked B: A's answer doesn't count");
+    let (code, head, _) = get(format!("/api/auth/sso/{}/discovery?{carried}&entityID={}", sp.id, enc(IDP_B))).await;
+    let (_, head, _) = get(header(&head, "location").unwrap()).await;
+    assert_eq!(code, 303);
+    let to_idp = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+    let q: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+    let request = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&STANDARD.decode(&q["SAMLRequest"]).unwrap()).unwrap()).unwrap();
+    let mut r = Response::new(&sp.acs(), &sp.entity(), request.split(" ID=\"").nth(1).unwrap().split('"').next().unwrap(), db::now());
+    from_b(&mut r);
+    let (code, to, _) = sp.post(Some(&r.posted()), Some(&q["RelayState"]), "").await;
+    assert!(code == 303 && to.starts_with("superbot://auth?code="), "{code} {to}");
+    let code_back: HashMap<_, _> = url::Url::parse(&to).unwrap().query_pairs().into_owned().collect();
+    let (status, res) = call(sp.port, "POST", "/api/auth/login", "", &json!({ "sso": code_back["code"], "verifier": verifier }).to_string()).await;
+    assert_eq!(status, 200, "{res}");
+    assert_eq!(serde_json::from_str::<Value>(&res).unwrap()["user"]["id"].as_str(), Some(bob.id.as_str()));
+
+    // The person gave up at the service: botd's own chooser, no script, each link a start at
+    // that IdP with the same parameters, never back to the service.
+    let (code, head, page) = get(format!("/api/auth/sso/{}/discovery?session=cookie", sp.id)).await;
+    assert_eq!((code, header(&head, "cache-control").as_deref()), (200, Some("no-store")), "{head}");
+    let csp = header(&head, "content-security-policy").unwrap();
+    assert!(csp.contains("form-action 'none'") && !csp.contains("script-src"), "{csp}");
+    assert!(page.contains(">Beta Institute<") && page.contains(">University A<") && !page.contains("<script"), "{page}");
+    assert!(page.contains(&format!("/api/auth/sso/{}/start?session=cookie&amp;idp={}", sp.id, enc(IDP_B))), "{page}");
+    assert_eq!(get(format!("/api/auth/sso/{}/discovery?session=cookie&entityID=", sp.id)).await.0, 200, "an empty answer is no answer");
+
+    // A provider that isn't there goes to its start, which says so.
+    let (code, head, _) = get("/api/auth/sso/nope/discovery?entityID=x".into()).await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/api/auth/sso/nope/start?idp=x")));
+
+    // Picked elsewhere (a portal's link, an IdP-initiated restart): no detour.
+    assert_eq!(sp.start_at(IDP).await.3, SSO_URL);
+
+    // Our metadata names where the service answers; the admin sees both.
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    assert!(md.contains(&format!(r#"<idpdisc:DiscoveryResponse xmlns:idpdisc="urn:oasis:names:tc:SAML:profiles:SSO:idp-discovery-protocol" Binding="urn:oasis:names:tc:SAML:profiles:SSO:idp-discovery-protocol" Location="{back}" index="0" isDefault="true"/>"#)), "{md}");
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((v["discoveryUrl"].as_str(), v["discoveryResponseUrl"].as_str()), (Some(DS), Some(back.as_str())));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn one_idp_publishes_no_discovery_response() {
+    let sp = serve(&[]).await;
+    let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
+    assert!(!md.contains("DiscoveryResponse"), "{md}");
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!((&v["discoveryUrl"], &v["discoveryResponseUrl"]), (&Value::Null, &Value::Null));
+    // A discovery service answering anyway goes to the start, which signs in at the one IdP.
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/discovery?entityID=https%3A%2F%2Fidp.other.example", sp.id), "", "", "").await;
+    assert_eq!(code, 303);
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &header(&head, "location").unwrap(), "", "", "").await;
+    assert!(code == 303 && header(&head, "location").unwrap().starts_with(SSO_URL), "{head}");
+}

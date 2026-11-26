@@ -1197,6 +1197,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/mfa/policy", put(mfa::put_policy))
         .route("/auth/sso", get(sso::list))
         .route("/auth/sso/{id}/start", get(sso::start))
+        .route("/auth/sso/{id}/discovery", get(sso::discovery))
         .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
         .route("/auth/sso/{id}/acs", post(sso::acs).get(sso::acs_get))
         .route("/auth/sso/{id}/metadata", get(sso::saml_metadata))
@@ -1832,11 +1833,11 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
 }
 
 /// `/api/auth/sso` (the list), `/api/auth/sso/{id}/start`, `/api/auth/sso/{id}/callback`, and native
-/// SAML's `/api/auth/sso/{id}/acs`, `/metadata`, `/slo`, `/slo/soap` and `/logout`: which one.
+/// SAML's `/api/auth/sso/{id}/acs`, `/metadata`, `/slo`, `/slo/soap`, `/logout` and `/discovery`: which one.
 fn sso_path(path: &str) -> Option<&str> {
     match path.strip_prefix("/api/auth/sso")? {
         "" => Some("list"),
-        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata" | "slo" | "slo/soap" | "logout")).map(|(_, step)| step),
+        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata" | "slo" | "slo/soap" | "logout" | "discovery")).map(|(_, step)| step),
     }
 }
 

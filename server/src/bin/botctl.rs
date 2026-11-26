@@ -2082,6 +2082,12 @@ fn saml_summary(v: &Value) -> String {
     } else {
         out += &format!("  IdP entity ID:            {}\n", s("idpEntityId"));
     }
+    if let Some(ds) = v["discoveryUrl"].as_str() {
+        out += &format!("  Discovery service:        {ds}\n");
+    }
+    if let Some(back) = v["discoveryResponseUrl"].as_str() {
+        out += &format!("  Discovery response URL:   {back}\n");
+    }
     let warnings = v["certificateWarnings"].as_array().map(Vec::as_slice).unwrap_or_default();
     if !warnings.is_empty() {
         out += "  Certificate warnings:\n";
@@ -4949,6 +4955,15 @@ mod tests {
         v["everyIdp"] = json!({ "idps": 900, "hidden": 3, "categories": ["https://refeds.org/sirtfi"] });
         let out = saml_summary(&v);
         assert!(out.contains("(900 now, 3 hidden from the chooser)") && out.contains("    Only those in category:  https://refeds.org/sirtfi\n"), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_the_discovery_service() {
+        let mut v = json!({ "provider": "fed", "label": "Fed", "idpEntityIds": ["https://a", "https://b"], "discoveryUrl": null, "discoveryResponseUrl": "https://bot.example.com/api/auth/sso/fed/discovery" });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Discovery response URL:   https://bot.example.com/api/auth/sso/fed/discovery\n") && !out.contains("Discovery service:"), "{out}");
+        v["discoveryUrl"] = json!("https://service.seamlessaccess.org/ds/");
+        assert!(saml_summary(&v).contains("  Discovery service:        https://service.seamlessaccess.org/ds/\n"));
     }
 
     #[test]
