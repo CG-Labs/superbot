@@ -290,10 +290,12 @@ impl ExternalStore {
     }
 
     fn list_from_backend(&self, scope: &Scope) -> Result<Vec<String>, Error> {
-        self.list_from_backend_at(scope, None)
+        self.list_from_backend_at(scope, None, false)
     }
 
-    fn list_from_backend_at(&self, scope: &Scope, index: Option<&str>) -> Result<Vec<String>, Error> {
+    /// With `seal`, the epoch moves as the answer is cached, under the same lock, so no list
+    /// that began before it can cache over it (`changed`).
+    fn list_from_backend_at(&self, scope: &Scope, index: Option<&str>, seal: bool) -> Result<Vec<String>, Error> {
         let target = Event::new(actor(), "secret.read").target("secret_folder", &scope.folder('/'));
         let mut details = self.details(scope, "list");
         let started = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
@@ -307,13 +309,21 @@ impl ExternalStore {
                 if self.epoch.load(std::sync::atomic::Ordering::SeqCst) == started {
                     cached.insert(scope.clone(), (Instant::now(), names.clone()));
                 }
+                if seal {
+                    self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 drop(cached);
                 details["names"] = json!(names.len());
                 audit(target.details(details));
                 Ok(names)
             }
             Err(e) => {
-                self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(scope);
+                let mut cached = self.names.lock().unwrap_or_else(|e| e.into_inner());
+                cached.remove(scope);
+                if seal {
+                    self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                drop(cached);
                 details["error"] = json!(e.kind());
                 audit(target.outcome(Outcome::Failure).details(details));
                 Err(e)
@@ -328,12 +338,13 @@ impl ExternalStore {
     fn fetch_at(&self, scope: &Scope, name: &str, index: Option<&str>) -> Result<Option<Zeroizing<String>>, Error> {
         let started = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let got = self.provider.read_at(scope.clone(), name, index);
-        self.took(scope, name, started, got)
+        self.took(scope, name, started, got, false)
     }
 
     /// What a read of `name` that began at `started` got: cached unless a refresh began
-    /// since, redacted, and audited.
-    fn took(&self, scope: &Scope, name: &str, started: u64, got: Result<Option<Zeroizing<String>>, Error>) -> Result<Option<Zeroizing<String>>, Error> {
+    /// since, redacted, and audited. With `seal`, the epoch moves as it is cached, under the
+    /// same lock, so no read that began before it can cache over it (`changed`).
+    fn took(&self, scope: &Scope, name: &str, started: u64, got: Result<Option<Zeroizing<String>>, Error>, seal: bool) -> Result<Option<Zeroizing<String>>, Error> {
         let key = (scope.clone(), name.to_string());
         let details = |found: Option<bool>, err: Option<&Error>| {
             let mut d = self.details(scope, "read");
@@ -356,13 +367,21 @@ impl ExternalStore {
                 if self.epoch.load(std::sync::atomic::Ordering::SeqCst) == started {
                     cached.insert(key, (Instant::now(), v.clone()));
                 }
+                if seal {
+                    self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 drop(cached);
                 audit(Event::new(actor(), "secret.read").target("secret", name).details(details(Some(v.is_some()), None)));
                 Ok(v)
             }
             Err(e) => {
                 // Fail closed: what was cached is dropped, not served past its time.
-                self.values.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                let mut cached = self.values.lock().unwrap_or_else(|e| e.into_inner());
+                cached.remove(&key);
+                if seal {
+                    self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                drop(cached);
                 audit(Event::new(actor(), "secret.read").target("secret", name).outcome(Outcome::Failure).details(details(None, Some(&e))));
                 Err(e)
             }
@@ -457,7 +476,7 @@ impl ExternalStore {
         let jobs: Vec<Job> = keys.into_iter().map(Job::Read).chain(folders.into_iter().map(Job::List)).collect();
         let done = parallel(&jobs, |job| match job {
             Job::Read((scope, name)) => Done::Read(self.fetch_at(scope, name, index)),
-            Job::List(scope) => Done::List(self.list_from_backend_at(scope, index)),
+            Job::List(scope) => Done::List(self.list_from_backend_at(scope, index, false)),
         });
 
         let mut entries = Vec::new();
@@ -492,9 +511,10 @@ impl ExternalStore {
     /// The backend announced a change to `name` in `scope` at `index` (ADR 0306): reads it
     /// again, from a backend that has seen the change. The answer replaces what was cached as
     /// a read would (audited, redacted, fail closed on an error), and the folder is listed
-    /// again at `index` too. Like a refresh, it moves the
-    /// epoch before reading, so neither a read already in flight nor this one can cache over
-    /// a newer answer. None when the store doesn't read that name there (another folder's,
+    /// again at `index` too. Like a refresh, it moves the epoch before reading, so neither a
+    /// read already in flight nor this one can cache over a newer answer; and again as it
+    /// caches, so a read that began meanwhile, perhaps from a standby that hasn't seen the
+    /// change, can't either. None when the store doesn't read that name there (another folder's,
     /// user folders off).
     pub fn changed(&self, scope: &Scope, name: &str, index: Option<&str>) -> Option<Refreshed> {
         if !scope.holds(name) || (scope.user_id().is_some() && !self.user_folders) {
@@ -505,8 +525,8 @@ impl ExternalStore {
         let old = self.values.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|(_, v)| v.clone());
         let at_startup = self.startup.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
         let got = self.provider.read_at(scope.clone(), name, index);
-        let now = self.took(scope, name, started, got);
-        let _ = self.list_from_backend_at(scope, index);
+        let now = self.took(scope, name, started, got, true);
+        let _ = self.list_from_backend_at(scope, index, true);
         Some(Refreshed::compared(name.to_string(), scope, old.as_ref(), at_startup.as_ref(), &now))
     }
 }
@@ -1579,9 +1599,34 @@ pub(crate) mod tests {
         assert_eq!(x.get("CH_TOKEN").unwrap().unwrap().expose(), "ch-newer-1", "the refresh's answer stays cached");
         assert_eq!(f.reads.load(Ordering::SeqCst), reads);
 
+        // Nor can a read that began while the change was reading, from a backend that hadn't
+        // seen it yet, and ended after it.
+        x.values.lock().unwrap().clear();
+        f.values.lock().unwrap().insert((Scope::Bots, "CH_TOKEN".into()), "ch-newest-1".into());
+        let (started, release) = f.pause_next();
+        let change = {
+            let x = Arc::clone(&x);
+            std::thread::spawn(move || x.changed(&Scope::Bots, "CH_TOKEN", None).unwrap().result)
+        };
+        started.recv().unwrap();
+        f.values.lock().unwrap().insert((Scope::Bots, "CH_TOKEN".into()), "ch-newer-1".into());
+        let (lagging, lagging_release) = f.pause_next();
+        let slow = {
+            let x = Arc::clone(&x);
+            std::thread::spawn(move || x.get("CH_TOKEN").unwrap().unwrap().expose().to_string())
+        };
+        lagging.recv().unwrap();
+        release.send(()).unwrap();
+        assert_eq!(change.join().unwrap(), Change::Found);
+        lagging_release.send(()).unwrap();
+        assert_eq!(slow.join().unwrap(), "ch-newer-1", "it gets what it read");
+        let reads = f.reads.load(Ordering::SeqCst);
+        assert_eq!(x.get("CH_TOKEN").unwrap().unwrap().expose(), "ch-newest-1", "but the change's answer stays cached");
+        assert_eq!(f.reads.load(Ordering::SeqCst), reads);
+
         assert!(x.changed(&Scope::Server, "CH_TOKEN", None).is_none(), "a name of another folder");
         assert!(x.changed(&user("ua1"), "CH_TOKEN", None).is_none(), "user folders off");
-        for v in ["ch-old-1", "ch-new-1", "ch-newer-1"] {
+        for v in ["ch-old-1", "ch-new-1", "ch-newer-1", "ch-newest-1"] {
             redact::forget(v);
         }
     }
