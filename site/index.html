@@ -4,10 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SuperBot · Your always-on AI team</title>
-  <meta name="description" content="SuperBot gives every person on your team their own always-on AI agents that work on a real computer. Routines, team bots, approvals and corporate single sign-on." />
-  <meta name="color-scheme" content="dark light" />
-  <meta name="theme-color" content="#171717" media="(prefers-color-scheme: dark)" />
-  <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+  <meta name="description" content="SuperBot gives every person on your team always-on AI agents that work on their own computer. Single sign-on, approvals, audit and self-hosting, even air-gapped." />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#faf9f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#1b1a19" media="(prefers-color-scheme: dark)" />
   <link rel="icon" type="image/svg+xml" href="/site/mark.svg" />
   <link rel="stylesheet" href="/site/site.css" />
 </head>
@@ -16,14 +16,14 @@
   <header class="top">
     <div class="wrap top-row">
       <a class="brand" href="/" aria-label="SuperBot home">
-        <span class="tile"><img src="/site/mark.svg" alt="" width="28" height="28" /></span>
+        <span class="tile"><img src="/site/mark.svg" alt="" width="24" height="24" /></span>
         <span>SuperBot</span>
       </a>
       <nav aria-label="Main">
         <ul class="nav">
-          <li class="nav-extra"><a href="#features">Features</a></li>
-          <li class="nav-extra"><a href="#how">How it works</a></li>
+          <li class="nav-extra"><a href="#computer">Product</a></li>
           <li class="nav-extra"><a href="#security">Security</a></li>
+          <li class="nav-extra"><a href="#self-host">Self-host</a></li>
           <li><a href="/app/">Sign in</a></li>
           <li><a class="btn btn-primary btn-small" href="/get-started">Get started</a></li>
         </ul>
@@ -32,26 +32,120 @@
   </header>
 
   <main id="main">
-    <section class="hero">
-      <div class="wrap hero-grid">
-        <div>
-          <p class="eyebrow">AI teammates with their own computer</p>
-          <h1>Your always-on AI team.</h1>
-          <p class="lede">SuperBot gives every person a team of AI agents that keep working when you don't. They work on their own always-on computer, so they can browse, write, run tools and finish real tasks, then hand back to you when they need a human.</p>
-          <div class="cta">
-            <a class="btn btn-primary" href="/get-started">Get started</a>
-            <a class="btn btn-ghost" href="/app/">Sign in</a>
-          </div>
-          <p class="fine">Per-user plans. Access is by approval while we onboard our first customers.</p>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wrap">
+        <p class="eyebrow">AI teammates with their own computer</p>
+        <h1 id="hero-title">Your <span class="nowrap">always-on</span> AI team.</h1>
+        <p class="lede">Every person gets AI agents that work on their own always-on computer. They browse, write, run tools and finish real tasks, then hand back to you when they need a human.</p>
+        <div class="cta">
+          <a class="btn btn-primary" href="/get-started">Get started</a>
+          <a class="link-arrow" href="/app/">Sign in</a>
         </div>
-        <div class="hero-art" aria-hidden="true">
-          <div class="window">
-            <div class="window-bar"><span></span><span></span><span></span></div>
-            <ul class="chat">
-              <li class="msg you">Every weekday at 8:00, brief me on our top accounts.</li>
-              <li class="msg bot"><img src="/site/mark.svg" alt="" width="22" height="22" /><span>Done. Routine "Morning brief" runs weekdays at 08:00. I'll post it here and flag anything that needs you.</span></li>
-              <li class="msg bot"><img src="/site/mark.svg" alt="" width="22" height="22" /><span>The vendor portal wants a sign-in. Can you take over my screen for a minute?</span></li>
+        <p class="fine">Per-user plans. Access is by approval while we onboard our first customers.</p>
+<!-- shared:shot:start -->
+        <div class="shot" aria-hidden="true">
+          <div class="shot-side">
+            <b>SuperBot</b>
+            <span class="shot-search">Search</span>
+            <span class="shot-bot on"><i class="dot"></i>Main Bot</span>
+            <span class="shot-bot"><i class="dot b"></i>Research</span>
+            <span class="shot-bot"><i class="dot c"></i>Reports</span>
+            <span class="shot-bot"><i class="dot d"></i>Ops</span>
+          </div>
+          <div class="shot-chat">
+            <p class="say-you">Every weekday at 8:00, brief me on our top accounts.</p>
+            <p class="say-bot"><img src="/site/mark.svg" alt="" width="24" height="24" /><span>Done. Routine "Morning brief" runs weekdays at 08:00. I'll post it here and flag anything that needs you.</span></p>
+            <p class="say-bot"><img src="/site/mark.svg" alt="" width="24" height="24" /><span>The vendor portal wants a sign-in. Can you take over my screen for a minute?</span></p>
+            <div class="say-ask">Send the weekly report to the finance channel?<span><i>Approve</i><i>Deny</i></span></div>
+            <div class="composer">Message Main Bot<b>↑</b></div>
+          </div>
+          <div class="shot-screen">
+            <div class="screen-label"><span>Main Bot's screen</span><span class="live">Live</span></div>
+            <div class="browser">
+              <div class="browser-bar"><i></i><i></i><i></i><u></u></div>
+              <div class="browser-body">
+                <span class="bar w8"></span>
+                <span class="bar w6"></span>
+                <span class="bar w4"></span>
+                <span class="tiles"><i></i><i></i><i></i><i></i></span>
+              </div>
+            </div>
+          </div>
+        </div>
+<!-- shared:shot:end -->
+      </div>
+    </section>
+
+<!-- shared:values:start -->
+    <section aria-label="Why SuperBot">
+      <div class="wrap values">
+        <div class="value" id="computer">
+          <div>
+            <p class="kicker">Your own computer</p>
+            <h2>An AI computer for every person</h2>
+            <p>Each person's agents work on their own always-on computer, with a real browser, a terminal and desktop apps. Watch the screen live, or take over when a site wants a sign-in.</p>
+            <ul class="ticks">
+              <li>Keeps working after you close the app</li>
+              <li>Watch live, or take over the screen</li>
+              <li>Kept apart from everyone else's</li>
             </ul>
+          </div>
+          <div class="value-art" aria-hidden="true">
+            <div class="panel">
+              <div class="panel-head">Your computer <small class="live">Always on</small></div>
+              <div class="apps">
+                <span><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3z" /></svg>Browser</span>
+                <span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M7 9l3 3-3 3M13 15h4" /></svg>Terminal</span>
+                <span><svg viewBox="0 0 24 24"><path d="M4 6a2 2 0 012-2h4l2 2h6a2 2 0 012 2v10a2 2 0 01-2 2H6a2 2 0 01-2-2z" /></svg>Files</span>
+                <span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>Desktop apps</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="value" id="security">
+          <div>
+            <p class="kicker">Enterprise ready</p>
+            <h2>Single sign-on and security, built in</h2>
+            <p>Sign in with your company account. Admins decide who can do what, risky actions wait for a person to approve them, and every action lands in the audit log.</p>
+            <ul class="ticks">
+              <li>Microsoft Entra ID, Google, GitHub, Apple, OpenID Connect and SAML 2.0</li>
+              <li>SCIM provisioning, with groups as teams</li>
+              <li>Roles, approvals and secrets encrypted at rest</li>
+            </ul>
+          </div>
+          <div class="value-art" aria-hidden="true">
+            <div class="panel">
+              <div class="signin">
+                <span>Continue with Microsoft Entra ID</span>
+                <span>Continue with Google</span>
+                <span>Continue with SAML</span>
+              </div>
+              <ul class="audit">
+                <li><span>Signed in</span><code>auth.login</code></li>
+                <li><span>Approval asked for</span><code>approval.requested</code></li>
+                <li><span>Approved by an admin</span><code>approval.approved</code></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="value" id="self-host">
+          <div>
+            <p class="kicker">Self-host</p>
+            <h2>Run it on your servers, even air-gapped</h2>
+            <p>SuperBot is open source. Install it on your own server with one script or Docker Compose, or from an offline bundle with no internet at all. Your data stays where you put it.</p>
+            <ul class="ticks">
+              <li>Any harness: Claude Code, Codex, Pi or Hermes Agent</li>
+              <li>Signed offline bundles for x86_64 and aarch64</li>
+              <li>Backups and restores, drilled in CI</li>
+            </ul>
+          </div>
+          <div class="value-art" aria-hidden="true">
+            <pre class="term"><span class="p">❯ </span>sudo bash install.sh --offline &lt;bundle&gt; \
+    --bundle-sha256 &lt;hex&gt; --domain &lt;name&gt; \
+    --tls-cert &lt;pem&gt; --tls-key &lt;pem&gt;
+<span class="c"># nothing is downloaded or built</span></pre>
           </div>
         </div>
       </div>
@@ -59,91 +153,95 @@
 
     <section id="features" class="band" aria-labelledby="features-title">
       <div class="wrap">
-        <h2 id="features-title">Built to do the work, not just talk about it</h2>
-        <ul class="features">
-          <li class="card">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
-            <h3>A real computer, always on</h3>
-            <p>Your agents work on an always-on server with real apps and a real browser. Each one gets its own screen, and you can watch or take over at any time.</p>
-          </li>
-          <li class="card">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="3" /><circle cx="17" cy="10" r="2.5" /><path d="M3 19c0-3 2.5-5 5-5s5 2 5 5M14 19c0-2.2 1.4-3.8 3-3.8s3 1.6 3 3.8" /></svg>
-            <h3>Personal and team bots</h3>
-            <p>Keep private bots for your own work, and share team bots so everyone builds on the same knowledge. You choose who can see and run each one.</p>
-          </li>
+        <div class="section-head">
+          <h2 id="features-title">Built to do the work, not just talk about it</h2>
+          <p class="lede">Everything a team needs to hand real work to AI and stay in charge of it.</p>
+        </div>
+        <ul class="grid">
           <li class="card">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></svg>
             <h3>Routines that run themselves</h3>
-            <p>Schedule briefings, reports, checks and follow-ups in plain words. Results land in your chat, and bots can ask each other for help.</p>
+            <p>Schedule briefings, reports, checks and follow-ups in plain words. Results land in your chat.</p>
+          </li>
+          <li class="card">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="3" /><circle cx="17" cy="10" r="2.5" /><path d="M3 19c0-3 2.5-5 5-5s5 2 5 5M14 19c0-2.2 1.4-3.8 3-3.8s3 1.6 3 3.8" /></svg>
+            <h3>Personal and team Bots</h3>
+            <p>Keep private Bots for your own work and share team Bots, choosing who can see and run each one.</p>
+          </li>
+          <li class="card">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 8h10M7 12h6" /><path d="M5 4h14a2 2 0 012 2v9a2 2 0 01-2 2h-6l-4 3v-3H5a2 2 0 01-2-2V6a2 2 0 012-2z" /></svg>
+            <h3>Bots that work together</h3>
+            <p>Bots ask each other for help, so a big job can be split across specialists.</p>
           </li>
           <li class="card">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z" /><path d="M9 12l2 2 4-4" /></svg>
-            <h3>You stay in control</h3>
-            <p>Risky actions wait for your approval. Every action is recorded in an audit log, and secrets are encrypted at rest.</p>
+            <h3>Approvals for risky actions</h3>
+            <p>Risky actions wait for a person. Approve or deny from the app, with a notification when one is waiting.</p>
+          </li>
+          <li class="card">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5" /><rect x="13" y="4" width="7" height="7" rx="1.5" /><rect x="4" y="13" width="7" height="7" rx="1.5" /><rect x="13" y="13" width="7" height="7" rx="1.5" /></svg>
+            <h3>Any agent harness</h3>
+            <p>Bring Claude Code, Codex, Pi or Hermes Agent, and pick the model and reasoning effort for each Bot.</p>
+          </li>
+          <li class="card">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="2" /><path d="M11 18h2" /></svg>
+            <h3>On web, iOS and Android</h3>
+            <p>One app on every device, with push notifications and an optional biometric lock.</p>
           </li>
         </ul>
       </div>
     </section>
 
-    <section id="how" aria-labelledby="how-title">
+    <section class="trust" aria-labelledby="trust-title">
       <div class="wrap">
-        <h2 id="how-title">How it works</h2>
-        <ol class="steps">
-          <li>
-            <span class="step-n" aria-hidden="true">1</span>
-            <h3>Request access</h3>
-            <p>Tell us about your team and what you'd like SuperBot to do. It takes about a minute.</p>
-          </li>
-          <li>
-            <span class="step-n" aria-hidden="true">2</span>
-            <h3>Get approved</h3>
-            <p>We review each request, set up your account and choose the right plan with you.</p>
-          </li>
-          <li>
-            <span class="step-n" aria-hidden="true">3</span>
-            <h3>Sign in</h3>
-            <p>Use your company account, or the one-time sign-in code we give you, on the web, desktop or mobile.</p>
-          </li>
-        </ol>
-      </div>
-    </section>
-
-    <section id="security" class="band" aria-labelledby="security-title">
-      <div class="wrap security">
-        <div>
-          <h2 id="security-title">Enterprise sign-in from day one</h2>
-          <p>Sign in with Microsoft Entra ID, Google, GitHub, Apple, any OpenID Connect provider, or SAML 2.0 through a broker. Roles, approvals and a full audit trail keep your admins in charge.</p>
-        </div>
-        <ul class="badges" aria-label="Supported sign-in providers">
-          <li>Microsoft Entra ID</li>
-          <li>Google</li>
-          <li>GitHub</li>
-          <li>Apple</li>
-          <li>OpenID Connect</li>
-          <li>SAML 2.0</li>
+        <h2 id="trust-title" class="sr-only">Security at a glance</h2>
+        <ul class="trust-row">
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z" /><path d="M9 12l2 2 4-4" /></svg><p><b>Single sign-on</b><span>Entra ID, Google, GitHub, Apple, OIDC and SAML 2.0</span></p></li>
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" /></svg><p><b>Audit trail</b><span>Every action recorded for admins to review</span></p></li>
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2" /><path d="M8 11V8a4 4 0 018 0v3" /></svg><p><b>Encrypted secrets</b><span>Bots' secrets are kept encrypted at rest</span></p></li>
+          <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.5 2.5H18v3.5l2.5 2.5-2.5 2.5V18h-3.5L12 20.5 9.5 18H6v-3.5L3.5 12 6 9.5V6h3.5z" /><path d="M9 12l2 2 4-4" /></svg><p><b>Signed releases</b><span>Images scanned, signed and attested</span></p></li>
         </ul>
       </div>
     </section>
+<!-- shared:values:end -->
 
     <section class="closing" aria-labelledby="closing-title">
       <div class="wrap">
-        <h2 id="closing-title">Put an AI team to work</h2>
-        <p>Request access and we'll be in touch to get you set up.</p>
-        <a class="btn btn-primary" href="/get-started">Get started</a>
+        <div class="closing-card">
+          <h2 id="closing-title">Put an AI team to work</h2>
+          <p>Request access and we'll be in touch to get you set up.</p>
+          <div class="cta"><a class="btn btn-primary" href="/get-started">Get started</a></div>
+        </div>
       </div>
     </section>
   </main>
 
   <footer class="foot">
-    <div class="wrap foot-row">
-      <span>&copy; SuperBot</span>
-      <nav aria-label="Footer">
-        <ul class="nav">
-          <li><a href="/app/">Sign in</a></li>
-          <li><a href="/get-started">Get started</a></li>
-          <li><a href="/console/">Admin console</a></li>
-        </ul>
-      </nav>
+    <div class="wrap">
+      <div class="foot-grid">
+        <div class="foot-about">
+          <a class="brand" href="/" aria-label="SuperBot home"><span class="tile"><img src="/site/mark.svg" alt="" width="24" height="24" /></span><span>SuperBot</span></a>
+          <p>AI teammates with their own computer.</p>
+        </div>
+        <nav aria-labelledby="foot-product">
+          <h2 id="foot-product">Product</h2>
+          <ul>
+            <li><a href="#computer">Your own computer</a></li>
+            <li><a href="#features">Features</a></li>
+            <li><a href="#security">Security</a></li>
+            <li><a href="#self-host">Self-host</a></li>
+          </ul>
+        </nav>
+        <nav aria-labelledby="foot-account">
+          <h2 id="foot-account">Account</h2>
+          <ul>
+            <li><a href="/get-started">Get started</a></li>
+            <li><a href="/app/">Sign in</a></li>
+            <li><a href="/console/">Admin console</a></li>
+          </ul>
+        </nav>
+      </div>
+      <div class="foot-base"><span>&copy; SuperBot</span></div>
     </div>
   </footer>
 </body>

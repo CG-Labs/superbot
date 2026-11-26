@@ -558,6 +558,8 @@ pub(crate) mod tests {
         f.pubsub.changed("SECRET_VERSION_ADD", "superbot-bots-GCP_EV_TOKEN");
         wait_for(|| get(&x, "GCP_EV_TOKEN").as_deref() == Some(new.as_str()));
         wait_for(|| f.pubsub.acked.lock().unwrap().len() == 4);
+        // Audited after the cache moves, so it can land a moment later.
+        wait_for(|| !refreshed("GCP_EV_TOKEN", "gcp-event").is_empty());
         assert_eq!(f.reads.load(Ordering::SeqCst) - reads, 1, "only the change is read, once; no request for the others");
         let ev = refreshed("GCP_EV_TOKEN", "gcp-event");
         assert_eq!(ev.len(), 1, "{ev:?}");
@@ -572,6 +574,7 @@ pub(crate) mod tests {
         f.pubsub.changed("SECRET_VERSION_ADD", "superbot-users-uev1-OPENAI_API_KEY");
         wait_for(|| get(&x, "GCP_EV_TOKEN").is_none());
         wait_for(|| x.user_get("uev1", "OPENAI_API_KEY").unwrap().unwrap().expose() == "gcp-ev-user-2");
+        wait_for(|| x.watch_status().unwrap().changes == 3);
         let w = x.watch_status().unwrap();
         assert_eq!((w.following, w.changes, w.catch_ups), (true, 3, 0));
         assert!(w.last_change_ms.is_some());
