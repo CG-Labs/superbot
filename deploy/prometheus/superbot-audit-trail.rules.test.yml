@@ -1,0 +1,101 @@
+# promtool test rules superbot-audit-trail.rules.test.yml
+rule_files:
+  - superbot-audit-trail.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A failing sink: a ticket after 15 minutes, per sink, and none once it recovers.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_audit_export_failing{job="superbot",instance="a:8080",kind="webhook"}'
+        values: '0x5 1x30 0x30'
+      - series: 'superbot_audit_export_failing{job="superbot",instance="a:8080",kind="datadog",name="dd"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SuperBotAuditExportFailing
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SuperBotAuditExportFailing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+              kind: webhook
+            exp_annotations:
+              summary: Audit events aren't reaching a sink
+              description: "botd has failed to deliver audit events to its webhook sink for 15 minutes. They wait in its database and nothing is lost yet. botctl audit siem shows the last error. See docs/support/runbook-audit-trail.md#the-export-is-failing."
+      - eval_time: 60m
+        alertname: SuperBotAuditExportFailing
+        exp_alerts: []
+
+  # A sink taken out: a ticket for the hour after, not for one stopped long before.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="a:8080"}'
+        values: '0x30 1x150'
+      - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="b:8080"}'
+        values: '1x180'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SuperBotAuditSinkStopped
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: SuperBotAuditSinkStopped
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: An audit sink was taken out of the export
+              description: "botd started without a sink it was sending audit events to, so that SIEM or archive gets nothing from now on. Find who changed AUDIT_EXPORT and why; if nobody can say, treat it as a security incident. See docs/support/runbook-audit-trail.md#a-sink-was-stopped."
+      - eval_time: 150m
+        alertname: SuperBotAuditSinkStopped
+        exp_alerts: []
+
+  # A failed chain check pages at once, from the counter's zero, and passing checks don't.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_events_total{job="superbot",instance="a:8080",event="audit.verified",outcome="failure"}'
+        values: '0x10 1x50'
+      - series: 'superbot_events_total{job="superbot",instance="a:8080",event="audit.verified",outcome="success"}'
+        values: '0+1x60'
+      - series: 'superbot_events_total{job="superbot",instance="b:8080",event="audit.verified",outcome="failure"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SuperBotAuditChainCheckFailed
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SuperBotAuditChainCheckFailed
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: The audit log's hash chain check failed
+              description: "A check of botd's audit log failed: an event may have been changed, removed or added. Don't restart or restore botd; copy app.sqlite, tell the security owner, and run botctl audit verify. See docs/support/runbook-audit-trail.md#the-chain-check-failed."
+
+  # Timestamps: a ticket after an hour of failing, none for a short outage.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_audit_timestamp_failing{job="superbot",instance="a:8080"}'
+        values: '0x5 1x30 0x10 1x90'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SuperBotAuditTimestampsFailing
+        exp_alerts: []
+      - eval_time: 110m
+        alertname: SuperBotAuditTimestampsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: Audit checkpoints aren't being timestamped
+              description: "botd has failed to get RFC 3161 timestamps for its audit checkpoints for an hour; they wait and are stamped once the TSA answers. botctl audit chain shows the last error. See docs/support/runbook-audit-trail.md#timestamps-are-failing."
