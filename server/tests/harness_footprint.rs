@@ -339,6 +339,8 @@ struct Measured {
     wall: Duration,
     result: String,
     text: String,
+    /// Each Bot's replies, in the order of `measure`'s `bots`.
+    replies: Vec<String>,
     model_calls: u64,
     usage: Usage,
     /// CPU seconds of the run's processes: what botd waited for, plus detached daemons.
@@ -399,17 +401,18 @@ fn measure(b: &Botd, bots: &[String], prompts: &[String]) -> Measured {
     let (own1, kids1) = botd_ticks(b);
     let tck = clk_tck();
     let detached: u64 = usage.detached_ticks.values().sum();
-    let mut texts = Vec::new();
+    let mut replies = Vec::new();
     for (id, before) in bots.iter().zip(befores) {
         let msgs = call(b, "GET", &format!("/api/bots/{id}/messages"), Value::Null);
         let fresh = msgs.as_array().map(|m| m[before.min(m.len())..].to_vec()).unwrap_or_default();
-        texts.extend(fresh.iter().filter(|m| m["role"] == "bot").map(|m| m["text"].as_str().unwrap_or_default().to_string()));
+        replies.push(fresh.iter().filter(|m| m["role"] == "bot").map(|m| m["text"].as_str().unwrap_or_default()).collect::<Vec<_>>().join("\n"));
     }
     let results: Vec<String> = finished.iter().map(|d| d["result"].as_str().unwrap_or_default().to_string()).collect();
     Measured {
         wall,
         result: results.join(","),
-        text: texts.join("\n"),
+        text: replies.iter().filter(|r| !r.is_empty()).cloned().collect::<Vec<_>>().join("\n"),
+        replies,
         model_calls: calls(b) - calls0,
         cpu_s: ((kids1 - kids0 + detached) as f64 / tck * 100.0).round() / 100.0,
         botd_cpu_s: ((own1 - own0) as f64 / tck * 100.0).round() / 100.0,
@@ -515,10 +518,14 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
         extra.push(call(&b, "POST", "/api/bots", body)["id"].as_str().unwrap().to_string());
     }
     let prompts: Vec<String> = extra.iter().map(|bot| typical(bot, 0)).collect();
+    // What the Bots whose run `i` left no marker replied.
+    let missed = |i: u64, m: &Measured| -> Vec<String> {
+        extra.iter().zip(&m.replies).filter(|(bot, _)| !proof.join(format!("{bot}-{i}.marker")).exists()).map(|(_, r)| r.clone()).collect()
+    };
     let together = measure(&b, &extra, &prompts);
-    let ran = extra.iter().filter(|bot| proof.join(format!("{bot}-0.marker")).exists()).count();
-    if ran != extra.len() {
-        broke.push(format!("{ran} of {} concurrent runs ran their command (results {})", extra.len(), together.result));
+    let failed = missed(0, &together);
+    if !failed.is_empty() {
+        broke.push(format!("{} of {} concurrent runs ran their command (results {}): {failed:?}", extra.len() - failed.len(), extra.len(), together.result));
     }
     println!("{harness}: {} at once: {:.2}s, peak PSS {:.0} MiB", s.concurrency, together.wall.as_secs_f64(), kib_mib(together.usage.peak_pss_kib));
     let new_bot_state = extra.iter().map(|bot| disk_bytes(&b.dir.join("data/bots").join(bot))).max().unwrap_or(0);
@@ -528,9 +535,9 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     // The same Bots again: the steady state, once each has run before.
     let prompts: Vec<String> = extra.iter().map(|bot| typical(bot, 1)).collect();
     let again = measure(&b, &extra, &prompts);
-    let ran = extra.iter().filter(|bot| proof.join(format!("{bot}-1.marker")).exists()).count();
-    if ran != extra.len() {
-        broke.push(format!("{ran} of {} concurrent warm runs ran their command (results {})", extra.len(), again.result));
+    let failed = missed(1, &again);
+    if !failed.is_empty() {
+        broke.push(format!("{} of {} concurrent warm runs ran their command (results {}): {failed:?}", extra.len() - failed.len(), extra.len(), again.result));
     }
     println!("{harness}: {} at once again: {:.2}s, peak PSS {:.0} MiB", s.concurrency, again.wall.as_secs_f64(), kib_mib(again.usage.peak_pss_kib));
 
