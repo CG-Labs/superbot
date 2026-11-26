@@ -9,7 +9,11 @@ name: change-evidence
 # restore drill CI ran last month with its step's result and time (ADR 0177).
 # The security owner copies the artifact to the evidence store before it expires. Run it by
 # hand for another period (whole UTC days; to is not included). Read access only: the
-# token can see the repository and nothing it does changes it.
+# token can see the repository and nothing it does changes it. The workflow's own token
+# can't see classic branch protection, so the bundle can't judge it against the change
+# management policy (ADR 0303); a CHANGE_EVIDENCE_TOKEN secret, a fine-grained token with
+# read-only Administration, Contents, Pull requests, Actions, Checks and Commit statuses,
+# is used for the change-management export instead when set.
 on:
   schedule:
     - cron: '17 4 1 * *'
@@ -50,7 +54,7 @@ jobs:
       - run: cargo build --locked --release --bin superbot-evidence
       - name: Export the period's changes
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.CHANGE_EVIDENCE_TOKEN || github.token }}
           FROM: ${{ inputs.from }}
           TO: ${{ inputs.to }}
         run: |

@@ -29,6 +29,8 @@ const DIRECT: &str = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
 const PUSHED_LATER: &str = "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0";
 /// A token the stand-in refuses Dependabot alerts to, as GitHub does without the permission.
 const NO_DEPENDABOT: &str = "test-token-no-dependabot-7c1d";
+/// A token the stand-in shows the ruleset's bypass list to, as GitHub does to its admins.
+const ADMIN: &str = "test-token-ruleset-admin-5e2b";
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -76,6 +78,14 @@ async fn github(State(m): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Res
         "/branches/main" => ok("branch-main.json"),
         "/branches/main/protection" => reply(403, fixture("protection-main.json"), None),
         "/rules/branches/main" => ok("rules-main.json"),
+        "/rulesets/42" => {
+            // GitHub shows who can bypass a ruleset only to those who can edit it.
+            let mut r: Value = serde_json::from_str(&fixture("ruleset-42.json")).unwrap();
+            if auth.as_deref() == Some(&format!("Bearer {ADMIN}")) {
+                r["bypass_actors"] = serde_json::json!([]);
+            }
+            reply(200, r.to_string(), None)
+        }
         "/pulls" => {
             assert_eq!((q["state"].as_str(), q["base"].as_str(), q["sort"].as_str(), q["direction"].as_str()), ("closed", "main", "updated", "desc"));
             match q.get("page").map(String::as_str) {
@@ -221,8 +231,10 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     assert!(out.contains("Merged without every required check passing: #101"), "{out}");
     assert!(out.contains("Commits without a merged pull request: d0d0d0d0d0d0"), "{out}");
     assert!(out.contains("Pushes, not pull request merges, to the branch: e0e0e0e0e0e0, d0d0d0d0d0d0"), "{out}");
+    assert!(out.contains("main's protection can't be judged against the change management policy with this token: it can't see whether administrators included."), "{out}");
 
     let requests = m.requests.lock().unwrap().clone();
+    assert_eq!(requests.iter().filter(|(u, _)| u.starts_with(&format!("{REPO}/rulesets/42"))).count(), 1, "each ruleset the rules come from is read once");
     assert!(requests.iter().all(|(_, auth)| auth.as_deref() == Some(&format!("Bearer {TOKEN}"))), "every request carries the token as a bearer");
     assert!(requests.iter().all(|(u, _)| !u.contains(TOKEN)), "never in a URL");
     assert!(!requests.iter().any(|(u, _)| u.contains("page=3")), "the page past the period isn't read");
@@ -253,7 +265,8 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
         String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap().to_string()
     };
     assert!(out.contains(&format!("Manifest SHA-256: {}", digest(b"manifest.json"))), "the printed digest is the manifest's");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64()), (Some("change-management"), Some(1)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64()), (Some("change-management"), Some(2)));
+    assert_eq!(manifest["protectionMeetsPolicy"], Value::Null);
     assert_eq!(manifest["period"], serde_json::json!({ "from": "2026-10-01", "to": "2026-11-01", "days": 31 }));
     assert_eq!(manifest["source"]["repository"], "example-org/example-repo");
     assert_eq!((manifest["source"]["tokenScopes"].as_str(), manifest["source"]["tokenCanWrite"].as_bool()), (Some("repo, read:org"), Some(true)));
@@ -263,7 +276,8 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     for f in manifest["files"].as_array().unwrap() {
         assert_eq!(f["sha256"].as_str().unwrap(), digest(f["name"].as_str().unwrap().as_bytes()), "{}", f["name"]);
     }
-    assert_eq!(manifest["files"][1]["checklist"], serde_json::json!(["CC3.4-1", "CC8.1-1", "CC8.1-2"]));
+    assert_eq!(manifest["files"][1]["checklist"], serde_json::json!(["CC3.4-1", "CC8.1-2"]), "CC8.1-1 isn't named while the protection can't be shown to meet the policy");
+    assert_eq!((manifest["files"][2]["criteria"].clone(), manifest["files"][2]["checklist"].clone()), (serde_json::json!([]), serde_json::json!([])));
 
     let prs = json(&folder, "pull-requests.json");
     let list = prs["pullRequests"].as_array().unwrap();
@@ -299,6 +313,14 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     assert_eq!((bp["summary"]["requiredApprovals"].as_u64(), bp["summary"]["forcePushesBlocked"].as_bool(), bp["summary"]["deletionsBlocked"].as_bool()), (Some(1), Some(true), Some(true)));
     assert_eq!((bp["classic"]["available"].as_bool(), bp["classic"]["status"].as_u64()), (Some(false), Some(403)), "a read-only token can't see classic protection; said so");
     assert!(bp["snapshotAt"].is_string());
+    let req = &bp["policy"]["requirements"];
+    assert_eq!(
+        ["requiredApproval", "requiredChecks", "forcePushesBlocked", "deletionsBlocked", "administratorsIncluded"].map(|k| req[k]["state"].as_str().unwrap()),
+        ["met", "met", "met", "met", "unknown"],
+        "the ruleset enforces each, but who can bypass it is hidden from this token"
+    );
+    assert_eq!((bp["policy"]["rulesets"][0]["id"].as_u64(), bp["policy"]["rulesets"][0]["bypassActors"].clone()), (Some(42), Value::Null));
+    assert_eq!(bp["exceptions"], serde_json::json!({ "notMet": [], "unseen": ["administratorsIncluded"], "bypass": [] }));
 
     let runs = json(&folder, "workflow-runs.json");
     assert_eq!(runs["total"], 3);
@@ -313,6 +335,20 @@ fn exports_merged_pull_requests_checks_protection_and_runs_as_a_checkable_bundle
     let o = export(&dir, &api, &[("GITHUB_TOKEN", TOKEN)], &["-o", "october.tar"]);
     assert!(!o.status.success() && text(&o).1.contains("october.tar"), "never over an existing file");
     assert_eq!(fs::read(dir.join("october.tar")).unwrap(), raw);
+
+    let o = export(&dir, &api, &[("GITHUB_TOKEN", ADMIN)], &["-o", "admin.tar"]);
+    let (out, err) = text(&o);
+    assert!(o.status.success(), "{out}\n{err}");
+    assert!(out.contains("main's protection meets the change management policy, as this token sees it."), "{out}");
+    let read = |file: &str| -> Value {
+        let o = Command::new("tar").args(["-xOf", "admin.tar", "--wildcards", &format!("*/{file}")]).current_dir(&dir).output().unwrap();
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    let manifest = read("manifest.json");
+    assert_eq!(manifest["protectionMeetsPolicy"], true);
+    assert_eq!(manifest["files"][1]["checklist"], serde_json::json!(["CC3.4-1", "CC8.1-1", "CC8.1-2"]));
+    assert_eq!((manifest["files"][2]["criteria"].clone(), manifest["files"][2]["checklist"].clone()), (serde_json::json!(["CC8.1"]), serde_json::json!(["CC8.1-1"])));
+    assert_eq!(read("branch-protection.json")["policy"]["rulesets"][0]["bypassActors"], serde_json::json!([]), "nobody can bypass it");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -417,6 +453,12 @@ fn the_monthly_workflow_reads_only() {
     assert!(wf.contains("--bin superbot-evidence"), "builds the exporter from this commit");
     assert!(wf.contains("superbot-evidence\" github ") && wf.contains("superbot-evidence\" vulnerabilities ") && wf.contains("superbot-evidence\" drills "), "exports all three bundles");
     assert!(wf.contains("GITHUB_TOKEN: ${{ github.token }}"), "uses the workflow's own token");
+    let tokens: Vec<&str> = wf.lines().map(str::trim).filter(|l| l.starts_with("GITHUB_TOKEN:")).collect();
+    assert!(
+        tokens.iter().all(|t| *t == "GITHUB_TOKEN: ${{ github.token }}" || *t == "GITHUB_TOKEN: ${{ secrets.CHANGE_EVIDENCE_TOKEN || github.token }}"),
+        "the workflow's own token, or the read-only one set for the change-management export: {tokens:?}"
+    );
+    assert_eq!(tokens.iter().filter(|t| t.contains("CHANGE_EVIDENCE_TOKEN")).count(), 1, "only the change-management export, which reads branch protection, takes it");
     let indent = |l: &str| l.len() - l.trim_start().len();
     let mut block: Option<usize> = None;
     let mut scripts = 0;
