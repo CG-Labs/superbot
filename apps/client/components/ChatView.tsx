@@ -18,7 +18,7 @@ import { isQueued, workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
 import { HARNESS_NAMES, hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { Message } from "../src/types";
-import { unsentFor } from "../src/unsent";
+import { unsentFor, type Unsent } from "../src/unsent";
 import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
 import { EmptyState } from "./EmptyState";
@@ -121,6 +121,24 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     };
   }, []);
 
+  /** The Bot whose failed send is back in the box, until the box is emptied. */
+  const restoredRef = useRef<string | null>(null);
+  /** Saves the box's failed words with their Bot again before they leave it. */
+  const keepRestored = (id: string, store: Unsent) => {
+    if (restoredRef.current !== id) return;
+    restoredRef.current = null;
+    const words = textRef.current;
+    if (!words || store.ended) return;
+    const saved = store.words[id];
+    store.words[id] = saved && saved !== words ? `${words}\n\n${saved}` : words;
+  };
+  const keepRef = useRef(keepRestored);
+  keepRef.current = keepRestored;
+  const edit = (value: string) => {
+    if (!value) restoredRef.current = null;
+    setText(value);
+  };
+
   useEffect(() => {
     if (!activeId) return;
     // Only into an empty box; otherwise it waits for the next visit or a Retry.
@@ -128,6 +146,8 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     const saved = store.words[activeId];
     if (saved && !textRef.current) {
       delete store.words[activeId];
+      restoredRef.current = activeId;
+      textRef.current = saved;
       setText(saved);
       // Back in the box, the words are sent from there; a Retry could send them twice.
       const retry = store.retries[activeId];
@@ -137,10 +157,18 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
       }
     }
     void load(activeId);
+    // Closing the chat or opening another Bot takes the words back, so they're neither lost nor sent to the wrong Bot.
+    return () => {
+      if (restoredRef.current !== activeId) return;
+      keepRef.current(activeId, store);
+      textRef.current = "";
+      setText("");
+    };
   }, [activeId, load]);
 
   useEffect(() => {
     if (prefill == null) return;
+    if (activeId) keepRestored(activeId, unsent);
     setText(prefill);
     inputRef.current?.focus();
     onPrefilled?.();
@@ -186,7 +214,10 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
       if (!mountedRef.current || shownRef.current !== id) store.words[id] = body;
       else
         setText((cur) => {
-          if (!cur) return body;
+          if (!cur) {
+            restoredRef.current = id;
+            return body;
+          }
           store.words[id] = body;
           return cur;
         });
@@ -197,7 +228,12 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
         onPress: () => {
           if (store.ended || store.retries[id] !== retry) return;
           delete store.retries[id];
-          if (mountedRef.current && shownRef.current === id) setText((cur) => (cur === body ? "" : cur));
+          if (mountedRef.current && shownRef.current === id)
+            setText((cur) => {
+              if (cur !== body) return cur;
+              restoredRef.current = null;
+              return "";
+            });
           if (store.words[id] === body) delete store.words[id];
           send(body, id, store);
         },
@@ -213,6 +249,7 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
       toast.dismiss(retry.toast);
     }
     if (unsent.words[bot.id] === body) delete unsent.words[bot.id];
+    restoredRef.current = null;
     setText("");
     send(body, bot.id);
   };
@@ -418,7 +455,7 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
                 placeholder={`Message ${bot.name}`}
                 placeholderTextColor={t.c.textFaint}
                 value={text}
-                onChangeText={setText}
+                onChangeText={edit}
                 onFocus={() => setComposing(true)}
                 onBlur={() => setComposing(false)}
                 multiline

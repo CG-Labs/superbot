@@ -269,6 +269,93 @@ describe("ChatView", () => {
     });
   });
 
+  describe("a failed message back in the box", () => {
+    const ui = (open = true) => (
+      <ToastProvider>{open ? <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} /> : null}</ToastProvider>
+    );
+    const failInBox = async (words = "Ship it") => {
+      const sendText = jest.fn().mockRejectedValueOnce(new TypeError("Network request failed")).mockResolvedValue(undefined);
+      mockCtx.sendText = sendText;
+      const view = await render(ui());
+      await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), words));
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue(words);
+      return { view, sendText };
+    };
+
+    it("survives closing the chat, and its Retry goes once it's back", async () => {
+      const { view } = await failInBox();
+      await view.rerender(ui(false));
+      expect(screen.getByRole("button", { name: "Retry" })).toBeOnTheScreen();
+      await view.rerender(ui(true));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    });
+
+    it("survives closing the chat as you edited it", async () => {
+      const { view } = await failInBox();
+      await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Ship it now"));
+      await view.rerender(ui(false));
+      await view.rerender(ui(true));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it now");
+
+      await view.rerender(ui(false));
+      await view.rerender(ui(true));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it now");
+    });
+
+    it("isn't sent twice when Retry is pressed after the chat closed", async () => {
+      const { view, sendText } = await failInBox();
+      await view.rerender(ui(false));
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Retry" })));
+      expect(sendText).toHaveBeenNthCalledWith(2, "Ship it", undefined, "b");
+
+      await view.rerender(ui(true));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("");
+    });
+
+    it("stays with its Bot when you open another, so it isn't sent there", async () => {
+      const { view, sendText } = await failInBox();
+      mockCtx.activeId = "a";
+      await view.rerender(ui());
+      expect(screen.getByLabelText("Message Ada")).toHaveDisplayValue("");
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+      expect(sendText).toHaveBeenCalledTimes(1);
+
+      mockCtx.activeId = "b";
+      await view.rerender(ui());
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    });
+
+    it("isn't kept once you clear the box", async () => {
+      const { view } = await failInBox();
+      await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), ""));
+      await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Something else"));
+      mockCtx.activeId = "a";
+      await view.rerender(ui());
+      expect(screen.getByLabelText("Message Ada")).toHaveDisplayValue("Something else");
+    });
+
+    it("comes back later when a suggested starter takes the box", async () => {
+      const { view } = await failInBox();
+      const withPrefill = (prefill: string | null) => (
+        <ToastProvider>
+          <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} prefill={prefill} onPrefilled={jest.fn()} />
+        </ToastProvider>
+      );
+      await view.rerender(withPrefill("Set up a routine to "));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Set up a routine to ");
+      await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), ""));
+      await view.rerender(withPrefill(null));
+      mockCtx.activeId = "a";
+      await view.rerender(withPrefill(null));
+      mockCtx.activeId = "b";
+      await view.rerender(withPrefill(null));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+    });
+  });
+
   it("keeps a failed message with its own Bot when you've moved to another", async () => {
     let fail!: (err: Error) => void;
     const sendText = jest
