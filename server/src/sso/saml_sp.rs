@@ -1731,6 +1731,14 @@ pub mod test_idp {
         xml.replacen("<md:KeyDescriptor", &format!("{ext}<md:KeyDescriptor"), 1)
     }
 
+    /// `xml` (an EntityDescriptor) with entity attributes, as a federation tags its IdPs
+    /// (ADR 0308): each `(name, value)` an `mdattr:EntityAttributes` attribute value.
+    pub fn with_categories(xml: &str, attrs: &[(&str, &str)]) -> String {
+        let attrs: String = attrs.iter().map(|(n, v)| format!(r#"<saml:Attribute Name="{n}"><saml:AttributeValue>{v}</saml:AttributeValue></saml:Attribute>"#)).collect();
+        let ext = format!(r#"<md:Extensions><mdattr:EntityAttributes xmlns:mdattr="{MDATTR}" xmlns:saml="{ASSERTION}">{attrs}</mdattr:EntityAttributes></md:Extensions>"#);
+        xml.replacen("<md:IDPSSODescriptor", &format!("{ext}<md:IDPSSODescriptor"), 1)
+    }
+
     pub const SLO_URL: &str = "https://idp.example/saml/slo";
 
     /// `xml` with an HTTP-Redirect SingleLogoutService added.

@@ -851,7 +851,7 @@ impl<T> Kept<'_, T> {
             return Ok(());
         }
         if self.seen.len() > MAX_EVERY {
-            return Err(bad(format!("the aggregate lists more than {MAX_EVERY} IdPs: name the ones wanted in SSO_<ID>_IDP_ENTITY_IDS, or fewer with SSO_<ID>_IDP_ENTITY_CATEGORIES")));
+            return Err(bad(format!("the aggregate lists more than {MAX_EVERY} IdPs: name the ones wanted in SSO_<ID>_IDP_ENTITY_IDS")));
         }
         match got {
             Ok(f) => {
@@ -1211,6 +1211,50 @@ mod tests {
         };
         assert_eq!(own(NOW + DAY), Ok(Some(NOW + DAY)));
         assert_eq!(own(NOW - 1), Err("expired"));
+    }
+
+    fn read_every(xml: &str) -> Result<Aggregate, String> {
+        read_each(xml.as_bytes(), Wanted::Every, &[anchor().cert()], NOW, |f| f).map_err(|e| match e {
+            Error::Refused(r) => r.reason.to_string(),
+            Error::Io(m) => format!("io: {m}"),
+        })
+    }
+
+    #[test]
+    fn every_saml_idp_of_an_aggregate_in_the_order_it_lists_them() {
+        let sp = entity("https://sp.member.example/sp", 0).replace("IDPSSODescriptor", "SPSSODescriptor");
+        let saml1 = entity("https://old.member.example/idp", 0).replacen(PROTOCOL, "urn:oasis:names:tc:SAML:1.1:protocol", 1);
+        let both = entity("https://both.member.example/idp", 0).replacen(PROTOCOL, &format!("urn:oasis:names:tc:SAML:1.1:protocol {PROTOCOL}"), 1);
+        let nested = format!(r#"<md:EntitiesDescriptor>{}</md:EntitiesDescriptor>"#, entity(B, 2).trim_start_matches(r#"<?xml version="1.0"?>"#));
+        let xml = signed_aggregate(&aggregate(&[sp, entity(A, 0), saml1, nested, both], NOW + DAY), anchor(), "#_agg");
+        let agg = read_every(&xml).unwrap();
+        assert_eq!((ids(&agg), agg.problems.len()), (vec![A, B, "https://both.member.example/idp"], 0), "SPs and SAML 1 IdPs aren't IdPs to sign in at");
+        assert_eq!(load(&agg.found[1]).unwrap().certs[0].sha256, signer(2).cert().sha256);
+        let mut seen = Vec::new();
+        let counted = read_each(xml.as_bytes(), Wanted::Every, &[anchor().cert()], NOW, |f| {
+            seen.push(f.entity_id.clone());
+            f.xml.len()
+        })
+        .unwrap();
+        assert_eq!((seen.len(), counted.found.iter().all(|&n| n > 0)), (3, true), "each handed over as it closes");
+
+        let twice = signed_aggregate(&aggregate(&[entity(A, 0), entity(B, 0), entity(A, 2)], NOW + DAY), anchor(), "#_agg");
+        let agg = read_every(&twice).unwrap();
+        assert_eq!((ids(&agg), &agg.problems[..]), (vec![B], &[(A.to_string(), "the aggregate lists it twice".to_string())][..]));
+        let changed = xml.replacen("https://idp.example/saml/sso", "https://evil.example/sso", 1);
+        assert_eq!(read_every(&changed).err().as_deref(), Some("bad_signature"), "nothing is used unless the whole aggregate verifies");
+    }
+
+    #[test]
+    fn at_most_max_every_idps() {
+        let mut take = |f: Found| f;
+        let mut kept = Kept { wanted: Wanted::Every, take: &mut take, found: Vec::new(), problems: Vec::new(), seen: HashSet::new() };
+        for i in 0..MAX_EVERY {
+            kept.add(format!("https://idp{i}.example"), true, Err("broken".into())).unwrap();
+        }
+        kept.add("https://sp.example".into(), false, Err("an SP".into())).unwrap();
+        assert_eq!(kept.problems.len(), MAX_EVERY, "SPs aren't counted");
+        assert!(matches!(kept.add("https://one-more.example".into(), true, Err("broken".into())), Err(Error::Refused(r)) if r.reason == "bad_metadata"));
     }
 
     #[test]

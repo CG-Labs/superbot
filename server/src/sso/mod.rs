@@ -3617,6 +3617,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn takes_every_idp_of_a_federation_from_its_aggregate_only() {
+        use xmldsig::test_signer::signers;
+        let dir = std::env::temp_dir().join(format!("superbot-every-idp-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let anchor = dir.join("federation.pem");
+        std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signers()[1].cert)).unwrap();
+        let anchor: &'static str = Box::leak(anchor.to_string_lossy().into_owned().into_boxed_str());
+        let url = "https://md.example.org/federation-metadata.xml";
+        let agg = ("SSO_CORP_IDP_AGGREGATE_URL", url);
+        let signer = ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor);
+        let one = ("SSO_CORP_IDP_ENTITY_ID", "");
+        let rs = "http://refeds.org/category/research-and-scholarship";
+        let sirtfi = "https://refeds.org/sirtfi";
+
+        let s = native(&[one, ("SSO_CORP_IDP_ENTITY_IDS", " ALL "), agg, signer]).unwrap();
+        let p = &s.providers[0];
+        assert_eq!((p.every_idp(), p.idps().len(), p.several_idps()), (Some(&EveryIdp::default()), 0, true));
+        assert_eq!(p.reaches(), [("SSO_CORP_IDP_AGGREGATE_URL".into(), url.into(), "metadata aggregate")], "one download");
+        assert!(p.not_ready().is_none() && p.listed_idps().is_empty() && !p.lists(ADFS), "none until it's read");
+        assert!(p.issuer_for(None).unwrap_err().contains("--idp"));
+        assert!(p.issuer_at(ADFS).unwrap_err().contains("aggregate"));
+        assert_eq!(p.issuer_linked(ADFS).as_deref(), Ok(ADFS), "a SCIM tenant's IdP outlasts a read");
+        assert!(p.issuer_linked("https://x.example/a|b").is_err());
+        assert!(p.audience().contains("every SAML IdP"), "{}", p.audience());
+
+        let cats = ("SSO_CORP_IDP_ENTITY_CATEGORIES", "http://refeds.org/category/research-and-scholarship, https://refeds.org/sirtfi,https://refeds.org/sirtfi");
+        let s = native(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), cats, agg, signer]).unwrap();
+        assert_eq!(s.providers[0].every_idp().unwrap().categories, [rs, sirtfi], "once each");
+
+        let err = |extra: &[(&'static str, &'static str)]| native(extra).err().unwrap();
+        assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_IDP_MDQ_URL", "https://mdq.example.org")]).contains("needs SSO_CORP_IDP_AGGREGATE_URL"), "MDQ can't list them");
+        assert!(err(&[("SSO_CORP_IDP_ENTITY_IDS", "all"), agg, signer]).contains("SSO_CORP_IDP_ENTITY_ID"), "not both");
+        assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all,https://a.example/idp"), agg, signer]).contains("alone"));
+        assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "https://a.example/idp,https://b.example/idp"), cats, agg, signer]).contains("only for SSO_CORP_IDP_ENTITY_IDS=all"));
+        assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_IDP_ENTITY_CATEGORIES", "research"), agg, signer]).contains("not an entity category"));
+        let nine: &'static str = Box::leak((0..9).map(|i| format!("urn:example:c{i}")).collect::<Vec<_>>().join(",").into_boxed_str());
+        assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_IDP_ENTITY_CATEGORIES", nine), agg, signer]).contains("at most 8"));
+        assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_JIT_ROLE", "member"), agg, signer]).contains("anyone any SAML IdP of the federation signs in"));
+        assert!(saml(&[("SSO_ADFS_IDP_ENTITY_CATEGORIES", rs)]).is_err(), "a native setting on the bridge");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn an_expired_copy_of_signed_metadata_is_never_used() {
         use saml_sp::test_idp::{IDP, metadata};
