@@ -46,6 +46,11 @@ describe("design tokens", () => {
       expect(contrast(c.success, c.successSoft)).toBeGreaterThanOrEqual(4.5);
       expect(contrast(c.text, c.codeBg)).toBeGreaterThanOrEqual(4.5);
     });
+
+    it("keeps the console's selected pills readable: setup's progress, step numbers and tags", () => {
+      expect(contrast(c.text, c.selected)).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(c.textMuted, c.selected)).toBeGreaterThanOrEqual(4.5);
+    });
   });
 
   it("gives screens not yet on the design system the dark palette's neutrals", () => {
