@@ -29,16 +29,17 @@ The store is attached to two connections: botd's own and the users' secrets' (AD
 
 1. botd takes the store lock on the new file (`chats.sqlite-lock`), so another botd can't use it.
 2. With botd's connection and the users' secrets' connection held, it copies the store with SQLite's backup API, under botd's database key, so an encrypted store stays encrypted and nothing plain is written. The copy is checked (`integrity_check`, and its `chat_store` row is this store's id and region), made a single file, synced and renamed into place.
-3. On both connections, the store's schema is detached and the new file attached under the same name, checked to be the store, and set to WAL. The views across places name the schema, so they read the new file from then on. botd's record (`chat_stores.path`) is updated.
-4. Only then are the connections let go. If any step fails, the old file is attached again on both connections, the copy deleted, and nothing has changed; the move is audited as failed.
-5. The store's backups are moved after it: each copied into the new folder's `backups/`, synced, renamed, then deleted from the old one. Half-made ones are deleted. The old file and its WAL are deleted and its lock let go. A `MOVED.txt` note in the old folder says where the store went and what `REGION_DATA_DIRS` must say. Anything that couldn't be moved or deleted is listed in the answer, the audit and the note.
+3. The old file is marked with where the copy is (a `chat_store_moved_to` table), so if botd stops before the old file is deleted, it is known to be stale (below).
+4. On both connections, the store's schema is detached and the new file attached under the same name, checked to be the store, and set to WAL. The views across places name the schema, so they read the new file from then on. botd's record (`chat_stores.path`) is updated.
+5. Only then are the connections let go. If any step fails, the old file is attached again on both connections, its mark and the copy deleted, and nothing has changed; the move is audited as failed.
+6. The store's backups are moved after it: each copied into the new folder's `backups/`, synced, renamed, the folder synced, then deleted from the old one. Half-made ones are deleted. The old file and its WAL are deleted and its lock let go. A `MOVED.txt` note in the old folder says where the store went and what `REGION_DATA_DIRS` must say. Anything that couldn't be moved or deleted is listed in the answer, the audit and the note.
 
 It is audited as `residency.chat_store_moved` (target `chat_store`, the region), with the old and new folders, the store id, its size, the backups moved, anything left, and `regionDataDirs`: the setting as it must be now.
 
 ### Until the settings say so
 
 - `REGION_DATA_DIRS` still names the old folder until the operator changes it. Admins are warned (`GET /api/regions`, `botctl regions`): the store was moved to the new folder and `REGION_DATA_DIRS` must name it before botd next starts.
-- At startup, a recorded store missing from the folder `REGION_DATA_DIRS` names, but present where botd recorded it, stops botd with the exact setting to use, rather than make an empty store in the old folder. botd doesn't follow the record by itself: the setting is the operator's statement of where the region's storage is.
+- At startup, a recorded store missing from the folder `REGION_DATA_DIRS` names, but present where botd recorded it, stops botd with the exact setting to use, rather than make an empty store in the old folder. So does an old file still there with the move's mark once botd's record names the copy: botd may have written to the copy since. A mark whose move never switched (the record still names the old file) is dropped. botd doesn't follow the record by itself: the setting is the operator's statement of where the region's storage is.
 - `botd chat-store list|restore` says the same when the settings still name the old folder: the store's backups moved with it.
 - Bucket copies (ADR 0246) are named by the store's id and each file's SHA-256, so they are unchanged and nothing is uploaded again.
 
@@ -57,7 +58,7 @@ It is audited as `residency.chat_store_moved` (target `chat_store`, the region),
 
 ## Tests
 
-- `db::chats`: a move while botd runs keeps every row, and reads, new rows, own secrets on the secrets' connection and pin moves all reach the new file, not the old one; it records the new path; a move that fails (a missing folder, a file already there, the same path, an unknown region) leaves the store attached where it was; an encrypted store stays under botd's key; after a move, startup with the old folder named is refused with the setting to use, and starts with the new one.
+- `db::chats`: a move while botd runs keeps every row, and reads, new rows, own secrets on the secrets' connection and pin moves all reach the new file, not the old one; it records the new path; a move that fails (a missing folder, a file already there, the same path, an unknown region) leaves the store attached where it was; an encrypted store stays under botd's key; after a move, startup with the old folder named is refused with the setting to use, and starts with the new one; the same holds when botd stopped before the old file was deleted, and a mark from a move that never switched is dropped at startup.
 - `machines::chat_store_restore`: `locate` refuses with the new folder while the settings name the old one, and finds the store once they name the new one.
 - HTTP (`machines_residency_tests.rs`): only admins move a store; a relative folder, one in `DATA_DIR`, one inside the store's folder, another store's folder and a non-empty one are refused and audited as failed, and folders botd made for them are removed; a move puts the store and its backup in the new folder and leaves only `MOVED.txt` in the old one, audited with `regionDataDirs`; new messages go there, the pin's report stays `kept`, the hourly check backs it up there, and `GET /api/regions` warns that `REGION_DATA_DIRS` still names the old folder.
 - `botctl`: `regions move-store <region> <folder>` sends the move.

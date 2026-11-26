@@ -148,6 +148,10 @@ pub const USAGE: &str = "token_usage";
 /// store is gone, as the only copy left (ADR 0293, ADR 0299, ADR 0304).
 const KEPT_WHEN_GONE: [&str; 4] = [SECRETS, SECOND_FACTOR, RECOVERY_CODE, USAGE];
 
+/// The table a move puts in the file it leaves, naming the copy, before botd switches to the
+/// copy (ADR 0309): a file that has it and that botd's record has left is stale.
+const MOVED_TO: &str = "chat_store_moved_to";
+
 fn kept(table: &str) -> Option<&'static Kept> {
     KEPT.iter().find(|k| k.name == table)
 }
@@ -583,6 +587,7 @@ fn copy_store(store: &ChatStore, from: &Path, to: &Path, key: Option<&DbKey>) ->
     })();
     if r.is_err() {
         remove_store_files(&partial);
+        remove_store_files(to);
     }
     r
 }
@@ -832,15 +837,18 @@ impl Db {
             let shown = path.display().to_string();
             let schema = format!("chats_{i}");
             let rec = recorded.iter().find(|(r, _, _)| r == region);
+            let moved_away = |id: &str, moved: &Path| {
+                format!(
+                    "{region}'s chat store (store {id}) was moved to {} while botd ran, but REGION_DATA_DIRS still names {}. Set it to {region}={} (ADR 0309).",
+                    moved.display(),
+                    dir.display(),
+                    moved.display()
+                )
+            };
             let missing = database_encryption::format(&path)? == Format::Missing;
             if let (true, Some((_, id, was))) = (missing, rec) {
                 if let Some(moved) = moved_to(was, &path)? {
-                    return Err(format!(
-                        "{region}'s chat store (store {id}) was moved to {} while botd ran, but REGION_DATA_DIRS still names {}. Set it to {region}={} (ADR 0309).",
-                        moved.display(),
-                        dir.display(),
-                        moved.display()
-                    ));
+                    return Err(moved_away(id, &moved));
                 }
                 return Err(format!(
                     "{region}'s chat store (store {id}, last at {was}) isn't at {shown}. Is its volume mounted? botd won't start an empty store in its place: \
@@ -853,6 +861,17 @@ impl Db {
                 let mut s = c.prepare(&format!("SELECT name FROM {schema}.sqlite_master WHERE type = 'table'")).map_err(|err| not_a_store(&path, &err))?;
                 s.query_map([], |r| r.get(0)).map_err(|err| not_a_store(&path, &err))?.collect::<rusqlite::Result<_>>().map_err(|err| not_a_store(&path, &err))?
             };
+            if tables.iter().any(|t| t == MOVED_TO) {
+                // A move stopped after marking this file: once the record names the copy, botd
+                // may have written there, so this file is stale. Otherwise the move never switched.
+                let to: Option<String> = c.query_row(&format!("SELECT path FROM {schema}.{MOVED_TO} LIMIT 1"), [], |r| r.get(0)).optional().map_err(e)?;
+                match (to, rec) {
+                    (Some(to), Some((_, id, was))) if to == *was && to != path_str => {
+                        return Err(moved_away(id, Path::new(&to).parent().unwrap_or(Path::new("/"))));
+                    }
+                    _ => c.execute_batch(&format!("DROP TABLE {schema}.{MOVED_TO}")).map_err(e)?,
+                }
+            }
             let own: Option<(String, String)> = if tables.iter().any(|t| t == "chat_store") {
                 c.query_row(&format!("SELECT id, region FROM {schema}.chat_store LIMIT 1"), [], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(e)?
             } else {
@@ -922,10 +941,23 @@ impl Db {
         if from == to {
             return Err(format!("{region}'s chat store is already at {}", to.display()));
         }
+        let to_str = to.to_str().ok_or_else(|| format!("{}: path is not UTF-8", to.display()))?;
         let c = self.c();
         let moved = |other: Option<(&Connection, &[ChatStore])>| -> Result<u64, String> {
             let other = other.filter(|(_, stores)| stores.iter().any(|s| s.schema == store.schema)).map(|(c, _)| c);
             let bytes = copy_store(store, &from, to, key)?;
+            let s = &store.schema;
+            let unmark = || {
+                let _ = c.execute_batch(&format!("DROP TABLE IF EXISTS {s}.{MOVED_TO}"));
+            };
+            let mark = c
+                .execute_batch(&format!("CREATE TABLE IF NOT EXISTS {s}.{MOVED_TO} (path TEXT NOT NULL); DELETE FROM {s}.{MOVED_TO}"))
+                .and_then(|()| c.execute(&format!("INSERT INTO {s}.{MOVED_TO} (path) VALUES (?1)"), [to_str]));
+            if let Err(err) = mark {
+                unmark();
+                remove_store_files(to);
+                return Err(format!("marking {} as moved: {err}", from.display()));
+            }
             let raw = key.map(DbKey::raw);
             let back = |c: &Connection| {
                 if let Err(err) = reattach(c, store, &from, raw) {
@@ -935,8 +967,7 @@ impl Db {
             let done = reattach(&c, store, to, raw)
                 .and_then(|()| other.map_or(Ok(()), |o| reattach(o, store, to, raw).inspect_err(|_| back(o))))
                 .and_then(|()| {
-                    let path = to.to_str().ok_or_else(|| format!("{}: path is not UTF-8", to.display()))?;
-                    c.execute("UPDATE main.chat_stores SET path = ?2 WHERE region = ?1", params![region, path]).map(|_| ()).map_err(|err| format!("recording where the store is: {err}")).inspect_err(|_| {
+                    c.execute("UPDATE main.chat_stores SET path = ?2 WHERE region = ?1", params![region, to_str]).map(|_| ()).map_err(|err| format!("recording where the store is: {err}")).inspect_err(|_| {
                         if let Some(o) = other {
                             back(o);
                         }
@@ -944,6 +975,7 @@ impl Db {
                 });
             if let Err(err) = done {
                 back(&c);
+                unmark();
                 remove_store_files(to);
                 return Err(err);
             }
@@ -3303,6 +3335,44 @@ mod tests {
         db.attach_chat_stores(&[("gb-lon".into(), new_dir.clone()), ("de-fra-2".into(), d.fra.clone())], &[], None).unwrap();
         assert_eq!(rows_in(&new_dir.join("chats.sqlite")), 1);
         assert_eq!(db.c().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn botd_wont_start_on_the_file_a_move_left_when_it_stopped_before_deleting_it() {
+        let d = Dirs::new();
+        let new_dir = d.dir.path().join("lon-2");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        {
+            let db = d.up();
+            let ada = user(&db, "ada");
+            db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+            db.place_chats().unwrap();
+            db.move_chat_store("gb-lon", &new_dir.join("chats.sqlite"), None, None).unwrap();
+            db.add_message(&bot_of(&db, &ada), "user", "after the move", None, false, None);
+        }
+        assert_eq!(rows_in(&d.lon.join("chats.sqlite")), 0);
+
+        let e = d.db().attach_chat_stores(&d.both(), &[], None).unwrap_err();
+        assert!(e.contains(&format!("was moved to {} while botd ran", new_dir.display())) && e.contains(&format!("Set it to gb-lon={}", new_dir.display())), "{e}");
+        let db = d.db();
+        db.attach_chat_stores(&[("gb-lon".into(), new_dir.clone()), ("de-fra-2".into(), d.fra.clone())], &[], None).unwrap();
+        assert_eq!(db.c().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_mark_left_by_a_move_that_never_switched_is_dropped_at_startup() {
+        let d = Dirs::new();
+        let copy = d.dir.path().join("lon-2").join("chats.sqlite");
+        d.up();
+        let old = d.lon.join("chats.sqlite");
+        rusqlite::Connection::open(&old)
+            .unwrap()
+            .execute_batch(&format!("CREATE TABLE {MOVED_TO} (path TEXT NOT NULL); INSERT INTO {MOVED_TO} (path) VALUES ('{}')", copy.display()))
+            .unwrap();
+
+        d.db().attach_chat_stores(&d.both(), &[], None).unwrap();
+        let left: i64 = rusqlite::Connection::open(&old).unwrap().query_row(&format!("SELECT COUNT(*) FROM sqlite_master WHERE name = '{MOVED_TO}'"), [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]

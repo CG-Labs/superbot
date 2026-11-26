@@ -148,8 +148,8 @@ pub fn move_store(db: &Db, secrets: Option<&UserSecrets>, region: &str, folder: 
     Ok(Moved { store: moved, backups, left })
 }
 
-/// Moves each backup in `from` to `to`: copied beside it, synced, renamed into place, then
-/// deleted from `from`. Half-made ones are deleted. How many moved, and what was left.
+/// Moves each backup in `from` to `to`: copied beside it, synced, renamed into place with
+/// `to` synced, then deleted from `from`. Half-made ones are deleted. How many moved, and what was left.
 fn move_backups(from: &Path, to: &Path) -> (usize, Vec<String>) {
     let mut left = Vec::new();
     let entries = match std::fs::read_dir(from) {
@@ -157,7 +157,8 @@ fn move_backups(from: &Path, to: &Path) -> (usize, Vec<String>) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, left),
         Err(e) => return (0, vec![format!("{}: {e}", from.display())]),
     };
-    if let Err(e) = std::fs::create_dir_all(to) {
+    let sync_dir = |d: &Path| std::fs::File::open(d).and_then(|d| d.sync_all());
+    if let Err(e) = std::fs::create_dir_all(to).and_then(|()| to.parent().map_or(Ok(()), sync_dir)) {
         return (0, vec![format!("{}: {e}; the backups are left in {}", to.display(), from.display())]);
     }
     let mut n = 0;
@@ -175,6 +176,7 @@ fn move_backups(from: &Path, to: &Path) -> (usize, Vec<String>) {
         let copied = std::fs::copy(&p, &partial)
             .and_then(|_| std::fs::File::open(&partial)?.sync_all())
             .and_then(|()| std::fs::rename(&partial, to.join(&name)))
+            .and_then(|()| sync_dir(to))
             .and_then(|()| std::fs::remove_file(&p));
         match copied {
             Ok(()) => n += 1,
@@ -184,7 +186,6 @@ fn move_backups(from: &Path, to: &Path) -> (usize, Vec<String>) {
             }
         }
     }
-    let _ = std::fs::File::open(to).and_then(|d| d.sync_all());
     let _ = std::fs::remove_dir(from);
     (n, left)
 }
