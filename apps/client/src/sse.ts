@@ -10,11 +10,13 @@ async function readFetchSse(
   headers: Record<string, string>,
   onEvent: Listener,
   signal: AbortSignal,
+  onLive?: () => void,
 ): Promise<void> {
   const res = await fetch(url, { headers, signal });
   if (!res.ok || !res.body) {
     throw new Error(`SSE failed: HTTP ${res.status}`);
   }
+  onLive?.();
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -41,12 +43,14 @@ async function readFetchSse(
 
 export type SseConnection = { close: () => void };
 
+/** `onLive` runs each time the stream is up, first time and after every reconnect. */
 export function connectSse(
   url: string,
   headers: Record<string, string>,
   onEvent: Listener,
   onOpen?: () => void,
   onError?: (err: unknown) => void,
+  onLive?: () => void,
 ): SseConnection {
   if (Platform.OS === "web") {
     const controller = new AbortController();
@@ -54,7 +58,7 @@ export function connectSse(
     void (async () => {
       while (!controller.signal.aborted) {
         try {
-          await readFetchSse(url, headers, onEvent, controller.signal);
+          await readFetchSse(url, headers, onEvent, controller.signal, onLive);
         } catch (err) {
           if (!controller.signal.aborted) onError?.(err);
         }
@@ -72,7 +76,10 @@ export function connectSse(
   }
 
   const es = new EventSource(url, { headers, pollingInterval: 0, timeout: 0 });
-  es.addEventListener("open", () => onOpen?.());
+  es.addEventListener("open", () => {
+    onLive?.();
+    onOpen?.();
+  });
   es.addEventListener("message", (ev) => {
     if (!ev.data) return;
     try {

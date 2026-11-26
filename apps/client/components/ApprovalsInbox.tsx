@@ -1,10 +1,13 @@
 import React, { useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
+import { errorText } from "../src/errors";
+import { useReducedMotion } from "../src/motion";
 import { focusFirst } from "../src/notifications";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors, ThemeScope, themedStyles, type } from "../src/theme";
 import type { Approval, ApprovalScope } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
+import { EmptyState } from "./EmptyState";
 
 interface Props {
   visible: boolean;
@@ -48,7 +51,7 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
     try {
       await decideApproval(a.id, approve, remember, scope);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed");
+      setError(errorText(err, "Couldn't send your answer"));
       setBusy(false);
     }
   };
@@ -76,7 +79,11 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
         <Text style={styles.faint}>Denied in {minutesLeft(a)}</Text>
       </View>
       {canRun ? <Text style={styles.faint}>{forRun}</Text> : null}
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? (
+        <Text style={styles.error} role="alert">
+          {error}
+        </Text>
+      ) : null}
       {canDecide ? (
       <View style={styles.actions}>
         <Pressable style={({ pressed }) => [styles.btn, pressed && styles.pressed]} disabled={busy} onPress={() => void decide(false)} accessibilityRole="button">
@@ -100,15 +107,20 @@ export function ApprovalsInbox({ visible, onClose, onOpenPolicy, focusId }: Prop
   const { approvals, policy, setGlobalPolicy, can } = useSuperBot();
   const ask = policy?.mode !== "bypass";
   const { list, gone } = focusFirst(approvals, focusId);
+  const reduceMotion = useReducedMotion();
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+    <Modal visible={visible} animationType={reduceMotion ? "none" : "slide"} transparent onRequestClose={onClose}>
       <View style={styles.backdrop}>
         <View style={styles.panel}>
           <View style={styles.titleRow}>
-            <Text style={styles.title}>Approvals</Text>
-            <Pressable onPress={onClose}>
-              <Text style={styles.close}>✕</Text>
+            <Text style={styles.title} role="heading">
+              Approvals
+            </Text>
+            <Pressable onPress={onClose} role="button" aria-label="Close approvals" hitSlop={8}>
+              <Text style={styles.close} maxFontSizeMultiplier={1.3}>
+                ✕
+              </Text>
             </Pressable>
           </View>
           {gone ? (
@@ -124,7 +136,9 @@ export function ApprovalsInbox({ visible, onClose, onOpenPolicy, focusId }: Prop
                 ))}
               </ThemeScope>
             ) : (
-              <Text style={styles.empty}>Nothing is waiting for you.</Text>
+              <ThemeScope scheme="dark">
+                <EmptyState compact glyph="✓" title="You're all caught up" message="Nothing is waiting for you. Bots ask here before risky actions." />
+              </ThemeScope>
             )}
           </ScrollView>
           <View style={styles.row}>
@@ -164,7 +178,6 @@ const styles = StyleSheet.create({
   dim: { color: colors.textDim },
   link: { color: colors.blueDot },
   faint: { color: colors.textFaint, fontSize: 13 },
-  empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
 });
 
 const useCardStyles = themedStyles((t) =>
