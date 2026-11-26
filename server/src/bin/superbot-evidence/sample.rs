@@ -549,6 +549,13 @@ pub fn parse_csv(s: &str) -> Result<Vec<Vec<String>>, String> {
 
 /// A samples bundle's files, checked against its own `SHA256SUMS` and manifest.
 pub fn read_samples(path: &Path) -> Result<(String, Files), String> {
+    read_made(path, PREFIX, "audit-samples", &[SAMPLES_FILE, WORKSHEET_FILE], "samples")
+}
+
+/// A bundle this tool keeps beside the store (samples, results, a deficiency log), named
+/// `prefix...` with a manifest of `kind` and the files in `need`, checked against its own
+/// `SHA256SUMS` and manifest. `what` names it in errors.
+pub fn read_made(path: &Path, prefix: &str, kind: &str, need: &[&str], what: &str) -> Result<(String, Files), String> {
     let shown = path.display();
     let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
     let (name, files) = if meta.is_dir() {
@@ -558,19 +565,19 @@ pub fn read_samples(path: &Path) -> Result<(String, Files), String> {
             let n = e.file_name().to_string_lossy().into_owned();
             let m = std::fs::metadata(e.path()).map_err(|e| format!("{n}: {e}"))?;
             if !m.is_file() || m.len() > MAX_BYTES {
-                return Err(format!("{shown}: {n} isn't a file of a samples bundle"));
+                return Err(format!("{shown}: {n} isn't a file of a {what} bundle"));
             }
             files.insert(n, std::fs::read(e.path()).map_err(|e| format!("{shown}: {e}"))?);
         }
         (name, files)
     } else {
         if meta.len() > MAX_BYTES {
-            return Err(format!("{shown} is over {} MiB, larger than any samples bundle", MAX_BYTES >> 20));
+            return Err(format!("{shown} is over {} MiB, larger than any {what} bundle", MAX_BYTES >> 20));
         }
         let entries = coverage::untar(&std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?).map_err(|e| format!("{shown}: {e}"))?;
         let tops: BTreeSet<String> = entries.iter().map(|(n, _)| n.split('/').next().unwrap_or_default().to_string()).collect();
         if tops.len() != 1 {
-            return Err(format!("{shown} holds more than one folder: give the samples bundle as made"));
+            return Err(format!("{shown} holds more than one folder: give the {what} bundle as made"));
         }
         let top = tops.into_iter().next().unwrap_or_default();
         let mut files = Files::new();
@@ -587,8 +594,8 @@ pub fn read_samples(path: &Path) -> Result<(String, Files), String> {
         }
         (top, files)
     };
-    if !name.starts_with(PREFIX) {
-        return Err(format!("{shown} isn't a samples bundle ({PREFIX}...): give the bundle superbot-evidence sample made"));
+    if !name.starts_with(prefix) {
+        return Err(format!("{shown} isn't a {what} bundle ({prefix}...): give the bundle superbot-evidence made"));
     }
     let mut problems = Vec::new();
     let sums = files.get("SHA256SUMS").map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
@@ -604,8 +611,8 @@ pub fn read_samples(path: &Path) -> Result<(String, Files), String> {
     }
     problems.extend(files.keys().filter(|n| *n != "SHA256SUMS" && !listed.contains(*n)).map(|n| format!("{n} isn't in SHA256SUMS")));
     let manifest: Value = files.get("manifest.json").and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default();
-    if manifest["product"] != "SuperBot" || manifest["kind"] != "audit-samples" {
-        problems.push("manifest.json isn't a SuperBot samples manifest".into());
+    if manifest["product"] != "SuperBot" || manifest["kind"] != kind {
+        problems.push(format!("manifest.json isn't a SuperBot {what} manifest"));
     }
     for f in manifest["files"].as_array().into_iter().flatten() {
         let n = f["name"].as_str().unwrap_or_default();
@@ -613,12 +620,12 @@ pub fn read_samples(path: &Path) -> Result<(String, Files), String> {
             problems.push(format!("{n} doesn't match manifest.json"));
         }
     }
-    for need in [SAMPLES_FILE, WORKSHEET_FILE] {
-        if !files.contains_key(need) {
+    for need in need {
+        if !files.contains_key(*need) {
             problems.push(format!("it has no {need}"));
         }
     }
-    if problems.is_empty() { Ok((name, files)) } else { Err(format!("{shown} doesn't check, so its samples can't be relied on:\n- {}", problems.join("\n- "))) }
+    if problems.is_empty() { Ok((name, files)) } else { Err(format!("{shown} doesn't check, so its {what} can't be relied on:\n- {}", problems.join("\n- "))) }
 }
 
 /// One line of the worksheet, as the tester filled it in.

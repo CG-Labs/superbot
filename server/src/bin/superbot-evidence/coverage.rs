@@ -54,9 +54,7 @@ pub const EGRESS: &str = "egress.json";
 pub const SECRETS: &str = "secrets.json";
 
 /// Files of botd's bundle that bundles made before them lack (ADR 0195): checked like
-/// the rest when listed, never required, so only the test against the evidence plan
-/// reads this.
-#[cfg(test)]
+/// the rest when listed, never required; the deficiency log reads their controls.
 pub const EVIDENCE_LATER: [Expected; 1] = [Expected { file: "baseline.json", criteria: &["CC5.1"], rows: &["CC5.1-1"] }];
 
 /// One kind of bundle the evidence plan collects monthly.
@@ -149,7 +147,7 @@ fn since_format(kind: &str, file: &str) -> u64 {
 }
 
 /// The files whose `exceptions` an auditor samples first.
-const EXCEPTION_FILES: [&str; 23] = [
+pub const EXCEPTION_FILES: [&str; 23] = [
     "pull-requests.json",
     "branch-protection.json",
     "vulnerability-alerts.json",
