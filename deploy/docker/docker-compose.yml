@@ -34,7 +34,8 @@ services:
       # botd is reachable only through Caddy, so the audit log takes the client IP from X-Forwarded-For.
       TRUST_FORWARDED_FOR: "1"
       # Screens' viewers listen on the compose network, where only Caddy reaches them (/screen/69xx/).
-      # Each checks its own token. Screens run with ISOLATION=off (docs/computer.md).
+      # Each checks its own token. With per-user accounts botd holds these ports and pipes each view
+      # to the account's own viewer on loopback (docs/computer.md).
       SCREEN_ADDR: 0.0.0.0
       # Where the backup sidecar writes archives, which botd copies off the host when
       # SERVER_BACKUP_S3_BUCKET is set in .env (docs/adr/0109-server-backups-off-the-host.md).

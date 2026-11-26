@@ -64,7 +64,7 @@ Compose also gives botd `shm_size: 1gb`: Docker's 64 MB `/dev/shm` is too small 
 
 ### Screens follow isolation, as on the bash install
 
-botd turns its screens off under `ISOLATION=users`: an X display belongs to botd's account, and per-user screens don't exist yet (ADR 0037). That doesn't change here. New `.env` files keep per-user accounts on, and their log says `Screens: off (per-user screens ...)`. `./init.sh --no-isolation` turns screens on, with what ADR 0058 says that costs. The image is ready for per-user screens when they exist.
+botd turns its screens off under `ISOLATION=users`: an X display belongs to botd's account, and per-user screens don't exist yet (ADR 0037). That doesn't change here. New `.env` files keep per-user accounts on, and their log says `Screens: off (per-user screens ...)`. `./init.sh --no-isolation` turns screens on, with what ADR 0058 says that costs. The image is ready for per-user screens when they exist. ([ADR 0342](0342-per-user-screens-on-one-server.md) later runs each screen as its run's per-user account, so Compose has screens with accounts on.)
 
 ### Compose pulls by default; building from source is one flag
 

@@ -145,7 +145,7 @@ grep -q 'Database encryption: encrypted with SQLCipher.*; created encrypted' <<<
 log "Per-user accounts (ADR 0058): on for a new .env, and an account can't read botd's data or env"
 grep -qx 'ISOLATION=users' "$SUPERBOT_ENV_FILE" || fail "a new .env doesn't turn per-user accounts on"
 grep -q 'Isolation: each user' <<<"$(dc logs --no-color botd)" || fail "botd didn't start with per-user accounts"
-grep -q 'Screens: off (per-user' <<<"$(dc logs --no-color botd)" || fail "screens aren't off under per-user accounts"
+grep -q 'Screens: on (each runs as its run' <<<"$(dc logs --no-color botd)" || fail "screens aren't on, as each run's account, under per-user accounts"
 probe=smokeprobe
 dc exec -T botd sudo -n /usr/local/sbin/superbot-userctl ensure "$probe" >/dev/null || fail "superbot-userctl couldn't make an account"
 as_account() { dc exec -T -w "/srv/superbot/users/$probe/home" botd sudo -n -u "sb-u-$probe" /opt/superbot/bin/superbot-run /bin/sh -c "$1"; }
@@ -163,6 +163,41 @@ uid=$(dc exec -T botd stat -c %u "/srv/superbot/users/$probe/home")
 dc up -d --no-build --force-recreate --wait --wait-timeout 120 botd
 dc exec -T botd sudo -n /usr/local/sbin/superbot-userctl ensure "$probe" >/dev/null || fail "superbot-userctl couldn't remake the account"
 [[ $(dc exec -T botd id -u "sb-u-$probe") == "$uid" ]] || fail "a recreated container gave the account another uid"
+
+log "Per-user screens (ADR 0342): a Bot's screen runs as its owner's account, only its cookie opens it, and Caddy serves its view"
+iso_bot=$(curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"Isoscreen"}' "$BASE/api/bots" \
+  | grep -o '"id":"[0-9a-zA-Z_-]*"' | sed -n '1s/"id":"\(.*\)"/\1/p')
+[[ -n "$iso_bot" ]] || fail "no id for the new Bot"
+iso_screen=$(curl -fsS "${AUTH[@]}" "$BASE/api/bots/$iso_bot/screen") || fail "the Bot's screen didn't start under per-user accounts: $(dc logs --no-color botd | grep -i screen | tail -5)"
+iso_url=$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$iso_screen")
+[[ "$iso_url" =~ ^/screen/(69[0-9][0-9])/\?token=([0-9a-f]{32})$ ]] || fail "unexpected screen link: $iso_screen"
+iso_port=${BASH_REMATCH[1]} iso_token=${BASH_REMATCH[2]}
+[[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::add-mask::$iso_token"
+grep -qi '<html' <<<"$(curl -fsS "$BASE$iso_url")" || fail "Caddy didn't serve the account's screen at $BASE/screen/$iso_port/"
+iso_ws() {
+  curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$BASE/screen/$iso_port/ws?token=$1" || true
+}
+[[ $(iso_ws "$iso_token") == 101 ]] || fail "the account's screen's live stream didn't open through Caddy"
+[[ $(iso_ws "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')") == 401 ]] || fail "the account's screen's live stream opened with a wrong token"
+# Which display it is: the one whose socket the owner's account holds.
+iso_display=$(dc exec -T botd sh -c 'for s in /tmp/.X11-unix/X*; do u=$(stat -c %U "$s"); case $u in sb-u-*) echo "${s##*/X} $u";; esac; done' | sed -n 1p)
+iso_acct=${iso_display#* } iso_display=":${iso_display%% *}"
+[[ "$iso_acct" == sb-u-* && "$iso_display" != : ]] || fail "no X display runs as a per-user account"
+iso_cookie="/srv/superbot/users/${iso_acct#sb-u-}/settings/$iso_bot/screen.xauth"
+if dc exec -T botd xdpyinfo -display "$iso_display" >/dev/null 2>&1; then fail "botd's account opened $iso_acct's display without its cookie"; fi
+as_account "command -v xdpyinfo" >/dev/null || fail "another account has no xdpyinfo to try $iso_acct's display with"
+if as_account "XAUTHORITY='$iso_cookie' xdpyinfo -display '$iso_display'" >/dev/null 2>&1; then
+  fail "another account opened $iso_acct's display"
+fi
+if as_account "head -c 1 '$iso_cookie'" >/dev/null 2>&1; then fail "another account can read $iso_acct's screen cookie"; fi
+iso_home="/srv/superbot/users/${iso_acct#sb-u-}/home"
+as_owner() { dc exec -T -u "$iso_acct" -w "$iso_home" -e HOME="$iso_home" -e DISPLAY="$iso_display" -e XAUTHORITY="$iso_cookie" botd "$@"; }
+as_owner xdpyinfo >/dev/null || fail "$iso_acct can't open its own display with its cookie"
+iso_ab() { as_owner env AGENT_BROWSER_SESSION=smoke-iso AGENT_BROWSER_HEADED=1 AGENT_BROWSER_NO_XVFB=1 agent-browser "$@"; }
+iso_ab open 'data:text/html,<title>superbot-iso</title><h1>mine</h1>' >/dev/null || fail "agent-browser couldn't open a page as $iso_acct"
+grep -q '"superbot-iso - Chromium"' <<<"$(as_owner xwininfo -root -tree)" || fail "Chromium isn't on $iso_acct's screen"
+iso_ab close >/dev/null || true
 
 log "Backup service wrote an archive"
 for _ in $(seq 1 30); do

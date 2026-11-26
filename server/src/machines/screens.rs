@@ -478,12 +478,8 @@ pub async fn for_run(app: &App, bot: &Bot, for_user: Option<&str>, to: &Assigned
     let by = Who::system("runner");
     match ensure(app, &e, &s, &by, bot, for_user, to, "run").await {
         Ok((reply, _)) => {
-            let info = crate::screen::Info { display: reply.display, bus: reply.bus, port: 0, token: String::new() };
-            let mut env = crate::screen::bot_env(&info, &bot.id, state_dir);
-            if let Some(x) = reply.xauthority {
-                env.insert("XAUTHORITY".into(), x);
-            }
-            Some(env)
+            let info = crate::screen::Info { display: reply.display, bus: reply.bus, port: 0, token: String::new(), xauthority: reply.xauthority, profile: None };
+            Some(crate::screen::bot_env(&info, &bot.id, state_dir))
         }
         Err(w) => {
             crate::obs::log::log_warn!("Screen of Bot {} on machine {}: {}", bot.id, to.machine_id, w.message());

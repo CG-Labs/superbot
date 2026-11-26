@@ -6,6 +6,7 @@
 #   SLEEP                             keep a heartbeat in the workspace until stopped
 #   LEAVE                             answer and exit, leaving the heartbeat going
 #   PROBE <other account> <name:path>...  try to read (and write next to) each path
+#   SCREEN <display> <cookie> <bus>   open its own screen, then another run's (none: skip)
 # Run as `claude auth login` (a teammate's login, ADR 0064), it writes a login into $HOME.
 # As hermes, a probe also leaves a gateway.pid, so botd runs `hermes gateway stop` after.
 set -u
@@ -58,6 +59,20 @@ case "$prompt" in
     (trap '' TERM; while :; do date +%s.%N >"$PWD/heartbeat"; sleep 0.2; done) &
     sleep 1
     out=left
+    ;;
+  SCREEN*)
+    # shellcheck disable=SC2086 # the prompt is words on purpose
+    set -- $prompt
+    can_open() { if xdpyinfo -display "$1" >/dev/null 2>&1; then echo open; else echo denied; fi; }
+    out="user=$me;display=${DISPLAY:-};xauthority=${XAUTHORITY:-};bus=${DBUS_SESSION_BUS_ADDRESS:-}"
+    out="$out;own_display=$(can_open "${DISPLAY:-none}")"
+    if [ "$2" != none ]; then
+      out="$out;other_display=$(XAUTHORITY=/nonexistent can_open "$2")"
+      out="$out;other_display_with_cookie=$(XAUTHORITY=$3 can_open "$2")"
+      out="$out;other_display_own_cookie=$(can_open "$2")"
+      out="$out;other_cookie=$(try_read "$3")"
+      out="$out;other_bus=$(try_read "$(dirname "$4")")"
+    fi
     ;;
   PROBE*)
     # shellcheck disable=SC2086 # the prompt is words on purpose
