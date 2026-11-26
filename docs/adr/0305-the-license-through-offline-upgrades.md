@@ -39,7 +39,7 @@ It prints where the license comes from, its mode (`active`, `grace`, `expired`, 
 - If Bots don't run now either, or the running release can't say, it warns and goes on. Stopping would only keep a server that runs no Bots on the old release.
 - Otherwise it logs what the new release makes of the license, and warns on each warning.
 
-With `--testing-mode`, which writes `TESTING_MODE=on`, Bots run with or without a license, so the check only says so. A botd is run with `license check` only when its file holds `botd license check`'s usage text, since an older botd would take the unknown subcommand as a start. Without it, the check is skipped with a warning. A new install with `--license-file` says whether the bundle's botd takes the key, and goes on either way, since no Bots run yet.
+With `--testing-mode`, which writes `TESTING_MODE=on`, Bots run with or without a license, so nothing is stopped; a rollback still chooses the license it leaves, as below. A botd is run with `license check` only when its file holds `botd license check`'s usage text, since an older botd would take the unknown subcommand as a start. Without it, the check is skipped with a warning. A new install with `--license-file` says whether the bundle's botd takes the key, and goes on either way, since no Bots run yet.
 
 ### A rollback keeps a renewal
 
@@ -71,7 +71,7 @@ The same stop applies: if Bots run now but the older release wouldn't run them w
     - a dry run, a license neither release takes, a running release or a bundle's botd from before the check, and an online install go on;
     - `--license-file` is judged on stdin in the license's place;
     - a new install's `--license-file` is judged, and goes on either way;
-    - a key wrapped across lines is judged without its whitespace, and `--testing-mode` goes on;
+    - a key wrapped across lines is judged without its whitespace, and `--testing-mode` goes on, a rollback with it still keeping a renewal;
     - a rollback keeps a renewal the older release takes, 0600, stops with botd stopped and the key kept when it can't write it, else judges and puts back the backup's license (plain and encrypted), judges with the old `.env` from a copy botd's user owns and removes, stops when Bots run now but wouldn't after, and installs `--license-file` over the backup's.
   - `offline.yml`, with no network and an encrypted database: `botd license check` as botd's user counts seats with the master key, judges a key given as invalid without installing it, and with no testing mode and no license says Bots wouldn't run. The upgrade and the rollback each log what the bundle's botd makes of the license.
 - Not covered:

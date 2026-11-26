@@ -1539,6 +1539,13 @@ done
 ! grep -q "systemctl start" "$RB/systemctl" || fail "superbot was started without the renewal"
 rm -rf "$RB/dir"
 
+lrb_host "" renewed
+out=$(lrollback "TESTING_MODE_ON=true ") || fail "a rollback with --testing-mode failed: $out"
+for want in "License: --testing-mode sets TESTING_MODE=on, so $VERSION runs Bots" "Kept the license installed since the upgrade as $RH/superbot/data/license.key"; do
+  grep -Fq -- "$want" <<<"$out" || fail "a rollback with --testing-mode didn't say $want: $out"
+done
+[[ $(cat "$RH/superbot/data/license.key") == renewed ]] || fail "a rollback with --testing-mode didn't keep the renewal"
+
 lrb_host "" old
 out=$(lrollback) || fail "a rollback whose older release takes only the license from before failed: $out"
 for want in "The license installed since the upgrade to 0.2.0 isn't one $VERSION takes" \

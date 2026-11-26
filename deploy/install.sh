@@ -1918,24 +1918,24 @@ offline_license_check() {
     esac
     return 0
   fi
-  if [[ "$TESTING_MODE_ON" == true ]]; then
-    log "License: --testing-mode sets TESTING_MODE=on, so $OFFLINE_VERSION runs Bots with or without a license (test servers only)"
-    return 0
-  fi
   if ! botd_checks_license "$botd"; then
     warn "The bundle's botd ($OFFLINE_VERSION) can't check licenses (botd license check), so the license wasn't checked before the $([[ "$ROLLBACK_RESTORE" == true ]] && echo rollback || echo upgrade)"
     return 0
-  fi
-  if botd_checks_license "$BIN_DIR/botd"; then
-    now_rc=0
-    license_verdict "$BIN_DIR/botd" >/dev/null || now_rc=$?
-    ((now_rc <= 1)) || now_rc=2
   fi
   if [[ "$ROLLBACK_RESTORE" == true ]]; then
     env_file="$(rollback_dir)/$(manifest_value "$(rollback_dir)/record" env)"
     [[ -n "$LICENSE_FILE" ]] || rollback_license_choice "$botd" "$env_file"
   elif [[ -z "$LICENSE_FILE" ]]; then
     LICENSE_WHAT="this server's license"
+  fi
+  if [[ "$TESTING_MODE_ON" == true ]]; then
+    log "License: --testing-mode sets TESTING_MODE=on, so $OFFLINE_VERSION runs Bots with or without a license (test servers only)"
+    return 0
+  fi
+  if botd_checks_license "$BIN_DIR/botd"; then
+    now_rc=0
+    license_verdict "$BIN_DIR/botd" >/dev/null || now_rc=$?
+    ((now_rc <= 1)) || now_rc=2
   fi
   out=$(license_verdict "$botd" "$LICENSE_JUDGED" "$env_file") || rc=$?
   case $rc in
