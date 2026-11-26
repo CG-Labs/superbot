@@ -240,6 +240,14 @@ fn not_covered(server_data: &Value, chats: &Value, audit_export: &Value) -> Vec<
             whole.join(", ")
         ));
     }
+    let partly: Vec<&Value> = audit_export.as_array().into_iter().flatten().filter(|s| s["details"] == "partly").collect();
+    if let Some(n) = partly.first().and_then(|s| s["wholeEvents"].as_i64()) {
+        let to: Vec<String> = partly.iter().map(|s| sink_named(s)).collect();
+        out.push(format!(
+            "{n} of their audit events whose details are still in botd's own database, not yet moved to the region's chat store, which the audit export sends whole to {} too (ADR 0316, ADR 0330).",
+            to.join(", ")
+        ));
+    }
     out
 }
 
@@ -280,7 +288,7 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
     }
     let server_in = server_data["inRegion"] == true;
     let chats = super::chat_stores::against(app, cp, region, &ids, server_in);
-    let audit_export = json!(crate::audit_export::for_pin(app, region, chats["store"] == true));
+    let audit_export = json!(crate::audit_export::for_pin(app, region, chats["store"] == true, chats["auditEvents"]["inServerDatabase"].as_i64().unwrap_or(0)));
     warnings.extend(super::chat_stores::report_warnings(&chats, region, crate::db::now()));
     let hosts = cp.hosts().map(|h| h.configured().into_iter().filter(|c| c.region.as_deref() == Some(region)).map(|c| c.name).collect::<Vec<_>>());
     let pinned_by = p.pinned_by.as_deref().map(|id| json!({ "id": id, "name": app.db.user(id).map(|u| u.name) }));
@@ -501,7 +509,11 @@ fn audit_export_markdown(sinks: &Value) -> String {
     let Some(sinks) = sinks.as_array().filter(|a| !a.is_empty()) else { return String::new() };
     let mut out = String::from("\n## Audit export\n\nWhere botd sends the audit log, and what each sink gets of their events.\n\n");
     for s in sinks {
-        let gets = if s["details"] == "whole" { "their events whole" } else { "only their events' sealed rows, their details held back" };
+        let gets = match s["details"].as_str() {
+            Some("whole") => "their events whole".to_string(),
+            Some("partly") => format!("their events' sealed rows, but {} whose details are still in botd's own database whole", cell(&s["wholeEvents"])),
+            _ => "only their events' sealed rows, their details held back".to_string(),
+        };
         out += &format!("- **{}:** {gets}\n", cell(&json!(sink_named(s))));
     }
     out
@@ -666,6 +678,12 @@ mod tests {
         assert!(md.starts_with("\n## Audit export\n") && md.contains("- **lon (webhook, in gb-lon):** their events whole\n"), "{md}");
         assert!(md.contains("- **us (webhook, in us-east-1):** only their events' sealed rows, their details held back\n"), "{md}");
         assert_eq!(audit_export_markdown(&Value::Null), "", "reports from before ADR 0330, or with no export, have no section");
+        let partly = json!([{ "kind": "webhook", "name": "us", "dataRegion": "us-east-1", "inRegion": false, "details": "partly", "wholeEvents": 2 }]);
+        assert_eq!(
+            not_covered(&inside, &Value::Null, &partly).last().unwrap(),
+            "2 of their audit events whose details are still in botd's own database, not yet moved to the region's chat store, which the audit export sends whole to us (webhook, in us-east-1) too (ADR 0316, ADR 0330)."
+        );
+        assert!(audit_export_markdown(&partly).contains("- **us (webhook, in us-east-1):** their events' sealed rows, but 2 whose details are still in botd's own database whole\n"));
     }
 
     #[test]
