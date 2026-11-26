@@ -288,6 +288,19 @@ pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
                         v => details[k] = v.clone(),
                     }
                 }
+                // Named on the chain before the restore is audited: a start cut off in between
+                // names them again, which changes nothing (ADR 0316).
+                let lost: Vec<[i64; 2]> = serde_json::from_value(note["auditDetailsLost"].clone()).unwrap_or_default();
+                if !lost.is_empty() {
+                    details["auditDetailsLost"] = json!(lost.iter().map(|[a, b]| b - a + 1).sum::<i64>());
+                    if let Err(e) = db.with_conn(|c| crate::audit_chain::insert_erased_ranges(c, ACTOR, ("chat_store", region), &lost)) {
+                        lines.push(format!(
+                            "Regional chat stores: the audit events whose details {region}'s store lost in the restore from {backup} couldn't be named on the chain ({e}); its note {} is kept for the next start (ADR 0316).",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                }
                 if let Err(e) = db.try_record(&Who::system(ACTOR).event(RESTORED).target("chat_store", region).details(details)) {
                     lines.push(format!("Regional chat stores: the restore of {region}'s store from {backup} couldn't be audited ({e}); its note {} is kept for the next start (ADR 0256).", path.display()));
                     continue;
@@ -568,6 +581,10 @@ pub struct Plan {
     /// Usage records kept from it (the store now missing or not opening, ADR 0304) that were
     /// still waiting for Stripe's meter, marked failed rather than sent again.
     meter_held_back: usize,
+    /// Audit events whose details only the store held and it doesn't (made since, or an
+    /// erasure since rewrote them), the store now missing or not opening (ADR 0316): their
+    /// rows in botd's log are named as erased when botd starts.
+    audit_lost: Vec<i64>,
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
@@ -588,11 +605,16 @@ fn erasures(c: &Connection, backup_at: i64) -> Result<(Vec<(String, String)>, Ve
             .map_err(db)?;
         s.query_map([], |r| r.get(0)).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
     };
-    for (id, pseudonym, at) in people.iter().filter(|(_, _, at)| *at >= backup_at) {
+    // What each erasure kept, whenever it was: a `bot.deleted` event's details may be in a
+    // regional store this connection doesn't attach (ADR 0316).
+    for (id, pseudonym, at) in &people {
         let kept: Option<String> = c.query_row("SELECT value FROM settings WHERE key = ?1", [format!("{ERASED_BOTS}{id}")], |r| r.get(0)).optional().map_err(db)?;
         if let Some(kept) = kept {
             let ids: Vec<String> = serde_json::from_str(&kept).map_err(|e| format!("botd's database: {ERASED_BOTS}{id}: {e}"))?;
             bots.extend(ids);
+            continue;
+        }
+        if *at < backup_at {
             continue;
         }
         let counted: Option<String> = c
@@ -674,6 +696,16 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
     (plan.sign_ins_replaced, plan.signed_in, plan.meter_held_back) = crate::db::sign_ins_from(&c, now, &kept).map_err(err)?;
     if now.is_some() {
         c.execute("DETACH DATABASE now_store", []).map_err(err)?;
+    } else {
+        // Audit events' details are kept from the backup as the only copy left, but not
+        // those an erasure since rewrote; any botd's log says the store held that the copy
+        // doesn't are lost (ADR 0316).
+        c.execute("ATTACH DATABASE ?1 AS botd KEY ?2", rusqlite::params![db_path, place.db_key.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
+        let lost = crate::db::audit_lost_in_copy(&c, "botd", &place.region, at);
+        c.execute("DETACH DATABASE botd", []).map_err(err)?;
+        let (erased, lost) = lost.map_err(err)?;
+        plan.erased.audit_events += erased;
+        plan.audit_lost = lost;
     }
     c.execute_batch("VACUUM").map_err(err)?;
     check(&c)?;
@@ -939,6 +971,7 @@ fn write_note(place: &Place, r: &Restore, work: &Path, at: i64) -> Result<PathBu
         "signInsReplaced": r.plan.sign_ins_replaced,
         "signedIn": r.plan.signed_in,
         "meterHeldBack": r.plan.meter_held_back,
+        "auditDetailsLost": crate::audit_chain::ranges(&r.plan.audit_lost),
         "back": r.plan.back,
         "gone": r.plan.gone,
         "uid": euid(),
@@ -1040,6 +1073,12 @@ impl Restore {
             out.push_str(&format!(
                 "  Model usage records in it still waiting for Stripe's meter: {}. With the store now gone nothing says whether they were sent since, so they are marked failed, not sent again. Check them against Stripe (ADR 0304).\n",
                 p.meter_held_back
+            ));
+        }
+        if !p.audit_lost.is_empty() {
+            out.push_str(&format!(
+                "  Audit events whose details only the store held, and the backup doesn't: {}. Their rows stay in botd's log, sealed; botd names them as erased (audit.erased) when it starts, so the log still verifies (ADR 0316).\n",
+                p.audit_lost.len()
             ));
         }
         if p.unopened > 0 {

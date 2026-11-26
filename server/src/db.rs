@@ -19,6 +19,7 @@ pub use chats::{
     kept_in_region, places, sign_ins_from, upgrade_copy, user_place,
 };
 pub use chats::{StoreMoved, moved_to, remove_store_files};
+pub use chats::{audit_lost_in_copy, audit_person, audit_placeholder, audit_store_for, insert_audit_details};
 #[cfg(test)]
 pub(crate) use chats::Scratch;
 
@@ -3228,6 +3229,9 @@ fn migrate_server_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
 /// The settings key an erasure sets, to its pseudonym, for its own transaction only:
 /// while it is there, `audit_events_no_update` lets an update replace a person's fields.
 const AUDIT_ERASING: &str = "audit_erasing";
+/// The settings key botd sets while it moves audit events' erasable fields between their
+/// row and a regional chat store (ADR 0316), for that transaction only.
+const AUDIT_MOVING: &str = "audit_details_moving";
 /// Settings key prefix for the Bots an unfinished erasure took on, by user id.
 const ERASING_BOTS: &str = "erasing_bots:";
 /// The Bots an erasure deleted, kept for good: restoring a regional chat store backup made
@@ -3255,22 +3259,25 @@ fn migrate_user_erasure(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
 }
 
 /// `audit_events_no_update`: refuses every update but an erasure's (ADR 0102). With the
-/// hash chain (ADR 0122) an erasure also keeps the row's seal and clears its salt.
+/// hash chain (ADR 0122) an erasure also keeps the row's seal and clears its salt, and
+/// botd may move a row's erasable fields and salt to and from a regional chat store
+/// (ADR 0316), with its seal and everything else kept.
 fn audit_update_trigger(chain: bool) -> String {
     let p = format!("(SELECT value FROM settings WHERE key = '{AUDIT_ERASING}')");
-    let chain = if chain {
-        "AND NEW.chain_prev IS OLD.chain_prev AND NEW.chain_hash IS OLD.chain_hash AND NEW.chain_digest IS OLD.chain_digest AND NEW.chain_salt IS NULL"
+    let sealed = "NEW.chain_prev IS OLD.chain_prev AND NEW.chain_hash IS OLD.chain_hash AND NEW.chain_digest IS OLD.chain_digest";
+    let (chain, moving) = if chain {
+        (
+            format!("AND {sealed} AND NEW.chain_salt IS NULL"),
+            format!("OR ((SELECT value FROM settings WHERE key = '{AUDIT_MOVING}') IS NOT NULL AND {AUDIT_FIXED_KEPT} AND {sealed})"),
+        )
     } else {
-        ""
+        (String::new(), String::new())
     };
     format!(
         "CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
-          WHEN NOT (
+          WHEN NOT ((
             {p} IS NOT NULL {chain}
-            AND NEW.id = OLD.id AND NEW.at = OLD.at AND NEW.actor_kind = OLD.actor_kind AND NEW.action = OLD.action
-            AND NEW.outcome = OLD.outcome AND NEW.target_type IS OLD.target_type AND NEW.bot_id IS OLD.bot_id
-            AND NEW.actor_role IS OLD.actor_role AND NEW.auth_method IS OLD.auth_method
-            AND NEW.idp IS OLD.idp AND NEW.idp_provider IS OLD.idp_provider
+            AND {AUDIT_FIXED_KEPT}
             AND (NEW.actor_id IS OLD.actor_id OR NEW.actor_id = {p})
             AND (NEW.target_id IS OLD.target_id OR NEW.target_id = {p})
             AND (NEW.on_behalf_of IS OLD.on_behalf_of OR NEW.on_behalf_of = {p})
@@ -3280,9 +3287,21 @@ fn audit_update_trigger(chain: bool) -> String {
             AND (NEW.ip IS OLD.ip OR NEW.ip IS NULL)
             AND (NEW.user_agent IS OLD.user_agent OR NEW.user_agent IS NULL)
             AND (NEW.session_id IS OLD.session_id OR NEW.session_id IS NULL)
-          )
+          ) {moving})
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;"
     )
+}
+
+/// The columns of an audit event no update may change.
+const AUDIT_FIXED_KEPT: &str = "NEW.id = OLD.id AND NEW.at = OLD.at AND NEW.actor_kind = OLD.actor_kind AND NEW.action = OLD.action
+            AND NEW.outcome = OLD.outcome AND NEW.target_type IS OLD.target_type AND NEW.bot_id IS OLD.bot_id
+            AND NEW.actor_role IS OLD.actor_role AND NEW.auth_method IS OLD.auth_method
+            AND NEW.idp IS OLD.idp AND NEW.idp_provider IS OLD.idp_provider";
+
+/// Puts the current `audit_events_no_update` on an existing log (ADR 0316): the chain's
+/// migration made one without the moving rule.
+pub(super) fn audit_update_trigger_now(c: &Connection) -> rusqlite::Result<()> {
+    c.execute_batch(&format!("DROP TRIGGER IF EXISTS main.audit_events_no_update; {}", audit_update_trigger(true)))
 }
 
 /// Whether Bot `?1` is held or has messages from a held Bot in its chat.
@@ -7690,11 +7709,19 @@ impl Db {
             if !changed && next == (actor_id, name, email, subject, target, behalf, ip, agent, session) {
                 continue;
             }
-            c.execute(
-                "UPDATE audit_events SET actor_id = ?2, actor_name = ?3, actor_email = ?4, actor_subject = ?5, target_id = ?6, on_behalf_of = ?7,
-                   ip = ?8, user_agent = ?9, session_id = ?10, details = ?11, chain_salt = NULL WHERE id = ?1",
-                params![id, next.0, next.1, next.2, next.3, next.4, next.5, next.6, next.7, next.8, if changed { d.to_string() } else { details }],
-            )?;
+            let details = if changed { d.to_string() } else { details };
+            // A regional store may hold the event's details rather than its row (ADR 0316).
+            let held = chats::audit_details_held(c, id)?;
+            let tables = if held.is_empty() { vec!["main.audit_events".to_string()] } else { held.iter().map(|s| format!("{s}.{}", chats::AUDIT)).collect() };
+            for t in tables {
+                c.execute(
+                    &format!(
+                        "UPDATE {t} SET actor_id = ?2, actor_name = ?3, actor_email = ?4, actor_subject = ?5, target_id = ?6, on_behalf_of = ?7,
+                           ip = ?8, user_agent = ?9, session_id = ?10, details = ?11, chain_salt = NULL WHERE id = ?1"
+                    ),
+                    params![id, next.0, next.1, next.2, next.3, next.4, next.5, next.6, next.7, next.8, details],
+                )?;
+            }
             cleared.push(id);
         }
         // On the chain, in the same transaction: the rows whose salt this erasure cleared.
@@ -9842,7 +9869,10 @@ impl Db {
         let last: Option<(i64, Option<String>)> =
             tx.query_row("SELECT id, chain_hash FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT 1", [end], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let Some((last, hash)) = last else { return Ok((0, None)) };
-        let n = tx.execute("DELETE FROM audit_events WHERE id <= ?", [last])?;
+        let n = tx.execute("DELETE FROM main.audit_events WHERE id <= ?", [last])?;
+        if !self.chat_stores_set().is_empty() {
+            self.on_places(&tx, &format!("DELETE FROM {{{}}} WHERE id <= ?1", chats::AUDIT), &[&last])?;
+        }
         // A record outlives its checkpoint while its timestamp event is still in the log, so that
         // event's export and check still have the token.
         tx.execute("DELETE FROM audit_checkpoints WHERE event_id <= ?1 AND (tsa_event_id IS NULL OR tsa_event_id <= ?1)", [last])?;
