@@ -389,6 +389,97 @@ async fn only_a_time_bound_role_is_requestable() {
 }
 
 #[tokio::test]
+async fn the_asker_hears_when_their_request_is_decided_or_lapses() {
+    use crate::team_role_requests_http_tests::{events_now, mailed, notices, pushed, until};
+    let (port, app, admin, _) = serve_app().await;
+    let (mail, rec) = notices(&app).await;
+    let (_, ana_auth) = user_with(port, &admin, "decided-ana@example.com", "admin").await;
+    let (_, abe_auth) = user_with(port, &admin, "decided-abe@example.com", "admin").await;
+    let (bo, bo_auth) = user_with(port, &admin, "decided-bo@example.com", "member").await;
+    let (rae, rae_auth) = user_with(port, &admin, "decided-rae@example.com", "readonly").await;
+    let (_, cy_auth) = user_with(port, &admin, "decided-cy@example.com", "member").await;
+    let oncall = requestable(port, &admin, "On-call", "member", &["machines.manage"], 1).await;
+    let peek = requestable(port, &admin, "Audit peek", "readonly", &["audit.view"], 1).await;
+    let prod = role(port, &admin, json!({ "name": "Prod", "permissions": ["bots.manage"], "maxDays": 1, "requestable": true, "approvals": 2 })).await;
+    let phone = |who: &str| format!("ExponentPushToken[{who}-phone]");
+    for (who, auth) in [("bo", &bo_auth), ("cy", &cy_auth), ("ana", &ana_auth)] {
+        let body = json!({ "token": phone(who), "platform": "ios" }).to_string();
+        assert_eq!(call(port, "PUT", "/api/me/push", auth, &body).await.0, 200, "{who}");
+    }
+    let body = json!({ "token": phone("rae"), "platform": "ios" }).to_string();
+    assert_eq!(call(port, "PUT", "/api/me/push", &rae_auth, &body).await.0, 403, "read-only people have no phones to push to");
+    let last_to = |addr: &str| mail.got.lock().unwrap().iter().rev().find(|m| m.to.iter().any(|t| t == addr)).cloned().unwrap();
+    let decided = json!({ "type": "role_decision", "url": "/settings" });
+
+    // Approved: the asker alone hears, by email and on their phone; the list and admins don't.
+    let q = asked(port, &bo_auth, json!({ "role": oncall, "hours": 8, "reason": "Pager week" })).await;
+    until("the list's email of the request", || Some(mailed(&mail)).filter(|m| m.len() >= 1)).await;
+    assert_eq!(call(port, "POST", &format!("/api/role-requests/{q}/approve"), &ana_auth, r#"{"hours":4,"note":"Paged by SRE"}"#).await.0, 200);
+    assert_eq!(until("the asker's email", || Some(mailed(&mail)).filter(|m| m.len() >= 2)).await, ["decided-bo@example.com", "ops@example.com"]);
+    assert_eq!(until("the asker's push", || Some(pushed(&rec)).filter(|p| !p.is_empty())).await, [phone("bo")]);
+    let m = last_to("decided-bo@example.com");
+    assert_eq!(m.to, ["decided-bo@example.com"]);
+    assert!(m.headers.contains("Subject: [SuperBot] Your request for On-call was approved"), "{}", m.headers);
+    for line in ["You hold it across the server until", "for 4 hours.", "Approved by decided-ana@example.com.", "Note: Paged by SRE", "Open it in SuperBot: https://bots.example.com/app/settings"] {
+        assert!(m.body.contains(line), "{line}: {}", m.body);
+    }
+    assert!(!m.body.contains("Console") && !m.body.contains("Pager week"), "{}", m.body);
+    let p = rec.sent.lock().unwrap()[0].clone();
+    assert_eq!((p.title.as_str(), p.body.as_str(), &p.data), ("Your request for a role", "It was approved.", &decided), "no role on a lock screen");
+    let sent = until("both audit events", || Some(events_now(&app, "notification.sent")).filter(|e| e.iter().filter(|e| e.details["event"] == "role.request_approved").count() >= 2)).await;
+    let push = sent.iter().find(|e| e.details["event"] == "role.request_approved" && e.details["channel"] == "push").unwrap();
+    assert_eq!((push.details["users"].clone(), push.target_id.as_deref()), (json!([bo]), Some(oncall.as_str())));
+    let email = sent.iter().find(|e| e.details["event"] == "role.request_approved" && e.details["channel"] == "email").unwrap();
+    assert_eq!(email.details["to"], json!(["decided-bo@example.com"]));
+
+    // Denied, to a read-only asker too (by email), with email kept from the people who can answer.
+    let s = notify::load(&app.db);
+    notify::save(&app.db, &notify::Settings { email: notify::EmailSettings { deciders: false, ..s.email }, ..s });
+    let q = asked(port, &rae_auth, json!({ "role": peek, "hours": 2, "reason": "Quarterly check" })).await;
+    until("the list's email of it", || Some(mailed(&mail)).filter(|m| m.len() >= 3)).await;
+    assert_eq!(call(port, "POST", &format!("/api/role-requests/{q}/deny"), &ana_auth, r#"{"note":"Ask your lead"}"#).await.0, 200);
+    until("the denial's email", || Some(mailed(&mail)).filter(|m| m.len() >= 4)).await;
+    let m = last_to("decided-rae@example.com");
+    assert!(m.headers.contains("Subject: [SuperBot] Your request for Audit peek was denied"), "{}", m.headers);
+    for line in ["Denied by decided-ana@example.com.", "Note: Ask your lead", "You asked for it across the server, for 2 hours."] {
+        assert!(m.body.contains(line), "{line}: {}", m.body);
+    }
+
+    // Lapsed with no decision; one withdrawn, or from someone since disabled, tells nobody.
+    let q = asked(port, &bo_auth, json!({ "role": oncall, "hours": 2, "reason": "Another week" })).await;
+    let gone = asked(port, &rae_auth, json!({ "role": peek, "hours": 1, "reason": "Again" })).await;
+    let withdrawn = asked(port, &cy_auth, json!({ "role": oncall, "hours": 1, "reason": "Oops" })).await;
+    until("the list's emails of them", || Some(mailed(&mail)).filter(|m| m.len() >= 7)).await;
+    assert_eq!(call(port, "POST", &format!("/api/me/role-requests/{withdrawn}/cancel"), &cy_auth, "").await.0, 200);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{rae}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    app.db.move_role_request_lapse(&q, db::now() - 1);
+    role_requests::lapse_due(&app);
+    assert_eq!((app.db.role_request(&q).unwrap().status, app.db.role_request(&gone).unwrap().status), ("lapsed".to_string(), "lapsed".to_string()));
+    until("the lapse's email", || Some(mailed(&mail)).filter(|m| m.len() >= 8)).await;
+    until("the lapse's push", || Some(pushed(&rec)).filter(|p| p.len() >= 2)).await;
+    let m = last_to("decided-bo@example.com");
+    assert!(m.headers.contains("Subject: [SuperBot] Your request for On-call lapsed"), "{}", m.headers);
+    assert!(m.body.contains("Nobody decided it within 7 days.") && m.body.contains("for 2 hours."), "{}", m.body);
+    assert_eq!(rec.sent.lock().unwrap()[1].body, "It lapsed with no decision.");
+
+    // Two approvers: the first tells the asker nothing, the second names both.
+    let q = asked(port, &cy_auth, json!({ "role": prod, "hours": 6, "reason": "Release" })).await;
+    until("the list's email of it", || Some(mailed(&mail)).filter(|m| m.len() >= 9)).await;
+    assert_eq!(call(port, "POST", &format!("/api/role-requests/{q}/approve"), &ana_auth, r#"{"hours":3}"#).await.0, 200);
+    until("the list hears it needs a second", || Some(mailed(&mail)).filter(|m| m.len() >= 10)).await;
+    assert_eq!(call(port, "POST", &format!("/api/role-requests/{q}/approve"), &abe_auth, "{}").await.0, 200);
+    until("the asker's email", || Some(mailed(&mail)).filter(|m| m.len() >= 11)).await;
+    until("the asker's push", || Some(pushed(&rec)).filter(|p| p.len() >= 3)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let m = last_to("decided-cy@example.com");
+    assert!(m.body.contains("Approved by decided-ana@example.com and decided-abe@example.com.") && m.body.contains("for 3 hours."), "{}", m.body);
+    assert_eq!(mailed(&mail).iter().filter(|t| t.as_str() == "decided-cy@example.com").count(), 1, "nothing on the first approval nor the withdrawal");
+    assert_eq!(pushed(&rec), [phone("bo"), phone("bo"), phone("cy")], "never an admin's phone");
+    assert_eq!(rec.sent.lock().unwrap()[2].data, decided);
+    assert_eq!(mailed(&mail).iter().filter(|t| t.as_str() == "decided-rae@example.com").count(), 1);
+}
+
+#[tokio::test]
 async fn bots_and_service_accounts_never_ask_for_roles() {
     let (port, app, admin, key) = serve_app().await;
     requestable(port, &admin, "On-call", "member", &["machines.manage"], 1).await;

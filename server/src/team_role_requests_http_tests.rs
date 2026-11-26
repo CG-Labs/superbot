@@ -204,7 +204,7 @@ async fn not_their_own_nor_a_team_admins_nor_over_the_identity_provider() {
     assert_eq!(call(port, "POST", &at(&gus_q, "deny"), &ada_auth, "{}").await.0, 404);
 }
 
-async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+pub(crate) async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     for _ in 0..500 {
         if let Some(v) = f() {
             return v;
@@ -215,7 +215,7 @@ async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 }
 
 /// A notifier with a stand-in mail server and push provider, and email on to `ops@example.com`.
-async fn notices(app: &App) -> (notify::smtp::fake::Server, notify::push::fake::Recorder) {
+pub(crate) async fn notices(app: &App) -> (notify::smtp::fake::Server, notify::push::fake::Recorder) {
     use notify::{push, smtp};
     let mail = smtp::fake::start(Default::default()).await;
     let rec = push::fake::Recorder::default();
@@ -227,13 +227,13 @@ async fn notices(app: &App) -> (notify::smtp::fake::Server, notify::push::fake::
     (mail, rec)
 }
 
-fn mailed(mail: &notify::smtp::fake::Server) -> Vec<String> {
+pub(crate) fn mailed(mail: &notify::smtp::fake::Server) -> Vec<String> {
     let mut to: Vec<String> = mail.got.lock().unwrap().iter().flat_map(|m| m.to.clone()).collect();
     to.sort();
     to
 }
 
-fn pushed(rec: &notify::push::fake::Recorder) -> Vec<String> {
+pub(crate) fn pushed(rec: &notify::push::fake::Recorder) -> Vec<String> {
     let mut to: Vec<String> = rec.sent.lock().unwrap().iter().map(|m| m.to.clone()).collect();
     to.sort();
     to
@@ -309,7 +309,7 @@ async fn team_owners_and_admins_hear_of_requests_they_may_decide() {
     assert_eq!(mailed(&mail).len(), 6);
 }
 
-fn events_now(app: &App, action: &str) -> Vec<db::AuditEvent> {
+pub(crate) fn events_now(app: &App, action: &str) -> Vec<db::AuditEvent> {
     let f = audit::Filter::from_query(&HashMap::from([("action".to_string(), action.to_string())])).unwrap();
     app.db.audit_events(&f, 50, true)
 }
@@ -353,8 +353,14 @@ async fn a_first_approval_tells_the_others_who_may_give_the_second() {
     let push = sent.iter().find(|e| e.details["event"] == "role.request_first_approved" && e.details["channel"] == "push").unwrap();
     assert_eq!(push.details["users"], json!([ada]));
 
-    // The second approval gives it, and tells nobody more.
+    // The second approval gives it, and tells only the asker (ADR 0329).
     assert_eq!(call(port, "POST", &at(&q, "approve"), &ada_auth, "{}").await.0, 200);
+    until("the asker's email", || Some(mailed(&mail)).filter(|m| m.len() >= 6)).await;
+    until("the asker's push", || Some(pushed(&rec)).filter(|p| p.len() >= 4)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!((mailed(&mail).len(), pushed(&rec).len()), (5, 3));
+    assert_eq!((mailed(&mail).len(), pushed(&rec).len()), (6, 4));
+    let m = mail.got.lock().unwrap()[5].clone();
+    assert_eq!(m.to, ["second-cy@example.com"]);
+    assert!(m.body.contains("Approved by second-eve@example.com and second-ada@example.com."), "{}", m.body);
+    assert_eq!(rec.sent.lock().unwrap()[3].to, phone("cy"));
 }

@@ -15,6 +15,11 @@ describe("pushLink", () => {
     expect(pushLink({ type: "role_request", url: "https://example.com/phish" })).toEqual({ pathname: "/team" });
   });
 
+  it("opens Settings when your own request is decided, whatever its url says", () => {
+    expect(pushLink({ type: "role_decision", url: "/settings" })).toEqual({ pathname: "/settings" });
+    expect(pushLink({ type: "role_decision", url: "https://example.com/phish" })).toEqual({ pathname: "/settings" });
+  });
+
   it("opens home for a test or an id that doesn't look like one", () => {
     expect(pushLink({ type: "test", url: "/home" })).toEqual({ pathname: "/home" });
     expect(pushLink({ type: "approval", approvalId: "../../settings" })).toEqual({ pathname: "/home" });
