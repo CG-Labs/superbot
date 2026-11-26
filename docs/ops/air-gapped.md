@@ -320,7 +320,7 @@ A check that doesn't finish (botd killed, or a license or settings it can't read
 
 It refuses a stack that has never run botd (there is nothing to upgrade, and a check would make its volumes), an image that isn't on the host (it never pulls; with a mirror, `docker pull` it first), and a Compose file that names botd's image without `SUPERBOT_IMAGE` (point it at the image there, or override it).
 
-**It refuses an older release** ([ADR 0327](../adr/0327-compose-upgrades-keep-a-way-back.md)). Before the settings, the image's own `botd support check` reads the stack's database, read-only. If a newer botd made it ("made by a newer botd") or ran on it last ("botd 0.3.0 ran on it last"), it stops: botd would start on that database anyway, and may not work on it. Go back with the data from before, [below](#going-back-with-compose). It doesn't take a backup itself: take a rollback point before you switch, and it says when you have one.
+**It refuses an older release** ([ADR 0327](../adr/0327-compose-upgrades-keep-a-way-back.md)). Before the settings, the image's own `botd support check` reads the stack's database, read-only. If a newer botd made it ("made by a newer botd") or ran on it last ("botd 0.3.0 ran on it last"), it stops: botd would start on that database anyway, and may not work on it. Go back with the data from before, [below](#going-back-with-compose). It stops too when the check fails the database for another reason, such as a master key that doesn't open it or a failed integrity check, and says what botd said. It doesn't take a backup itself: take a rollback point before you switch, and it says when you have one.
 
 ### Going back with Compose
 
