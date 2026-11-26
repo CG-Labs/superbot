@@ -872,6 +872,12 @@ case $1 in
   config)
     if [[ -f "$cs/override" ]]; then cat "$cs/override"; elif [[ -n "${SUPERBOT_IMAGE:-}" ]]; then echo "$SUPERBOT_IMAGE"; else cat "$cs/configured"; fi ;;
   run)
+    if [[ "${*:2:6}" == "--rm --no-deps -T --entrypoint sh botd" && "${*: -1}" == *"botd database query"* ]]; then
+      echo "keycheck image=${SUPERBOT_IMAGE:-}" >>"$cs/log"
+      echo "previous=$(cat "$cs/previous" 2>/dev/null || echo no)"
+      cat "$cs/keycheck" 2>/dev/null || true
+      exit
+    fi
     if [[ "${*:2:6}" == "--rm --no-deps -T --entrypoint sh botd" ]]; then
       echo "pre image=${SUPERBOT_IMAGE:-}" >>"$cs/log"
       cat "$cs/pre" 2>/dev/null || echo 0
@@ -904,7 +910,10 @@ case $1 in
       cat "$cs/archive"
       exit "$(cat "$cs/backup_rc" 2>/dev/null || echo 0)"
     fi
-    if [[ $4 == sh ]]; then caps "$running" "$(check_of "${*: -1}")"; else botd_out "$running" "$5"; fi ;;
+    if [[ $4 == sh && "${*: -1}" == *"botd database query"* ]]; then
+      echo previous=no
+      cat "$cs/keycheck" 2>/dev/null || true
+    elif [[ $4 == sh ]]; then caps "$running" "$(check_of "${*: -1}")"; else botd_out "$running" "$5"; fi ;;
   stop) echo "stop opts=${opts[*]}" >>"$cs/log"; [[ ! -f "$cs/running" ]] || mv "$cs/running" "$cs/stopped" ;;
   start) echo "start opts=${opts[*]}" >>"$cs/log"; [[ ! -f "$cs/stopped" ]] || mv "$cs/stopped" "$cs/running" ;;
   up)
@@ -1099,6 +1108,7 @@ A1=$(rec archive)
 { cmp -s "$RB/$A1" "$CS/archive" && [[ "$(stat -c %a "$RB/$A1")" == 600 ]]; } || fail "the rollback point isn't what superbot-backup streamed, kept private"
 [[ "$(rec format) $(rec project) $(rec image) $(rec image_id)" == "1 stack old:1 sha256:$(printf old:1 | sha256sum | cut -c1-64)" ]] || { cat "$RB/record" >&2; fail "the record doesn't name the image botd ran on"; }
 [[ "$(rec sha256)" == "$(sha256sum <"$RB/$A1" | cut -c1-64)" && -n "$(rec taken)" ]] || fail "the record doesn't hold the archive's SHA-256 and when"
+[[ "$(rec key_check)" == unknown ]] || fail "a botd without botd database query recorded a key check: $(rec key_check)"
 { grep -Fq "Rollback point: superbot-rollback/$A1" "$T/bc.log" && grep -Fq "rollback-compose --identity <your backup key>" "$T/bc.log"; } \
   || { cat "$T/bc.log" >&2; fail "backup-compose didn't say how to go back"; }
 cstack check-compose --image new:2 >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose failed with a rollback point"; }
@@ -1117,17 +1127,27 @@ rm -f "$CS/backup_rc"
 printf 'not an archive' >"$CS/archive"
 if cstack backup-compose >"$T/bc.log" 2>&1; then fail "backup-compose kept something that isn't an archive"; fi
 grep -Fq "wrote no archive" "$T/bc.log" || fail "a stream that isn't an archive wasn't said"
-{ cmp -s "$RB/record" "$T/record.kept" && [[ -f "$RB/$A2" && ! -e "$RB/.partial" ]]; } || fail "a failed backup-compose touched the last rollback point"
+{ cmp -s "$RB/record" "$T/record.kept" && [[ -f "$RB/$A2" && -z "$(find "$RB" -name '.partial.*' -o -name '.record.*')" ]]; } || fail "a failed backup-compose touched the last rollback point, or left its files"
+if command -v flock >/dev/null; then
+  : >>"$RB/.lock"
+  (flock -n 7 && if cstack backup-compose >"$T/bc.log" 2>&1; then exit 1; fi) 7<"$RB/.lock" || fail "backup-compose ran while another held the rollback folder"
+  grep -Fq "Another backup-compose or rollback-compose is using superbot-rollback" "$T/bc.log" || { cat "$T/bc.log" >&2; fail "a held rollback folder wasn't said"; }
+  cmp -s "$RB/record" "$T/record.kept" || fail "a backup-compose that waited on the lock touched the rollback point"
+fi
 rm -f "$CS/running"
 if cstack backup-compose >"$T/bc.log" 2>&1; then fail "backup-compose ran with botd stopped"; fi
 grep -Fq "botd isn't running in this Compose stack" "$T/bc.log" || fail "a stopped botd wasn't said"
 echo old:1 >"$CS/running"
-ok "backup-compose keeps one private rollback point, the running botd's own backup with the image it ran on, and keeps the last one when it fails"
+ok "backup-compose keeps one private rollback point, the running botd's own backup with the image it ran on, keeps the last one when it fails, and runs one at a time"
 
 # The stack has switched to new:2, and .env names old:1 again.
+cimage old:1 settings license database
+cimage new:2 settings license support database
+echo 'sb1:sealed-under-the-old-key' >"$CS/keycheck"
 printf 'age-encryption.org/v1\n-> X25519 stand-in\n' >"$CS/archive"
 cstack backup-compose >/dev/null 2>&1 || fail "backup-compose failed"
 A3=$(rec archive)
+[[ "$(rec key_check)" == "$(printf 'sb1:sealed-under-the-old-key' | sha256sum | cut -c1-64)" ]] || fail "the record doesn't hold the SHA-256 of the database's key check: $(rec key_check)"
 cp "$RB/record" "$T/record.kept"
 cp "$RB/$A3" "$T/archive.kept"
 echo new:2 >"$CS/running"
@@ -1149,8 +1169,10 @@ for want in "run image=old:1 opts=-p stack args=settings check stdin=" \
   "stop opts=-p stack" "up opts=-p stack -d --wait"; do
   grep -Fqx -- "$want" "$CS/log" || { cat "$CS/log" >&2; fail "rollback-compose didn't run: $want"; }
 done
-order=$(grep -E '^(run image=old:1 .*settings|restore |pre |stop |up )' "$CS/log" | awk '{ print $1 }' | tr '\n' ' ')
-[[ "$order" == "run restore pre stop restore up " ]] || { cat "$CS/log" >&2; fail "rollback-compose ran its steps out of order: $order"; }
+grep -Fqx "keycheck image=new:2" "$CS/log" || { cat "$CS/log" >&2; fail "rollback-compose didn't read the live database's key check with the running botd"; }
+order=$(grep -E '^(run image=old:1 .*settings|keycheck |restore |pre |stop |up )' "$CS/log" | awk '{ print $1 }' | tr '\n' ' ')
+[[ "$order" == "run keycheck restore pre stop restore up " ]] || { cat "$CS/log" >&2; fail "rollback-compose ran its steps out of order: $order"; }
+grep -Fq "Master key: the one that sealed the rollback point's saved secrets seals the stack's database now" "$T/rc.log" || { cat "$T/rc.log" >&2; fail "rollback-compose didn't say the master key is the same"; }
 [[ ! -e "$RB/record" && ! -e "$RB/$A3" && "$(cat "$CS/running")" == old:1 ]] || fail "rollback-compose didn't start the stack on old:1 and remove the rollback point"
 for want in "everything saved in this stack since $(sed -n 's/^taken=//p' "$T/record.kept") is lost" "its newest audit event: 2026-11-20T09:59:00Z" "The stack runs on old:1 again"; do
   grep -Fq -- "$want" "$T/rc.log" || { cat "$T/rc.log" >&2; fail "rollback-compose didn't say: $want"; }
@@ -1188,7 +1210,25 @@ csays old:1 settings 0 "$OK_SETTINGS"
 echo 1 >"$CS/check_rc"
 crolledback "a rollback point superbot-restore refuses" "superbot-restore in old:1 refused the rollback point" --identity "$T/identity.txt"
 rm -f "$CS/check_rc"
-ok "rollback-compose refuses, with nothing changed, without a rollback point or its key, while .env names another image, and for a changed archive or record, another build or project, and settings or a backup the old release refuses"
+echo 'sb1:sealed-under-the-new-key' >"$CS/keycheck"
+crolledback "a master key rotated since" "The master key was rotated since the rollback point was taken ($(rec taken)): its saved secrets open only with the key from before, and botd isn't given it. Set SUPERBOT_MASTER_KEY_PREVIOUS in .env" --identity "$T/identity.txt"
+if command -v flock >/dev/null; then
+  (flock -n 7 && crolledback "a rollback folder another run holds" "Another backup-compose or rollback-compose is using superbot-rollback" --identity "$T/identity.txt") 7<"$RB/.lock" \
+    || fail "rollback-compose ran while another held the rollback folder"
+fi
+ok "rollback-compose refuses, with nothing changed, without a rollback point or its key, while .env names another image, for a changed archive or record, another build or project, settings or a backup the old release refuses, a master key rotated since without the key from before, and while another run holds the folder"
+
+cback
+echo yes >"$CS/previous"
+cstack rollback-compose --identity "$T/identity.txt" >"$T/rc.log" 2>&1 || { cat "$T/rc.log" >&2; fail "rollback-compose refused a rotated master key with the previous one given"; }
+grep -Fq "botd opens the rollback point's saved secrets with SUPERBOT_MASTER_KEY_PREVIOUS, which must be the key from before" "$T/rc.log" || { cat "$T/rc.log" >&2; fail "a rotated master key with the previous one given wasn't said"; }
+rm -f "$CS/previous"
+echo 'sb1:sealed-under-the-old-key' >"$CS/keycheck"
+cback
+sed -i '/^key_check=/d' "$RB/record"
+cstack rollback-compose --identity "$T/identity.txt" >"$T/rc.log" 2>&1 || { cat "$T/rc.log" >&2; fail "rollback-compose refused a record without a key check"; }
+grep -Fq "The rollback point doesn't say which master key sealed its saved secrets" "$T/rc.log" || { cat "$T/rc.log" >&2; fail "a record without a key check wasn't warned of"; }
+ok "rollback-compose goes on with a rotated master key when botd is given the key from before, and warns when the rollback point doesn't say which key sealed it"
 
 cback
 echo 1 >"$CS/restore_rc"
@@ -1204,10 +1244,11 @@ rm -f "$CS/restore_rc" "$CS/swaps"
 cback
 echo 1 >"$CS/up_rc"
 if cstack rollback-compose --identity "$T/identity.txt" >"$T/rc.log" 2>&1; then fail "rollback-compose passed a stack that didn't come up"; fi
-grep -Fq "The data is back as it was on" "$T/rc.log" || { cat "$T/rc.log" >&2; fail "a stack that didn't come up after the restore wasn't said"; }
+{ grep -Fq "The data is back as it was on" "$T/rc.log" && grep -Fq "The rollback point is kept in superbot-rollback" "$T/rc.log"; } || { cat "$T/rc.log" >&2; fail "a stack that didn't come up after the restore wasn't said"; }
+[[ -f "$RB/record" && -f "$RB/$A3" ]] || fail "the rollback point was removed though the stack didn't come up"
 rm -f "$CS/up_rc" "$CS/stopped"
 echo old:1 >"$CS/running"
-ok "a restore that fails before it touches the data starts the stack again as it was; one that fails while swapping leaves it stopped; a stack that doesn't come up is said"
+ok "a restore that fails before it touches the data starts the stack again as it was; one that fails while swapping leaves it stopped; a stack that doesn't come up is said, and its rollback point kept"
 
 ibuild "$T/iown" --image own=own-image:2 --allow-unsigned >"$T/iown.log" 2>&1 || { cat "$T/iown.log" >&2; fail "a local image didn't bundle"; }
 [[ "$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest")" == "$OWN" ]] || fail "the local image wasn't bundled from docker save"

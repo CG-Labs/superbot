@@ -900,8 +900,30 @@ rollback_dir() {
   chmod 0700 -- "$1"
 }
 
+# One backup-compose or rollback-compose at a time per rollback folder.
+rollback_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  [[ ! -L "$1/.lock" ]] || die "Refusing the symlinked lock file $1/.lock"
+  exec 8>>"$1/.lock"
+  flock -n 8 || die "Another backup-compose or rollback-compose is using $1: wait for it to finish, then run this again"
+}
+
+# Prints previous=yes|no (whether botd is given SUPERBOT_MASTER_KEY_PREVIOUS), then the database's
+# key check: a value sealed under the master key, written again by each rotation (ADR 0096).
+# shellcheck disable=SC2016 # expanded in the container
+KEY_CHECK_SH='p=no; [ -z "${SUPERBOT_MASTER_KEY_PREVIOUS:-}${SUPERBOT_MASTER_KEY_PREVIOUS_FILE:-}" ] || p=yes; echo "previous=$p"
+exec botd database query "${DATA_DIR:-/data}/app.sqlite" "SELECT value FROM settings WHERE key = '\''secrets_key_check'\''"'
+KEY_CHECK_HAS="usage: botd database backup"
+
+# KEY_CHECK_SH's output as a record keeps it: the key check's SHA-256, or none before botd sealed anything.
+key_check_digest() {
+  local v
+  v=$(sed 1d <<<"$1")
+  if [[ -z "$v" ]]; then echo none; else printf '%s' "$v" | sha256sum | awk '{ print $1 }'; fi
+}
+
 cmd_backup_compose() {
-  local dir=$COMPOSE_ROLLBACK_DIR cid image image_id project ext name old sha stamp part doc="docs/ops/air-gapped.md#going-back-with-compose"
+  local dir=$COMPOSE_ROLLBACK_DIR cid image image_id project ext name old sha stamp part new kc out doc="docs/ops/air-gapped.md#going-back-with-compose"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir) dir=${2:-}; shift 2 ;;
@@ -919,8 +941,13 @@ cmd_backup_compose() {
   [[ "${image_id:-}" =~ ^sha256:[0-9a-f]{64}$ && "${project:-}" =~ ^[a-z0-9][a-z0-9_-]*$ && -n "${image:-}" && "$image" != *'$'* ]] \
     || die "Couldn't tell which image and Compose project botd's container $cid runs"
   rollback_dir "$dir"
-  part="$dir/.partial"
-  rm -f -- "$part"
+  rollback_lock "$dir"
+  # Which master key sealed the database's values, so rollback-compose can tell a rotation since.
+  kc=unknown
+  if stack_botd_has "$KEY_CHECK_HAS" && out=$(stack exec -T botd sh -c "$KEY_CHECK_SH" </dev/null 2>/dev/null); then
+    kc=$(key_check_digest "$out")
+  fi
+  part=$(umask 077 && mktemp "$dir/.partial.XXXXXX") || die "Couldn't write in $dir"
   # The running release's own superbot-backup, as the backup service runs it: a consistent copy
   # of the database, encrypted to the stack's backup recipients when it has them.
   if ! (umask 077 && stack exec -T botd superbot-backup - </dev/null >"$part" 2>"$COMPOSE_ERR"); then
@@ -941,9 +968,10 @@ cmd_backup_compose() {
   sha=$(sha256sum <"$dir/$name" | awk '{ print $1 }')
   old=""
   [[ ! -f "$dir/record" ]] || old=$(record_value "$dir/record" archive)
-  (umask 077 && printf 'format=1\nproject=%s\nimage=%s\nimage_id=%s\ntaken=%s\narchive=%s\nsha256=%s\n' \
-    "$project" "$image" "$image_id" "$(date -u +%FT%TZ)" "$name" "$sha" >"$dir/.record.new") || die "Couldn't write $dir/.record.new"
-  mv -- "$dir/.record.new" "$dir/record"
+  new=$(umask 077 && mktemp "$dir/.record.XXXXXX") || die "Couldn't write in $dir"
+  printf 'format=1\nproject=%s\nimage=%s\nimage_id=%s\ntaken=%s\narchive=%s\nsha256=%s\nkey_check=%s\n' \
+    "$project" "$image" "$image_id" "$(date -u +%FT%TZ)" "$name" "$sha" "$kc" >"$new" || { rm -f -- "$new"; die "Couldn't write $new"; }
+  mv -- "$new" "$dir/record"
   [[ "$old" == "$name" || ! "$old" =~ $ROLLBACK_ARCHIVE_RE ]] || rm -f -- "${dir:?}/$old"
   log "Rollback point: $dir/$name ($(du -h "$dir/$name" | cut -f1)), of botd on $image. One is kept: the next backup-compose replaces it."
   [[ "$ext" == .tar.gz.age ]] || warn "It isn't encrypted (the stack has no SUPERBOT_BACKUP_AGE_RECIPIENTS): keep $dir private"
@@ -957,9 +985,32 @@ pre_restores() {
   SUPERBOT_IMAGE=$1 stack run --rm --no-deps -T --entrypoint sh botd -c 'ls -d "${DATA_DIR:-/data}"/.pre-restore-* 2>/dev/null | wc -l' </dev/null 2>"$COMPOSE_ERR"
 }
 
+# Refuses a rollback point whose saved secrets need a master key botd won't be given: the key
+# check KC that backup-compose recorded, against the stack's database now, read by RUNNING's botd.
+compose_key_check() {
+  local running=$1 kc=$2 taken=$3 out
+  [[ "$kc" != none ]] || return 0
+  if [[ ! "$kc" =~ ^[0-9a-f]{64}$ ]]; then
+    warn "The rollback point doesn't say which master key sealed its saved secrets: if the key was rotated since $taken, set SUPERBOT_MASTER_KEY_PREVIOUS in .env to the key from before"
+    return 0
+  fi
+  if ! image_botd_has "$running" "$KEY_CHECK_HAS" \
+    || ! out=$(SUPERBOT_IMAGE=$running stack run --rm --no-deps -T --entrypoint sh botd -c "$KEY_CHECK_SH" </dev/null 2>"$COMPOSE_ERR"); then
+    warn "Couldn't read which master key seals the stack's database now: if it was rotated since $taken, set SUPERBOT_MASTER_KEY_PREVIOUS in .env to the key from before"
+    return 0
+  fi
+  if [[ "$(key_check_digest "$out")" == "$kc" ]]; then
+    log "Master key: the one that sealed the rollback point's saved secrets seals the stack's database now"
+    return 0
+  fi
+  [[ "$(head -n 1 <<<"$out")" == previous=yes ]] \
+    || die "The master key was rotated since the rollback point was taken ($taken): its saved secrets open only with the key from before, and botd isn't given it. Set SUPERBOT_MASTER_KEY_PREVIOUS in .env to that key, then run this again (docs/ops/master-key-rotation.md). Nothing has changed"
+  log "Master key: rotated since $taken; botd opens the rollback point's saved secrets with SUPERBOT_MASTER_KEY_PREVIOUS, which must be the key from before"
+}
+
 cmd_rollback_compose() {
   local dir=$COMPOSE_ROLLBACK_DIR identity="" rec format project image image_id taken archive sha cid now_project running configured have
-  local before after out rc newest doc="docs/ops/air-gapped.md#going-back-with-compose"
+  local before after out rc newest kc doc="docs/ops/air-gapped.md#going-back-with-compose"
   local -a mount=() rargs=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -973,8 +1024,10 @@ cmd_rollback_compose() {
   rec="$dir/record"
   [[ -f "$rec" ]] \
     || die "No rollback point in $dir: backup-compose takes one before you switch. Without one, restore a backup made on the release you go back to (docs/ops/backup-restore.md)"
+  rollback_lock "$dir"
   format=$(record_value "$rec" format) project=$(record_value "$rec" project) image=$(record_value "$rec" image)
   image_id=$(record_value "$rec" image_id) taken=$(record_value "$rec" taken) archive=$(record_value "$rec" archive) sha=$(record_value "$rec" sha256)
+  kc=$(record_value "$rec" key_check)
   [[ "$format" == 1 ]] || die "$rec isn't a rollback record this offline-bundle.sh reads (format ${format:-missing})"
   [[ "$project" =~ ^[a-z0-9][a-z0-9_-]*$ && "$image_id" =~ ^sha256:[0-9a-f]{64}$ && "$sha" =~ ^[0-9a-f]{64}$ && -n "$taken" \
     && -n "$image" && "$image" != -* && "$image" != *'$'* && "$image" != *[[:space:]]* && "$archive" =~ $ROLLBACK_ARCHIVE_RE ]] \
@@ -1009,6 +1062,7 @@ cmd_rollback_compose() {
     || die "$image here is another build ($have) than the rollback point was taken on ($image_id): load that release's bundle again. Nothing has changed"
 
   compose_settings_check "$image" "then run this again" "$doc"
+  compose_key_check "$running" "$kc" "$taken"
   rc=0
   out=$(SUPERBOT_IMAGE=$image stack run --rm --no-deps -T "${mount[@]}" botd superbot-restore "${rargs[@]}" --check - <"$dir/$archive" 2>"$COMPOSE_ERR") || rc=$?
   [[ $rc -eq 0 ]] || die "superbot-restore in $image refused the rollback point: $(compose_err). Nothing has changed"
@@ -1030,10 +1084,10 @@ cmd_rollback_compose() {
     fi
     die "The restore failed while it swapped botd's data in: $why. The stack stays stopped: the data from before is in the newest .pre-restore-* folder in botd's data volume. Run this again, or move that folder's contents back (docker compose run --rm --no-deps --entrypoint sh botd) and docker compose start ($doc)"
   fi
-  rm -f -- "$rec" "${dir:?}/$archive"
   log "Restored botd's data from $taken. Starting the stack on $image"
   stack up -d --wait >/dev/null 2>"$COMPOSE_ERR" \
-    || die "The data is back as it was on $taken, but the stack didn't come up healthy on $image: $(compose_err). See docker compose ps and docker compose logs botd ($doc)"
+    || die "The data is back as it was on $taken, but the stack didn't come up healthy on $image: $(compose_err). See docker compose ps and docker compose logs botd. The rollback point is kept in $dir: fix what botd says, then docker compose up -d, or run this again ($doc)"
+  rm -f -- "$rec" "${dir:?}/$archive"
   log "The stack runs on $image again, with its data from $taken. What the restore replaced is in .pre-restore-* in botd's data volume: remove it once SuperBot looks right"
 }
 

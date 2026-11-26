@@ -410,9 +410,12 @@ way_back() { "$DIR/../offline-bundle.sh" "$@" -- "${COMPOSE_FILES[@]}" -p "$PROJ
 way_back backup-compose --dir "$WORK/rollback" >"$WORK/backup-compose.log" 2>&1 || { cat "$WORK/backup-compose.log" >&2; fail "backup-compose failed"; }
 point=$(sed -n 's/^archive=//p' "$WORK/rollback/record")
 [[ "$point" == *.tar.gz.age && $(head -c 21 "$WORK/rollback/$point") == age-encryption.org/v1 ]] || fail "the rollback point isn't encrypted to the stack's backup key: $point"
+grep -Eq '^key_check=[0-9a-f]{64}$' "$WORK/rollback/record" || { cat "$WORK/rollback/record" >&2; fail "backup-compose didn't record which master key sealed the saved secret"; }
 curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"AfterRollbackPoint"}' "$BASE/api/bots" >/dev/null
 way_back rollback-compose --dir "$WORK/rollback" --identity "$WORK/identity.txt" >"$WORK/rollback-compose.log" 2>&1 \
   || { cat "$WORK/rollback-compose.log" >&2; fail "rollback-compose failed"; }
+grep -Fq "Master key: the one that sealed the rollback point's saved secrets seals the stack's database now" "$WORK/rollback-compose.log" \
+  || { cat "$WORK/rollback-compose.log" >&2; fail "rollback-compose didn't compare the master key with the stack's database"; }
 [[ $(curl -fsS "$BASE/healthz") == '{"ok":true}' ]] || fail "botd isn't healthy after rollback-compose"
 bots=$(curl -fsS "${AUTH[@]}" "$BASE/api/bots")
 grep -q '"name":"KeepMe"' <<<"$bots" || fail "rollback-compose lost KeepMe, saved before the rollback point"
