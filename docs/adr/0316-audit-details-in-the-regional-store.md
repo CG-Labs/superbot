@@ -47,7 +47,15 @@ An erasure rewrites the details where they are kept. Retention deletes them with
 
 ### A store lost
 
-If a forgotten store (`REGION_DATA_FORGET`) or a lost one held an event's only details, botd's row has no salt, and verification would fail on it. So botd names those events with an `audit.erased` event (actor `residency`, target the store's region), the same way an erasure names the rows it clears. The log still verifies, and says why those details are gone.
+If a forgotten store (`REGION_DATA_FORGET`) or a lost one held an event's only details, botd's row has no salt, and verification would fail on it. So botd names those events with an `audit.erased` event (actor `residency`, target the store's region), the same way an erasure names the rows it clears. The log still verifies, and says why those details are gone. Forgetting the store's record and naming its events share one transaction, so a start cut off between them does both again.
+
+### A crash between two files
+
+botd's database and each store are separate SQLite files, and a transaction across them commits each file on its own. So a crash can keep one file's half of a write or move and not the other's. Each start checks every store's events against where their details are:
+
+- An event that points at one store but whose details another holds (a move between stores cut off) is pointed at that store.
+- An event whose details no place holds (the store's commit was lost) is named with `audit.erased`, once. Its details are gone, as a whole event cut off before its commit would be.
+- Details whose row botd's log lost are ignored by reads (they are only joined to rows with no salt), dropped on the next pass, and their id is never handed out again: botd's id counter is raised past every store's highest at start.
 
 A restore takes the details from the store it replaces, as it does sign-ins. With that store gone, the backup's details are kept, with erasures since the backup applied again. Events whose details only the lost store held are named as erased, and the restore says how many (`auditDetailsLost`).
 
@@ -74,7 +82,7 @@ A restore takes the details from the store it replaces, as it does sign-ins. Wit
 
 ## Tests
 
-- `db::chats`: a pinned person's audit details move to the store and back with the pin, and new ones are written there; they survive a restart and a pass cut off after its copy; botd's log still refuses any change but an erasure or a move; an erasure rewrites them where they are kept; retention deletes them there; a forgotten store's events are named as erased and the log verifies; a place's summary names them.
-- `machines::chat_store_restore`: a restore takes audit details from the store it replaces; with it gone, the events only it held are named as erased and the log still verifies.
+- `db::chats`: a pinned person's audit details move to the store and back with the pin, and new ones are written there; they survive a restart and a pass cut off after its copy; botd's log still refuses any change but an erasure or a move; an erasure rewrites them where they are kept; retention deletes them there; a forgotten store's events are named as erased and the log verifies; a crash between the files' commits is put right on the next start (details lost named once, a cut-off move pointed at the right store, details whose row was lost ignored, dropped and their id not reused); a place's summary names them.
+- `machines::chat_store_restore`: a restore takes audit details from the store it replaces; with it gone, the events only it held are named as erased and the log still verifies; it waits for details of someone unpinned to go home first.
 - HTTP (`machines_residency_tests.rs`): a pin moves audit details into London's store, audited; the audit page reads them whole, new ones are written there, and verification passes; the report and `GET /api/me/residency` say so; unpinned, they come back and the log still verifies.
 - Client (`residency.test.ts`): Settings names the audit details with the rest when the server says so.
