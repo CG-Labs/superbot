@@ -1339,6 +1339,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/service-accounts/{id}/tokens", get(service_accounts::list_tokens).post(service_accounts::create_token))
         .route("/service-accounts/{id}/tokens/{token}", delete(service_accounts::revoke_token))
         .route("/service-accounts/{id}/tokens/{token}/rotate", post(service_accounts::rotate_token))
+        .route("/service-accounts/{id}/kept-bots", post(kept_bots::put_many))
         .route("/sessions", get(users::list_sessions))
         .route("/sessions/{id}", delete(users::revoke_session))
         .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))

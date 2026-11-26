@@ -608,6 +608,12 @@ export interface ServiceAccount {
   keepable?: { id: string; name: string; visibility: Visibility; keptBy: { id: string; name: string } | null }[];
 }
 
+/** `POST /api/service-accounts/{id}/kept-bots` (ADR 0324): the account as `GET` shows it, and which Bots changed. */
+export interface KeptBotsResult extends ServiceAccount {
+  handed: string[];
+  unchanged: string[];
+}
+
 /** A service account's API token, never its secret. */
 export interface ServiceToken {
   id: string;

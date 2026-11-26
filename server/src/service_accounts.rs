@@ -367,7 +367,7 @@ fn need_person(c: &Caller) -> Res<()> {
 /// The live service account `key` names, if the caller may see it: admins any, anyone
 /// else only those they own. Someone who manages none gets 404 for others' (ADR 0239), so
 /// they don't learn which exist.
-fn need_account(app: &AppState, c: &Caller, by: &Who, key: &str) -> Res<ServiceAccount> {
+pub(crate) fn need_account(app: &AppState, c: &Caller, by: &Who, key: &str) -> Res<ServiceAccount> {
     need_person(c)?;
     let sa = app.db.service_account(key).filter(|s| s.deleted_at.is_none()).ok_or_else(|| not_found("Service account"))?;
     if c.admin() || c.user.as_ref().is_some_and(|u| u.id == sa.owner_id) {
@@ -665,16 +665,21 @@ pub async fn create(State(app): State<AppState>, Extension(c): Extension<Caller>
 /// the Bots it reaches.
 pub async fn get(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let sa = need_account(&app, &c, &by, &key)?;
-    let mut v = view_one(&app, &sa);
+    Ok(Json(detail(&app, &c, &by, &sa)))
+}
+
+/// One account as `GET /api/service-accounts/{id}` shows it to `c`.
+pub(crate) fn detail(app: &AppState, c: &Caller, by: &Who, sa: &ServiceAccount) -> Value {
+    let mut v = view_one(app, sa);
     let at = crate::db::now();
     v["tokenList"] = json!(app.db.service_tokens(&sa.user.id).iter().map(|t| token_view(t, at)).collect::<Vec<_>>());
-    v["bots"] = bots_view(&app, &sa);
+    v["bots"] = bots_view(app, sa);
     // Every Bot it keeps, even while its owner lends nothing, so it can be let go; and those
     // the caller may hand it (ADR 0229).
     let kept: Vec<Value> = app.db.kept_bots(&sa.user.id).iter().filter_map(|id| app.db.bot(id)).map(|b| json!({ "id": b.id, "name": b.name, "visibility": b.visibility })).collect();
     v["keptBotList"] = json!(kept);
-    v["keepable"] = crate::kept_bots::keepable(&app, &c, &by, &sa);
-    Ok(Json(v))
+    v["keepable"] = crate::kept_bots::keepable(app, c, by, sa);
+    v
 }
 
 /// `PATCH /api/service-accounts/{id}` `{name?, description?, role?, team?, status?, owner?}`.
@@ -944,6 +949,7 @@ mod tests {
             ("POST", "/api/team/billing/portal"),
             ("GET", "/api/service-accounts"),
             ("POST", "/api/service-accounts/sa1/tokens"),
+            ("POST", "/api/service-accounts/sa1/kept-bots"),
             ("PATCH", "/api/bots/b1/access"),
             ("PUT", "/api/bots/b1/grants/u2"),
             ("DELETE", "/api/bots/b1/grants/u2"),

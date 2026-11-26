@@ -221,6 +221,8 @@ describe("service accounts (ADR 0143, 0152)", () => {
     expect(last()).toEqual([`${BASE}/api/service-accounts/sa1/tokens/st1`, expect.objectContaining({ method: "DELETE" })]);
     await api.deleteServiceAccount("sa1");
     expect(last()).toEqual([`${BASE}/api/service-accounts/sa1`, expect.objectContaining({ method: "DELETE" })]);
+    await api.keepBots("s/1", ["b1", "b2"]);
+    expect(last()).toEqual([`${BASE}/api/service-accounts/s%2F1/kept-bots`, expect.objectContaining({ method: "POST", body: JSON.stringify({ bots: ["b1", "b2"] }) })]);
   });
 });
 
