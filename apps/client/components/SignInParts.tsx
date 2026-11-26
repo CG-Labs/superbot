@@ -58,7 +58,7 @@ export function Field({ label, ...input }: { label: string } & TextInputProps) {
         accessibilityLabel={label}
         placeholderTextColor={t.c.textFaint}
         {...input}
-        style={[styles.input, focused && styles.inputFocused]}
+        style={[styles.input, input.style, focused && styles.inputFocused]}
         onFocus={(e) => (setFocused(true), input.onFocus?.(e))}
         onBlur={(e) => (setFocused(false), input.onBlur?.(e))}
       />

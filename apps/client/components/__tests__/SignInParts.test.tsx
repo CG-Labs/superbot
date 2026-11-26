@@ -62,6 +62,15 @@ describe("Field", () => {
   });
 });
 
+describe("Field styles", () => {
+  it("takes the caller's style, under the focus ring", async () => {
+    await render(<Field label="Code" value="" onChangeText={() => {}} style={{ minHeight: 60, borderColor: "red" }} />);
+    expect(screen.getByLabelText("Code")).toHaveStyle({ minHeight: 60, borderColor: "red" });
+    await fireEvent(screen.getByLabelText("Code"), "focus");
+    expect(screen.getByLabelText("Code")).toHaveStyle({ minHeight: 60, borderColor: themes.light.c.accent });
+  });
+});
+
 describe("buttons and notices", () => {
   it("fills the primary button with the accent, and holds it while busy", async () => {
     const onPress = jest.fn();
