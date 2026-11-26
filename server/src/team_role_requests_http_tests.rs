@@ -177,10 +177,17 @@ async fn not_their_own_nor_a_team_admins_nor_over_the_identity_provider() {
     assert_eq!(app.db.team_member(&fay).unwrap().role_id.as_deref(), Some(standing.as_str()), "unchanged");
     // Read in the approval's own transaction.
     let saw = std::cell::Cell::new(false);
-    let r = app.db.approve_role_request(&fay_q, None, Some(&ada), None, |s| {
-        saw.set(s.from_idp);
-        Err("from_idp")
-    });
+    let r = app.db.approve_role_request(
+        &fay_q,
+        None,
+        Some(&ada),
+        None,
+        |s| {
+            saw.set(s.from_idp);
+            Err("from_idp")
+        },
+        |_| false,
+    );
     assert_eq!((saw.get(), r.unwrap_err()), (true, db::RoleRequestError::Refused("from_idp")));
     // Denying changes no role, so they may.
     assert_eq!(call(port, "POST", &at(&fay_q, "deny"), &ada_auth, "{}").await.0, 200);

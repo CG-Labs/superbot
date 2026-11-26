@@ -919,6 +919,8 @@ pub struct CustomRole {
     pub max_days: Option<i64>,
     /// People may ask for it (ADR 0209). Only ever set on a time-bound role.
     pub requestable: bool,
+    /// How many different people approve a request for it before it's given: 1 or 2 (ADR 0320).
+    pub approvals: i64,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub updated_at: i64,
@@ -950,6 +952,18 @@ pub struct RoleRequest {
     pub note: Option<String>,
     /// When the role it gave ends. Only once approved.
     pub granted_until: Option<i64>,
+    /// The first of two approvals (ADR 0320), while its role needs two.
+    pub first: Option<FirstApproval>,
+}
+
+/// The first approval of a request whose role needs two (ADR 0320): who, when, for how
+/// many hours (the second approval can't give more), and their note.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FirstApproval {
+    pub by: String,
+    pub at: i64,
+    pub hours: i64,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -966,6 +980,10 @@ pub enum RoleRequestError {
     Refused(&'static str),
     /// Longer than the role's limit allows now, in hours.
     OverLimit(i64),
+    /// Longer than the first approval gave (ADR 0320), in hours.
+    OverFirst(i64),
+    /// The caller gave the first of the two approvals it needs (ADR 0320).
+    ApprovedAlready,
     NotFound,
     Db(String),
 }
@@ -980,16 +998,30 @@ pub struct RequestState<'a> {
     /// Whether a SCIM mapping or team role group gave them their role in the request's
     /// team (ADR 0138, ADR 0206). False for a request across the server.
     pub from_idp: bool,
+    /// Whoever gave the first of two approvals (ADR 0320), with their membership of the
+    /// request's team, while they exist.
+    pub first: Option<(&'a User, Option<&'a TeamMember>)>,
 }
 
 /// An approved request, with the role they held in its scope just before (and its end),
-/// and the SCIM or SAML claim on it that giving it by hand ended.
+/// and the SCIM or SAML claim on it that giving it by hand ended. `first`: the first of
+/// the two approvals that gave it (ADR 0320).
 #[derive(Debug)]
 pub struct ApprovedRequest {
     pub request: RoleRequest,
     pub before: (Option<String>, Option<i64>),
     pub taken: Option<String>,
     pub taken_saml: Option<String>,
+    pub first: Option<FirstApproval>,
+}
+
+/// What an approval did (ADR 0320): gave the role, or was the first of two its role needs.
+/// `replaced`: an earlier first approval that no longer counted, as its approver can't
+/// approve the request any more.
+#[derive(Debug)]
+pub enum RequestApproval {
+    Given(ApprovedRequest),
+    First { request: RoleRequest, replaced: Option<FirstApproval> },
 }
 
 fn role_request_row(r: &Row) -> rusqlite::Result<RoleRequest> {
@@ -1007,6 +1039,10 @@ fn role_request_row(r: &Row) -> rusqlite::Result<RoleRequest> {
         decided_by: r.get("decided_by")?,
         note: r.get("note")?,
         granted_until: r.get("granted_until")?,
+        first: match r.get::<_, Option<String>>("first_by")? {
+            Some(by) => Some(FirstApproval { by, at: r.get("first_at")?, hours: r.get("first_hours")?, note: r.get("first_note")? }),
+            None => None,
+        },
     })
 }
 
@@ -2083,6 +2119,7 @@ fn custom_role_row(r: &Row) -> rusqlite::Result<CustomRole> {
         permissions: serde_json::from_str(&permissions).unwrap_or_default(),
         max_days: r.get("max_days")?,
         requestable: r.get::<_, Option<bool>>("requestable")?.unwrap_or(false),
+        approvals: r.get::<_, Option<i64>>("approvals")?.unwrap_or(1),
         created_at: r.get("created_at")?,
         created_by: r.get("created_by")?,
         updated_at: r.get("updated_at")?,
@@ -2470,7 +2507,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 73] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 74] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2544,7 +2581,25 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 73] = [
     migrate_saml_session_users,
     migrate_saml_group_roles_per_idp,
     migrate_scim_token_idp,
+    migrate_two_approvers,
 ];
+
+/// Two approvers for chosen roles (ADR 0320): how many different people approve a request
+/// for a role before it's given (1, as before, or 2), and the first of two approvals while
+/// the request waits for the second.
+fn migrate_two_approvers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('roles') WHERE name = 'approvals'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE roles ADD COLUMN approvals INTEGER NOT NULL DEFAULT 1 CHECK (approvals IN (1, 2));
+        ALTER TABLE role_requests ADD COLUMN first_by TEXT;
+        ALTER TABLE role_requests ADD COLUMN first_at INTEGER;
+        ALTER TABLE role_requests ADD COLUMN first_hours INTEGER;
+        ALTER TABLE role_requests ADD COLUMN first_note TEXT;",
+    )
+}
 
 /// The native SAML IdP a SCIM tenant's `externalId`s are NameIDs at (ADR 0297). Tokens made
 /// before keep a null: the provider's one IdP, as before.
@@ -6317,6 +6372,12 @@ impl Db {
             > 0
     }
 
+    /// How many different people approve a request for the role before it's given, 1 or 2
+    /// (ADR 0320). False when the role is gone.
+    pub fn set_role_approvals(&self, id: &str, approvals: i64) -> bool {
+        self.c().execute("UPDATE roles SET approvals = ?1, updated_at = ?2 WHERE id = ?3", params![approvals, now(), id]).unwrap_or(0) > 0
+    }
+
     /// Files a pending request, lapsing at `expires_at`. Refused, in the same transaction,
     /// when the role isn't requestable or allows fewer hours, when they have a pending
     /// request for it in this scope, `max_pending` pending requests of any kind, or made
@@ -6441,7 +6502,21 @@ impl Db {
     /// made can slip through. Across the server their built-in role becomes the role's base,
     /// which `check` keeps equal to theirs. Given by hand, it ends any SCIM or SAML claim on
     /// the role in its scope, as `give_user_custom_role_until` does.
-    pub fn approve_role_request(&self, id: &str, hours: Option<i64>, by: Option<&str>, note: Option<&str>, check: impl FnOnce(&RequestState) -> Result<(), &'static str>) -> Result<ApprovedRequest, RoleRequestError> {
+    ///
+    /// A role that needs two approvals (ADR 0320) is given only by a second approver, other
+    /// than the first, for the first's hours or fewer. Without a first approval that still
+    /// `counts` (its approver could approve the request now), this approval becomes the
+    /// first: saved on the request, which stays pending, after the same checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn approve_role_request(
+        &self,
+        id: &str,
+        hours: Option<i64>,
+        by: Option<&str>,
+        note: Option<&str>,
+        check: impl FnOnce(&RequestState) -> Result<(), &'static str>,
+        counts: impl FnOnce(&RequestState) -> bool,
+    ) -> Result<RequestApproval, RoleRequestError> {
         let err = |e: rusqlite::Error| RoleRequestError::Db(e.to_string());
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(err)?;
@@ -6461,9 +6536,44 @@ impl Db {
             None => None,
         };
         let from_idp = q.team_id.is_some() && Self::idp_team_role_in(&tx, &q.user_id).map_err(err)?;
-        check(&RequestState { request: &q, role: &role, user: &user, member: member.as_ref(), from_idp }).map_err(RoleRequestError::Refused)?;
-        let hours = hours.unwrap_or(q.hours);
+        let first_user = match &q.first {
+            Some(f) => tx.query_row("SELECT * FROM users WHERE id = ?", [&f.by], user_row).optional().map_err(err)?,
+            None => None,
+        };
+        let first_member = match (&first_user, &q.team_id) {
+            (Some(u), Some(t)) => tx.query_row("SELECT * FROM team_members WHERE user_id = ?1 AND team_id = ?2", [&u.id, t], team_member_row).optional().map_err(err)?,
+            _ => None,
+        };
+        let state = RequestState { request: &q, role: &role, user: &user, member: member.as_ref(), from_idp, first: first_user.as_ref().map(|u| (u, first_member.as_ref())) };
+        check(&state).map_err(RoleRequestError::Refused)?;
+        let standing = q.first.clone().filter(|_| state.first.is_some() && counts(&state));
         let limit = role.max_days.map(|d| d * 24).ok_or(RoleRequestError::Refused("not_requestable"))?;
+        let first = if role.approvals >= 2 {
+            match standing {
+                Some(f) if Some(f.by.as_str()) == by => return Err(RoleRequestError::ApprovedAlready),
+                Some(f) if hours.is_some_and(|h| h > f.hours) => return Err(RoleRequestError::OverFirst(f.hours)),
+                Some(f) => Some(f),
+                None => {
+                    let hours = hours.unwrap_or(q.hours);
+                    if hours > limit {
+                        return Err(RoleRequestError::OverLimit(limit));
+                    }
+                    let replaced = q.first.take();
+                    let by = by.ok_or(RoleRequestError::Refused("unknown_approver"))?;
+                    tx.execute(
+                        "UPDATE role_requests SET first_by = ?2, first_at = ?3, first_hours = ?4, first_note = ?5 WHERE id = ?1",
+                        params![q.id, by, at, hours, note],
+                    )
+                    .map_err(err)?;
+                    tx.commit().map_err(err)?;
+                    q.first = Some(FirstApproval { by: by.to_string(), at, hours, note: note.map(str::to_string) });
+                    return Ok(RequestApproval::First { request: q, replaced });
+                }
+            }
+        } else {
+            None
+        };
+        let hours = hours.unwrap_or(first.as_ref().map_or(q.hours, |f| f.hours));
         if hours > limit {
             return Err(RoleRequestError::OverLimit(limit));
         }
@@ -6494,7 +6604,7 @@ impl Db {
         tx.commit().map_err(err)?;
         q.status = "approved".into();
         (q.decided_at, q.decided_by, q.note, q.granted_until) = (Some(at), by.map(str::to_string), note.map(str::to_string), Some(until));
-        Ok(ApprovedRequest { request: q, before, taken, taken_saml })
+        Ok(RequestApproval::Given(ApprovedRequest { request: q, before, taken, taken_saml, first }))
     }
 
     // SCIM groups mapped to custom roles (ADR 0138).
@@ -7595,6 +7705,7 @@ impl Db {
         run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM role_requests WHERE user_id = ?", &[&user_id])?;
         run("UPDATE role_requests SET decided_by = ?2 WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
+        run("UPDATE role_requests SET first_by = ?2 WHERE first_by = ?1", &[&user_id, &pseudonym])?;
         run("DELETE FROM settings WHERE key = ?", &[&format!("machine_egress_policy:user:{user_id}")])?;
         run("DELETE FROM residency_pins WHERE subject_type = 'user' AND subject_id = ?", &[&user_id])?;
         run("DELETE FROM settings WHERE key = ?", &[&format!("{}{user_id}", crate::machines::egress_policy::USER_KEY)])?;
