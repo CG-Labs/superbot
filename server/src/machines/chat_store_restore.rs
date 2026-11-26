@@ -1944,6 +1944,39 @@ mod tests {
         assert!(r.ok && r.erased == 0, "{r:?}");
     }
 
+    fn kept_for(store: &Path, id: i64) -> Option<String> {
+        let c = Connection::open(store).unwrap();
+        c.query_row("SELECT user_id FROM audit_details WHERE id = ?1", [id], |r| r.get(0)).ok()
+    }
+
+    #[tokio::test]
+    async fn a_restore_waits_for_audit_details_whose_person_left_to_follow_another_of_their_people() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (cy, _) = pinned_bot(&db, "cy", "gb-lon");
+        let id = acted(&db, &cy, "192.0.2.76", Some(&ada));
+        assert_eq!(kept_for(&w.store(), id), Some(cy.clone()));
+        backup_pass(&db, 7, now() - DAY);
+        let name = chat_stores::backups_strictly(&w.place().store).unwrap()[0].1.file_name().unwrap().to_string_lossy().into_owned();
+        db.unpin_residency(PinOn::User, &cy).unwrap();
+        drop(db);
+        // Still kept for Cy until a pass gives it to Ada: a restore now would leave it behind.
+        let refused = restore(&w.place(), &opts(&name, true), now()).await.unwrap_err();
+        assert!(refused.contains("audit event's details of Bots or people kept elsewhere now"), "{refused}");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        db.place_chats().unwrap();
+        drop(db);
+        assert_eq!(kept_for(&w.store(), id), Some(ada.clone()));
+        let r = restore(&w.place(), &opts(&name, true), now()).await.unwrap();
+        assert_eq!(r.plan.audit_lost.len(), 0, "{r:?}");
+        assert_eq!(kept_for(&w.store(), id), Some(ada), "still in London, for Ada");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!(ip_of(&db, id).as_deref(), Some("192.0.2.76"));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+    }
+
     fn factor(user: &str, secret: &str) -> String {
         sealed::cipher().seal(&sealed::mfa_context(user), secret.as_bytes())
     }

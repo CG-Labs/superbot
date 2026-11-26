@@ -37,11 +37,12 @@ This needs the event's fixed columns (`actor_kind`, `target_type`) from botd's r
 A store's backups keep each event's details under the person they were kept for when the backup was made. That may not be the person they belong to now. So:
 
 - **Clearing a store's backups** (ADR 0238) takes out the audit details the store no longer holds, by event id, rather than those of the people who left. Details kept for one person in a backup but for another now are cleared once they leave the store, and never while they are still there.
-- **A restore with the store gone** (ADR 0256) keeps the backup's details only for events botd's log says this store holds, whoever the backup kept them for, and drops the rest as kept elsewhere now. The next pass gives them to whoever they belong to. A restore with the store readable still takes them from that store, as before.
+- **A restore with the store gone** (ADR 0256) keeps the backup's details only for events botd's log says this store holds, whoever the backup kept them for, and drops the rest as kept elsewhere now. The next pass gives them to whoever they belong to. A restore with the store readable still takes them from that store, as before: it waits, as for any row, while the store holds details kept for someone who left until a pass gives them to whoever they belong to now.
+- Placement doesn't wait for clearing. Details that come back to the store while its backups are cleared may still be taken out of them, as if the clearing had come first. The store holds them, and the backups taken from then on do too.
 
 ### Saying so
 
-`GET /api/me/residency` adds `chats.auditAbout`. The app then says "... and the details of the audit log's entries about what you did and what others did about you are kept in ...". The DPA template's annex IV, the data flows page and the ops guide say the same. Reports count these events with the person's own.
+`GET /api/me/residency` adds `chats.auditAbout`. The app then says "... and the details of the audit log's entries about what you did and what others not held in another region did about you are kept in ...". The DPA template's annex IV, the data flows page and the ops guide say the same. Reports count these events with the person's own.
 
 ## Consequences
 
@@ -59,6 +60,7 @@ A store's backups keep each event's details under the person they were kept for 
 ## Tests
 
 - `db::chats`: an event's people are listed in order without repeats; an unpinned admin's events about a pinned person wait in botd's log, counted as that person's, until the next pass moves them to their store, and new ones are written there; one by someone pinned elsewhere stays with them; when the admin is pinned to another region, the events become the admin's and move there; when the admin is unpinned, they go back to the person's store; with neither pinned, they go back into botd's log, which still verifies; a backup restored with its store gone keeps only the details botd's log says the store holds.
+- `machines::chat_store_restore`: a restore waits while the store holds details kept for someone who left, then keeps them for the other person they belong to.
 - `machines::chat_stores`: a store's backups are cleared of details that left the store with another of their people, though the backup kept them for someone else, and keep those still in the store when the person the backup kept them for leaves.
 - HTTP (`machines_residency_tests.rs`): the admin's pin of a pinned person, and the first residency report on it, are kept in the person's store; `GET /api/me/residency` says `auditAbout`.
 - Client (`residency.test.ts`): Settings names what others did about you when the server says so.
