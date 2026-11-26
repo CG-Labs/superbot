@@ -388,6 +388,12 @@ impl Sso {
         format!("{}/api/auth/sso/{id}/slo/soap", self.public_url)
     }
 
+    /// Native SAML with several IdPs: where a discovery service sends the browser back with
+    /// the IdP picked (ADR 0314), our metadata's `DiscoveryResponse`.
+    pub fn discovery_response_url(&self, id: &str) -> String {
+        format!("{}/api/auth/sso/{id}/discovery", self.public_url)
+    }
+
     /// Native SAML: the page that posts our LogoutRequest to an IdP that takes logout only over
     /// HTTP-POST, once (ADR 0248). The client opens it as it would the IdP's redirect URL.
     fn logout_page_url(&self, id: &str, handle: &str) -> String {
@@ -465,7 +471,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 42] = [
+const ONLY_FOR: [(&str, &[&str]); 43] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -508,11 +514,12 @@ const ONLY_FOR: [(&str, &[&str]); 42] = [
     ("FORCE_AUTHN", &["saml"]),
     ("MAX_AUTHN_AGE", &["saml"]),
     ("IDP_SESSION_LIMIT", &["saml"]),
+    ("DISCOVERY_URL", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 27] = [
+const SAML_NATIVE_ONLY: [&str; 28] = [
     "IDP_ENTITY_IDS",
     "IDP_ENTITY_CATEGORIES",
     "IDP_METADATA_URL",
@@ -540,6 +547,7 @@ const SAML_NATIVE_ONLY: [&str; 27] = [
     "FORCE_AUTHN",
     "MAX_AUTHN_AGE",
     "IDP_SESSION_LIMIT",
+    "DISCOVERY_URL",
 ];
 
 /// Native SAML's IdP: `IDP_ENTITY_ID`, or several of a federation's in `IDP_ENTITY_IDS` (ADR
@@ -609,6 +617,26 @@ fn every_idp(key: &dyn Fn(&str) -> String, list: &List, every: bool) -> Result<O
         return Err(format!("{} lists {} categories: at most {MAX_ENTITY_CATEGORIES}", key("IDP_ENTITY_CATEGORIES"), categories.len()));
     }
     Ok(Some(EveryIdp { categories }))
+}
+
+/// The query parameters of the discovery protocol that botd sets itself on its request.
+const DISCOVERY_PARAMS: [&str; 5] = ["entityID", "return", "returnIDParam", "policy", "isPassive"];
+
+/// With several IdPs: `SSO_<ID>_DISCOVERY_URL`, the federation's discovery service the browser
+/// picks its IdP at instead of botd's chooser (ADR 0314). An https URL, with no fragment and none
+/// of the protocol's own parameters.
+fn discovery_url(key: &dyn Fn(&str) -> String, var: &Var, several: bool) -> Result<Option<String>, String> {
+    let Some(u) = var(&key("DISCOVERY_URL")) else { return Ok(None) };
+    if !several {
+        return Err(format!("{} is only for {}: with one IdP there is nothing to choose", key("DISCOVERY_URL"), key("IDP_ENTITY_IDS")));
+    }
+    let Some(parsed) = Url::parse(&u).ok().filter(|p| p.fragment().is_none() && secure_url(&u)) else {
+        return Err(format!("{} must be the https URL of the federation's discovery service, like https://service.seamlessaccess.org/ds/", key("DISCOVERY_URL")));
+    };
+    if let Some((k, _)) = parsed.query_pairs().find(|(k, _)| DISCOVERY_PARAMS.contains(&k.as_ref())) {
+        return Err(format!("{}: botd sets {k} itself, remove it from the URL", key("DISCOVERY_URL")));
+    }
+    Ok(Some(u))
 }
 
 /// Claims people or their admins can change, so they can't be the subject.
@@ -856,8 +884,9 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             };
             let authn_context = authn_context(&key, var, list, &attributes)?;
             let freshness = freshness(&key, var)?;
+            let discovery = discovery_url(&key, var, several)?;
             (
-                Kind::SamlSp { entity_ids, every_idp, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness },
+                Kind::SamlSp { entity_ids, every_idp, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, discovery },
                 saml::LABEL,
             )
         }
@@ -1147,13 +1176,18 @@ pub async fn start(
     if a.limiter.blocked(&ip, at).is_some() {
         return no_store(ret.fail("sso_too_many"));
     }
-    // Several IdPs (ADR 0282): the chooser first, then only one of them. With every IdP of a
-    // federation (ADR 0308), the aggregate says whether it's one, below.
+    // Several IdPs (ADR 0282): the chooser first, or the federation's discovery service (ADR
+    // 0314), then only one of them. With every IdP of a federation (ADR 0308), the aggregate
+    // says whether it's one, below.
     let idp = match (p.several_idps(), q.get("idp")) {
         (false, _) => p.idps().first().cloned().unwrap_or_default(),
         (true, None) => {
+            if let (Some(ds), Kind::SamlSp { sp_entity_id, .. }) = (p.discovery_service(), &p.kind) {
+                let back = with_pairs(&sso.discovery_response_url(&id), &carried(&q));
+                return no_store(see(&saml_sp::discovery_request(ds, sp_entity_id, &back)));
+            }
             p.every_idp_read(sso.refresh_gap).await;
-            return no_store(chooser(p, &q));
+            return no_store(chooser(p, &q, &format!("/api/auth/sso/{id}/start")));
         }
         (true, Some(e)) if p.every_idp().is_some() || p.lists(e) => e.clone(),
         (true, Some(e)) => {
@@ -1220,15 +1254,16 @@ pub async fn start(
 ///
 /// With every IdP of a federation (ADR 0308), thousands, the page is a search box instead: the
 /// IdPs matching every word of `q` in their name, entity ID or email domains, at most
-/// `CHOOSER_MATCHES` of them, never those the federation hides from discovery.
-fn chooser(p: &Provider, q: &HashMap<String, String>) -> Response {
-    let action = format!("/api/auth/sso/{}/start", p.id);
-    let carry: Vec<(String, String)> = q.iter().filter(|(k, _)| !["idp", "q"].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+/// `CHOOSER_MATCHES` of them, never those the federation hides from discovery. The search goes
+/// to `action`: this start, or where a discovery service answered, so it doesn't go back there.
+fn chooser(p: &Provider, q: &HashMap<String, String>, action: &str) -> Response {
+    let start = format!("/api/auth/sso/{}/start", p.id);
+    let carry = carried(q);
     let link = |e: &str| {
         let mut query = url::form_urlencoded::Serializer::new(String::new());
         query.extend_pairs(carry.iter());
         query.append_pair("idp", e);
-        format!("{action}?{}", query.finish())
+        format!("{start}?{}", query.finish())
     };
     let every = p.every_idp().is_some();
     let typed: String = q.get("q").map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(100).collect()).unwrap_or_default();
@@ -1245,13 +1280,64 @@ fn chooser(p: &Provider, q: &HashMap<String, String>) -> Response {
     choices.sort_by_cached_key(|(name, _)| name.to_lowercase());
     let more = if every { choices.len().saturating_sub(CHOOSER_MATCHES) } else { 0 };
     choices.truncate(choices.len() - more);
-    let search = every.then(|| saml_sp::ChooserSearch { action: &action, carry: &carry, query: &typed, more });
+    let search = every.then(|| saml_sp::ChooserSearch { action, carry: &carry, query: &typed, more });
     let csp = HeaderValue::from_str(&saml_sp::chooser_csp(every)).expect("ASCII");
     ([(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")), (header::CONTENT_SECURITY_POLICY, csp)], saml_sp::chooser_page(&p.label, &choices, search.as_ref())).into_response()
 }
 
 /// The most IdPs the chooser shows for one search, with every IdP of a federation.
 const CHOOSER_MATCHES: usize = 50;
+
+/// A sign-in's own start parameters (`session`, `redirect`, `challenge`, `state`, `label`),
+/// without the IdP picked, the chooser's search or a discovery service's answer, sorted so a
+/// URL made from them is always the same.
+fn carried(q: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut carry: Vec<(String, String)> = q.iter().filter(|(k, _)| !["idp", "q", DISCOVERY_ANSWER].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+    carry.sort();
+    carry
+}
+
+/// `url` (a path, or a URL with no query) with `pairs` as its query, if any.
+fn with_pairs(url: &str, pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
+        return url.to_string();
+    }
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.extend_pairs(pairs.iter());
+    format!("{url}?{}", query.finish())
+}
+
+/// The parameter a discovery service names the picked IdP in: the protocol's default, since
+/// botd sends no `returnIDParam` and a service may answer without being asked.
+const DISCOVERY_ANSWER: &str = "entityID";
+
+/// `GET /api/auth/sso/{id}/discovery?entityID=`: where a federation's discovery service sends
+/// the browser back (ADR 0314), the `DiscoveryResponse` in our metadata. The service only picks:
+/// its pick goes to this provider's start as `idp`, checked there like a chooser link's, with the
+/// sign-in's own parameters. With no pick (the person gave up there), botd's own chooser, whose
+/// search comes back here rather than to the service again. Anything else (not ready, one IdP,
+/// too many tries) goes to the start, which refuses or signs in as it would. A provider that
+/// isn't configured is not found, so no URL is made from what the path says.
+pub async fn discovery(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let Some(p) = a.sso.provider(&id) else { return not_found("SSO provider").into_response() };
+    let carry = carried(&q);
+    let start = format!("/api/auth/sso/{}/start", p.id);
+    let blocked = a.limiter.blocked(source.ip.as_deref().unwrap_or_default(), db::now()).is_some();
+    let picked = q.get(DISCOVERY_ANSWER).filter(|e| !e.is_empty());
+    match Some(p).filter(|p| p.ready() && p.saml_sp() && p.several_idps()) {
+        Some(p) if !blocked && picked.is_none() => {
+            p.every_idp_read(a.sso.refresh_gap).await;
+            no_store(chooser(p, &q, &format!("/api/auth/sso/{}/discovery", p.id)))
+        }
+        _ => {
+            let mut to = carry;
+            if let Some(e) = picked {
+                to.push(("idp".into(), e.clone()));
+            }
+            no_store(see(&with_pairs(&start, &to)))
+        }
+    }
+}
 
 /// Native SAML: the browser off to the IdP with an AuthnRequest whose ID is `request_id` and
 /// whose RelayState is `state`, signed when the provider signs them, with `binder` set as a web
@@ -1871,7 +1957,9 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let signing_certs: Vec<&str> = keys.iter().flatten().map(|k| k.cert.as_str()).collect();
     let signing = keys.as_ref().map(|_| SpSigning { certs: &signing_certs, slo: &slo, slo_soap: &slo_soap, sign_requests: *sign_requests });
     let enc_certs: Vec<&str> = enc.iter().map(|k| k.cert.as_str()).collect();
-    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc, *response_binding);
+    // Even without DISCOVERY_URL: a federation's own discovery service may send people back.
+    let discovery = p.several_idps().then(|| a.sso.discovery_response_url(&id));
+    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc, *response_binding, discovery.as_deref());
     ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
 }
 
@@ -2493,6 +2581,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "signedMetadata": metadata_trust.as_ref().map_or("off", |t| if t.require { "require" } else { "allow" }),
         "metadataSigningCertificates": metadata_trust.as_ref().map(|t| t.certs.iter().map(cert).collect::<Vec<_>>()),
         "idpEntityId": (!several).then(|| &entity_ids[0]), "idpEntityIds": entity_ids, "source": source.name(), "from": from, "idp": idp, "idps": idps, "everyIdp": every_idp,
+        "discoveryUrl": p.discovery_service(), "discoveryResponseUrl": several.then(|| a.sso.discovery_response_url(&p.id)),
         "audience": p.audience(), "jitRole": p.jit_role.map(Role::as_str),
         "groupsAttribute": attributes.groups, "requiredGroups": required_groups,
         "roleMappings": a.app.as_ref().map(|app| app.db.saml_role_mappings_of(&p.id).len()),
@@ -3094,7 +3183,7 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, every_idp: None, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness }
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, every_idp: None, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness, discovery: None }
             if *freshness == saml_sp::Freshness::default() && entity_ids == &[ADFS] && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
@@ -3666,6 +3755,52 @@ mod tests {
         assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_IDP_ENTITY_CATEGORIES", nine), agg, signer]).contains("at most 8"));
         assert!(err(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), ("SSO_CORP_JIT_ROLE", "member"), agg, signer]).contains("anyone any SAML IdP of the federation signs in"));
         assert!(saml(&[("SSO_ADFS_IDP_ENTITY_CATEGORIES", rs)]).is_err(), "a native setting on the bridge");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_discovery_service_is_only_for_several_idps() {
+        use xmldsig::test_signer::signers;
+        let dir = std::env::temp_dir().join(format!("superbot-discovery-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let anchor = dir.join("federation.pem");
+        std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signers()[1].cert)).unwrap();
+        let anchor: &'static str = Box::leak(anchor.to_string_lossy().into_owned().into_boxed_str());
+        let agg = ("SSO_CORP_IDP_AGGREGATE_URL", "https://md.example.org/federation-metadata.xml");
+        let signer = ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor);
+        let one = ("SSO_CORP_IDP_ENTITY_ID", "");
+        let two = ("SSO_CORP_IDP_ENTITY_IDS", "https://a.example/idp,https://b.example/idp");
+        let ds = |u: &'static str| ("SSO_CORP_DISCOVERY_URL", u);
+
+        let s = native(&[one, two, agg, signer, ds("https://service.seamlessaccess.org/ds/")]).unwrap();
+        assert_eq!(s.providers[0].discovery_service(), Some("https://service.seamlessaccess.org/ds/"));
+        assert_eq!(s.discovery_response_url("corp"), "https://bot.example.com/api/auth/sso/corp/discovery");
+        let s = native(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), agg, signer, ds("https://wayf.example.org/DS?lang=en")]).unwrap();
+        assert_eq!(s.providers[0].discovery_service(), Some("https://wayf.example.org/DS?lang=en"), "a query of its own is kept");
+        assert_eq!(native(&[one, two, agg, signer]).unwrap().providers[0].discovery_service(), None, "botd's chooser by default");
+
+        let err = |extra: &[(&'static str, &'static str)]| native(extra).err().unwrap();
+        assert!(err(&[ds("https://service.seamlessaccess.org/ds/")]).contains("only for SSO_CORP_IDP_ENTITY_IDS"), "one IdP: nothing to choose");
+        for bad in ["http://ds.example.org/ds", "service.seamlessaccess.org/ds", "https://ds.example.org/ds#x"] {
+            assert!(err(&[one, two, agg, signer, ds(bad)]).contains("must be the https URL"), "{bad}");
+        }
+        for ours in ["return", "entityID", "returnIDParam", "isPassive", "policy"] {
+            let u: &'static str = Box::leak(format!("https://ds.example.org/ds?{ours}=x").into_boxed_str());
+            assert!(err(&[one, two, agg, signer, ds(u)]).contains(&format!("botd sets {ours} itself")), "{ours}");
+        }
+        assert!(saml(&[("SSO_ADFS_DISCOVERY_URL", "https://ds.example.org/ds")]).is_err(), "a native setting on the bridge");
+        assert!(with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "oidc"), ("SSO_CORP_ISSUER", "https://idp.example.com"), ("SSO_CORP_CLIENT_ID", "x"), ("SSO_CORP_DISCOVERY_URL", "https://ds.example.org/ds")], &[]).err().unwrap().contains("only for SSO_CORP_TYPE=saml"));
+
+        // With every IdP, the chooser after the service searches where the service answered,
+        // so a search never goes back to the service; and carries the sign-in's own parameters.
+        let s = native(&[one, ("SSO_CORP_IDP_ENTITY_IDS", "all"), agg, signer, ds("https://service.seamlessaccess.org/ds/")]).unwrap();
+        let q: HashMap<String, String> = [("session", "cookie"), ("q", "uni"), ("entityID", ""), ("idp", "x"), ("label", "Web")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_eq!(carried(&q), [("label".to_string(), "Web".to_string()), ("session".into(), "cookie".into())], "sorted, without the pick or the search");
+        assert_eq!(with_pairs("/api/auth/sso/corp/start", &carried(&q)), "/api/auth/sso/corp/start?label=Web&session=cookie");
+        assert_eq!(with_pairs("/api/auth/sso/corp/start", &[]), "/api/auth/sso/corp/start");
+        let res = chooser(&s.providers[0], &q, "/api/auth/sso/corp/discovery");
+        let page = String::from_utf8(axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(page.contains(r#"<form method="get" action="/api/auth/sso/corp/discovery">"#) && page.contains(r#"name="label" value="Web""#) && !page.contains(r#"name="entityID""#), "{page}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

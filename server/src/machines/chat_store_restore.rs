@@ -188,7 +188,7 @@ fn bucket(s: &Settings, region: &str, folder: &Path, sealed: Sealed) -> Result<O
 
 /// Holds botd's data lock and the store's, as botd does while it runs, so nothing changes
 /// either while a restore reads and writes them.
-struct Locks(#[allow(dead_code)] std::fs::File, #[allow(dead_code)] std::fs::File);
+struct Locks(#[allow(dead_code)] database_encryption::DataDirLock, #[allow(dead_code)] database_encryption::DataDirLock);
 
 fn lock(place: &Place) -> Result<Locks, String> {
     let stopped = |e: String| format!("{e}. botd must be stopped for a restore (sudo systemctl stop superbot; Compose: docker compose stop botd)");
@@ -286,6 +286,19 @@ pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
                         Value::String(v) => details[k] = json!(clip(v, 200)),
                         Value::Null => {}
                         v => details[k] = v.clone(),
+                    }
+                }
+                // Named on the chain before the restore is audited: a start cut off in between
+                // names them again, which changes nothing (ADR 0316).
+                let lost: Vec<[i64; 2]> = serde_json::from_value(note["auditDetailsLost"].clone()).unwrap_or_default();
+                if !lost.is_empty() {
+                    details["auditDetailsLost"] = json!(lost.iter().map(|[a, b]| b - a + 1).sum::<i64>());
+                    if let Err(e) = db.with_conn(|c| crate::audit_chain::insert_erased_ranges(c, ACTOR, ("chat_store", region), &lost)) {
+                        lines.push(format!(
+                            "Regional chat stores: the audit events whose details {region}'s store lost in the restore from {backup} couldn't be named on the chain ({e}); its note {} is kept for the next start (ADR 0316).",
+                            path.display()
+                        ));
+                        continue;
                     }
                 }
                 if let Err(e) = db.try_record(&Who::system(ACTOR).event(RESTORED).target("chat_store", region).details(details)) {
@@ -568,6 +581,10 @@ pub struct Plan {
     /// Usage records kept from it (the store now missing or not opening, ADR 0304) that were
     /// still waiting for Stripe's meter, marked failed rather than sent again.
     meter_held_back: usize,
+    /// Audit events whose details only the store held and it doesn't (made since, or an
+    /// erasure since rewrote them), the store now missing or not opening (ADR 0316): their
+    /// rows in botd's log are named as erased when botd starts.
+    audit_lost: Vec<i64>,
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
@@ -588,11 +605,16 @@ fn erasures(c: &Connection, backup_at: i64) -> Result<(Vec<(String, String)>, Ve
             .map_err(db)?;
         s.query_map([], |r| r.get(0)).map_err(db)?.collect::<rusqlite::Result<_>>().map_err(db)?
     };
-    for (id, pseudonym, at) in people.iter().filter(|(_, _, at)| *at >= backup_at) {
+    // What each erasure kept, whenever it was: a `bot.deleted` event's details may be in a
+    // regional store this connection doesn't attach (ADR 0316).
+    for (id, pseudonym, at) in &people {
         let kept: Option<String> = c.query_row("SELECT value FROM settings WHERE key = ?1", [format!("{ERASED_BOTS}{id}")], |r| r.get(0)).optional().map_err(db)?;
         if let Some(kept) = kept {
             let ids: Vec<String> = serde_json::from_str(&kept).map_err(|e| format!("botd's database: {ERASED_BOTS}{id}: {e}"))?;
             bots.extend(ids);
+            continue;
+        }
+        if *at < backup_at {
             continue;
         }
         let counted: Option<String> = c
@@ -674,6 +696,16 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
     (plan.sign_ins_replaced, plan.signed_in, plan.meter_held_back) = crate::db::sign_ins_from(&c, now, &kept).map_err(err)?;
     if now.is_some() {
         c.execute("DETACH DATABASE now_store", []).map_err(err)?;
+    } else {
+        // Audit events' details are kept from the backup as the only copy left, but not
+        // those an erasure since rewrote; any botd's log says the store held that the copy
+        // doesn't are lost (ADR 0316).
+        c.execute("ATTACH DATABASE ?1 AS botd KEY ?2", rusqlite::params![db_path, place.db_key.as_ref().map_or("", |k| k.raw())]).map_err(err)?;
+        let lost = crate::db::audit_lost_in_copy(&c, "botd", &place.region, at);
+        c.execute("DETACH DATABASE botd", []).map_err(err)?;
+        let (erased, lost) = lost.map_err(err)?;
+        plan.erased.audit_events += erased;
+        plan.audit_lost = lost;
     }
     c.execute_batch("VACUUM").map_err(err)?;
     check(&c)?;
@@ -939,6 +971,7 @@ fn write_note(place: &Place, r: &Restore, work: &Path, at: i64) -> Result<PathBu
         "signInsReplaced": r.plan.sign_ins_replaced,
         "signedIn": r.plan.signed_in,
         "meterHeldBack": r.plan.meter_held_back,
+        "auditDetailsLost": crate::audit_chain::ranges(&r.plan.audit_lost),
         "back": r.plan.back,
         "gone": r.plan.gone,
         "uid": euid(),
@@ -1040,6 +1073,12 @@ impl Restore {
             out.push_str(&format!(
                 "  Model usage records in it still waiting for Stripe's meter: {}. With the store now gone nothing says whether they were sent since, so they are marked failed, not sent again. Check them against Stripe (ADR 0304).\n",
                 p.meter_held_back
+            ));
+        }
+        if !p.audit_lost.is_empty() {
+            out.push_str(&format!(
+                "  Audit events whose details only the store held, and the backup doesn't: {}. Their rows stay in botd's log, sealed; botd names them as erased (audit.erased) when it starts, so the log still verifies (ADR 0316).\n",
+                p.audit_lost.len()
             ));
         }
         if p.unopened > 0 {
@@ -1823,6 +1862,85 @@ mod tests {
         db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
         assert_eq!(db.tokens_used(&ada, 0, i64::MAX), 20);
         assert!(waiting(&db).is_empty());
+    }
+
+    /// An event `user` made from `ip`, about `about` if given.
+    fn acted(db: &Db, user: &str, ip: &str, about: Option<&str>) -> i64 {
+        let actor = crate::audit::Actor { kind: crate::audit::ActorKind::User, id: Some(user.into()), ..Default::default() };
+        let e = Who { actor, source: crate::audit::Source { ip: Some(ip.into()), user_agent: None } }.event("bot.updated");
+        db.try_record(&about.map_or(e.clone(), |p| e.target("user", p))).unwrap()
+    }
+
+    fn ip_of(db: &Db, id: i64) -> Option<String> {
+        db.audit_events(&crate::audit::Filter::default(), 1000, true).into_iter().find(|e| e.id == id).unwrap().ip
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_takes_audit_details_from_the_store_it_replaces_or_names_those_lost_with_it() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let (bob, _) = pinned_bot(&db, "bob", "gb-lon");
+        let (cy, _) = pinned_bot(&db, "cy", "gb-lon");
+        let first = acted(&db, &ada, "192.0.2.71", None);
+        let about_bob = acted(&db, &cy, "192.0.2.72", Some(&bob));
+        backup_pass(&db, 7, now() - DAY);
+        let name = chat_stores::backups_strictly(&w.place().store).unwrap()[0].1.file_name().unwrap().to_string_lossy().into_owned();
+        let since = acted(&db, &ada, "192.0.2.73", None);
+        db.erase_user(&bob, "erased-0316", None, &[]).unwrap();
+        db.place_chats().unwrap();
+        drop(db);
+
+        // With the store there, its details replace the backup's: none made since is lost, none rewritten comes back.
+        let r = restore(&w.place(), &opts(&name, true), now()).await.unwrap();
+        assert_eq!((r.plan.sign_ins_replaced.audit_events, r.plan.signed_in.audit_events, r.plan.audit_lost.len()), (2, 3, 0), "{r:?}");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!(ip_of(&db, since).as_deref(), Some("192.0.2.73"));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+        drop(db);
+
+        // With it gone, the backup's are the only copy, but not one an erasure since rewrote; the rest are named lost.
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+        let r = restore(&w.place(), &opts_gone(&name, true), now()).await.unwrap();
+        assert_eq!((r.plan.erased.audit_events, r.plan.audit_lost.clone()), (1, vec![about_bob, since]), "{r:?}");
+        let text = r.text("gb-lon");
+        assert!(text.contains("Audit events whose details only the store held, and the backup doesn't: 2.") && text.contains("1 audit event's details of people erased since"), "{text}");
+        assert!(!holds(&w.store(), &bob), "the erased person's id is gone from every page");
+        let db = Db::open(&w.app).unwrap();
+        assert!(audit_restores(&db, &w.dirs()).iter().all(|l| !l.contains("couldn't")));
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!((ip_of(&db, first).as_deref(), ip_of(&db, since)), (Some("192.0.2.71"), None));
+        let f = crate::audit::Filter { actions: vec![RESTORED.into()], ..Default::default() };
+        let restored = db.audit_events(&f, 10, true);
+        assert_eq!(restored.last().unwrap().details["auditDetailsLost"], 2);
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok, "the lost ones are named: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_restore_waits_for_audit_details_of_someone_unpinned_to_go_home_first() {
+        let (w, db) = World::new();
+        let (ada, _) = pinned_bot(&db, "ada", "gb-lon");
+        let id = acted(&db, &ada, "192.0.2.75", None);
+        backup_pass(&db, 7, now() - DAY);
+        let name = chat_stores::backups_strictly(&w.place().store).unwrap()[0].1.file_name().unwrap().to_string_lossy().into_owned();
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        drop(db);
+        let refused = restore(&w.place(), &opts(&name, true), now()).await.unwrap_err();
+        assert!(refused.contains("1 audit event's details of Bots or people kept elsewhere now"), "{refused}");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        db.place_chats().unwrap();
+        drop(db);
+        let r = restore(&w.place(), &opts(&name, true), now()).await.unwrap();
+        assert_eq!(r.plan.audit_lost.len(), 0, "{r:?}");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!(ip_of(&db, id).as_deref(), Some("192.0.2.75"), "home in botd's log");
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok && r.erased == 0, "{r:?}");
     }
 
     fn factor(user: &str, secret: &str) -> String {

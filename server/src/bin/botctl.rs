@@ -66,7 +66,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user routines <user>                      Routines that run for the user, and which are paused
   botctl user resume-routines <user>               Turn back on the routines paused when they were disabled
   botctl user handover <user> <to> [--resume]      Give a disabled user's Bots and routines to <to>;
-                                                   --resume turns their paused routines back on
+                                                   --resume turns their paused routines back on.
+                                                   With bots.manage too: never an admin's, the owner's,
+                                                   a custom-role holder's or the primary Bot, nor to you
   botctl user erase <user> [--destroy-machine] [--delete-backups] --yes
                                                    Erase their personal data for good (GDPR): Bots, chats,
                                                    sign-ins, secrets; the audit log keeps a pseudonym.
@@ -2081,6 +2083,12 @@ fn saml_summary(v: &Value) -> String {
         out += &format!("  IdPs:                     {}, chosen at each sign-in\n", several.len());
     } else {
         out += &format!("  IdP entity ID:            {}\n", s("idpEntityId"));
+    }
+    if let Some(ds) = v["discoveryUrl"].as_str() {
+        out += &format!("  Discovery service:        {ds}\n");
+    }
+    if let Some(back) = v["discoveryResponseUrl"].as_str() {
+        out += &format!("  Discovery response URL:   {back}\n");
     }
     let warnings = v["certificateWarnings"].as_array().map(Vec::as_slice).unwrap_or_default();
     if !warnings.is_empty() {
@@ -4949,6 +4957,15 @@ mod tests {
         v["everyIdp"] = json!({ "idps": 900, "hidden": 3, "categories": ["https://refeds.org/sirtfi"] });
         let out = saml_summary(&v);
         assert!(out.contains("(900 now, 3 hidden from the chooser)") && out.contains("    Only those in category:  https://refeds.org/sirtfi\n"), "{out}");
+    }
+
+    #[test]
+    fn saml_summary_shows_the_discovery_service() {
+        let mut v = json!({ "provider": "fed", "label": "Fed", "idpEntityIds": ["https://a", "https://b"], "discoveryUrl": null, "discoveryResponseUrl": "https://bot.example.com/api/auth/sso/fed/discovery" });
+        let out = saml_summary(&v);
+        assert!(out.contains("  Discovery response URL:   https://bot.example.com/api/auth/sso/fed/discovery\n") && !out.contains("Discovery service:"), "{out}");
+        v["discoveryUrl"] = json!("https://service.seamlessaccess.org/ds/");
+        assert!(saml_summary(&v).contains("  Discovery service:        https://service.seamlessaccess.org/ds/\n"));
     }
 
     #[test]

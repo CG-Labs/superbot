@@ -1586,6 +1586,27 @@ mod tests {
     }
 
     #[test]
+    fn a_saml_discovery_service_is_named_where_people_pick_their_idp() {
+        let cert = &crate::sso::xmldsig::test_signer::signer(1).cert;
+        let pem = temp_file("offline-federation.pem", &format!("-----BEGIN CERTIFICATE-----\n{cert}\n-----END CERTIFICATE-----\n"));
+        let vars = [
+            ("SSO_PROVIDERS", "uni"),
+            ("SSO_PUBLIC_URL", "https://bot.corp.example"),
+            ("SSO_UNI_TYPE", "saml"),
+            ("SSO_UNI_IDP_ENTITY_IDS", "https://idp.a.example/idp,https://idp.b.example/idp"),
+            ("SSO_UNI_IDP_AGGREGATE_URL", "https://md.fed.internal/aggregate.xml"),
+            ("SSO_UNI_METADATA_SIGNING_CERT_FILE", pem.as_str()),
+            ("SSO_UNI_DISCOVERY_URL", "https://service.seamlessaccess.org/ds/"),
+        ];
+        let f = findings(&vars, &["md.fed.internal"]);
+        assert_eq!(by(&f, "SSO_UNI_IDP_AGGREGATE_URL").status, Status::Ok, "{f:#?}");
+        let ds = by(&f, "SSO_UNI_DISCOVERY_URL");
+        assert_eq!((ds.status, ds.host.as_deref()), (Status::Check, Some("service.seamlessaccess.org")), "{f:#?}");
+        assert!(ds.detail.starts_with("SSO provider uni's discovery service at service.seamlessaccess.org"), "{}", ds.detail);
+        assert_eq!(by(&findings(&vars, &["md.fed.internal", "service.seamlessaccess.org"]), "SSO_UNI_DISCOVERY_URL").status, Status::Ok);
+    }
+
+    #[test]
     fn audit_sinks_are_judged_at_the_hosts_they_send_to() {
         let secops = findings(&[("AUDIT_EXPORT", "google-secops://eu/my-project/01234567-89ab-cdef-0123-456789abcdef/SUPERBOT_AUDIT")], &[]);
         let to = by(&secops, "AUDIT_EXPORT");

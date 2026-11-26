@@ -26,10 +26,11 @@ Someone can't do what their custom role should let them, or can do something it 
 
 | Sign | Why | What to do |
 |---|---|---|
-| `delegate_limit`, `protected_user` | Delegates can't change, sign in as or sign out an admin, the owner account, or anyone with a custom role across the server (themselves included) | Working as intended. An admin does it |
+| `delegate_limit`, `protected_user` | Delegates can't change, sign in as or sign out an admin, the owner account, or anyone with a custom role across the server (themselves included), nor hand over their Bots ([ADR 0315](../adr/0315-bot-handover-under-bots-manage.md)) | Working as intended. An admin does it |
 | `delegate_limit`, `admin_role` | Delegates can't make anyone an admin | An admin does it |
 | `delegate_limit`, `tier` | Changing a tier needs `billing.manage` too | Add it to the role, if the customer wants that |
 | `delegate_limit`, `team_role` | In a team, delegates can't invite or remove owners, admins or anyone with a team role | A team owner or admin does it |
+| `delegate_limit`, `primary_bot`, `self` or `service_account` on `botctl user handover` | With `bots.manage`, a handover is refused when the leaver owns the primary Bot, when it's to the holder themselves, or from a service account's token ([ADR 0315](../adr/0315-bot-handover-under-bots-manage.md)) | Working as intended. An admin, or another holder for `self`, does it: `botctl user handover <user> <to> [--resume]` |
 | A team owner's `botctl role assign --team`, `role requests`, `role approve` or `role deny` is refused (403) | Those are the server admins' routes. In their own team, owners and admins use the team's ([ADR 0311](../adr/0311-botctl-team-commands-for-owners.md)) | `botctl team roles`, `botctl team role assign <role> <user>`, `botctl team requests`, `botctl team approve\|deny <request>`; the error names the one to use |
 | 403 on a route no permission names | Secrets, policy, SSO, SCIM, retention, server backups, the license, setup, roles themselves and a few machine actions stay with admins ([ADR 0123](../adr/0123-custom-roles.md#permissions)) | Working as intended. An admin does it |
 | A team role does nothing | Team roles apply only in that team, and only while the person is on it and not read-only | `botctl role show <role>` shows where it's held; give it across the server if that's what they need |

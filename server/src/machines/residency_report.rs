@@ -40,10 +40,11 @@ const PIN_CHANGES: [&str; 8] = [
 const KEPT: &str = "user.residency_pin_kept";
 const REFUSALS: [&str; 6] = ["machine.residency_refused", "bot.run_refused", "user.region_change_refused", "team.region_change_refused", "team.join_refused", "team.delete_refused"];
 
-const NOT_COVERED: [&str; 3] = [
+const NOT_COVERED: [&str; 4] = [
     "What a Bot's own tools send over the network; outbound allow-lists are the control for that (ADR 0135).",
     "Push, email, webhooks, payments and sign-in providers, as the DPA's subprocessor annex lists them.",
     "People who have left a pinned team: their data is held by a pin of their own, kept from the team's when they left, with its own report, until botd holds none of their machine data unless the operator keeps such pins (ADR 0171, ADR 0205).",
+    "Audit events sent whole to a SIEM or the write-once audit archive the operator sets up, wherever those are (ADR 0316).",
 ];
 
 fn rfc3339(ms: i64) -> String {
@@ -217,15 +218,15 @@ pub(super) fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Op
 
 /// What the pin doesn't cover. botd's own data is listed, with why, unless the operator
 /// states it is in the pin's region (ADR 0184); without chats, routines, approvals, Bots'
-/// memory, owners' facts, sign-ins, own secrets, second factors and usage records when they
-/// are all in the region's own chat store (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283,
-/// ADR 0293, ADR 0299, ADR 0304).
+/// memory, owners' facts, sign-ins, own secrets, second factors, usage records and audit
+/// events' details when they are all in the region's own chat store (ADR 0215, ADR 0228,
+/// ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304, ADR 0316).
 fn not_covered(server_data: &Value, chats: &Value) -> Vec<String> {
     let mut out = Vec::new();
     if server_data["inRegion"] != true {
         let why: Vec<&str> = server_data["outside"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let what = if chats["store"] == true && chats["inRegion"] == true {
-            "botd's own database apart from chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors and model usage records, which are in the region's chat store (accounts, the audit log; its server backups also hold chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors and model usage records from before they moved there)"
+            "botd's own database apart from chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors, model usage records and the details of their audit events, which are in the region's chat store (accounts, the audit log's sealed rows; its server backups also hold chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors, model usage records and audit details from before they moved there)"
         } else {
             "botd's own database (accounts, chats, routines, approvals, sign-ins, own secrets, second factors, model usage records, the audit log; its files hold Bots' memory and the facts they keep about their owners)"
         };
@@ -433,7 +434,7 @@ fn chats_markdown(c: &Value, region: &Value) -> String {
     };
     let backup = c["lastBackupAt"].as_i64().map_or("-".to_string(), rfc3339);
     let mut out = format!(
-        "\n## Chats, routines, approvals and memory\n\nTheir Bots' chat messages, routines, approvals and memory, the facts their Bots keep about them, their sign-ins, their own secrets, their second factors and the model usage records of their runs, by where they are kept.\n\n- **Regional chat store:** {store}\n"
+        "\n## Chats, routines, approvals and memory\n\nTheir Bots' chat messages, routines, approvals and memory, the facts their Bots keep about them, their sign-ins, their own secrets, their second factors, the model usage records of their runs and the details of their audit events, by where they are kept.\n\n- **Regional chat store:** {store}\n"
     );
     for (key, what) in [
         ("messages", "Messages"),
@@ -448,6 +449,7 @@ fn chats_markdown(c: &Value, region: &Value) -> String {
         ("secondFactors", "Second factors"),
         ("recoveryCodes", "Recovery codes"),
         ("usageRecords", "Model usage records"),
+        ("auditEvents", "Audit events' details"),
     ] {
         let m = &c[key];
         if m.is_object() {
@@ -582,7 +584,7 @@ mod tests {
         assert_eq!(not_covered(&Value::Null, &none).len(), NOT_COVERED.len() + 1, "no server data section: not covered");
         // Chats all in the region's own store are left out of what isn't covered (ADR 0215).
         let held = not_covered(&out, &json!({ "store": true, "inRegion": true }));
-        assert!(held[0].starts_with("botd's own database apart from chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors and model usage records, which are in the region's chat store (accounts, the audit log"), "{held:?}");
+        assert!(held[0].starts_with("botd's own database apart from chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors, model usage records and the details of their audit events, which are in the region's chat store (accounts, the audit log's sealed rows"), "{held:?}");
         assert!(!held[0].contains("its files hold"), "owners' facts are in the store too (ADR 0277): {held:?}");
         let moving = not_covered(&out, &json!({ "store": true, "inRegion": false }));
         assert!(moving[0].starts_with("botd's own database (accounts, chats, routines, approvals,"), "{moving:?}");

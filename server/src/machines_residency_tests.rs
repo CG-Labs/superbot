@@ -714,7 +714,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
     assert!(md.contains("## Chats") && md.contains("- **Messages in it:** 3"), "{md}");
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     let lon_row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap();
     assert_eq!(lon_row["chatStore"]["messages"].as_i64(), Some(3), "{regions}");
@@ -765,7 +765,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
     assert_eq!(
         me["chats"],
-        json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true }),
+        json!({ "store": true, "inRegion": false, "moving": false, "earlierBackups": 1, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true }),
         "the move is done; only old backups are left: {me}"
     );
 
@@ -790,7 +790,7 @@ async fn a_pinned_persons_chats_are_kept_in_their_regions_chat_store_and_come_ba
     assert!(!r["warnings"].to_string().contains("backups of gb-lon's chat store"), "{r}");
     assert_eq!(r["digest"].as_str(), Some(crate::machines::residency_report::digest(&r).as_str()));
     let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
-    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true }), "{me}");
+    assert_eq!(me["chats"], json!({ "store": true, "inRegion": true, "moving": false, "earlierBackups": 0, "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true }), "{me}");
     let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
     assert!(!regions["residency"]["warnings"].to_string().contains("may still hold the rows"), "{regions}");
 }
@@ -1074,7 +1074,7 @@ async fn a_pinned_persons_sign_ins_are_kept_in_their_regions_chat_store() {
     let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
     assert_eq!((r["status"].as_str(), r["chats"]["sessions"]["inStore"].as_i64(), r["chats"]["sessions"]["inServerDatabase"].as_i64()), (Some("kept"), Some(2), Some(0)), "{r}");
     assert!(
-        r["notCovered"][0].as_str().unwrap().contains("owners' facts, sign-ins, own secrets, second factors and model usage records, which are in the region's chat store (accounts, the audit log"),
+        r["notCovered"][0].as_str().unwrap().contains("owners' facts, sign-ins, own secrets, second factors, model usage records and the details of their audit events, which are in the region's chat store (accounts, the audit log's sealed rows"),
         "{r}"
     );
     let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
@@ -1280,6 +1280,57 @@ async fn a_pinned_persons_usage_records_are_kept_in_their_regions_chat_store_and
     assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
     assert_eq!(count(), 0);
     assert_eq!(tokens().await, Some(120));
+}
+
+#[tokio::test]
+async fn a_pinned_persons_audit_details_are_kept_in_their_regions_chat_store_and_the_log_still_reads_and_verifies() {
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let lon = scratch.path().join("lon");
+    std::fs::create_dir_all(&lon).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, _) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false, new_derived_keys: false }).unwrap();
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let acted = |ip: &str| {
+        let actor = crate::audit::Actor { kind: crate::audit::ActorKind::User, id: Some(ada.clone()), name: Some("Ada".into()), ..Default::default() };
+        let who = crate::audit::Who { actor, source: crate::audit::Source { ip: Some(ip.into()), user_agent: None } };
+        app.db.try_record(&who.event("bot.updated").details(json!({ "name": "Ada's Bot" }))).unwrap()
+    };
+    acted("192.0.2.81");
+    let count = || rusqlite::Connection::open(lon.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM audit_details", [], |r| r.get::<_, i64>(0)).unwrap();
+    let verified = || async { call_json(port, "GET", "/api/audit/verify", &admin, "").await.1["ok"].as_bool() };
+
+    // A pin moves her events' details into London's store, audited; the log reads them whole and still verifies.
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    let held = count();
+    assert!(held >= 1, "{held}");
+    let moved = audit(port, &admin, chat_stores::MOVED).await;
+    assert_eq!((moved[0]["details"]["to"].as_str(), moved[0]["details"]["auditEvents"].as_i64()), (Some("gb-lon"), Some(held)), "{moved:?}");
+    acted("192.0.2.82");
+    assert_eq!(count(), held + 1, "new ones are written there");
+    let read = audit(port, &admin, "bot.updated").await;
+    let ips: Vec<&str> = read.iter().filter_map(|e| e["ip"].as_str()).collect();
+    assert_eq!(ips.len(), 2, "{read:?}");
+    assert!(ips.contains(&"192.0.2.81") && ips.contains(&"192.0.2.82") && read.iter().all(|e| e["actorId"].as_str() == Some(ada.as_str())), "{read:?}");
+    assert_eq!(verified().await, Some(true));
+
+    // The report and the app count them.
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["status"].as_str(), r["chats"]["auditEvents"]["inStore"].as_i64(), r["chats"]["auditEvents"]["inServerDatabase"].as_i64()), (Some("kept"), Some(held + 1), Some(0)), "{r}");
+    let (_, md) = call(port, "GET", &format!("/api/users/{ada}/residency/report?format=markdown"), &admin, "").await;
+    assert!(md.contains(&format!("- **Audit events' details in it:** {}", held + 1)), "{md}");
+    let (_, me) = call_json(port, "GET", "/api/me/residency", &ada_s, "").await;
+    assert_eq!(me["chats"]["auditEvents"].as_bool(), Some(true), "{me}");
+
+    // Unpinned, they go back into botd's log, which reads and verifies as before.
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{ada}/residency"), &admin, r#"{"reason":"contract ended"}"#).await.0, 200);
+    assert_eq!(count(), 0);
+    let read = audit(port, &admin, "bot.updated").await;
+    assert_eq!(read.iter().filter(|e| e["ip"].as_str().is_some()).count(), 2, "{read:?}");
+    assert_eq!(verified().await, Some(true));
 }
 
 #[tokio::test]

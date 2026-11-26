@@ -1,14 +1,16 @@
 //! Pinned people's chats, routines, approvals, Bots' memory, owners' facts, sign-in
-//! sessions, own secrets, second factors and model usage records in a database in their
-//! region (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304),
-//! the first part of splitting botd's database by region. Each region in REGION_DATA_DIRS
-//! has a SQLite file of its own (`chats.sqlite`, keyed like botd's database), attached to
-//! botd's connection. A Bot's messages, routines, approvals and memory are kept in the
-//! store of its owner's residency pin (their team's, else their own, as
-//! `residency::of_user`), and a person's facts, sessions (with each session's SAML sign-in
-//! and push device), own secrets, second factor (with its recovery codes) and the usage
-//! records of runs charged to them in the store of their own pin by the same rule, or in
-//! botd's own database when that region has no store or the person isn't pinned.
+//! sessions, own secrets, second factors, model usage records and audit event details in a
+//! database in their region (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293,
+//! ADR 0299, ADR 0304, ADR 0316), the first part of splitting botd's database by region.
+//! Each region in REGION_DATA_DIRS has a SQLite file of its own (`chats.sqlite`, keyed like
+//! botd's database), attached to botd's connection. A Bot's messages, routines, approvals
+//! and memory are kept in the store of its owner's residency pin (their team's, else their
+//! own, as `residency::of_user`), and a person's facts, sessions (with each session's SAML
+//! sign-in and push device), own secrets, second factor (with its recovery codes), the
+//! usage records of runs charged to them and the personal details of their audit events in
+//! the store of their own pin by the same rule, or in botd's own database when that region
+//! has no store or the person isn't pinned. An audit event's row stays in botd's log, with
+//! its seal; only the fields an erasure may rewrite move (`audit_events`).
 //! Their secrets are read and written on the users' secrets' own connection, which attaches
 //! the stores too (`attach_to`, `secrets::sealed::UserSecrets`). botd's own copy of a
 //! Bot's memory is a file in DATA_DIR (`DATA_DIR/bots/<id>/MEMORY.md`), and of a person's
@@ -78,7 +80,7 @@ struct Kept {
 
 /// A parent comes before the tables that point at it, so a move into botd's own database
 /// copies it first, and deletes run in reverse.
-const KEPT: [Kept; 12] = [
+const KEPT: [Kept; 13] = [
     Kept { name: "messages", key: Key::Bot, pk: "id", indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], unique: &[], parent: None, rowid: false },
     Kept { name: "routines", key: Key::Bot, pk: "id", indexes: &[("routines_bot", "bot_id")], unique: &[], parent: None, rowid: false },
     Kept { name: "approvals", key: Key::Bot, pk: "id", indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], unique: &[], parent: None, rowid: true },
@@ -110,11 +112,12 @@ const KEPT: [Kept; 12] = [
         name: "token_usage",
         key: Key::User,
         pk: "id",
-        indexes: &[("token_usage_user_at", "user_id, at"), ("token_usage_run", "run_id"), ("token_usage_meter", "meter_status, id")],
+        indexes: &[("token_usage_user_at", "user_id, at"), ("token_usage_run", "run_id"), ("token_usage_meter", "        meter_status, id")],
         unique: &[],
         parent: None,
         rowid: false,
     },
+    Kept { name: AUDIT, key: Key::User, pk: "id", indexes: &[("audit_details_user", "user_id, id")], unique: &[], parent: None, rowid: false },
 ];
 const N: usize = KEPT.len();
 const MESSAGES: usize = 0;
@@ -124,6 +127,7 @@ const USER_SECRETS: usize = 8;
 const SECOND_FACTORS: usize = 9;
 const RECOVERY_CODES: usize = 10;
 const USAGE_RECORDS: usize = 11;
+const AUDIT_EVENTS: usize = 12;
 
 /// Kept tables whose integer ids come from botd's own sequence for them (`insert_numbered`).
 const NUMBERED: [&str; 2] = ["messages", USAGE];
@@ -144,9 +148,14 @@ pub const RECOVERY_CODE: &str = "mfa_recovery_codes";
 /// per run, charged to the Bot's owner.
 pub const USAGE: &str = "token_usage";
 
+/// The table of the personal details of each pinned person's audit events (ADR 0316): per
+/// event, the fields an erasure may rewrite and the salt of their digest. The event's row
+/// stays in botd's `audit_events`, sealed into the chain.
+pub const AUDIT: &str = "audit_details";
+
 /// Tables a restore takes from the store it replaces, but keeps from the backup when that
-/// store is gone, as the only copy left (ADR 0293, ADR 0299, ADR 0304).
-const KEPT_WHEN_GONE: [&str; 4] = [SECRETS, SECOND_FACTOR, RECOVERY_CODE, USAGE];
+/// store is gone, as the only copy left (ADR 0293, ADR 0299, ADR 0304, ADR 0316).
+const KEPT_WHEN_GONE: [&str; 5] = [SECRETS, SECOND_FACTOR, RECOVERY_CODE, USAGE, AUDIT];
 
 /// The table a move puts in the file it leaves, naming the copy, before botd switches to the
 /// copy (ADR 0309): a file that has it and that botd's record has left is stale.
@@ -303,6 +312,9 @@ pub struct Held {
     /// The model usage records of runs charged to them (ADR 0050, ADR 0304). Not named after
     /// tokens in JSON, because the audit log hides the values of keys naming tokens.
     pub usage_records: i64,
+    /// The personal details of their audit events (ADR 0316); each event's row stays in
+    /// botd's log.
+    pub audit_events: i64,
 }
 
 impl Held {
@@ -320,6 +332,7 @@ impl Held {
             second_factors: n[SECOND_FACTORS],
             recovery_codes: n[RECOVERY_CODES],
             usage_records: n[USAGE_RECORDS],
+            audit_events: n[AUDIT_EVENTS],
         }
     }
 
@@ -337,6 +350,7 @@ impl Held {
             self.second_factors,
             self.recovery_codes,
             self.usage_records,
+            self.audit_events,
         ]
     }
 
@@ -370,6 +384,11 @@ impl Held {
         Held { usage_records: self.usage_records, ..Held::default() }
     }
 
+    /// The details of a person's audit events (ADR 0316).
+    pub fn audit(&self) -> Held {
+        Held { audit_events: self.audit_events, ..Held::default() }
+    }
+
     /// "3 chat messages, 1 routine, 2 approvals, 1 Bot memory and 1 person's facts", leaving
     /// out tables with none.
     pub fn describe(&self) -> String {
@@ -386,6 +405,7 @@ impl Held {
             (self.second_factors, "second factor", "second factors"),
             (self.recovery_codes, "recovery code", "recovery codes"),
             (self.usage_records, "model usage record", "model usage records"),
+            (self.audit_events, "audit event's details", "audit events' details"),
         ]
         .into_iter()
         .filter(|(n, _, _)| *n > 0)
@@ -423,6 +443,8 @@ pub struct ChatMove {
     pub recovery_codes: usize,
     /// Model usage records (ADR 0304).
     pub usage_records: usize,
+    /// Audit events' details (ADR 0316).
+    pub audit_events: usize,
 }
 
 impl ChatMove {
@@ -441,6 +463,7 @@ impl ChatMove {
             self.second_factors,
             self.recovery_codes,
             self.usage_records,
+            self.audit_events,
         ];
         Held::of(n.map(|n| n as i64))
     }
@@ -756,6 +779,286 @@ fn zeroing<T>(c: &Connection, f: impl FnOnce() -> rusqlite::Result<T>) -> rusqli
     r
 }
 
+/// The TEMP table on botd's connection naming the stores attached to it, by region: the
+/// audit log's writes have only a connection (ADR 0316).
+const STORE_PLACES: &str = "chat_store_places";
+
+/// The columns of an audit event a store keeps for a pinned person (ADR 0316): those an
+/// erasure may rewrite and the salt of their digest, as botd's log has them.
+fn audit_moved(c: &Connection) -> rusqlite::Result<Vec<Col>> {
+    let names: Vec<&str> = crate::audit_chain::ERASABLE.iter().copied().chain(["chain_salt"]).collect();
+    Ok(columns(c, "main", "audit_events")?.into_iter().filter(|col| names.contains(&col.name.as_str())).collect())
+}
+
+/// Makes botd's own `audit_details`, for events' details on their way between their row and
+/// a store, with the columns `audit_moved` names; a store's copy takes its columns from it.
+fn ensure_audit_details(c: &Connection) -> rusqlite::Result<()> {
+    let col = |name: &str, ty: &str, notnull: bool| Col { name: name.into(), ty: ty.into(), notnull, default: None };
+    let mut cols = vec![col("id", "INTEGER", false), col("user_id", "TEXT", true)];
+    cols.extend(audit_moved(c)?);
+    ensure_table(c, "main", kept(AUDIT).expect("audit_details is kept"), &cols)?;
+    // Finds the events about a person in a pass (`audit_out`), as `audit_events_actor` and
+    // `audit_events_on_behalf_of` find the others.
+    // And the rows whose details a place holds, or an erasure cleared (`audit_unheld`).
+    c.execute_batch(
+        "CREATE INDEX IF NOT EXISTS main.audit_events_user_target ON audit_events(target_id, id) WHERE target_type = 'user';
+         CREATE INDEX IF NOT EXISTS main.audit_events_unsalted ON audit_events(details) WHERE chain_salt IS NULL;",
+    )
+}
+
+/// Whose audit event it is, from its columns (ADR 0316): the person who acted, else the one
+/// a Bot acted for, else the person it is about. None: nobody's (a system event about a
+/// Bot, say), kept whole in botd's log. `audit_out` and `audit_inline_of` say it in SQL.
+pub fn audit_person<'a>(actor_kind: Option<&str>, actor_id: Option<&'a str>, on_behalf_of: Option<&'a str>, target_type: Option<&str>, target_id: Option<&'a str>) -> Option<&'a str> {
+    match (actor_kind, actor_id) {
+        (Some("user"), Some(id)) => Some(id),
+        _ => on_behalf_of.or(if target_type == Some("user") { target_id } else { None }),
+    }
+}
+
+/// What botd's own row of an audit event holds in `details` while `region`'s store keeps
+/// its details (ADR 0316).
+pub fn audit_placeholder(region: &str) -> String {
+    serde_json::json!({ "inChatStore": region }).to_string()
+}
+
+/// The stores attached to `c`, as `(region, schema)`: none on a connection without them.
+fn store_places(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    if !has_table(c, "temp", STORE_PLACES)? {
+        return Ok(Vec::new());
+    }
+    let mut s = c.prepare_cached(&format!("SELECT region, schema FROM temp.{STORE_PLACES} ORDER BY schema"))?;
+    s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+}
+
+/// Where a new audit event of `person`'s keeps its details (ADR 0316): `(region, schema)` of
+/// the store of their pin, their team's first. None: in its own row in botd's log.
+pub fn audit_store_for(c: &Connection, person: Option<&str>) -> rusqlite::Result<Option<(String, String)>> {
+    let Some(person) = person else { return Ok(None) };
+    let places = store_places(c)?;
+    if places.is_empty() {
+        return Ok(None);
+    }
+    let region: Option<String> = c.query_row(&format!("SELECT {}", pinned_region_of("?1")), [person], |r| r.get(0))?;
+    Ok(region.and_then(|r| places.into_iter().find(|(reg, _)| *reg == r)))
+}
+
+/// Writes the details of new audit event `id` of `person`'s into the store attached as
+/// `schema` (ADR 0316): `cols` (`audit_chain::ERASABLE` and `chain_salt`) with `vals`.
+pub fn insert_audit_details(c: &Connection, schema: &str, id: i64, person: &str, cols: &[&str], vals: &[rusqlite::types::Value]) -> rusqlite::Result<()> {
+    let marks = vec!["?"; cols.len() + 2].join(", ");
+    let mut all: Vec<rusqlite::types::Value> = vec![id.into(), person.to_string().into()];
+    all.extend(vals.iter().cloned());
+    // Replacing: details left under this id by a write whose row in botd's log was lost.
+    c.execute(&format!("INSERT OR REPLACE INTO {schema}.{AUDIT} (id, user_id, {}) VALUES ({marks})", cols.join(", ")), rusqlite::params_from_iter(all))?;
+    Ok(())
+}
+
+/// The places holding audit event `id`'s details (ADR 0316): a store's schema, or `main` for
+/// botd's own `audit_details` mid-move. None: its row in botd's log holds them.
+pub fn audit_details_held(c: &Connection, id: i64) -> rusqlite::Result<Vec<String>> {
+    let places = store_places(c)?;
+    if places.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for s in std::iter::once("main".to_string()).chain(places.into_iter().map(|(_, s)| s)) {
+        if c.query_row(&format!("SELECT 1 FROM {s}.{AUDIT} WHERE id = ?1"), [id], |_| Ok(())).optional()?.is_some() {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+/// Makes the TEMP view `audit_events` that reads each event whole (ADR 0316): botd's own row,
+/// with its details from whichever place holds them. Writes name the table they change.
+fn create_audit_view(c: &Connection, stores: &[ChatStore]) -> rusqlite::Result<()> {
+    let moved: Vec<String> = audit_moved(c)?.into_iter().map(|col| col.name).collect();
+    let places: Vec<&str> = schemas(stores).collect();
+    let select: Vec<String> = columns(c, "main", "audit_events")?
+        .into_iter()
+        .map(|col| {
+            let q = quote(&col.name);
+            if !moved.contains(&col.name) {
+                return format!("a.{q}");
+            }
+            let whens: String = (0..places.len()).map(|i| format!(" WHEN d{i}.id IS NOT NULL THEN d{i}.{q}")).collect();
+            format!("CASE{whens} ELSE a.{q} END AS {q}")
+        })
+        .collect();
+    // Only a row whose details went to a place (no salt) takes them from one: not one that
+    // reused the id of details left by a write whose row was lost.
+    let joins: String = places.iter().enumerate().map(|(i, s)| format!(" LEFT JOIN {s}.{AUDIT} AS d{i} ON d{i}.id = a.id AND a.chain_salt IS NULL")).collect();
+    c.execute_batch(&format!("CREATE TEMP VIEW audit_events AS SELECT {} FROM main.audit_events AS a{joins}", select.join(", ")))
+}
+
+/// Runs `f` with botd's update trigger letting it move audit events' details between their
+/// rows and `audit_details` (ADR 0316), inside the caller's transaction.
+fn moving_audit<T>(c: &Connection, f: impl FnOnce() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    c.execute("INSERT OR REPLACE INTO main.settings (key, value) VALUES (?1, '1')", [super::AUDIT_MOVING])?;
+    let r = f();
+    c.execute("DELETE FROM main.settings WHERE key = ?1", [super::AUDIT_MOVING])?;
+    r
+}
+
+/// The people placed in a store this pass (`temp.user_place`), as SQL.
+const IN_STORES: &str = "SELECT user_id FROM temp.user_place WHERE schema != 'main'";
+
+/// Takes the details of audit events whose person is placed in a store this pass out of
+/// their rows in botd's log into its `audit_details`, for the pass to copy there, leaving
+/// that store's region in `details` (ADR 0316); events whose details a store already holds
+/// (a pass cut off) only lose them from their row. Needs `temp.user_place`. How many.
+fn audit_out(c: &Connection, stores: &[ChatStore]) -> rusqlite::Result<usize> {
+    let moved: Vec<String> = audit_moved(c)?.into_iter().map(|col| quote(&col.name)).collect();
+    let region: String = stores.iter().map(|s| format!(" WHEN {} THEN {}", literal(&s.schema), literal(&s.region))).collect();
+    let held: String = stores.iter().map(|s| format!(" AND o.id NOT IN (SELECT id FROM {}.{AUDIT})", s.schema)).collect();
+    let actor = "a.actor_kind = 'user' AND a.actor_id IS NOT NULL";
+    c.execute_batch(&format!(
+        "CREATE TEMP TABLE IF NOT EXISTS audit_out (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, region TEXT NOT NULL);
+         DELETE FROM temp.audit_out;
+         INSERT OR IGNORE INTO temp.audit_out (id, user_id, region)
+           SELECT a.id, p.user_id, CASE p.schema{region} END FROM temp.user_place p JOIN main.audit_events a ON a.actor_kind = 'user' AND a.actor_id = p.user_id
+             WHERE p.schema != 'main'
+           UNION ALL SELECT a.id, p.user_id, CASE p.schema{region} END FROM temp.user_place p JOIN main.audit_events a ON a.on_behalf_of = p.user_id
+             WHERE p.schema != 'main' AND NOT ({actor})
+           UNION ALL SELECT a.id, p.user_id, CASE p.schema{region} END FROM temp.user_place p JOIN main.audit_events a ON a.target_type = 'user' AND a.target_id = p.user_id
+             WHERE p.schema != 'main' AND NOT ({actor}) AND a.on_behalf_of IS NULL;"
+    ))?;
+    let n: i64 = c.query_row("SELECT COUNT(*) FROM temp.audit_out", [], |r| r.get(0))?;
+    if n == 0 {
+        return Ok(0);
+    }
+    let cols = moved.join(", ");
+    let from_row: String = moved.iter().map(|q| format!(", a.{q}")).collect();
+    let cleared: String = moved.iter().map(|q| if q == "\"details\"" { format!("{q} = json_object('inChatStore', o.region)") } else { format!("{q} = NULL") }).collect::<Vec<_>>().join(", ");
+    moving_audit(c, || {
+        c.execute_batch(&format!(
+            "INSERT OR IGNORE INTO main.{AUDIT} (id, user_id, {cols})
+               SELECT o.id, o.user_id{from_row} FROM temp.audit_out o JOIN main.audit_events a ON a.id = o.id WHERE true{held};
+             UPDATE main.audit_events AS t SET {cleared} FROM temp.audit_out AS o WHERE o.id = t.id;"
+        ))
+    })?;
+    Ok(n as usize)
+}
+
+/// Puts the details in botd's own `audit_details` whose person isn't placed in a store
+/// (any more) back into their rows in botd's log, and deletes them there (ADR 0316). `all`:
+/// every one, as on a start with no stores. How many.
+fn audit_home(c: &Connection, all: bool) -> rusqlite::Result<usize> {
+    if !has_table(c, "main", AUDIT)? || c.query_row(&format!("SELECT NOT EXISTS (SELECT 1 FROM main.{AUDIT})"), [], |r| r.get::<_, bool>(0))? {
+        return Ok(0);
+    }
+    let set: String = audit_moved(c)?.iter().map(|col| format!("{q} = d.{q}", q = quote(&col.name))).collect::<Vec<_>>().join(", ");
+    let whose = if all { String::new() } else { format!(" WHERE user_id NOT IN ({IN_STORES})") };
+    moving_audit(c, || {
+        c.execute_batch(&format!(
+            "CREATE TEMP TABLE IF NOT EXISTS audit_home (id INTEGER PRIMARY KEY);
+             DELETE FROM temp.audit_home;
+             INSERT INTO temp.audit_home (id) SELECT id FROM main.{AUDIT}{whose};
+             UPDATE main.audit_events AS t SET {set} FROM main.{AUDIT} AS d WHERE d.id = t.id AND d.id IN (SELECT id FROM temp.audit_home);"
+        ))?;
+        c.execute(&format!("DELETE FROM main.{AUDIT} WHERE id IN (SELECT id FROM temp.audit_home)"), [])
+    })
+}
+
+/// Points botd's rows of the events whose details `store` holds at its region (ADR 0316),
+/// after a pass moved some there from another store.
+fn audit_placeholders(c: &Connection, store: &ChatStore) -> rusqlite::Result<usize> {
+    let here = audit_placeholder(&store.region);
+    moving_audit(c, || {
+        c.execute(&format!("UPDATE main.audit_events SET details = ?1 WHERE id IN (SELECT id FROM {}.{AUDIT}) AND details IS NOT ?1", store.schema), [&here])
+    })
+}
+
+/// How many audit events of `users` (a JSON list) still hold their details in their own row
+/// in botd's log (ADR 0316): for those placed in a store, until the next pass.
+fn audit_inline_of(c: &Connection, users: &str) -> rusqlite::Result<i64> {
+    let actor = "a.actor_kind = 'user' AND a.actor_id IS NOT NULL";
+    let them = "(SELECT value FROM json_each(?1))";
+    c.query_row(
+        &format!(
+            "SELECT (SELECT COUNT(*) FROM main.audit_events a WHERE a.actor_kind = 'user' AND a.actor_id IN {them})
+                  + (SELECT COUNT(*) FROM main.audit_events a WHERE a.on_behalf_of IN {them} AND NOT ({actor}))
+                  + (SELECT COUNT(*) FROM main.audit_events a WHERE a.target_type = 'user' AND a.target_id IN {them} AND NOT ({actor}) AND a.on_behalf_of IS NULL)"
+        ),
+        [users],
+        |r| r.get(0),
+    )
+}
+
+/// Squares botd's rows that say `region`'s store holds their details with where those are
+/// (ADR 0316), with `stores` attached: a row whose details another store holds (a move
+/// between stores whose files committed apart) is pointed at it; one whose details no place
+/// holds (`region`'s store forgotten, REGION_DATA_FORGET, or a write whose store lost its
+/// commit in a crash) is named on the chain with an `audit.erased` event unless one names
+/// it already, as an erased row nothing names fails verification (ADR 0122). Details in
+/// botd's own `audit_details` are a move under way, left to the next pass. How many named.
+fn audit_unheld(c: &Connection, region: &str, stores: &[ChatStore]) -> rusqlite::Result<usize> {
+    let mine: String = stores.iter().filter(|s| s.region == region).map(|s| format!(" AND id NOT IN (SELECT id FROM {}.{AUDIT})", s.schema)).collect();
+    let ids: Vec<i64> = {
+        let mut s = c.prepare(&format!("SELECT id FROM main.audit_events WHERE chain_salt IS NULL AND details = ?1 AND id NOT IN (SELECT id FROM main.{AUDIT}){mine} ORDER BY id"))?;
+        s.query_map([audit_placeholder(region)], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    let (mut elsewhere, mut lost) = (Vec::new(), Vec::new());
+    for id in ids {
+        let mut held = None;
+        for s in stores.iter().filter(|s| s.region != region) {
+            if c.query_row(&format!("SELECT 1 FROM {}.{AUDIT} WHERE id = ?1", s.schema), [id], |_| Ok(())).optional()?.is_some() {
+                held = Some(s);
+                break;
+            }
+        }
+        if let Some(s) = held {
+            elsewhere.push((id, audit_placeholder(&s.region)));
+            continue;
+        }
+        let named: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM main.audit_events e, json_each(e.details, '$.rows') r
+               WHERE e.action = ?1 AND e.id > ?2 AND ?2 BETWEEN json_extract(r.value, '$[0]') AND json_extract(r.value, '$[1]'))",
+            params![crate::audit_chain::ERASED, id],
+            |r| r.get(0),
+        )?;
+        if !named {
+            lost.push(id);
+        }
+    }
+    if !elsewhere.is_empty() {
+        moving_audit(c, || {
+            for (id, there) in &elsewhere {
+                c.execute("UPDATE main.audit_events SET details = ?1 WHERE id = ?2", params![there, id])?;
+            }
+            Ok(())
+        })?;
+    }
+    if !lost.is_empty() {
+        crate::audit_chain::insert_erased_ranges(c, "residency", ("chat_store", region), &crate::audit_chain::ranges(&lost))?;
+    }
+    Ok(lost.len())
+}
+
+/// Before a backup of `region`'s store is restored with that store gone (ADR 0316), with
+/// botd's database attached to `c` (the backup's copy) as `botd`: deletes the copy's details
+/// of events an erasure at or after `since` named, which it rewrote, so they can't come
+/// back; and returns how many it deleted and the ids of the events botd's log says the store
+/// held that the copy doesn't (made since, or just deleted): their details are lost.
+pub fn audit_lost_in_copy(c: &Connection, botd: &str, region: &str, since: i64) -> rusqlite::Result<(i64, Vec<i64>)> {
+    if !has_table(c, "main", AUDIT)? {
+        return Ok((0, Vec::new()));
+    }
+    let erased = c.execute(
+        &format!(
+            "DELETE FROM main.{AUDIT} WHERE EXISTS (
+               SELECT 1 FROM {botd}.audit_events e, json_each(e.details, '$.rows') r
+                WHERE e.action = ?1 AND e.at >= ?2
+                  AND main.{AUDIT}.id BETWEEN json_extract(r.value, '$[0]') AND json_extract(r.value, '$[1]'))"
+        ),
+        params![crate::audit_chain::ERASED, since],
+    )?;
+    let mut s = c.prepare(&format!("SELECT a.id FROM {botd}.audit_events a WHERE a.details = ?1 AND a.id NOT IN (SELECT id FROM main.{AUDIT}) ORDER BY a.id"))?;
+    let lost = s.query_map([audit_placeholder(region)], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    Ok((erased as i64, lost))
+}
+
 impl Db {
     pub(super) fn chat_stores_set(&self) -> &[ChatStore] {
         self.5.get().map_or(&[], |s| s.stores.as_slice())
@@ -787,6 +1090,8 @@ impl Db {
         if !columns(&c, "main", "chat_moves_out").map_err(e)?.iter().any(|col| col.name == "cleared_at") {
             c.execute_batch("ALTER TABLE main.chat_moves_out ADD COLUMN cleared_at INTEGER").map_err(e)?;
         }
+        super::audit_update_trigger_now(&c).map_err(e)?;
+        ensure_audit_details(&c).map_err(e)?;
         let recorded: Vec<(String, String, String)> = {
             let mut s = c.prepare("SELECT region, store_id, path FROM main.chat_stores ORDER BY region").map_err(e)?;
             s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(e)?.collect::<rusqlite::Result<_>>().map_err(e)?
@@ -911,14 +1216,40 @@ impl Db {
                 let top: i64 = c.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {schema}.{t}"), [], |r| r.get(0)).map_err(e)?;
                 bump_sequence(&c, t, top).map_err(e)?;
             }
+            // An audit event's id isn't taken again for details whose row a crash lost.
+            let top: i64 = c.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {schema}.{AUDIT}"), [], |r| r.get(0)).map_err(e)?;
+            bump_sequence(&c, "audit_events", top).map_err(e)?;
             stores.push(ChatStore { region: region.clone(), schema, path, id });
         }
+        // A forgotten store's record goes with naming what only it held, so a start cut off
+        // in between does it again.
         for (region, _) in &out.forgotten {
-            c.execute("DELETE FROM main.chat_stores WHERE region = ?1", [region]).map_err(e)?;
+            let tx = c.unchecked_transaction().map_err(e)?;
+            tx.execute("DELETE FROM main.chat_stores WHERE region = ?1", [region]).map_err(e)?;
+            audit_unheld(&tx, region, &stores).map_err(e)?;
+            tx.commit().map_err(e)?;
         }
-        if !stores.is_empty() {
+        for s in &stores {
+            let tx = c.unchecked_transaction().map_err(e)?;
+            audit_unheld(&tx, &s.region, &stores).map_err(e)?;
+            tx.commit().map_err(e)?;
+        }
+        if stores.is_empty() {
+            zeroing(&c, || {
+                let tx = c.unchecked_transaction()?;
+                audit_home(&tx, true)?;
+                tx.commit()
+            })
+            .map_err(e)?;
+        } else {
             for (k, cols) in KEPT.iter().zip(&cols) {
                 create_view(&c, &stores, k, cols).map_err(e)?;
+            }
+            create_audit_view(&c, &stores).map_err(e)?;
+            c.execute_batch(&format!("CREATE TEMP TABLE IF NOT EXISTS {STORE_PLACES} (region TEXT PRIMARY KEY, schema TEXT NOT NULL); DELETE FROM temp.{STORE_PLACES};"))
+                .map_err(e)?;
+            for s in &stores {
+                c.execute(&format!("INSERT INTO temp.{STORE_PLACES} (region, schema) VALUES (?1, ?2)"), params![s.region, s.schema]).map_err(e)?;
             }
         }
         let paths = std::sync::RwLock::new(stores.iter().map(|s| s.path.clone()).collect());
@@ -1145,8 +1476,12 @@ impl Db {
             pinned_region("b.id"),
             pinned_region_of("u.id")
         ))?;
+        zeroing(&tx, || audit_out(&tx, &set.stores))?;
         let here = |k: &Kept, to: &str| match k.key {
             Key::Bot => format!("bot_id IN (SELECT bot_id FROM temp.chat_place WHERE schema = {})", literal(to)),
+            // An audit event's details are never dropped while its sealed row stands: those
+            // of anyone no store is for (deleted people too) go back to botd's log.
+            Key::User if k.name == AUDIT && to == "main" => format!("user_id NOT IN ({IN_STORES})"),
             Key::User => format!("user_id IN (SELECT user_id FROM temp.user_place WHERE schema = {})", literal(to)),
         };
         let pairs: Vec<(&str, &str)> = schemas(&set.stores).flat_map(|to| schemas(&set.stores).filter(move |f| *f != to).map(move |from| (from, to))).collect();
@@ -1212,17 +1547,27 @@ impl Db {
                     second_factors: n[SECOND_FACTORS],
                     recovery_codes: n[RECOVERY_CODES],
                     usage_records: n[USAGE_RECORDS],
+                    audit_events: n[AUDIT_EVENTS],
                 });
             }
             for s in &set.stores {
-                for k in &KEPT {
+                for k in KEPT.iter().filter(|k| k.name != AUDIT) {
                     let (col, owners) = match k.key {
                         Key::Bot => ("bot_id", "main.bots"),
                         Key::User => ("user_id", "main.users"),
                     };
                     tx.execute(&format!("DELETE FROM {}.{} WHERE {col} NOT IN (SELECT id FROM {owners})", s.schema, k.name), [])?;
                 }
+                // Details of events retention deleted, if its delete here didn't commit, or
+                // whose row a crash lost (an id another row may take).
+                tx.execute(&format!("DELETE FROM {}.{AUDIT} WHERE id NOT IN (SELECT id FROM main.audit_events WHERE chain_salt IS NULL)", s.schema), [])?;
                 orphans_in(&tx, &s.schema)?;
+            }
+            audit_home(&tx, false)?;
+            for m in moves.iter().filter(|m| m.audit_events > 0 && m.from.is_some()) {
+                if let Some(store) = set.stores.iter().find(|s| m.to.as_deref() == Some(s.region.as_str())) {
+                    audit_placeholders(&tx, store)?;
+                }
             }
             tx.commit()?;
             Ok(moves)
@@ -1376,14 +1721,21 @@ impl Db {
     /// What of the Bots `owners` own, and of their own facts, is in each place: botd's own
     /// database first, then each store, places with none left out.
     pub fn chat_counts(&self, owners: &[String]) -> Vec<ChatCount> {
-        let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
         let c = self.c();
         let stores = self.chat_stores_set();
+        let placed: Vec<&String> = owners.iter().filter(|o| place_in(&c, stores, Key::User, o).is_ok_and(|s| s != "main")).collect();
+        let placed = if placed.is_empty() { String::new() } else { serde_json::to_string(&placed).unwrap_or_else(|_| "[]".into()) };
+        let owners = serde_json::to_string(owners).unwrap_or_else(|_| "[]".into());
         let bots = "bot_id IN (SELECT id FROM main.bots WHERE owner_id IN (SELECT value FROM json_each(?1)))";
         let users = "user_id IN (SELECT value FROM json_each(?1))";
         schemas(stores)
             .filter_map(|s| {
-                let held = held_in(&c, s, Filter(bots, &[&owners]), Filter(users, &[&owners])).ok()?;
+                let mut held = held_in(&c, s, Filter(bots, &[&owners]), Filter(users, &[&owners])).ok()?;
+                // Details still in their own rows in botd's log, of people a store is for:
+                // everyone else's are always there, as the log itself is.
+                if s == "main" && !placed.is_empty() {
+                    held.audit_events += audit_inline_of(&c, &placed).ok()?;
+                }
                 (held.total() > 0).then(|| ChatCount { region: region_of(stores, s).map(str::to_string), held })
             })
             .collect()
@@ -1827,6 +2179,7 @@ mod tests {
             second_factors: 0,
             recovery_codes: 0,
             usage_records: 0,
+            audit_events: 0,
         }
     }
 
@@ -3250,6 +3603,236 @@ mod tests {
         assert_eq!(Held { sessions: 2, saml_sessions: 1, push_devices: 1, ..Held::default() }.describe(), "2 sign-in sessions, 1 SAML sign-in and 1 push device");
         assert_eq!(Held { messages: 1, sessions: 1, ..Held::default() }.sign_ins(), Held { sessions: 1, ..Held::default() });
         assert_eq!(Held { messages: 1, sessions: 1, ..Held::default() }.of_bots(), Held { messages: 1, ..Held::default() });
+    }
+
+    fn audit_move(from: Option<&str>, to: Option<&str>, n: usize) -> ChatMove {
+        ChatMove { audit_events: n, ..mv(from, to, 0, [0, 0, 0]) }
+    }
+
+    /// An event `user` made, from `ip`, about `about` (a person) if given.
+    fn acted(db: &Db, user: &str, ip: &str, about: Option<&str>) -> i64 {
+        use crate::audit::{Actor, ActorKind, Source, Who};
+        let actor = Actor { kind: ActorKind::User, id: Some(user.into()), name: Some(format!("{user} name")), email: Some(format!("{user}@example.com")), ..Default::default() };
+        let who = Who { actor, source: Source { ip: Some(ip.into()), user_agent: Some("agent/1".into()) } };
+        let e = who.event("bot.updated").details(serde_json::json!({ "note": format!("by {user}") }));
+        db.try_record(&match about {
+            Some(p) => e.target("user", p),
+            None => e,
+        })
+        .unwrap()
+    }
+
+    /// `(actor_id, ip, details, salt is set)` of event `id` as `table` holds it.
+    fn audit_row(db: &Db, table: &str, id: i64) -> (Option<String>, Option<String>, String, bool) {
+        db.c().query_row(&format!("SELECT actor_id, ip, details, chain_salt IS NOT NULL FROM {table} WHERE id = ?1"), [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+    }
+
+    fn file_holds(path: &Path, what: &str) -> bool {
+        std::fs::read(path).unwrap().windows(what.len()).any(|w| w == what.as_bytes())
+    }
+
+    #[test]
+    fn a_pinned_persons_audit_details_are_kept_in_their_store_and_move_with_the_pin() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let before = acted(&db, &ada, "192.0.2.77", None);
+        assert_eq!(audit_row(&db, "main.audit_events", before).0.as_deref(), Some(ada.as_str()));
+
+        // Pinned, their events' details wait in botd's log until the next pass moves them.
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: None, held: Held { audit_events: 1, ..Held::default() } }]);
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(None, Some("gb-lon"), 1)]);
+        assert_eq!(audit_row(&db, "main.audit_events", before), (None, None, r#"{"inChatStore":"gb-lon"}"#.to_string(), false), "the row keeps only its seal");
+        assert_eq!(audit_row(&db, "chats_0.audit_details", before), (Some(ada.clone()), Some("192.0.2.77".into()), format!(r#"{{"note":"by {ada}"}}"#), true));
+
+        // New ones go straight there; an unpinned person's stay in botd's log.
+        let after = acted(&db, &ada, "192.0.2.77", None);
+        let theirs = acted(&db, &cy, "192.0.2.9", Some(&ada));
+        assert_eq!((count(&db, "chats_0", AUDIT), audit_row(&db, "main.audit_events", after).0), (2, None));
+        assert_eq!(audit_row(&db, "main.audit_events", theirs).0.as_deref(), Some(cy.as_str()), "the person who acted decides");
+
+        // Reads see each event whole, and the chain still verifies.
+        let read = db.audit_events(&crate::audit::Filter::default(), 100, true);
+        let e = read.iter().find(|e| e.id == after).unwrap();
+        assert_eq!((e.actor_id.as_deref(), e.actor_name.clone(), e.ip.as_deref()), (Some(ada.as_str()), Some(format!("{ada} name")), Some("192.0.2.77")));
+        assert_eq!(e.details["note"], format!("by {ada}"));
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok && r.erased == 0, "{r:?}");
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), held: Held { audit_events: 2, ..Held::default() } }]);
+        assert!(!file_holds(&d.dir.path().join("app.sqlite"), "192.0.2.77"), "no copy left in botd's file");
+
+        // Pinned elsewhere, they move store to store, and the rows say where.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        db.pin_residency(PinOn::User, &ada, "de-fra-2", "DPA-2", None).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("gb-lon"), Some("de-fra-2"), 2)]);
+        assert_eq!(audit_row(&db, "main.audit_events", before).2, r#"{"inChatStore":"de-fra-2"}"#);
+        assert_eq!((count(&db, "chats_0", AUDIT), count(&db, "chats_1", AUDIT)), (0, 2));
+
+        // Unpinned, they go back into their rows, and the move is recorded for the store's earlier backups.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("de-fra-2"), None, 2)]);
+        assert_eq!(audit_row(&db, "main.audit_events", before), (Some(ada.clone()), Some("192.0.2.77".into()), format!(r#"{{"note":"by {ada}"}}"#), true));
+        assert_eq!((count(&db, "main", AUDIT), count(&db, "chats_1", AUDIT)), (0, 0));
+        let fra = db.chat_stores().into_iter().find(|s| s.region == "de-fra-2").unwrap();
+        assert_eq!(db.moves_out_to_clear(&fra).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+        assert!(db.place_chats().unwrap().is_empty(), "nothing left to move");
+    }
+
+    #[test]
+    fn audit_details_in_a_store_survive_a_restart_and_a_pass_cut_off_after_its_copy() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let id = acted(&db, &ada, "192.0.2.77", None);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!((count(&db, "main", AUDIT), count(&db, "chats_0", AUDIT)), (1, 1), "in both places");
+        let read = |db: &Db| db.audit_events(&crate::audit::Filter::default(), 100, true).into_iter().find(|e| e.id == id).unwrap().ip;
+        assert_eq!(read(&db).as_deref(), Some("192.0.2.77"));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+        drop(db);
+        let db = d.up();
+        assert_eq!(read(&db).as_deref(), Some("192.0.2.77"));
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(None, Some("gb-lon"), 1)]);
+        assert_eq!((count(&db, "main", AUDIT), count(&db, "chats_0", AUDIT)), (0, 1));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+    }
+
+    #[test]
+    fn botds_log_refuses_changes_to_an_events_details_except_an_erasure_or_a_move() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let id = acted(&db, &ada, "192.0.2.77", None);
+        assert!(db.c().execute("UPDATE main.audit_events SET ip = 'x' WHERE id = ?1", [id]).is_err(), "still append-only");
+        assert!(db.c().execute("UPDATE audit_events SET ip = 'x' WHERE id = ?1", [id]).is_err(), "the view isn't written");
+        db.c().execute_batch(&format!("INSERT INTO main.settings (key, value) VALUES ('{}', '1')", super::super::AUDIT_MOVING)).unwrap();
+        assert!(db.c().execute("UPDATE main.audit_events SET action = 'x' WHERE id = ?1", [id]).is_err(), "a move keeps the fixed columns");
+        assert!(db.c().execute("UPDATE main.audit_events SET chain_digest = 'x' WHERE id = ?1", [id]).is_err(), "and the seal");
+    }
+
+    #[test]
+    fn an_erasure_rewrites_audit_details_where_they_are_kept() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        for u in [&ada, &cy] {
+            db.pin_residency(PinOn::User, u, "gb-lon", "DPA-1", None).unwrap();
+        }
+        let own = acted(&db, &ada, "192.0.2.77", None);
+        let about = acted(&db, &cy, "192.0.2.9", Some(&ada));
+        db.erase_user(&ada, "erased-01", None, &[]).unwrap();
+        assert_eq!(audit_row(&db, "chats_0.audit_details", own), (Some("erased-01".into()), None, r#"{"note":"by erased-01"}"#.to_string(), false));
+        let target: Option<String> = db.c().query_row("SELECT target_id FROM chats_0.audit_details WHERE id = ?1", [about], |r| r.get(0)).unwrap();
+        assert_eq!(target.as_deref(), Some("erased-01"));
+        assert!(crate::audit_chain::verify(&db, vec![]).ok, "the erasure names them");
+
+        // Their pin went with the erasure: their own events come home, already rewritten.
+        assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("gb-lon"), None, 1)]);
+        assert_eq!(audit_row(&db, "main.audit_events", own).0.as_deref(), Some("erased-01"));
+        assert_eq!(count(&db, "chats_0", AUDIT), 1, "Cy's event about them stays with Cy");
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok, "{r:?}");
+    }
+
+    #[test]
+    fn retention_deletes_audit_details_where_they_are_kept() {
+        let d = Dirs::new();
+        let db = d.db();
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", super::super::audit_delete_trigger())).unwrap();
+        db.attach_chat_stores(&d.both(), &[], None).unwrap();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let actor = crate::audit::Actor { kind: crate::audit::ActorKind::User, id: Some(ada.clone()), ..Default::default() };
+        let at = |t: i64| db.record_at(&crate::audit::Event::new(actor.clone(), "bot.updated"), t).unwrap();
+        let (old, young) = (at(now() - 40 * 86_400_000), at(now()));
+        assert_eq!(count(&db, "chats_0", AUDIT), 2);
+        db.set_audit_retention(Some(30));
+        let (n, anchor) = db.prune_audit(None).unwrap();
+        assert_eq!((n, anchor.map(|a| a.id)), (1, Some(old)));
+        let left: Vec<i64> = db.c().prepare("SELECT id FROM chats_0.audit_details").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(left, [young]);
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+    }
+
+    #[test]
+    fn a_forgotten_store_names_the_events_whose_details_only_it_held() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        let id = acted(&db, &ada, "192.0.2.77", None);
+        drop(db);
+        remove_store_files(&d.lon.join("chats.sqlite"));
+        let db = d.db();
+        db.attach_chat_stores(&[("de-fra-2".into(), d.fra.clone())], &["gb-lon".into()], None).unwrap();
+        assert_eq!(audit_row(&db, "audit_events", id), (None, None, r#"{"inChatStore":"gb-lon"}"#.to_string(), false));
+        let named: String = db.c().query_row("SELECT details FROM audit_events WHERE action = 'audit.erased' AND target_type = 'chat_store'", [], |r| r.get(0)).unwrap();
+        assert_eq!(named, format!(r#"{{"rows":[[{id},{id}]]}}"#));
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok, "{r:?}");
+    }
+
+    fn erased_events(db: &Db) -> i64 {
+        db.c().query_row("SELECT COUNT(*) FROM main.audit_events WHERE action = 'audit.erased'", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_crash_between_the_files_commits_of_audit_details_is_put_right_on_the_next_start() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, bea, cy) = (user(&db, "ada"), user(&db, "bea"), user(&db, "cy"));
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        db.pin_residency(PinOn::User, &bea, "gb-lon", "DPA-1", None).unwrap();
+        let lost = acted(&db, &ada, "192.0.2.77", None);
+        let moved = acted(&db, &bea, "192.0.2.78", None);
+
+        // The store's commit of one event's details was lost; botd's of another's move to
+        // Frankfurt was, after the store's went through.
+        db.c().execute(&format!("DELETE FROM chats_0.{AUDIT} WHERE id = ?1"), [lost]).unwrap();
+        db.c().execute_batch(&format!("INSERT INTO chats_1.{AUDIT} SELECT * FROM chats_0.{AUDIT} WHERE id = {moved}; DELETE FROM chats_0.{AUDIT} WHERE id = {moved};")).unwrap();
+        // And a write whose store committed and whose row in botd's log didn't.
+        let orphan = moved + 1;
+        db.c().execute(&format!("INSERT INTO chats_0.{AUDIT} (id, user_id, ip, details, chain_salt) VALUES (?1, ?2, '203.0.113.1', '{{}}', 'salt')"), params![orphan, ada]).unwrap();
+        let reused = acted(&db, &cy, "192.0.2.9", None);
+        assert_eq!(reused, orphan);
+        let read = |db: &Db, id: i64| db.audit_events(&crate::audit::Filter::default(), 100, true).into_iter().find(|e| e.id == id).unwrap().ip;
+        assert_eq!(read(&db, reused).as_deref(), Some("192.0.2.9"), "a row in botd's log with its own details ignores those left under its id");
+        assert!(!crate::audit_chain::verify(&db, vec![]).ok);
+        let ahead = reused + 5;
+        db.c().execute(&format!("INSERT INTO chats_0.{AUDIT} (id, user_id, ip, details, chain_salt) VALUES (?1, ?2, '203.0.113.2', '{{}}', 'salt')"), params![ahead, ada]).unwrap();
+        drop(db);
+
+        let db = d.up();
+        assert_eq!(audit_row(&db, "main.audit_events", moved).2, r#"{"inChatStore":"de-fra-2"}"#, "pointed at the store that holds them");
+        assert_eq!(read(&db, moved).as_deref(), Some("192.0.2.78"));
+        let named: String = db.c().query_row("SELECT details FROM main.audit_events WHERE action = 'audit.erased' AND target_type = 'chat_store' AND target_id = 'gb-lon'", [], |r| r.get(0)).unwrap();
+        assert_eq!(named, format!(r#"{{"rows":[[{lost},{lost}]]}}"#), "the one no place holds is named");
+        let r = crate::audit_chain::verify(&db, vec![]);
+        assert!(r.ok, "{r:?}");
+        let next = acted(&db, &cy, "192.0.2.79", None);
+        assert!(next > ahead, "no id details are left under is taken again");
+        db.place_chats().unwrap();
+        let left: i64 = db.c().query_row(&format!("SELECT COUNT(*) FROM chats_0.{AUDIT} WHERE id IN (?1, ?2)"), [orphan, ahead], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "details whose row was lost are dropped");
+        assert_eq!(read(&db, reused).as_deref(), Some("192.0.2.9"));
+        let before = erased_events(&db);
+        drop(db);
+        let db = d.up();
+        assert_eq!(erased_events(&db), before, "named once");
+        assert!(crate::audit_chain::verify(&db, vec![]).ok);
+    }
+
+    #[test]
+    fn describing_what_a_place_holds_names_audit_details() {
+        assert_eq!(Held { usage_records: 1, audit_events: 2, ..Held::default() }.describe(), "1 model usage record and 2 audit events' details");
+        assert_eq!(Held { audit_events: 1, ..Held::default() }.describe(), "1 audit event's details");
+        assert_eq!(Held { sessions: 1, audit_events: 2, ..Held::default() }.audit(), Held { audit_events: 2, ..Held::default() });
+        assert_eq!(Held { audit_events: 2, ..Held::default() }.of_bots(), Held::default());
     }
 
     #[test]
