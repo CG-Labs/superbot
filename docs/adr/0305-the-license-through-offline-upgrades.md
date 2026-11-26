@@ -49,6 +49,8 @@ On `--rollback`, the older release's botd judges the license over the `.env` it 
 - else the license installed now, when it differs from the backup's and the older release takes it. It is read as botd's user, since DATA_DIR is theirs, and kept by root in a 0700 folder. Once the backup is restored, it is written back as `DATA_DIR/license.key`, as botd's user, 0600, so a renewal installed since the upgrade outlives the rollback. The backup's license wasn't judged then, so if that write fails, the rollback stops with botd still stopped, and says where the key is: a root-only copy in the rollback folder, and the restore's `.pre-restore-*` copy of DATA_DIR;
 - else the backup's, which root reads from the archive, decrypting it with the backup key when it's encrypted.
 
+When the old `.env` sets `LICENSE_KEY_FILE` to a file in DATA_DIR, the restore puts that file back too, and it wins over `license.key`. So the backup's copy of it is judged instead, given with `--key-file` over a copy of the `.env` without `LICENSE_KEY_FILE`, and a renewal in `license.key` isn't carried over. With `--license-file`, its key is judged the same way and, once the backup is restored, written where `LICENSE_KEY_FILE` points rather than as `license.key`.
+
 The same stop applies: if Bots run now but the older release wouldn't run them with that license, the rollback changes nothing and asks for `--license-file`.
 
 ## Considered
@@ -72,7 +74,7 @@ The same stop applies: if Bots run now but the older release wouldn't run them w
     - `--license-file` is judged on stdin in the license's place;
     - a new install's `--license-file` is judged, and goes on either way;
     - a key wrapped across lines is judged without its whitespace, and `--testing-mode` goes on, a rollback with it still keeping a renewal;
-    - a rollback keeps a renewal the older release takes, 0600, stops with botd stopped and the key kept when it can't write it, else judges and puts back the backup's license (plain and encrypted), judges with the old `.env` from a copy botd's user owns and removes, stops when Bots run now but wouldn't after, and installs `--license-file` over the backup's.
+    - a rollback keeps a renewal the older release takes, 0600, stops with botd stopped and the key kept when it can't write it, else judges and puts back the backup's license (plain and encrypted), judges the backup's `LICENSE_KEY_FILE` when the old `.env` points it into DATA_DIR, and writes `--license-file` there, judges with the old `.env` from a copy botd's user owns and removes, stops when Bots run now but wouldn't after, and installs `--license-file` over the backup's.
   - `offline.yml`, with no network and an encrypted database: `botd license check` as botd's user counts seats with the master key, judges a key given as invalid without installing it, and with no testing mode and no license says Bots wouldn't run. The upgrade and the rollback each log what the bundle's botd makes of the license.
 - Not covered:
   - Docker Compose: its `.env` and volumes are the operator's. `botd license check --env-file` runs in the image the same way.

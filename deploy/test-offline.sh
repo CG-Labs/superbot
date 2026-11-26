@@ -1530,7 +1530,7 @@ cmp -s "$RB/bundle/bin/env" "$RH/superbot/.env" || fail "the older botd didn't r
 lrb_host "" renewed
 rm -f "$RB/systemctl"
 if out=$(lrollback "write_license_key() { return 1; }; "); then fail "a rollback went on though it couldn't keep the renewal: $out"; fi
-for want in "Couldn't put the license installed since the upgrade back as $RH/superbot/data/license.key. superbot is left stopped" \
+for want in "Couldn't write the license installed since the upgrade as $RH/superbot/data/license.key. superbot is left stopped" \
   "The key is kept in $RB/dir/license.key"; do
   grep -Fq -- "$want" <<<"$out" || fail "a renewal that couldn't be kept didn't say $want: $out"
 done
@@ -1545,6 +1545,25 @@ for want in "License: --testing-mode sets TESTING_MODE=on, so $VERSION runs Bots
   grep -Fq -- "$want" <<<"$out" || fail "a rollback with --testing-mode didn't say $want: $out"
 done
 [[ $(cat "$RH/superbot/data/license.key") == renewed ]] || fail "a rollback with --testing-mode didn't keep the renewal"
+
+# An old .env whose LICENSE_KEY_FILE is in DATA_DIR: the restore puts that file back, and it wins.
+KF=$RH/superbot/data/keys/lic
+rb_host "LICENSE_KEY_FILE=$KF"$'\n'
+mkdir -p "${KF%/*}" && echo oldkf >"$KF"
+rb "$UPGRADE_TO; offline_rollback_point" >/dev/null || fail "the backup before an upgrade failed"
+rb_upgraded
+echo renewed >"$KF" && echo renewed >"$RH/superbot/data/license.key"
+lbotd "$RB/bin" "$RH/superbot/data" && printf 'oldkf\nrenewed\n' >"$RB/bin/accepts"
+lbotd "$RB/bundle/bin" "$RH/superbot/data" && echo renewed >"$RB/bundle/bin/accepts"
+touch "$RB/active"
+if out=$(lrollback); then fail "a rollback went on though the older release wouldn't run Bots with the LICENSE_KEY_FILE it puts back: $out"; fi
+grep -Fq "wouldn't run Bots with the license in LICENSE_KEY_FILE ($KF) from before the upgrade" <<<"$out" || fail "the backup's LICENSE_KEY_FILE wasn't judged: $out"
+[[ $(cat "$RB/bundle/bin/judged") == oldkf ]] || fail "the live LICENSE_KEY_FILE was judged, not the backup's: $(cat "$RB/bundle/bin/judged")"
+! grep -q '^LICENSE_KEY_FILE=' "$RB/bundle/bin/env" || fail "LICENSE_KEY_FILE was left over the key judged in its place"
+[[ $(rows) == before,after && $(cat "$KF") == renewed ]] || fail "a refused rollback changed something"
+out=$(lrollback "LICENSE_FILE=$T/lkey " "; install_license") || fail "a rollback with --license-file over LICENSE_KEY_FILE failed: $out"
+grep -Fq "Kept the key in --license-file, which LICENSE_KEY_FILE names, as $KF" <<<"$out" || fail "--license-file wasn't written where LICENSE_KEY_FILE points: $out"
+[[ $(rows) == before && $(cat "$KF") == renewed && ! -e "$RH/superbot/data/license.key" ]] || fail "--license-file didn't replace the backup's LICENSE_KEY_FILE alone"
 
 lrb_host "" old
 out=$(lrollback) || fail "a rollback whose older release takes only the license from before failed: $out"
@@ -1575,7 +1594,7 @@ if command -v age-keygen >/dev/null 2>&1; then
 fi
 rm -f "$RB/bin/botd" "$RB/bin/accepts" "$RB/bin/args" "$RB/bin/pwd" "$RB/bin/judged" "$RB/bin/env" "$RB/bin/copy"
 cp "$T/bin/botd" "$RB/bundle/bin/botd"
-ok "a rollback keeps a renewal the older release takes (leaving botd stopped if it can't write it), else judges the backup's license, and stops when Bots run now but wouldn't after"
+ok "a rollback keeps a renewal the older release takes (leaving botd stopped if it can't write it), else judges the backup's license (or LICENSE_KEY_FILE in DATA_DIR), and stops when Bots run now but wouldn't after"
 
 # A dry run of the whole offline install, as main runs it, without root. With unprivileged
 # namespaces, it runs with no network at all.
