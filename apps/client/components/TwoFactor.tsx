@@ -4,7 +4,7 @@ import { SvgXml } from "react-native-svg";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
-import { colors } from "../src/theme";
+import { colors, hairline, themedStyles, themes, ThemeScope, type } from "../src/theme";
 import type { MfaPolicy, MfaProof, MfaSetup, MfaStatus } from "../src/types";
 import { Chips } from "./Chips";
 
@@ -18,19 +18,20 @@ export function proofFrom(input: string): MfaProof | null {
 
 /** The key to add to an authenticator app: its QR code, the key to type, and a link. */
 export function MfaSetupView({ setup }: { setup: MfaSetup }) {
+  const s = useSetupStyles();
   return (
-    <View style={styles.setup} testID="mfa-setup">
+    <View style={s.setup} testID="mfa-setup">
       {setup.qrSvg ? (
-        <View style={styles.qr} accessibilityLabel="QR code to add SuperBot to an authenticator app">
+        <View style={s.qr} accessibilityLabel="QR code to add SuperBot to an authenticator app">
           <SvgXml xml={setup.qrSvg} width={176} height={176} />
         </View>
       ) : null}
-      <Text style={styles.dim}>Or enter this key in the app:</Text>
-      <Text style={styles.key} selectable testID="mfa-key">
+      <Text style={s.dim}>Or enter this key in the app:</Text>
+      <Text style={s.key} selectable testID="mfa-key">
         {setup.secret.replace(/(.{4})/g, "$1 ").trim()}
       </Text>
-      <Pressable onPress={() => void Linking.openURL(setup.otpauthUrl).catch(() => {})} accessibilityRole="link">
-        <Text style={styles.link}>Open in an authenticator app on this device</Text>
+      <Pressable style={({ pressed }) => pressed && s.pressed} onPress={() => void Linking.openURL(setup.otpauthUrl).catch(() => {})} accessibilityRole="link">
+        <Text style={s.link}>Open in an authenticator app on this device</Text>
       </Pressable>
     </View>
   );
@@ -38,28 +39,59 @@ export function MfaSetupView({ setup }: { setup: MfaSetup }) {
 
 /** Recovery codes, shown this once: the server keeps only their hashes. */
 export function RecoveryCodes({ codes, onDone, doneLabel = "I saved them" }: { codes: string[]; onDone: () => void; doneLabel?: string }) {
+  const s = useSetupStyles();
   const [copied, setCopied] = useState<boolean | null>(null);
   return (
-    <View style={styles.codesWrap} testID="recovery-codes">
-      <Text style={styles.warn}>Save these recovery codes somewhere safe. Each works once if you lose your authenticator app. They can&apos;t be shown again.</Text>
-      <View style={styles.codes}>
+    <View style={s.codesWrap} testID="recovery-codes">
+      <View style={s.warnCard}>
+        <Text style={s.warn}>Save these recovery codes somewhere safe. Each works once if you lose your authenticator app. They can&apos;t be shown again.</Text>
+      </View>
+      <View style={s.codes}>
         {codes.map((c) => (
-          <Text key={c} style={styles.code} selectable>
+          <Text key={c} style={s.code} selectable>
             {c}
           </Text>
         ))}
       </View>
-      <View style={styles.row}>
-        <Pressable style={styles.btn} onPress={() => void copyText(codes.join("\n")).then(setCopied)}>
-          <Text style={styles.btnText}>{copied ? "Copied" : copied === false ? "Select and copy them" : `${COPY_LABEL} codes`}</Text>
+      <View style={s.row}>
+        <Pressable style={({ pressed }) => [s.btn, pressed && s.pressed]} onPress={() => void copyText(codes.join("\n")).then(setCopied)} accessibilityRole="button">
+          <Text style={s.btnText}>{copied ? "Copied" : copied === false ? "Select and copy them" : `${COPY_LABEL} codes`}</Text>
         </Pressable>
-        <Pressable style={[styles.btn, styles.primary]} onPress={onDone}>
-          <Text style={[styles.btnText, styles.primaryText]}>{doneLabel}</Text>
+        <Pressable style={({ pressed }) => [s.btn, s.primary, pressed && s.pressed]} onPress={onDone} accessibilityRole="button">
+          <Text style={[s.btnText, s.primaryText]}>{doneLabel}</Text>
         </Pressable>
       </View>
     </View>
   );
 }
+
+const useSetupStyles = themedStyles((t) =>
+  StyleSheet.create({
+    setup: { gap: t.space.sm, alignItems: "center" },
+    // QR codes need dark modules on a light ground to scan, in either scheme.
+    qr: { backgroundColor: themes.light.c.raised, padding: t.space.sm, borderRadius: t.radius.md, borderWidth: hairline, borderColor: t.c.border, marginBottom: t.space.xs },
+    dim: { color: t.c.textMuted, ...type(t, "sm") },
+    key: { color: t.c.text, fontFamily: t.font.mono, ...type(t, "md"), textAlign: "center" },
+    link: { color: t.c.accentText, ...type(t, "sm"), fontWeight: t.font.weight.medium },
+    pressed: { opacity: 0.6 },
+    codesWrap: { gap: t.space.md },
+    warnCard: { backgroundColor: t.c.warningSoft, borderRadius: t.radius.md, paddingHorizontal: t.space.md + 2, paddingVertical: t.space.md },
+    warn: { color: t.c.warning, ...type(t, "sm") },
+    codes: { flexDirection: "row", flexWrap: "wrap", rowGap: t.space.sm, padding: t.space.lg, borderRadius: t.radius.md, backgroundColor: t.c.codeBg },
+    code: { color: t.c.text, fontFamily: t.font.mono, ...type(t, "md"), width: "50%" },
+    row: { flexDirection: "row", flexWrap: "wrap", gap: t.space.sm, alignItems: "center", justifyContent: "flex-end" },
+    btn: {
+      borderRadius: t.radius.pill,
+      borderWidth: 1,
+      borderColor: t.c.borderStrong,
+      paddingHorizontal: t.space.lg,
+      paddingVertical: t.space.sm + 2,
+    },
+    btnText: { color: t.c.text, ...type(t, "md"), fontWeight: t.font.weight.medium },
+    primary: { backgroundColor: t.c.accent, borderColor: t.c.accent },
+    primaryText: { color: t.c.onAccent, fontWeight: t.font.weight.semibold },
+  }),
+);
 
 export type MfaApi = Pick<SuperBotApi, "mfaStatus" | "mfaEnroll" | "mfaConfirm" | "mfaNewRecoveryCodes" | "mfaDisable" | "setMfaPolicy">;
 
@@ -154,10 +186,14 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
       {!status ? (
         <ActivityIndicator color={colors.textDim} />
       ) : codes ? (
-        <RecoveryCodes codes={codes} onDone={() => setCodes(null)} />
+        <ThemeScope scheme="dark">
+          <RecoveryCodes codes={codes} onDone={() => setCodes(null)} />
+        </ThemeScope>
       ) : setup ? (
         <>
-          <MfaSetupView setup={setup} />
+          <ThemeScope scheme="dark">
+            <MfaSetupView setup={setup} />
+          </ThemeScope>
           <TextInput
             style={styles.input}
             inputMode="numeric"
@@ -250,15 +286,7 @@ const styles = StyleSheet.create({
   text: { color: colors.text },
   dim: { color: colors.textDim },
   faint: { color: colors.textFaint, fontSize: 13 },
-  warn: { color: colors.warning },
   error: { color: colors.danger },
-  link: { color: colors.blueDot },
-  setup: { gap: 8, alignItems: "flex-start" },
-  qr: { backgroundColor: "#fff", padding: 8, borderRadius: 12 },
-  key: { color: colors.text, fontFamily: "monospace", fontSize: 15 },
-  codesWrap: { gap: 10 },
-  codes: { flexDirection: "row", flexWrap: "wrap", gap: 8, padding: 12, borderRadius: 12, borderWidth: 1, borderColor: colors.border },
-  code: { color: colors.text, fontFamily: "monospace", fontSize: 15, width: "45%" },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
   input: { backgroundColor: colors.bgBubble, borderColor: colors.border, borderWidth: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, color: colors.text, fontSize: 16 },
   btn: { borderRadius: 10, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 14, paddingVertical: 8 },
