@@ -58,6 +58,9 @@ fn new_folder(stores: &[ChatStore], region: &str, folder: &str, data_dir: &Path)
     if !Path::new(folder).is_absolute() {
         return Err(format!("the folder must be an absolute path, not \"{}\"", clip(folder, 64)));
     }
+    if folder.contains("..") {
+        return Err(format!("folder names can't contain \"..\", as in \"{}\"", clip(folder, 64)));
+    }
     let existed = std::fs::symlink_metadata(folder).is_ok();
     let path = crate::paths::root(folder).map_err(|e| format!("{}: {e}", clip(folder, 200)))?;
     let checked = check_folder(stores, region, &path, data_dir);

@@ -92,6 +92,7 @@ botd holds its database and the users' secrets' connection while it copies the s
 
 | Refused | Why | Fix |
 |---|---|---|
+| `absolute path` or `can't contain ".."` | The folder is relative or climbs with `..` | Give its full path, as `REGION_DATA_DIRS` will name it |
 | `isn't empty` | The folder holds files | Pick or make an empty folder |
 | `outside DATA_DIR` or `overlaps` | It is in `DATA_DIR` (server backups would take the store out of the region), or in or around a store's folder | Pick a folder of its own |
 | `belongs to uid ...` | botd's user doesn't own it | `chown` it to the user botd runs as |

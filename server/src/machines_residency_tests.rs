@@ -1393,6 +1393,7 @@ async fn an_admin_moves_a_regions_chat_store_to_another_folder_while_botd_runs()
     };
     for (folder, why) in [
         ("lon-2".to_string(), "absolute path"),
+        (format!("{}/../lon-2", lon.display()), "can't contain \"..\""),
         (app.cfg.data_dir.join("lon").display().to_string(), "outside DATA_DIR"),
         (lon.join("inner").display().to_string(), "gb-lon's store's own folder"),
         (fra.display().to_string(), "de-fra-2's chat store's folder"),
@@ -1407,7 +1408,7 @@ async fn an_admin_moves_a_regions_chat_store_to_another_folder_while_botd_runs()
     assert!(code == 409 && body["error"].as_str().unwrap().contains("isn't empty"), "{body}");
     std::fs::remove_file(lon2.join("other.txt")).unwrap();
     let failed = audit(port, &admin, STORE_MOVED).await;
-    assert!(failed.iter().all(|e| e["outcome"] == "failure") && failed.len() == 5, "{failed:?}");
+    assert!(failed.iter().all(|e| e["outcome"] == "failure") && failed.len() == 6, "{failed:?}");
 
     // Moved: the store and its backup are in the new folder, the old one keeps only a note,
     // and the move is audited with what REGION_DATA_DIRS must say now.
