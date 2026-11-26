@@ -22,7 +22,7 @@ groups:
           severity: ticket
         annotations:
           summary: The customer health score is at risk
-          description: "The 30-day health score is below 50. Contact the customer's owner this week with a plan, and tell the support manager. botctl health-score shows each signal; docs/support/health-score.md says what to do about each."
+          description: "The 30-day health score is below 50. Contact the customer's owner this week with a plan, and tell the support manager. botctl health-score shows each signal; docs/support/health-score.md#the-signals says what to do about each. See docs/support/health-score.md#alerts."
 
       # A signal was at risk on the newest recorded day, whatever the band.
       - alert: SuperBotHealthSignalAtRisk
@@ -31,7 +31,7 @@ groups:
           severity: ticket
         annotations:
           summary: "A health score signal is at risk: {{ $labels.signal }}"
-          description: "The {{ $labels.signal }} signal of the customer health score is at risk. Call the customer before the next check-in; docs/support/health-score.md#{{ $labels.signal }} says what to do."
+          description: "The {{ $labels.signal }} signal of the customer health score is at risk. Call the customer before the next check-in; docs/support/health-score.md#{{ $labels.signal }} says what to do. See docs/support/health-score.md#alerts."
 
       # 10 points or more below the week's highest score: worth a line in the customer's record.
       - alert: SuperBotHealthScoreFell
@@ -40,7 +40,7 @@ groups:
           severity: ticket
         annotations:
           summary: The customer health score fell 10 points or more this week
-          description: "The 30-day health score is {{ $value }} points below its highest in the last 7 days. botctl health-score history shows which signals got worse; raise it at the next check-in, sooner for a signal at risk."
+          description: "The 30-day health score is {{ $value }} points below its highest in the last 7 days. botctl health-score history shows which signals got worse; raise it at the next check-in, sooner for a signal at risk. See docs/support/health-score.md#alerts."
 
       # botd records the score within the first hours of each UTC day: none for 36 hours means
       # recording stopped or never worked (a full disk, a broken database; botd shows 0 while it
@@ -52,4 +52,4 @@ groups:
           severity: ticket
         annotations:
           summary: botd hasn't recorded the health score for over a day
-          description: "The newest recorded health score is more than 36 hours old. botd's log says why (Health score history: couldn't record today's score); check the disk, and run botd support check."
+          description: "The newest recorded health score is more than 36 hours old. botd's log says why (Health score history: couldn't record today's score); check the disk, and run botd support check. See docs/support/health-score.md#alerts."

@@ -178,6 +178,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0307-health-score-alerts.md"));
     files.push(repo().join("docs/adr/0313-runbooks-for-scim-backups-and-the-license.md"));
     files.push(repo().join("docs/adr/0322-runbooks-for-the-secrets-store-and-the-audit-trail.md"));
+    files.push(repo().join("docs/adr/0331-every-alert-links-its-runbook.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -982,5 +983,188 @@ fn the_secrets_runbook_names_every_failure_botd_records() {
     assert!(triage.contains(r#"f.runbook("support/runbook-secrets.md#runs-refused")"#), "runs refused secrets_unavailable point at the runbook");
     for guide in ["docs/ops/vault.md", "docs/ops/cloud-secrets.md"] {
         assert!(fs::read_to_string(repo().join(guide)).unwrap().contains("(../support/runbook-secrets.md"), "{guide} doesn't point at the secrets runbook");
+    }
+}
+
+/// The shipped Prometheus rule files.
+fn rule_files() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(repo().join("deploy/prometheus"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().ends_with(".rules.yml"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Each alert in a rule file, with its description.
+fn alerts(rules: &str) -> Vec<(String, String)> {
+    rules
+        .split("- alert: ")
+        .skip(1)
+        .map(|block| {
+            let name = block.lines().next().unwrap().trim().to_string();
+            let description = block.split("description: ").nth(1).map_or("", |d| d.lines().next().unwrap()).trim().trim_matches('"').to_string();
+            (name, description)
+        })
+        .collect()
+}
+
+/// A heading's section, by its anchor: from the heading to the next one as high or higher.
+fn section(md: &str, anchor: &str) -> Option<String> {
+    let level = |l: &str| l.starts_with('#').then(|| l.chars().take_while(|c| *c == '#').count());
+    let mut lines = md.lines().skip_while(|l| level(l).is_none() || anchors(l).iter().next().map(String::as_str) != Some(anchor));
+    let head = lines.next()?;
+    let top = level(head).unwrap();
+    Some(lines.take_while(|l| level(l).is_none_or(|n| n > top)).collect::<Vec<_>>().join("\n"))
+}
+
+/// ADR 0331: every alert SuperBot ships ends with `See docs/support/<page>#<section>.`, and
+/// that section names it, so whoever is paged opens the right runbook.
+#[test]
+fn every_shipped_alert_links_a_runbook_section_that_names_it() {
+    let (mut count, mut books, mut bad) = (0, HashSet::new(), Vec::new());
+    for file in rule_files() {
+        let fname = file.file_name().unwrap().to_string_lossy().into_owned();
+        for (name, description) in alerts(&fs::read_to_string(&file).unwrap()) {
+            count += 1;
+            let Some(at) = description.rfind("See docs/support/") else {
+                bad.push(format!("{fname}: {name} doesn't end with its runbook"));
+                continue;
+            };
+            let link = description[at + "See docs/support/".len()..].split(|c: char| c.is_whitespace() || c == '"').next().unwrap().trim_end_matches('.');
+            let Some((page, anchor)) = link.split_once('#').filter(|(_, a)| !a.is_empty() && !a.contains('{')) else {
+                bad.push(format!("{fname}: {name} links {link}, not a section"));
+                continue;
+            };
+            let Ok(md) = fs::read_to_string(support().join(page)) else {
+                bad.push(format!("{fname}: {name} links {page}, which doesn't exist"));
+                continue;
+            };
+            match section(&md, anchor) {
+                None => bad.push(format!("{fname}: {name} links {page}#{anchor}, which isn't a heading")),
+                Some(s) if !s.contains(&format!("`{name}`")) => bad.push(format!("{fname}: {page}#{anchor} doesn't name {name}")),
+                Some(_) => {
+                    books.insert(page.to_string());
+                }
+            }
+        }
+    }
+    assert!(count >= 43, "the shipped alerts: {count}");
+    assert!(bad.is_empty(), "alerts without their runbook:\n{}", bad.join("\n"));
+    for b in ["runbook-capacity.md", "runbook-encryption.md", "runbook-server-errors.md", "runbook-sign-in.md", "runbook-audit-trail.md"] {
+        assert!(books.contains(b), "no alert links {b}");
+    }
+}
+
+/// ADR 0331: every rule file has promtool tests, and CI checks and tests both.
+#[test]
+fn every_rule_file_is_checked_and_tested_in_ci() {
+    let ci = fs::read_to_string(repo().join(".github/workflows/server.yml")).unwrap();
+    for file in rule_files() {
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let test = name.replace(".rules.yml", ".rules.test.yml");
+        let tests = fs::read_to_string(file.with_file_name(&test)).unwrap_or_else(|e| panic!("{name} has no {test}: {e}"));
+        assert!(tests.contains(&format!("rule_files:\n  - {name}\n")), "{test} doesn't load {name}");
+        assert!(ci.contains(&format!("promtool check rules deploy/prometheus/{name}\n")), "CI doesn't check {name}");
+        assert!(ci.contains(&format!("promtool test rules deploy/prometheus/{test}\n")), "CI doesn't run {test}");
+    }
+}
+
+/// Whether `span` has `pattern`'s literal pieces, in order, its `{...}` placeholders aside:
+/// `{} has {} of {max} machines` fits `has 40 of 40 machines`.
+fn fits(span: &str, pattern: &str) -> bool {
+    let mut pieces = vec![String::new()];
+    let mut inside = false;
+    for c in pattern.chars() {
+        match c {
+            '{' => inside = true,
+            '}' => {
+                inside = false;
+                pieces.push(String::new());
+            }
+            _ if !inside => pieces.last_mut().unwrap().push(c),
+            _ => {}
+        }
+    }
+    let mut rest = span;
+    for p in pieces.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        let Some(at) = rest.find(p) else { return false };
+        rest = &rest[at + p.len()..];
+    }
+    !span.is_empty()
+}
+
+/// ADR 0331: the capacity runbook explains every reason placement gives for a host it
+/// won't use, and triage's placement failures point at it.
+#[test]
+fn the_capacity_runbook_explains_every_reason_placement_gives() {
+    let page = read("runbook-capacity.md");
+    let spans = codes_in(&page, "## No room for new machines");
+    let code = source("machines/placement.rs");
+    let own = code.split("const OWN_HOSTS: &str = \"").nth(1).unwrap().split('"').next().unwrap();
+    let mut reasons: Vec<String> = Vec::new();
+    for f in ["pub fn closed(", "pub fn elsewhere(", "pub fn not_for(", "pub fn room("] {
+        let body = code.split(f).nth(1).unwrap_or_else(|| panic!("placement.rs has no {f}")).split("\n    }\n").next().unwrap();
+        reasons.extend(body.split("format!(\"").skip(1).map(|r| r.split('"').next().unwrap().replace("{OWN_HOSTS}", own)));
+    }
+    assert!(reasons.len() >= 9 && reasons.iter().any(|r| r.contains("is drained")), "placement's reasons: {reasons:?}");
+    for r in &reasons {
+        assert!(spans.iter().any(|s| fits(s, r)), "runbook-capacity.md's no room section doesn't explain \"{r}\"");
+    }
+    assert!(code.contains("none is configured") && spans.contains("none is configured"), "no host configured");
+    let triage = source("support_triage.rs");
+    assert!(triage.contains(r#"return ("capacity", "machines refused or waiting for room", Some("support/runbook-capacity.md#no-room-for-new-machines"));"#), "triage's audit.capacity points at the runbook");
+    assert!(page.contains("`audit.capacity`") && page.contains("`machine.placement_failed`"), "the runbook names triage's group and the event");
+}
+
+/// ADR 0331: the encryption runbook names every backup target botd reports and the plain
+/// copy encrypting leaves.
+#[test]
+fn the_encryption_runbook_names_every_backup_target_and_the_plain_copy() {
+    let page = read("runbook-encryption.md");
+    let code = source("backup_encryption.rs");
+    let targets: Vec<&str> = ["vec![target(\"", "out.push(target(\""].iter().flat_map(|p| code.split(p).skip(1)).map(|r| r.split('"').next().unwrap()).collect();
+    assert!(targets.len() >= 4 && targets.contains(&"chat_stores"), "the backup targets: {targets:?}");
+    let table = codes_in(&page, "## Backups aren't encrypted");
+    for t in targets {
+        assert!(table.contains(t), "runbook-encryption.md's backups section doesn't name {t}");
+    }
+    let db = source("database_encryption.rs");
+    let prefix = db.split("pub const PLAIN_COPY_PREFIX: &str = \"").nth(1).unwrap().split('"').next().unwrap();
+    assert!(codes_in(&page, "## A plain copy is left").iter().any(|c| c.starts_with(prefix)), "runbook-encryption.md doesn't name the plain copy ({prefix}...)");
+    assert!(read("runbook-backups.md").contains("(runbook-encryption.md#backups-arent-encrypted)"), "the backups runbook points at it");
+}
+
+/// ADR 0331: the errors runbook explains every route class `/metrics` counts requests under
+/// and the error reports' outcomes; triage's panics point at it.
+#[test]
+fn the_errors_runbook_explains_every_route_class() {
+    let page = read("runbook-server-errors.md");
+    let obs = source("obs/mod.rs");
+    let body = obs.split("pub fn route_class(").nth(1).unwrap().split("\n}\n").next().unwrap();
+    let classes: HashSet<&str> = body.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+    assert!(classes.len() >= 15 && classes.contains("api_other") && classes.contains("approval_hook"), "the route classes: {classes:?}");
+    let table = codes_in(&page, "## Requests failing");
+    let mut missing: Vec<&&str> = classes.iter().filter(|c| !table.contains(**c)).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "runbook-server-errors.md's requests section doesn't explain {missing:?}");
+    let errors = source("obs/errors.rs");
+    assert!(errors.contains(r#"pub const OUTCOMES: [&str; 3] = ["sent", "failed", "dropped"];"#), "the error reports' outcomes moved: update this test and the runbook");
+    let reports = codes_in(&page, "## Error reports aren't arriving");
+    assert!(reports.contains("failed") && reports.contains("dropped"), "the runbook tells failed reports from dropped ones");
+    assert!(source("support_triage.rs").contains(r#".runbook("support/runbook-server-errors.md#panics")"#), "triage's panics point at the runbook");
+}
+
+/// ADR 0331: the sign-in runbook explains every suspicious pattern botd watches for.
+#[test]
+fn the_sign_in_runbook_explains_every_suspicious_pattern() {
+    let code = source("signin_watch.rs");
+    let patterns = code.split("pub const PATTERNS: [&str; ").nth(1).unwrap().split("= [").nth(1).unwrap().split(']').next().unwrap();
+    let patterns: Vec<&str> = patterns.split('"').skip(1).step_by(2).collect();
+    assert_eq!(patterns.len(), 4, "the patterns: {patterns:?}");
+    let table = codes_in(&read("runbook-sign-in.md"), "## Suspicious sign-ins");
+    for p in patterns {
+        assert!(table.contains(p), "runbook-sign-in.md's suspicious sign-ins don't explain {p}");
     }
 }

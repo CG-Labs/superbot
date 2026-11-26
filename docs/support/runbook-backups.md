@@ -21,6 +21,8 @@ The procedures are in [backup and restore](../ops/backup-restore.md) and [machin
 
 ## Server backups
 
+Alerts: `SuperBotServerBackupsOnHost` (no store, for an hour: the first row), `SuperBotServerBackupPastRPO` (a page: `server.backup_rpo_breached`) and `SuperBotServerBackupCopyFailing` (two failed copies in two hours: `server.backup_copy_failed`).
+
 | What botd says | Usually | Fix |
 |---|---|---|
 | Server backups aren't set up; they stay on this host | No store: `SERVER_BACKUP_S3_*` unset, and no machine backup store to share | Give botd a store of its own ([off-site copies](../ops/backup-restore.md#off-site-copies)). If the customer copies archives off the host themselves, `SERVER_BACKUP_OFF_HOST=off`, and they check their own copies |
@@ -28,11 +30,13 @@ The procedures are in [backup and restore](../ops/backup-restore.md) and [machin
 | `server.backup_copy_failed` | The store refused the upload: wrong keys, a bucket or endpoint that moved, a policy without the multipart actions, a full quota; `interrupted` means botd stopped mid-copy | The event's `error` says which. Fix the keys or the policy. botd retries a failed copy 30 minutes after it started, by itself; `botctl backups copy` waits for that too, and answers `"copied": null` until then, which isn't another failure. After the 30 minutes, `botctl backups copy` tries at once |
 | `server.backup_rpo_breached` | The newest copy off the host is older than `SERVER_BACKUP_RPO_HOURS` (26 by default): copies fail, or `superbot-backup` writes no new archive | The alert names the last copy error, or that no newer archive exists. No archive: `journalctl -u superbot-backup` (Compose: `docker compose logs backup`) says why: the timer stopped, the disk is full, `age` or the master key missing. Then back up now: `sudo systemctl start superbot-backup.service` (Compose: `docker compose exec botd superbot-backup`) |
 | No archives, or the newest is more than 26 hours old (`botd support check`) | The timer or the Compose service hasn't run | As above, from `journalctl -u superbot-backup`; check `systemctl list-timers superbot-backup.timer` shows the next run |
-| Backups aren't encrypted | No age recipients for that target | Set them ([encryption](../ops/backup-restore.md#encryption)), and copy the identity off the host |
+| Backups aren't encrypted | No age recipients for that target | [Encryption at rest](runbook-encryption.md#backups-arent-encrypted) |
 
 A breach ends by itself, audited as `server.backup_rpo_recovered`, when a copy lands within the RPO. Check one does: `botctl backups` shows the newest copy's time.
 
 ## Machine backups
+
+Alerts, for Linode machines: `SuperBotMachineBackupsStale` (a tier's machines past `MACHINE_BACKUPS_RPO_HOURS`: `machine.rpo_breached`) and `SuperBotMachineBackupsOff` (backups off for an hour: `machine.backups_failed`, or `MACHINE_BACKUPS=off`).
 
 | What botd says | Usually | Fix |
 |---|---|---|

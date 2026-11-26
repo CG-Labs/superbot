@@ -5,11 +5,11 @@ Bot runs fail or time out on one harness (Hermes Agent, Claude Code, Codex, Pi) 
 ## First five minutes
 
 1. **Which harness, which model, how many.** One Bot, everyone on one plan (its tier's route), or every run on one harness? Ask for a failing run's time and the Bot.
-2. **The signals.** The status page's harness runners component; the `SuperBotHarnessRunsFailing` alert (more than 25% of a harness's runs failing over 30 minutes) or `SuperBotRunFailuresHigh` ([SLO alerts](../slo.md#alerts), [error alerts](../../deploy/README.md#metrics-and-logs)).
+2. **The signals.** The status page's harness runners component; the `SuperBotHarnessRunsFailing` alert (more than 25% of a harness's runs failing over 30 minutes) or `SuperBotRunFailuresHigh` (more than 10% of an hour's runs on every harness: [SLO alerts](../slo.md#alerts), [error alerts](../../deploy/README.md#metrics-and-logs)).
 3. **What the runs say.** botd logs every finished run with its harness and result:
 
    ```sh
-   journalctl -u superbot -o cat | jq -c 'select(.msg == "run.finished" and .result != "done")' | tail -20
+   journalctl -u superbot -o cat | jq -Rc 'fromjson? | select(.msg == "run.finished" and .result != "done")' | tail -20
    ```
 
    Or make a support bundle: `logs.jsonl` has the recent `run.finished` lines and `health.json` the last 15 minutes' runs by result. The Bot's chat shows the harness's own error text to its owner.

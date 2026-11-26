@@ -45,8 +45,11 @@ Runbooks for the incidents support sees most:
 | [License and seats](runbook-license.md) | The license is ending, has ended or won't install, Bots stopped for it, or no seat is left |
 | [Secrets store](runbook-secrets.md) | Vault or a cloud secret manager can't be read or signed in to, runs are refused for it, or per-run credentials fail |
 | [Audit trail](runbook-audit-trail.md) | The SIEM export fails or a sink was stopped, timestamps fail, or a check of the audit log's chain fails |
+| [Host capacity](runbook-capacity.md) | No Incus host has room for new machines, hosts are nearly full, a machine is on another team's host, or a host runs short of memory, disk or CPU |
+| [Encryption at rest](runbook-encryption.md) | The database or a backup target is plain, a plain copy is left, or botd won't start for the database key |
+| [Errors and panics](runbook-server-errors.md) | botd answers with 5xx errors or spends its error budget, panics, or its error reports stop arriving |
 
-The health score's signals, the monthly health check's items and bundle triage's findings each point at one of these.
+The health score's signals, the monthly health check's items and bundle triage's findings each point at one of these, and so does every alert in [`deploy/prometheus/`](../../deploy/prometheus/): each description ends with `See docs/support/<runbook>#<section>`, the section that names the alert, so whoever is paged starts in the right place ([ADR 0331](../adr/0331-every-alert-links-its-runbook.md)).
 
 ## Opening a ticket
 
@@ -76,4 +79,5 @@ Check `<status-page-url>` (the server's `/status`) first: a known incident there
 - Triage each bundle a ticket brings with `botctl support-triage` ([bundle triage](triage.md#where-it-fits)) before the first response, and paste it into the ticket's internal note.
 - Run the [support report](support-report.md#each-month) each month, with the replies export for its [update targets](support-report.md#update-targets), and look into every missed response target and late update.
 - Draft each Severity 1's review with `botctl incident review` ([incident reviews](incident-review.md#finishing-the-review)), and look into every missed status page target it flags.
+- Load every rules file in [`deploy/prometheus/`](../../deploy/prometheus/) into the Prometheus that watches each server, and route pages to the on-call engineer and tickets to the support queue: each alert says which runbook section to open.
 - Review this folder with the rest of the [security pack](../security/README.md) at least once a year, and after any incident whose review changes a runbook.

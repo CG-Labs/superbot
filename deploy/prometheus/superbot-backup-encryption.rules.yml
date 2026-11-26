@@ -24,4 +24,4 @@ groups:
           severity: ticket
         annotations:
           summary: "Backups aren't encrypted ({{ $labels.target }})"
-          description: "botd writes {{ $labels.target }} backups plain, so anyone who gets a copy can read every chat in it. Set the age recipients (SUPERBOT_BACKUP_AGE_RECIPIENTS, SERVER_BACKUP_AGE_RECIPIENTS or MACHINE_BACKUP_AGE_RECIPIENTS; deploy/install.sh --backup-age-generate makes a key), or SUPERBOT_BACKUP_ENCRYPTION=off to keep them plain by choice. botctl backups shows each target. See docs/ops/backup-restore.md#encryption."
+          description: "botd writes {{ $labels.target }} backups plain, so anyone who gets a copy can read every chat in it. Set the age recipients (SUPERBOT_BACKUP_AGE_RECIPIENTS, SERVER_BACKUP_AGE_RECIPIENTS or MACHINE_BACKUP_AGE_RECIPIENTS; deploy/install.sh --backup-age-generate makes a key), or SUPERBOT_BACKUP_ENCRYPTION=off to keep them plain by choice. botctl backups shows each target. See docs/support/runbook-encryption.md#backups-arent-encrypted."

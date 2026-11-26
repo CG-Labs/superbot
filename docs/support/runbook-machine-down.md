@@ -47,7 +47,7 @@ botd alerts "Incus host `<name>` isn't answering" after `INCUS_HOST_DOWN_MINUTES
 
 ## The server itself
 
-The service is down for everyone: Severity 1, page the on-call engineer, post an incident within 15 minutes of confirming it ([SLO](../slo.md#status-page-and-incidents)).
+The service is down for everyone: Severity 1, page the on-call engineer, post an incident within 15 minutes of confirming it ([SLO](../slo.md#status-page-and-incidents)). The alerts are `SuperBotDown` (Prometheus can't scrape botd for 2 minutes) and `SuperBotStatusProbeFailing` (the outside-in probe of `/status.json` fails for 2 minutes, so users likely can't reach it); either alone may be the scrape's or the probe's own network, so check from outside before posting. botd up but answering with errors is [errors and panics](runbook-server-errors.md).
 
 1. **Is botd running?** `systemctl status superbot` and `journalctl -u superbot -n 200` (installer), or `docker compose ps` and `docker compose logs --tail 200 botd` (Compose). A botd that refuses to start says why in its last lines: usually a setting it rejects, a full disk, or the database key. `sudo botd support check --home /home/superbot` checks the database, master key, disk, backups and license without botd ([support check](support-check.md)), and `botd support bundle` saves them for the ticket.
 2. **The host.** Disk (`df -h`), memory, and the hosting provider's status. Caddy in front of it (`systemctl status caddy`, or the `caddy` container) if botd answers on `127.0.0.1:3000` but not outside.

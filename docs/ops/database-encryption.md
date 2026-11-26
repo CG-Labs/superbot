@@ -88,3 +88,5 @@ Rotating the master key ([guide](master-key-rotation.md)) re-encrypts the databa
 | `another botd is using this DATA_DIR`, or `encrypting the database: another process has it open` | Another botd, or a tool like `sqlite3`, has the database open | Stop it and start botd again; nothing was changed |
 | `encrypting the database: ...` | A step above failed (disk full, a damaged database, a process still writing) | botd left the plain database as it was; fix the cause and start again |
 | The master key is lost | An encrypted database can't be opened, and `SUPERBOT_FORGET_SEALED` doesn't help | Restore a backup together with the key it was made under |
+
+Support works through the [encryption at rest runbook](../support/runbook-encryption.md): the database or a backup plain, a plain copy left, and botd not starting for the key.

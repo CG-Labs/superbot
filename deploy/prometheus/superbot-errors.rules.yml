@@ -43,7 +43,7 @@ groups:
           severity: ticket
         annotations:
           summary: "Bot runs on {{ $labels.harness }} are failing"
-          description: "{{ $value | humanizePercentage }} of {{ $labels.harness }} runs in the last 30 minutes ended in error or timeout. Check the harness's CLI version and login, its model provider's status, and botd's run.finished log lines for that harness."
+          description: "{{ $value | humanizePercentage }} of {{ $labels.harness }} runs in the last 30 minutes ended in error or timeout. Check the harness's CLI version and login, its model provider's status, and botd's run.finished log lines for that harness. See docs/support/runbook-harness-outage.md#first-five-minutes."
 
       - alert: SuperBotRouteClassErrors
         expr: |
@@ -55,7 +55,7 @@ groups:
           severity: ticket
         annotations:
           summary: "botd's {{ $labels.route_class }} routes are failing"
-          description: "{{ $value | humanizePercentage }} of {{ $labels.route_class }} requests in the last 10 minutes were answered with a 5xx. Check the error tracker (ERROR_REPORT_DSN) or botd's http.request log lines at level warn for that routeClass."
+          description: "{{ $value | humanizePercentage }} of {{ $labels.route_class }} requests in the last 10 minutes were answered with a 5xx. Check the error tracker (ERROR_REPORT_DSN) or botd's http.request log lines at level warn for that routeClass. See docs/support/runbook-server-errors.md#requests-failing."
 
       # A panic that ends botd is never scraped: SuperBotDown covers that one.
       - alert: SuperBotPanics
@@ -64,7 +64,7 @@ groups:
           severity: ticket
         annotations:
           summary: botd panicked
-          description: "botd at {{ $labels.instance }} panicked in the last 15 minutes. A request that panics answers 500; a task that panics stops. Find it in the error tracker or botd's server.panic log line, and its message in botd's stderr."
+          description: "botd at {{ $labels.instance }} panicked in the last 15 minutes. A request that panics answers 500; a task that panics stops. Find it in the error tracker or botd's server.panic log line, and its message in botd's stderr. See docs/support/runbook-server-errors.md#panics."
 
       - alert: SuperBotRunQueueBacklog
         expr: sum by (job, instance) (superbot_runs_waiting) > 0
@@ -73,7 +73,7 @@ groups:
           severity: ticket
         annotations:
           summary: Bot runs have waited for a slot for 30 minutes
-          description: "{{ $value }} runs at {{ $labels.instance }} are waiting for a run slot, and some have been waiting for 30 minutes without a break. Raise MAX_CONCURRENT_RUNS or a tier's concurrentRuns (ADR 0073), or look for runs that don't finish."
+          description: "{{ $value }} runs at {{ $labels.instance }} are waiting for a run slot, and some have been waiting for 30 minutes without a break. Raise MAX_CONCURRENT_RUNS or a tier's concurrentRuns (ADR 0073), or look for runs that don't finish. See docs/support/runbook-harness-outage.md#causes-and-fixes."
 
       - alert: SuperBotErrorReportsFailing
         expr: sum by (job, instance) (increase(superbot_error_reports_total{outcome="failed"}[30m])) > 0
@@ -81,4 +81,4 @@ groups:
           severity: ticket
         annotations:
           summary: botd's error reports aren't reaching the error tracker
-          description: "The error tracker refused or didn't answer reports from botd at {{ $labels.instance }} in the last 30 minutes, so panics and 5xx answers may be missing there. Check ERROR_REPORT_DSN, the tracker's rate limits, and botd's log for \"error tracker\"."
+          description: "The error tracker refused or didn't answer reports from botd at {{ $labels.instance }} in the last 30 minutes, so panics and 5xx answers may be missing there. Check ERROR_REPORT_DSN, the tracker's rate limits, and botd's log for \"error tracker\". See docs/support/runbook-server-errors.md#error-reports-arent-arriving."
