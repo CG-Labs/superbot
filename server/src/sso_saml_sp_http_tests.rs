@@ -3050,6 +3050,107 @@ fn from_b(r: &mut Response) {
 }
 
 #[tokio::test]
+async fn a_federation_aggregate_signs_people_in_at_its_listed_idps() {
+    use crate::sso::saml_sp::test_idp::{aggregate, signed_aggregate};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let signer = |i: usize| crate::sso::xmldsig::test_signer::signer(i);
+    let week = db::now() + 7 * 86_400_000;
+    let entity = |id: &str, key: usize, host: &str| test_idp::metadata_with(id, &[signer(key)], "").replace("https://idp.example/", host);
+    let mut members: Vec<String> = (0..800).map(|i| entity(&format!("https://idp{i}.member.example/idp"), 0, &format!("https://idp{i}.member.example/"))).collect();
+    members.push(entity(IDP, 0, "https://idp.example/"));
+    let without_b = members.clone();
+    members.push(entity(IDP_B, 2, "https://login.uni-b.example/"));
+    let full = signed_aggregate(&aggregate(&members, week), signer(1), "#_agg");
+    assert!(full.len() > crate::sso::saml_sp::MAX_METADATA, "{}", full.len());
+
+    // What the federation serves: the aggregate, gzipped or not, and its ETag.
+    let served = Arc::new(std::sync::Mutex::new((full, true, "\"v1\"".to_string())));
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let md_port = listener.local_addr().unwrap().port();
+    let (s, a) = (served.clone(), asked.clone());
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+        let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(String::from);
+        a.lock().unwrap().push((h("if-none-match"), h("accept-encoding")));
+        let (xml, gzip, etag) = s.lock().unwrap().clone();
+        let res = if h("if-none-match").as_deref() == Some(etag.as_str()) {
+            (StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response()
+        } else if gzip {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut e, xml.as_bytes()).unwrap();
+            ([("etag", etag), ("content-encoding", "gzip".into())], e.finish().unwrap()).into_response()
+        } else {
+            ([("etag", etag)], xml.into_bytes()).into_response()
+        };
+        std::future::ready(res)
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = std::env::temp_dir().join(format!("saml-agg-{}", random_hex(4)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let anchor = dir.join("federation.pem");
+    std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signer(1).cert)).unwrap();
+    let id = format!("n{}", random_hex(4));
+    let up = id.to_ascii_uppercase();
+    let vars = HashMap::from([
+        ("SSO_PROVIDERS".into(), id.clone()),
+        (format!("SSO_{up}_TYPE"), "saml".into()),
+        (format!("SSO_{up}_IDP_ENTITY_IDS"), format!("{IDP},{IDP_B}")),
+        (format!("SSO_{up}_IDP_AGGREGATE_URL"), format!("http://127.0.0.1:{md_port}/federation.xml")),
+        (format!("SSO_{up}_METADATA_SIGNING_CERT_FILE"), anchor.to_string_lossy().into_owned()),
+    ]);
+    let mut provider = None;
+    let (port, app, admin) = serve_vars_with(vars, |a| provider = a.sso.providers.first().cloned()).await;
+    let (sp, provider) = (Sp { port, app, admin, id, sp_entity: None }, provider.unwrap());
+    let downloads = || asked.lock().unwrap().len();
+
+    // One download, gzipped, signs people in at both IdPs, each checked against its own key.
+    let bob = sp.app.db.create_user(None, Some("bob@uni-b.example"), "Bob", Role::Member).unwrap();
+    sp.app.db.link_identity(&bob.id, &NewIdentity { provider: &sp.id, issuer: IDP_B, subject: STORED, tenant: None, email: None, created_by: Some("test") }).unwrap();
+    let (code, _, head) = sp.sign_in_at(IDP_B, from_b).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(bob.id.clone()));
+    let ada = sp.link();
+    let (code, _, head) = sp.sign_in_at(IDP, |_| {}).await;
+    assert_eq!(code, 200, "{head}");
+    assert_eq!(signed_in_as(sp.port, &head).await, Some(ada.id.clone()));
+    let (code, to, _) = sp.sign_in_at(IDP, |r| r.signer = 2).await;
+    assert_eq!((code, to.as_str()), (303, "/login?error=sso_failed"), "B's key doesn't sign for A");
+    assert_eq!(asked.lock().unwrap().clone(), [(None, Some("gzip".to_string()))]);
+    let (_, v) = call(sp.port, "GET", &format!("/api/sso/{}/saml", sp.id), &sp.admin, "").await;
+    let v: Value = serde_json::from_str(&v).unwrap();
+    assert_eq!(v["source"].as_str(), Some("aggregate"));
+    assert!(v["from"].as_str().unwrap().ends_with("/federation.xml"), "{}", v["from"]);
+
+    // A day later it hasn't changed: asked with its ETag, and not again until the next day.
+    provider.age_idp(std::time::Duration::from_secs(25 * 3600));
+    assert_eq!(sp.sign_in_at(IDP, |_| {}).await.0, 200);
+    assert_eq!(sp.sign_in_at(IDP_B, from_b).await.0, 200);
+    assert_eq!((downloads(), asked.lock().unwrap()[1].0.as_deref()), (2, Some("\"v1\"")));
+
+    // The federation drops B: B's copy goes with it, and A still signs in.
+    *served.lock().unwrap() = (signed_aggregate(&aggregate(&without_b, week), signer(1), "#_agg"), false, "\"v2\"".into());
+    provider.age_idp(std::time::Duration::from_secs(25 * 3600));
+    assert_eq!(sp.sign_in_at(IDP, |_| {}).await.0, 200);
+    assert!(provider.idp_loaded_for(IDP_B).is_none());
+    let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start?idp={}", sp.id, url::form_urlencoded::byte_serialize(IDP_B.as_bytes()).collect::<String>()), "", "", "").await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_failed")));
+    assert_eq!(downloads(), 3, "read today: not again for B");
+
+    // A badly signed aggregate is refused as a whole and audited for no one IdP; A's copy stays.
+    *served.lock().unwrap() = (signed_aggregate(&aggregate(&without_b, week), signer(0), "#_agg"), true, "\"v3\"".into());
+    provider.age_idp(std::time::Duration::from_secs(25 * 3600));
+    assert_eq!(sp.sign_in_at(IDP, |_| {}).await.0, 200, "the last good copy");
+    let refused = &sp.audit("sso.saml_metadata_refused").await[0];
+    assert_eq!(
+        (refused["details"]["reason"].as_str(), refused["details"]["source"].as_str(), refused["details"]["kept"].as_bool(), &refused["details"]["entityId"]),
+        (Some("bad_signature"), Some("aggregate"), Some(true), &Value::Null)
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn one_provider_signs_people_in_at_each_idp_of_a_federation() {
     let (sp, dir, _) = serve_federation(&[], 2).await;
 

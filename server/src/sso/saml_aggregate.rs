@@ -58,8 +58,6 @@ pub struct Found {
 /// What a verified aggregate holds for the IdPs asked for. An IdP in neither list isn't in it.
 #[derive(Debug)]
 pub struct Aggregate {
-    /// The root's `validUntil`, past which none of it vouches for anything.
-    pub valid_until: i64,
     pub found: Vec<Found>,
     /// IdPs listed but not usable, with why: listed twice, or too big.
     pub problems: Vec<(String, String)>,
@@ -383,11 +381,14 @@ impl<R: Read> Lexer<R> {
 /// Bindings in scope: a prefix (`""` for the default) and its namespace.
 type Bindings = Rc<Vec<(String, String)>>;
 
+/// An element's own declarations: a prefix and its namespace, None for `xmlns=""`.
+type Declarations = Vec<(String, Option<String>)>;
+
 /// The namespace declarations of each open element.
 #[derive(Default)]
 struct Scope {
-    /// Each open element's declarations (None: `xmlns=""`), and every binding in scope there.
-    frames: Vec<(Vec<(String, Option<String>)>, Bindings)>,
+    /// Each open element's declarations, and every binding in scope there.
+    frames: Vec<(Declarations, Bindings)>,
 }
 
 impl Scope {
@@ -403,7 +404,7 @@ impl Scope {
         None
     }
 
-    fn push(&mut self, decls: Vec<(String, Option<String>)>) {
+    fn push(&mut self, decls: Declarations) {
         let visible = match self.frames.last() {
             Some((_, v)) if decls.is_empty() => v.clone(),
             parent => {
@@ -459,7 +460,7 @@ fn split(qname: &str) -> (&str, &str) {
 
 /// Opens `s` in `scope`, its own declarations first, as namespaces-in-XML says.
 fn resolve(scope: &mut Scope, s: Start) -> Result<Element, Error> {
-    let mut decls: Vec<(String, Option<String>)> = Vec::new();
+    let mut decls: Declarations = Vec::new();
     let mut plain = Vec::new();
     for (q, v) in s.attrs {
         let declared = if q == "xmlns" {
@@ -788,7 +789,7 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
     for f in &mut found {
         f.valid_until = f.valid_until.min(valid_until);
     }
-    Ok(Aggregate { valid_until, found, problems })
+    Ok(Aggregate { found, problems })
 }
 
 /// Closes the innermost open element: in the digest, in the copy being made, and when that is
@@ -1023,7 +1024,7 @@ mod tests {
         let xml = signed_aggregate(&aggregate(&all, NOW + 7 * DAY), anchor(), "#_agg");
         assert!(xml.len() > MAX_METADATA, "{}", xml.len());
         let agg = read_ok(&xml, &[A, B, "https://not-a-member.example/idp"]).unwrap();
-        assert_eq!((agg.valid_until, ids(&agg), agg.problems.len()), (NOW + 7 * DAY, vec![A, B], 0), "one not in it is neither found nor a problem");
+        assert_eq!((ids(&agg), agg.problems.len()), (vec![A, B], 0), "one not in it is neither found nor a problem");
         let a = load(&agg.found[0]).unwrap();
         assert_eq!((a.entity_id.as_str(), a.certs[0].sha256.clone(), a.valid_until), (A, signer(0).cert().sha256, Some(NOW + 7 * DAY)));
         assert_eq!(load(&agg.found[1]).unwrap().certs[0].sha256, signer(2).cert().sha256);
@@ -1032,7 +1033,7 @@ mod tests {
 
     #[test]
     fn a_whole_document_reference_and_small_reads_verify_too() {
-        let xml = signed_aggregate(&aggregate(&[entity(A, 0), entity(B, 3)], NOW + DAY), &signer(3), "");
+        let xml = signed_aggregate(&aggregate(&[entity(A, 0), entity(B, 3)], NOW + DAY), signer(3), "");
         let agg = read_as(&xml, &[B], &[signer(3).cert()]).unwrap();
         assert_eq!(ids(&agg), [B]);
         assert!(load(&agg.found[0]).is_ok());
@@ -1079,7 +1080,7 @@ mod tests {
         assert_eq!(swap("https://idp.example/saml/sso", "https://evil.example/sso"), Err("bad_signature".into()));
         let evil = entity("https://evil.example/idp", 0);
         assert_eq!(swap("\n</md:EntitiesDescriptor>", &format!("{}\n</md:EntitiesDescriptor>", evil.trim_start_matches(r#"<?xml version="1.0"?>"#))), Err("bad_signature".into()), "an IdP slipped in");
-        assert_eq!(swap(&format!(r#"entityID="{B}""#, ), r#"entityID="https://evil.example/idp""#), Err("bad_signature".into()));
+        assert_eq!(swap(&format!(r#"entityID="{B}""#), r#"entityID="https://evil.example/idp""#), Err("bad_signature".into()));
         assert_eq!(swap("<md:IDPSSODescriptor", "<!-- a note --><md:IDPSSODescriptor"), Ok(()), "comments aren't signed, and the copy reads the same");
         assert_eq!(swap("</md:EntitiesDescriptor>\n", "</md:EntitiesDescriptor>\n\n<!-- end -->"), Ok(()), "nor anything outside the root");
         assert_eq!(swap(r#"xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" ID"#, r#"xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:x="urn:x" ID"#), Ok(()), "unused namespaces don't count");

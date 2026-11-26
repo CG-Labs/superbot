@@ -198,6 +198,7 @@ pub fn action(p: &Provider, f: &Finding) -> String {
         Role::IdpSigning => match (f.replacement, c.from) {
             (Some(r), _) => format!("The IdP's metadata already has a newer certificate (SHA-256 {r}): nothing to do unless the IdP keeps signing with this one."),
             (None, "mdq") => "Renew it at the IdP, and have the IdP's operators publish its new certificate in the federation's metadata. botd asks the MDQ server again daily and takes it by itself; nothing to import.".into(),
+            (None, "aggregate") => "Renew it at the IdP, and have the IdP's operators publish its new certificate in the federation's metadata. botd reads the federation's aggregate again daily and takes it by itself; nothing to import.".into(),
             (None, "url") => "Renew it at the IdP. Its metadata URL lists no newer certificate yet; botd reads it again daily and takes the new one by itself.".into(),
             (None, "file") => format!("Renew it at the IdP, then put its new metadata (listing both certificates) in SSO_{up}_IDP_METADATA_FILE and restart botd, before the IdP switches."),
             (None, _) => format!("Renew it at the IdP, then import its new metadata (listing both certificates) before the IdP switches: botctl sso saml {id} import < metadata.xml."),
