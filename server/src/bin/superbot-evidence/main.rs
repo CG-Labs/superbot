@@ -19,17 +19,20 @@
 //! botd, the rules loaded against those shipped, and Alertmanager's notifications.
 //! `sample` and `results` (ADR 0296): samples drawn from the store's populations by a
 //! seeded ranking anyone can re-perform, with a worksheet for the tester, and the
-//! filled-in worksheet checked against them.
+//! filled-in worksheet checked against them. `deficiencies` (ADR 0326): every exception
+//! the store's bundles and the control-testing results list for a period, tracked from
+//! bundle to bundle with its rows and owners, as the management review's deficiency log.
 //!
 //! Reads GitHub only, with a token from `GITHUB_TOKEN` (or `GH_TOKEN`), never from the
 //! command line. Run by the `change-evidence` workflow each month, or by an operator.
-//! `coverage`, `register`, `sample` and `results` read local files only, and so do `drills --no-ci` and
+//! `coverage`, `register`, `sample`, `results` and `deficiencies` read local files only, and so do `drills --no-ci` and
 //! `uptime --checks`; `uptime --prometheus` and `alerts` read only the operator's
 //! Prometheus.
 
 mod alerts;
 mod changes;
 mod coverage;
+mod deficiencies;
 mod drills;
 mod github;
 #[path = "../../evidence_period.rs"]
@@ -45,7 +48,7 @@ mod vulns;
 use std::io::Write;
 use std::process::ExitCode;
 
-const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), alert history (ADR 0288), its coverage (ADR 0169), and samples to test it on (ADR 0296).
+const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, ADR 0086), restore drills (ADR 0177), the policy register (ADR 0204), uptime (ADR 0249), alert history (ADR 0288), its coverage (ADR 0169), samples to test it on (ADR 0296), and the deficiencies it lists (ADR 0326).
 
   superbot-evidence github --repo <owner/name> [--branch <name>]
                     [--from <YYYY-MM-DD> --to <YYYY-MM-DD>] [-o <file>] [--no-titles]
@@ -66,6 +69,9 @@ const USAGE: &str = "superbot-evidence: SOC 2 evidence from GitHub (ADR 0148, AD
   superbot-evidence sample <evidence store> [--from <YYYY-MM-DD> --to <YYYY-MM-DD>]
                     [--seed <text>] [--size <test>=<n>]... [-o <file>]
   superbot-evidence results <samples bundle> <worksheet.csv> [-o <file>]
+  superbot-evidence deficiencies <evidence store> [--from <YYYY-MM-DD> --to <YYYY-MM-DD>]
+                    [--checklist <soc2-readiness-checklist.md>] [--results <results bundle>]...
+                    [--since <previous deficiency log>] [-o <file>]
 
 Writes one bundle for the period (whole UTC days, --to not included; neither: last month):
 every pull request merged into the branch (default: the repository's default branch) with
@@ -179,7 +185,18 @@ the tester; it copies no evidence. results checks a filled-in copy of that works
 result of pass, fail or n/a, the tester's register id and the day tested for each item)
 against the samples bundle and writes a bundle of the results and each test's deviations,
 untested items and incomplete populations. Exits 0 when nothing deviated and everything
-was tested, 2 otherwise, 1 on an error. No token and no network.";
+was tested, 2 otherwise, 1 on an error. No token and no network.
+
+deficiencies reads the evidence store as coverage does and writes one bundle for the
+period (for the quarterly management review, give the quarter) of every exception the
+bundles that check list, and each --results bundle's deviations, untested items and
+incomplete populations: each tracked from bundle to bundle by its id, with when it was
+first and last listed, whether the newest bundle of its source still lists it, and the
+checklist rows it bears on; with --checklist, their owners and the rows that aren't Done;
+with --since, which findings of the previous log are still listed, no longer listed or
+new; and the store's own problems, from the coverage report. deficiencies.md has the same
+for the review's papers. Exits 0 when nothing is still listed and the store is complete,
+2 otherwise, 1 on an error. No token and no network; it writes nothing into the store.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -441,6 +458,7 @@ fn main() -> ExitCode {
     let judged: Option<fn(&[String], chrono::DateTime<chrono::Utc>) -> Result<(String, bool), String>> = match args.first().map(String::as_str) {
         Some("coverage") => Some(coverage::run),
         Some("results") => Some(sample::run_results),
+        Some("deficiencies") => Some(deficiencies::run),
         _ => None,
     };
     if let Some(judge) = judged {
