@@ -27,6 +27,9 @@ name: offline
 # Before the upgrade and the rollback change anything, the bundle's botd judges the server's
 # license as its start would, and botd license check counts seats in the encrypted database
 # (docs/adr/0305-the-license-through-offline-upgrades.md).
+# They also run the bundle's botd settings check on the .env, as botd's user, which judges every
+# setting botd refuses at start, and an upgrade stops on one outside machines
+# (docs/adr/0310-offline-upgrades-checked-against-every-setting.md).
 # release-bundle: for every v* tag, once the docker workflow has published and signed that tag's
 # images (or by hand, for a published release), bundles them for each arch, with a Hermes bundle
 # and a harness bundle for each arch, signs each bundle with cosign keylessly under this
@@ -288,6 +291,7 @@ jobs:
             | tee /tmp/offline-upgrade.log
           grep -Fq "Offline upgrade: $OLD -> $NEW" /tmp/offline-upgrade.log
           grep -Fq "License: $NEW would run Bots with this server's license" /tmp/offline-upgrade.log
+          grep -Fq "Settings: the bundle's botd would start with them (botd settings check)" /tmp/offline-upgrade.log
           grep -qx "version=$NEW" /usr/local/share/superbot/offline-release
           # The backup --rollback goes back to, encrypted to the server's backup key (ADR 0300).
           grep -Fq "Rollback point: /usr/local/share/superbot/rollback/superbot-pre-upgrade-$OLD-" /tmp/offline-upgrade.log
@@ -463,7 +467,7 @@ jobs:
           grep -Fq "botd wouldn't start with these settings: Machine enrollment: MACHINE_HARNESS_BUNDLE: $mb holds claude" /tmp/offline-machines-stale.log
           grep -Fq "but machines' plan pins 0.0.1" /tmp/offline-machines-stale.log
           upgrade --machine-harness-bundle "$mb" | tee /tmp/offline-machines-upgrade.log
-          grep -Fq "Machines' settings: the bundle's botd would start with them (botd machines check)" /tmp/offline-machines-upgrade.log
+          grep -Fq "Settings: the bundle's botd would start with them (botd settings check)" /tmp/offline-machines-upgrade.log
           sudo grep -qx "MACHINE_HARNESS_BUNDLE=$mb" "$home/superbot/.env"
           sudo systemctl is-active --quiet superbot
           before=$(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot)
@@ -475,6 +479,40 @@ jobs:
           grep -Fq "wouldn't start with $home/superbot/.env: Machine enrollment: MACHINE_CONTROL_URL needs the control plane" /tmp/offline-machines-refused.log
           grep -Fq "Nothing has changed." /tmp/offline-machines-refused.log
           [[ $(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot) == "$before" ]]
+          sudo cp -p /tmp/offline-env.bak "$home/superbot/.env"
+          sudo systemctl is-active --quiet superbot
+      # The installed botd judges every setting its start refuses before it opens the database, as
+      # botd's user, with no network; an upgrade stops on one outside machines (ADR 0310).
+      - name: An offline upgrade checks every setting first, and stops on one outside machines botd would refuse
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          home=$(getent passwd superbot | cut -d: -f6)
+          check() {
+            sudo ip netns exec offline sudo -u superbot env -i PATH=/usr/bin:/bin HOME="$home" /usr/local/bin/botd settings check --home "$home" "$@"
+          }
+          check | tee /tmp/offline-settings.log
+          grep -Fq "botd would start with these settings." /tmp/offline-settings.log
+          for area in "Server backups" "Backup encryption" "Isolation" "Machine enrollment"; do
+            grep -Fqx "  ok       $area" /tmp/offline-settings.log
+          done
+          if check --set SSO_PROVIDERS=okta >/tmp/offline-settings-sso.log 2>&1; then
+            echo "botd settings check passed SSO with no public URL" >&2; exit 1
+          fi
+          grep -Fq "botd wouldn't start with these settings: SSO: SSO_PUBLIC_URL is required with SSO_PROVIDERS" /tmp/offline-settings-sso.log
+          before=$(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot)
+          sudo cp -p "$home/superbot/.env" /tmp/offline-env.bak
+          sudo cp -p /usr/local/share/superbot/offline-release /tmp/offline-release.bak
+          echo "SERVER_BACKUP_OFF_HOST=sometimes" | sudo tee -a "$home/superbot/.env" >/dev/null
+          if sudo ip netns exec offline bash deploy/install.sh --offline "$RUNNER_TEMP/b/superbot-offline-$NEW-$arch.tar.gz" --upgrade \
+            --domain offline.test --tls-cert "$RUNNER_TEMP/tls.pem" --tls-key "$RUNNER_TEMP/tls.key" --non-interactive --tz UTC \
+            >/tmp/offline-settings-refused.log 2>&1; then
+            echo "an upgrade went ahead with a setting botd would refuse" >&2; exit 1
+          fi
+          grep -Fq "wouldn't start with $home/superbot/.env: Server backups: SERVER_BACKUP_OFF_HOST must be auto, on or off" /tmp/offline-settings-refused.log
+          grep -Fq "Nothing has changed." /tmp/offline-settings-refused.log
+          [[ $(sudo systemctl show -p ExecMainStartTimestampMonotonic --value superbot) == "$before" ]]
+          sudo cmp -s /tmp/offline-release.bak /usr/local/share/superbot/offline-release
           sudo cp -p /tmp/offline-env.bak "$home/superbot/.env"
           sudo systemctl is-active --quiet superbot
       # The installed botd judges the server's license as its start would, as botd's user, counting
@@ -532,6 +570,7 @@ jobs:
           grep -Fq "Rollback: the backup taken before the upgrade to $NEW unpacks and checks out" /tmp/offline-rollback.log
           grep -Fq "Put back DATA_DIR and .env from before the upgrade to $NEW" /tmp/offline-rollback.log
           grep -Fq "License: $OLD would run Bots with the license from before the upgrade, which the rollback puts back" /tmp/offline-rollback.log
+          grep -Fq "Settings: the bundle's botd would start with them (botd settings check)" /tmp/offline-rollback.log
           grep -qx "version=$OLD" /usr/local/share/superbot/offline-release
           [[ -z $(sudo ls -A /usr/local/share/superbot/rollback) ]]
           healthy

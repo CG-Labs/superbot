@@ -209,7 +209,7 @@ Usage: install.sh [options]
                       With --offline --upgrade: set MACHINE_HERMES_BUNDLE and MACHINE_HARNESS_BUNDLE
                       in .env (as there: FILE or FILE=SHA-256, comma-separated, one per arch), the
                       bundles users' machines take from botd. Before anything changes, the bundle's
-                      botd checks machines' settings with them (botd machines check)
+                      botd checks its settings with them (botd settings check)
   --rollback          With --offline <older bundle> --upgrade: go back to the release this host
                       ran before its last offline upgrade, putting back the database and .env
                       that upgrade backed up. Everything since that upgrade is lost
@@ -965,7 +965,7 @@ configure_database_encryption() {
   fi
 }
 
-# --machine-hermes-bundle and --machine-harness-bundle, as machine_settings_check checked them.
+# --machine-hermes-bundle and --machine-harness-bundle, as offline_settings_start_check checked them.
 configure_machine_bundles() {
   local env_file=$1 key value
   for key in MACHINE_HERMES_BUNDLE MACHINE_HARNESS_BUNDLE; do
@@ -1782,59 +1782,113 @@ offline_settings_check() {
   esac
 }
 
-# Offline installs over an existing .env: whether the bundle's botd would start with machines'
-# settings in it, with --machine-*-bundle over them, before anything changes
-# (docs/adr/0294-offline-upgrades-checked-against-machines-settings.md). A release can move the
-# pins machines install, and botd won't start while .env names Hermes or harness bundles that
-# don't hold them. It runs as botd's user, who must read the bundles, with only the .env, as the
-# unit runs botd. An older botd would take the subcommand for a start and run as the server, so
-# the check runs only with a botd that has it.
-machine_settings_check() {
+# What configure_env writes into ENV_FILE on this run, as `--set` for botd settings check, so the
+# bundle's botd judges the .env the install leaves (docs/adr/0310-offline-upgrades-checked-against-every-setting.md).
+# A password or age key made later, and S3 keys from the installer's environment, are stand-ins:
+# botd only checks they're there, and the keys never reach a command line.
+next_env_settings() {
+  local env_file=$1 home=$2 key policy
+  NEXT_ENV_SETTINGS=(--set HOST=127.0.0.1 --set PORT=3000 --set "DATA_DIR=$home/superbot/data" --set "WORKSPACE_DIR=$home/superbot/workspace")
+  [[ "$TESTING_MODE_ON" != true ]] || NEXT_ENV_SETTINGS+=(--set TESTING_MODE=on)
+  [[ -z "$DOMAIN" ]] || NEXT_ENV_SETTINGS+=(--set "ALLOWED_HOSTS=$DOMAIN" --set "CORS_ORIGINS=https://${DOMAIN}")
+  if ! grep -q '^AUTH_PASSWORD=.' "$env_file" && ! grep -q '^AUTH_PASSWORD_FILE=.' "$env_file"; then
+    NEXT_ENV_SETTINGS+=(--set AUTH_PASSWORD=made-by-the-installer)
+  fi
+  if [[ -n "$BACKUP_S3_BUCKET" ]]; then
+    NEXT_ENV_SETTINGS+=(--set "SERVER_BACKUP_S3_ENDPOINT=$BACKUP_S3_ENDPOINT" --set "SERVER_BACKUP_S3_BUCKET=$BACKUP_S3_BUCKET")
+    [[ -z "$BACKUP_S3_REGION" ]] || NEXT_ENV_SETTINGS+=(--set "SERVER_BACKUP_S3_REGION=$BACKUP_S3_REGION")
+    [[ -z "$BACKUP_S3_PREFIX" ]] || NEXT_ENV_SETTINGS+=(--set "SERVER_BACKUP_S3_PREFIX=$BACKUP_S3_PREFIX")
+  fi
+  for key in SERVER_BACKUP_S3_ACCESS_KEY_ID SERVER_BACKUP_S3_SECRET_ACCESS_KEY; do
+    [[ -z "${!key:-}" ]] || NEXT_ENV_SETTINGS+=(--set "$key=given-to-the-installer" --set "${key}_FILE=")
+  done
+  [[ -z "$BACKUP_AGE_RECIPIENTS" ]] || NEXT_ENV_SETTINGS+=(--set "SUPERBOT_BACKUP_AGE_RECIPIENTS=$BACKUP_AGE_RECIPIENTS")
+  [[ -z "$BACKUP_OFF_HOST" ]] || NEXT_ENV_SETTINGS+=(--set "SERVER_BACKUP_OFF_HOST=$BACKUP_OFF_HOST")
+  [[ -z "$BACKUP_ENCRYPTION" ]] || NEXT_ENV_SETTINGS+=(--set "SUPERBOT_BACKUP_ENCRYPTION=$BACKUP_ENCRYPTION")
+  policy=${BACKUP_ENCRYPTION:-$(env_value "$env_file" SUPERBOT_BACKUP_ENCRYPTION | tr '[:upper:]' '[:lower:]')}
+  if [[ "$BACKUP_AGE_GENERATE" == true && -z "$BACKUP_AGE_RECIPIENTS" && "$policy" != off ]] && ! backup_recipients_set "$env_file"; then
+    NEXT_ENV_SETTINGS+=(--set SUPERBOT_BACKUP_AGE_RECIPIENTS=made-by-the-installer)
+  fi
+  [[ -z "$DATABASE_ENCRYPTION" ]] || NEXT_ENV_SETTINGS+=(--set "SUPERBOT_DATABASE_ENCRYPTION=$DATABASE_ENCRYPTION")
+  [[ "$ISOLATION_MODE" != off ]] || NEXT_ENV_SETTINGS+=(--set ISOLATION=off)
+  [[ -z "$MACHINE_HERMES_BUNDLE_VALUE" ]] || NEXT_ENV_SETTINGS+=(--set "MACHINE_HERMES_BUNDLE=$MACHINE_HERMES_BUNDLE_VALUE")
+  [[ -z "$MACHINE_HARNESS_BUNDLE_VALUE" ]] || NEXT_ENV_SETTINGS+=(--set "MACHINE_HARNESS_BUNDLE=$MACHINE_HARNESS_BUNDLE_VALUE")
+}
+
+# Offline installs over an existing .env: whether the bundle's botd would start with it, before
+# anything changes. A release can tighten a setting it used to take, or move the pins machines
+# install, and botd won't start while .env names something it refuses
+# (docs/adr/0310-offline-upgrades-checked-against-every-setting.md). `botd settings check` judges
+# every setting botd refuses at start before it opens the database, over what this run writes;
+# a bundle's botd from before it (a rollback to an older release) judges machines' alone, with
+# --machine-*-bundle over them (docs/adr/0294-offline-upgrades-checked-against-machines-settings.md).
+# It runs as botd's user, who must read the bundles, with only the .env, as the unit runs botd.
+# An older botd would take the subcommand for a start and run as the server, so each check runs
+# only with a botd that has it.
+offline_settings_start_check() {
   [[ -n "$OFFLINE_BUNDLE" ]] || return 0
-  local home env_file out rc=0 doc="docs/ops/air-gapped.md#upgrading" args=() why
+  local home env_file out rc=0 doc="docs/ops/air-gapped.md#upgrading" args=() why what=settings said refused
   id "$SUPERBOT_USER" &>/dev/null || return 0
   home=$(user_home)
   env_file="$home/superbot/.env"
   [[ -f "$env_file" ]] || return 0
-  if ! grep -qaF "Usage: botd machines check" "$OFFLINE_DIR/bin/botd"; then
+  [[ "$ROLLBACK_RESTORE" != true ]] || env_file="$(rollback_dir)/$(manifest_value "$(rollback_dir)/record" env)"
+  if grep -qaF "Usage: botd settings check" "$OFFLINE_DIR/bin/botd"; then
+    next_env_settings "$env_file" "$home"
+    args=("${NEXT_ENV_SETTINGS[@]}")
+  elif grep -qaF "Usage: botd machines check" "$OFFLINE_DIR/bin/botd"; then
+    what=machines
+    [[ -z "$MACHINE_HERMES_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HERMES_BUNDLE=$MACHINE_HERMES_BUNDLE_VALUE")
+    [[ -z "$MACHINE_HARNESS_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HARNESS_BUNDLE=$MACHINE_HARNESS_BUNDLE_VALUE")
+    [[ "$ROLLBACK_RESTORE" != true ]] || args=()
+  else
     warn "The bundle's botd ($OFFLINE_VERSION) can't check machines' settings (botd machines check), so they weren't checked before the upgrade"
     return 0
   fi
-  [[ -z "$MACHINE_HERMES_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HERMES_BUNDLE=$MACHINE_HERMES_BUNDLE_VALUE")
-  [[ -z "$MACHINE_HARNESS_BUNDLE_VALUE" ]] || args+=(--set "MACHINE_HARNESS_BUNDLE=$MACHINE_HARNESS_BUNDLE_VALUE")
   if [[ "$ROLLBACK_RESTORE" == true ]]; then
     # A rollback puts back the .env from before the upgrade, which root alone reads. botd's user
     # gets a copy of its own, as it owns the live .env: a pipe root made can't be reopened as
     # /dev/stdin by another user. botd runs in the folder the unit runs it in.
-    env_file="$(rollback_dir)/$(manifest_value "$(rollback_dir)/record" env)"
     doc="docs/ops/air-gapped.md#going-back"
     local copy
     copy=$(cat -- "$env_file" | (cd / && sudo -u "$SUPERBOT_USER" sh -c 'f=$(mktemp) && cat >"$f" && echo "$f"')) \
       || die "Couldn't hand $SUPERBOT_USER the .env from before the upgrade to check. Nothing has changed."
-    out=$(cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --env-file "$copy" 2>&1) || rc=$?
+    out=$(cd "$home/superbot" && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" "$what" check --env-file "$copy" "${args[@]}" 2>&1) || rc=$?
     rm -f -- "$copy"
   else
-    out=$(cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" machines check --home "$home" "${args[@]}" 2>&1) || rc=$?
+    out=$(cd / && sudo -u "$SUPERBOT_USER" env -i PATH=/usr/bin:/bin HOME="$home" "$OFFLINE_DIR/bin/botd" "$what" check --home "$home" "${args[@]}" 2>&1) || rc=$?
   fi
+  said="Machines' settings: the bundle's botd would start with them (botd machines check)"
+  [[ "$what" == machines ]] || said="Settings: the bundle's botd would start with them (botd settings check)"
   case $rc in
     0)
-      log "Machines' settings: the bundle's botd would start with them (botd machines check)"
+      log "$said"
       grep -E '^(Machines:|Machine upkeep:|Machines would|x86_64 |aarch64 )' <<<"$out" | sed 's/^/    /' || true
       ;;
     1)
-      why=$(sed -n "s/^botd wouldn't start with these settings: //p;T;q" <<<"$out")
-      [[ -n "$why" ]] || why=$out
-      why="The bundle's botd ($OFFLINE_VERSION) wouldn't start with $env_file: $why"
+      refused=$(sed -n "s/^botd wouldn't start with these settings: //p" <<<"$out")
+      # Per-user accounts this run turns on are made after the check: their folder and helpers.
+      if [[ "$what" == settings && "$(isolation_mode)" == users ]] && ! root_only "$SUDOERS_FILE"; then
+        refused=$(grep -v '^Isolation: ' <<<"$refused" || true)
+        if [[ -z "$refused" ]]; then
+          log "$said, once this run has set up per-user accounts"
+          return 0
+        fi
+      fi
+      [[ -n "$refused" ]] || refused=$out
+      why="The bundle's botd ($OFFLINE_VERSION) wouldn't start with $env_file: $(head -n 1 <<<"$refused")"
       if [[ "$DRY_RUN" == true ]]; then
         warn "[dry-run] would stop here: $why"
+        tail -n +2 <<<"$refused" | sed 's/^/    and: /' >&2
         return 0
       fi
       warn "$why"
+      tail -n +2 <<<"$refused" | sed 's/^/    and: /' >&2
       [[ "$ROLLBACK_RESTORE" != true ]] \
         || die "Nothing has changed. The .env from before the upgrade names something $OFFLINE_VERSION's botd can't use now, such as machines' bundles since removed: put back what it names, then run the rollback again ($doc)"
-      die "Nothing has changed. If it names MACHINE_HERMES_BUNDLE or MACHINE_HARNESS_BUNDLE, carry in this release's Hermes or harness bundles for your machines' arches, put them on this server where $SUPERBOT_USER can read them, and re-run with --machine-hermes-bundle or --machine-harness-bundle naming them; else change $env_file ($doc)"
+      die "Nothing has changed. If it names MACHINE_HERMES_BUNDLE or MACHINE_HARNESS_BUNDLE, carry in this release's Hermes or harness bundles for your machines' arches, put them on this server where $SUPERBOT_USER can read them, and re-run with --machine-hermes-bundle or --machine-harness-bundle naming them; else change $env_file as it says, checking with the bundle's botd: sudo -u $SUPERBOT_USER <bundle>/bin/botd settings check --home $home ($doc)"
       ;;
-    *) warn "botd machines check didn't run (status $rc), so machines' settings weren't checked before the upgrade: $(head -n 1 <<<"$out")" ;;
+    *) warn "botd $what check didn't run (status $rc), so $([[ "$what" == machines ]] && echo "machines' settings weren't" || echo "botd's settings weren't") checked before the upgrade: $(head -n 1 <<<"$out")" ;;
   esac
 }
 
@@ -2963,7 +3017,7 @@ main() {
     prepare_hermes_bundle
     prepare_harness_bundle
     prepare_rollback
-    machine_settings_check
+    offline_settings_start_check
     offline_license_check
   else
     detect_source_dir
