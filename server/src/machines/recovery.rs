@@ -206,7 +206,7 @@ fn time(ms: i64) -> String {
 }
 
 fn alert(app: &AppState, m: &Machine, action: &str, title: String, lines: Vec<String>) {
-    let a = Alert { event: action.into(), title, lines, target_type: "machine".into(), target_id: m.id.clone(), link: None };
+    let a = Alert { event: action.into(), title, lines, target_type: "machine".into(), target_id: m.id.clone(), link: None, ..Default::default() };
     notify::alert(app, a, PAGE);
 }
 

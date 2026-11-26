@@ -245,6 +245,7 @@ mod tests {
             target_type: "machine".into(),
             target_id: "m1".into(),
             link: Some("https://bots.example.com/console/#machines".into()),
+            ..Default::default()
         };
         let n = Notice { kind: NoticeKind::Alert, bot_id: String::new(), bot_name: String::new(), items: vec![], more: 0, alert: Some(a) };
         let t = body(Format::Slack, &n)["text"].as_str().unwrap().to_string();
