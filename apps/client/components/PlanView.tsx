@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
+import { AppState, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { BILLING_OFF, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
 import { overLimits, planUsageLines, storageWarning, usageLines } from "../src/plan";
-import { colors } from "../src/theme";
+import { themedStyles, type } from "../src/theme";
 import type { BillingEmails, BillingView, MyUsage } from "../src/types";
+import { kit, PageHeader, Spinner } from "./ui";
 
 /** After a successful checkout, how often and how many times to look for Stripe's confirmation. */
 export const CONFIRM_EVERY_MS = 3000;
@@ -21,6 +22,7 @@ interface Props {
 
 /** Your model tokens and runs this billing period (ADR 0050). */
 function UsageCard({ usage, warn }: { usage: MyUsage; warn?: boolean }) {
+  const styles = useStyles();
   const warning = warn ? storageWarning(usage.storage) : null;
   return (
     <View style={styles.card} accessibilityLabel="Usage this period">
@@ -41,6 +43,7 @@ function UsageCard({ usage, warn }: { usage: MyUsage; warn?: boolean }) {
 
 /** Whether you get usage emails, while the server sends billing emails (ADR 0091). */
 function EmailsCard({ emails, busy, onChange }: { emails: BillingEmails; busy: boolean; onChange: (usage: boolean) => void }) {
+  const styles = useStyles();
   return (
     <View style={styles.card}>
       <Text style={styles.cardTitle}>Emails</Text>
@@ -55,6 +58,7 @@ function EmailsCard({ emails, busy, onChange }: { emails: BillingEmails; busy: b
 
 /** Your plan, your use of it, and Stripe's pages to buy or manage one (ADR 0042). */
 export function PlanView({ api, onBack, checkout, open = openBillingPage }: Props) {
+  const styles = useStyles();
   const [view, setView] = useState<BillingView | null | undefined>(undefined);
   const [usage, setUsage] = useState<MyUsage | null>(null);
   const [emails, setEmails] = useState<BillingEmails | null>(null);
@@ -124,20 +128,13 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
     }
   };
 
-  const header = (
-    <View style={styles.header}>
-      <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
-        <Text style={styles.back}>‹ Bots</Text>
-      </Pressable>
-      <Text style={styles.title}>Plan</Text>
-    </View>
-  );
+  const header = <PageHeader title="Plan" onBack={onBack} />;
 
   if (view === undefined && !error) {
     return (
       <View style={styles.root}>
         {header}
-        <ActivityIndicator style={styles.loading} color={colors.textDim} />
+        <Spinner style={styles.loading} />
       </View>
     );
   }
@@ -150,20 +147,24 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
     return (
       <View style={styles.root}>
         {header}
-        <Text style={[styles.dim, styles.pad]} accessibilityRole="summary">
-          {BILLING_OFF}
-        </Text>
-        {usage || emailsCard ? (
-          <ScrollView contentContainerStyle={styles.body}>
-            {error ? (
-              <Text style={styles.error} accessibilityRole="alert">
-                {error}
-              </Text>
-            ) : null}
-            {usage ? <UsageCard usage={usage} warn /> : null}
-            {emailsCard}
-          </ScrollView>
-        ) : null}
+        <ScrollView contentContainerStyle={styles.body}>
+          <View style={styles.card}>
+            <Text style={styles.dim} accessibilityRole="summary">
+              {BILLING_OFF}
+            </Text>
+          </View>
+          {usage || emailsCard ? (
+            <>
+              {error ? (
+                <Text style={styles.error} accessibilityRole="alert">
+                  {error}
+                </Text>
+              ) : null}
+              {usage ? <UsageCard usage={usage} warn /> : null}
+              {emailsCard}
+            </>
+          ) : null}
+        </ScrollView>
       </View>
     );
   }
@@ -260,30 +261,29 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  loading: { marginTop: 32 },
-  pad: { padding: 16 },
-  body: { padding: 16, gap: 12, maxWidth: 640, width: "100%", alignSelf: "center" },
-  notice: { fontSize: 15 },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  warn: { color: colors.warning },
-  dim: { color: colors.textDim },
-  section: { color: colors.textDim, fontSize: 13, textTransform: "uppercase", letterSpacing: 0.5, marginTop: 8 },
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 6, borderWidth: 1, borderColor: colors.border },
-  currentCard: { borderColor: colors.blueDot },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  line: { color: colors.text, fontSize: 14 },
-  tag: { color: colors.blueDot, fontSize: 14, marginTop: 6 },
-  btn: { alignSelf: "flex-start", borderRadius: 999, borderWidth: 1, borderColor: colors.border, paddingVertical: 8, paddingHorizontal: 16, marginTop: 8 },
-  btnText: { color: colors.text, fontSize: 15 },
-  primaryBtn: { alignSelf: "flex-start", backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16, marginTop: 8 },
-  primaryText: { color: "#111", fontSize: 15 },
-  busy: { opacity: 0.6 },
-  row: { flexDirection: "row", alignItems: "center", gap: 12, marginTop: 4 },
-  grow: { flex: 1 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: { marginTop: t.space.xxl },
+    body: k.body,
+    notice: { ...k.text },
+    good: k.good,
+    error: k.error,
+    warn: k.warn,
+    dim: k.dim,
+    section: k.section,
+    card: { ...k.card, gap: t.space.sm },
+    currentCard: { borderColor: t.c.accentBorder },
+    cardTitle: k.cardTitle,
+    line: { ...k.text, ...type(t, "sm") },
+    tag: { ...k.tag, ...k.tagAccent, alignSelf: "flex-start", marginTop: t.space.xs },
+    btn: { ...k.btn, alignSelf: "flex-start", marginTop: t.space.sm },
+    btnText: k.btnText,
+    primaryBtn: { ...k.btn, ...k.primary, alignSelf: "flex-start", marginTop: t.space.sm },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    busy: k.disabled,
+    row: { flexDirection: "row", alignItems: "center", gap: t.space.md, marginTop: t.space.xs },
+    grow: { flex: 1 },
+  });
 });

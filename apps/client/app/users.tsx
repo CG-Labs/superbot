@@ -3,11 +3,13 @@ import { Redirect, router } from "expo-router";
 import { StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { UsersAdmin } from "../components/UsersAdmin";
+import { kit } from "../components/ui";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 
 /** Admins only. The server refuses everything here to anyone else; this just says so. */
 export default function UsersScreen() {
+  const styles = useStyles();
   const { api, me } = useSuperBot();
   if (!api) return <Redirect href="/" />;
   const back = () => (router.canGoBack() ? router.back() : router.replace("/home"));
@@ -27,9 +29,12 @@ export default function UsersScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  denied: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
-  text: { color: colors.text, fontSize: 16 },
-  link: { color: colors.blueDot },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    denied: k.center,
+    text: k.text,
+    link: k.link,
+  });
 });

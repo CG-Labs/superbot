@@ -846,6 +846,17 @@ pub fn audit_placeholder(region: &str) -> String {
     serde_json::json!({ "inChatStore": region }).to_string()
 }
 
+/// The audit events from `from` to `to` whose details a chat store keeps, by id, with its
+/// region, as botd's own rows name it (`audit_placeholder`): what the export holds back from
+/// a sink in another region (ADR 0330). An event not listed is whole in botd's log.
+pub fn audit_kept_in(c: &Connection, from: i64, to: i64) -> rusqlite::Result<std::collections::BTreeMap<i64, String>> {
+    let mut s = c.prepare_cached(
+        "SELECT id, json_extract(details, '$.inChatStore') FROM main.audit_events
+         WHERE id BETWEEN ?1 AND ?2 AND chain_salt IS NULL AND json_valid(details) AND json_type(details, '$.inChatStore') = 'text'",
+    )?;
+    s.query_map([from, to], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+}
+
 /// The stores attached to `c`, as `(region, schema)`: none on a connection without them.
 fn store_places(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
     if !has_table(c, "temp", STORE_PLACES)? {
@@ -3775,12 +3786,16 @@ mod tests {
         assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("gb-lon"), Some("de-fra-2"), 2)]);
         assert_eq!(audit_row(&db, "main.audit_events", before).2, r#"{"inChatStore":"de-fra-2"}"#);
         assert_eq!((count(&db, "chats_0", AUDIT), count(&db, "chats_1", AUDIT)), (0, 2));
+        // The export finds where each event's details are from botd's rows alone (ADR 0330).
+        let kept = db.audit_kept_in(before, theirs).unwrap();
+        assert_eq!(kept.into_iter().collect::<Vec<_>>(), vec![(before, "de-fra-2".to_string()), (after, "de-fra-2".to_string())], "not {theirs}, whole in botd's log");
 
         // Unpinned, they go back into their rows, and the move is recorded for the store's earlier backups.
         db.unpin_residency(PinOn::User, &ada).unwrap();
         assert_eq!(db.place_chats().unwrap(), vec![audit_move(Some("de-fra-2"), None, 2)]);
         assert_eq!(audit_row(&db, "main.audit_events", before), (Some(ada.clone()), Some("192.0.2.77".into()), format!(r#"{{"note":"by {ada}"}}"#), true));
         assert_eq!((count(&db, "main", AUDIT), count(&db, "chats_1", AUDIT)), (0, 0));
+        assert!(db.audit_kept_in(before, theirs).unwrap().is_empty());
         let fra = db.chat_stores().into_iter().find(|s| s.region == "de-fra-2").unwrap();
         assert_eq!(db.moves_out_to_clear(&fra).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
         assert!(crate::audit_chain::verify(&db, vec![]).ok);

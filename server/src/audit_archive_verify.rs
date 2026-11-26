@@ -107,6 +107,9 @@ pub struct Checked {
     pub bound: u64,
     pub bound_fixed: u64,
     pub unbound: u64,
+    /// Matched events the archive holds only the sealed row of, their details kept in another
+    /// region's chat store when they were sent (ADR 0330).
+    pub held_back: u64,
     /// Events after this one were sent with their digest, so must have it.
     pub digests_after: Option<i64>,
     pub gone: u64,
@@ -212,22 +215,40 @@ pub struct Local {
 }
 
 /// A row of this server's log, in the export's shape. `erased`: an erasure has cleared
-/// its salt, so only the fields it can't rewrite are still the archive's.
-#[derive(Clone, Debug)]
+/// its salt, so only the fields it can't rewrite are still the archive's. `held`: the
+/// region whose chat store kept its details when botd sent the archive only its sealed row
+/// (ADR 0330), as botd recorded it.
+#[derive(Clone, Debug, Default)]
 pub struct Row {
     pub event: Value,
     pub erased: bool,
+    pub held: Option<String>,
 }
 
 /// The first field the hash covers in which the archive's event differs from this server's
 /// row with the same hash. A line without its digest and salt isn't bound to its contents
 /// on its own: the salted digest that binds them stays here.
 fn differing(archived: &Value, row: &Row) -> Option<&'static str> {
-    let fields = FIXED_FIELDS.iter().chain(if row.erased { [].iter() } else { ERASABLE_FIELDS.iter() }).chain(["chainPrev"].iter());
+    let fixed_only = row.erased || sent_sealed(archived, row);
+    let fields = FIXED_FIELDS.iter().chain(if fixed_only { [].iter() } else { ERASABLE_FIELDS.iter() }).chain(["chainPrev"].iter());
     fields.copied().find(|f| {
         let (a, h) = (archived.get(*f).unwrap_or(&Value::Null), row.event.get(*f).unwrap_or(&Value::Null));
         if *f == "details" { !redacted_from(a, h) } else { a != h }
     })
+}
+
+/// The region an archived event names if it is only its sealed row, as the export sends it
+/// to a sink outside the region whose chat store keeps its details (ADR 0330): every field
+/// an erasure may rewrite empty but `details`, which names the store.
+fn held_back(archived: &Value) -> Option<&str> {
+    let d = archived["details"].as_object().filter(|o| o.len() == 1)?.get("inChatStore")?.as_str()?;
+    ERASABLE_FIELDS.iter().filter(|f| **f != "details").all(|f| archived.get(*f).is_none_or(Value::is_null)).then_some(d)
+}
+
+/// Whether an archived event is the sealed row botd recorded sending it: a line that only
+/// looks sealed is held to every field, so stripping a copy's details doesn't pass.
+fn sent_sealed(archived: &Value, row: &Row) -> bool {
+    held_back(archived).is_some_and(|r| row.held.as_deref() == Some(r))
 }
 
 /// Whether `archived` is `here` as the export wrote it: equal, except that each
@@ -484,7 +505,12 @@ impl<'a> Walker<'a> {
         let differs = match (local.hashes.get(&e.id), anchor) {
             (Some(Some(h)), _) if *h == e.hash => {
                 match local.rows.get(&e.id).and_then(|r| differing(&e.raw, r)) {
-                    None => self.rep.matched += 1,
+                    None => {
+                        self.rep.matched += 1;
+                        if local.rows.get(&e.id).is_some_and(|r| sent_sealed(&e.raw, r)) {
+                            self.rep.held_back += 1;
+                        }
+                    }
                     Some(field) => {
                         self.rep.altered += 1;
                         self.problem(Some(key), Some(e.id), "contents", format!("event {}'s {field} in {key} differs from this server's, under the same hash: the archive's copy was changed", e.id));
@@ -666,13 +692,18 @@ fn objects(prefix: &str, listed: Vec<ObjectVersion>, w: &mut Walker) -> Vec<Obje
     out
 }
 
-/// One query, so an erasure can't land between reading a row's salt and its fields.
+/// One query, so an erasure can't land between reading a row's salt and its fields, nor
+/// retention between reading a row and botd's record of sending it sealed (ADR 0330).
 /// `details` is read as stored: the export redacted it with the secrets known then.
-fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
+fn local(app: &App, sink: &str, lo: i64, hi: i64) -> rusqlite::Result<Local> {
     use crate::audit_chain::{ERASABLE, FIXED};
     let cols: Vec<&str> = FIXED.iter().chain(ERASABLE.iter()).copied().collect();
     let fields: Vec<&str> = FIXED_FIELDS.iter().chain(ERASABLE_FIELDS.iter()).copied().collect();
-    let sql = format!("SELECT chain_hash, chain_salt IS NULL, chain_prev, {} FROM audit_events WHERE id BETWEEN ?1 AND ?2", cols.join(", "));
+    let sql = format!(
+        "SELECT chain_hash, chain_salt IS NULL, chain_prev, (SELECT h.region FROM audit_export_held h WHERE h.sink = ?3 AND h.id = audit_events.id), {}
+         FROM audit_events WHERE id BETWEEN ?1 AND ?2",
+        cols.join(", ")
+    );
     let json = |col: &str, v: Sql| match (col, v) {
         ("details", Sql::Text(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
         (_, Sql::Integer(n)) => Value::from(n),
@@ -682,13 +713,13 @@ fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
     };
     app.db.with_conn(|c| {
         let mut s = c.prepare(&sql)?;
-        let mut rows = s.query([lo, hi])?;
+        let mut rows = s.query(rusqlite::params![lo, hi, sink])?;
         let mut out = Local::default();
         while let Some(r) = rows.next()? {
             let mut event = serde_json::Map::new();
             event.insert("chainPrev".into(), json("chain_prev", r.get(2)?));
             for (i, (col, field)) in cols.iter().zip(&fields).enumerate() {
-                event.insert(field.to_string(), json(col, r.get(3 + i)?));
+                event.insert(field.to_string(), json(col, r.get(4 + i)?));
             }
             let Some(id) = event["id"].as_i64() else { continue };
             let hash = match r.get::<_, Sql>(0)? {
@@ -696,7 +727,7 @@ fn local(app: &App, lo: i64, hi: i64) -> rusqlite::Result<Local> {
                 _ => None,
             };
             out.hashes.insert(id, hash);
-            out.rows.insert(id, Row { event: Value::Object(event), erased: r.get(1)? });
+            out.rows.insert(id, Row { event: Value::Object(event), erased: r.get(1)?, held: r.get(3)? });
         }
         Ok(out)
     })
@@ -714,6 +745,8 @@ pub struct Basis {
     pub start: Option<i64>,
     /// The last event sent without its digest (ADR 0199).
     pub digests_after: Option<i64>,
+    /// The sink's id, under which botd records what it held back (ADR 0330).
+    pub sink: String,
 }
 
 impl Basis {
@@ -723,6 +756,7 @@ impl Basis {
             batches: app.db.audit_export_cursor(&format!("{}#batch", x.sink.id)).is_some(),
             start: app.db.audit_export_cursor(&format!("{}#start", x.sink.id)),
             digests_after: app.db.audit_export_cursor(crate::audit_export::DIGESTS),
+            sink: x.sink.id.clone(),
         }
     }
 }
@@ -826,7 +860,7 @@ pub async fn check(app: &App, a: &Archive, basis: &Basis, range: Range, since: O
         }
     }
     if let Some(s) = since {
-        match local(app, s.head.id, s.head.id) {
+        match local(app, &basis.sink, s.head.id, s.head.id) {
             Ok(here) => w.head_held(here.hashes.get(&s.head.id), app.db.audit_chain_anchor().as_ref()),
             Err(e) => {
                 w.fail(format!("couldn't read event {} of the audit log: {e}", s.head.id));
@@ -849,7 +883,7 @@ pub async fn check(app: &App, a: &Archive, basis: &Basis, range: Range, since: O
             }
         };
         let (lo, hi) = Walker::span(&body).unwrap_or(r.object.named);
-        let here = match local(app, lo, hi) {
+        let here = match local(app, &basis.sink, lo, hi) {
             Ok(l) => l,
             Err(e) => {
                 w.fail(format!("couldn't read the audit log from event {lo} to {hi}: {e}"));
@@ -1096,7 +1130,7 @@ mod tests {
             let mut v: Value = serde_json::from_str(&line(id)).unwrap();
             v["details"] = details;
             v.as_object_mut().unwrap().remove("schema");
-            Row { event: v, erased }
+            Row { event: v, erased, held: None }
         };
         let mut here = local(3);
         here.rows = (1..=3).map(|i| (i, row(i, json!({}), false))).collect();
@@ -1126,7 +1160,7 @@ mod tests {
 
     #[test]
     fn details_may_have_been_redacted_on_the_way_out() {
-        let row = |details: Value| Row { event: json!({ "details": details }), erased: false };
+        let row = |details: Value| Row { event: json!({ "details": details }), ..Default::default() };
         let archived = |details: Value| json!({ "details": details });
         let here = json!({ "k": "token sk-live-0123456789 for b", "n": [1, "x"] });
         assert_eq!(differing(&archived(here.clone()), &row(here.clone())), None);
@@ -1136,6 +1170,30 @@ mod tests {
             assert_eq!(differing(&archived(forged.clone()), &row(here.clone())), Some("details"), "{forged}");
         }
         assert!(!redacted_text("ab[redacted]ba", "aba"), "the ends can't overlap");
+    }
+
+    #[test]
+    fn an_event_sent_as_its_sealed_row_is_held_to_its_fixed_fields_only() {
+        let event = json!({ "id": 2, "action": "bot.updated", "actorId": "u1", "ip": "192.0.2.9", "details": { "name": "Ada's Bot" }, "chainPrev": "p" });
+        let row = Row { event, held: Some("gb-lon".into()), ..Default::default() };
+        let sealed = json!({ "id": 2, "action": "bot.updated", "actorId": null, "ip": null, "details": { "inChatStore": "gb-lon" }, "chainPrev": "p" });
+        assert_eq!(held_back(&sealed), Some("gb-lon"));
+        assert_eq!(differing(&sealed, &row), None, "botd sent it sealed: its details are kept in a store elsewhere");
+        let mut other = sealed.clone();
+        other["action"] = json!("bot.deleted");
+        assert_eq!(differing(&other, &row), Some("action"), "what no erasure may change still must match");
+        let stripped = Row { held: None, ..row.clone() };
+        assert_eq!(differing(&sealed, &stripped), Some("actorId"), "a copy stripped to look sealed, which botd sent whole, is changed");
+        let elsewhere = Row { held: Some("de-fra-2".into()), ..row.clone() };
+        assert_eq!(differing(&sealed, &elsewhere), Some("actorId"), "or naming another store than botd recorded");
+        for not_sealed in [
+            json!({ "actorId": "u1", "details": { "inChatStore": "gb-lon" } }),
+            json!({ "details": { "inChatStore": "gb-lon", "name": "x" } }),
+            json!({ "details": { "inChatStore": 3 } }),
+            json!({ "details": { "name": "Ada's Bot" } }),
+        ] {
+            assert_eq!(held_back(&not_sealed), None, "{not_sealed}");
+        }
     }
 
     #[test]

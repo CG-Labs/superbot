@@ -70,6 +70,17 @@ function mockApi() {
 const show = (api: ReturnType<typeof mockApi>) => render(<RolesAdmin api={api as unknown as SuperBotApi} meId="me" onBack={jest.fn()} />);
 
 describe("RolesAdmin (ADR 0132)", () => {
+  it("has a titled header that goes back to Bots", async () => {
+    const api = mockApi();
+    const onBack = jest.fn();
+    const u = userEvent.setup();
+    await render(<RolesAdmin api={api as unknown as SuperBotApi} meId="me" onBack={onBack} />);
+    await screen.findByLabelText("Role Support");
+    expect(screen.getByRole("header", { name: "Roles" })).toBeOnTheScreen();
+    await u.press(screen.getByLabelText("Back to Bots"));
+    expect(onBack).toHaveBeenCalledTimes(1);
+  });
+
   it("builds a role from the fixed permissions and shows what it adds up to", async () => {
     const api = mockApi();
     const u = userEvent.setup();

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import {
   botAccessLabel,
   csvFileName,
@@ -16,8 +16,9 @@ import {
 } from "../src/accessReview";
 import { ApiError, type SuperBotApi } from "../src/api";
 import { saveCsv } from "../src/saveCsv";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type } from "../src/theme";
 import type { AccessReview as Report, AccessReviewPerson, AccessReviewServiceAccount, AccessReviewSignOff } from "../src/types";
+import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -26,10 +27,11 @@ interface Props {
 
 const MAX_NOTES = 500;
 
-function Person({ p }: { p: AccessReviewPerson }) {
+function Person({ p, first }: { p: AccessReviewPerson; first: boolean }) {
+  const styles = useStyles();
   const marks = flags(p);
   return (
-    <View style={styles.person} accessibilityLabel={`Access of ${p.name}`}>
+    <View style={[styles.person, first && styles.personFirst]} accessibilityLabel={`Access of ${p.name}`}>
       <View style={styles.rowTop}>
         <Text style={styles.name} numberOfLines={1}>
           {p.name}
@@ -49,6 +51,7 @@ function Person({ p }: { p: AccessReviewPerson }) {
 }
 
 function Tags({ marks }: { marks: string[] }) {
+  const styles = useStyles();
   if (!marks.length) return null;
   return (
     <View style={styles.tags}>
@@ -62,9 +65,10 @@ function Tags({ marks }: { marks: string[] }) {
 }
 
 /** A service account (ADR 0165): who owns it, what it can use today, its Bots and live tokens. */
-function ServiceAccount({ s }: { s: AccessReviewServiceAccount }) {
+function ServiceAccount({ s, first }: { s: AccessReviewServiceAccount; first: boolean }) {
+  const styles = useStyles();
   return (
-    <View style={styles.person} accessibilityLabel={`Access of service account ${s.name}`}>
+    <View style={[styles.person, first && styles.personFirst]} accessibilityLabel={`Access of service account ${s.name}`}>
       <View style={styles.rowTop}>
         <Text style={styles.name} numberOfLines={1}>
           {s.name}
@@ -89,10 +93,11 @@ function ServiceAccount({ s }: { s: AccessReviewServiceAccount }) {
   );
 }
 
-function SignOff({ r }: { r: AccessReviewSignOff }) {
+function SignOff({ r, first }: { r: AccessReviewSignOff; first: boolean }) {
+  const styles = useStyles();
   const who = r.reviewer.name || r.reviewer.email || r.reviewer.id || "Unknown";
   return (
-    <View style={styles.review}>
+    <View style={[styles.review, first && styles.personFirst]}>
       <Text style={styles.line}>
         {new Date(r.at).toLocaleString()} · {who}
         {r.summary ? <Text style={styles.dim}> · {r.summary.people} people</Text> : null}
@@ -104,6 +109,8 @@ function SignOff({ r }: { r: AccessReviewSignOff }) {
 
 /** Who has access, for an admin to review and sign off (SOC 2 CC6.3, ADR 0099). The server refuses it to everyone else. */
 export function AccessReview({ api, onBack }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
@@ -162,21 +169,21 @@ export function AccessReview({ api, onBack }: Props) {
   const s = report?.summary;
   return (
     <View style={styles.root}>
-      <View style={styles.header}>
-        <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
-          <Text style={styles.back}>‹ Bots</Text>
-        </Pressable>
-        <Text style={styles.title}>Access review</Text>
-        <Pressable
-          style={[styles.primaryBtn, (exporting || !report) && styles.busy]}
-          onPress={() => void exportCsv()}
-          disabled={exporting || !report}
-          accessibilityRole="button"
-          accessibilityState={{ disabled: exporting || !report, busy: exporting }}
-        >
-          <Text style={styles.primaryText}>{exporting ? "Exporting…" : "Export CSV"}</Text>
-        </Pressable>
-      </View>
+      <PageHeader
+        title="Access review"
+        onBack={onBack}
+        right={
+          <Pressable
+            style={[styles.headerBtn, (exporting || !report) && styles.busy]}
+            onPress={() => void exportCsv()}
+            disabled={exporting || !report}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: exporting || !report, busy: exporting }}
+          >
+            <Text style={styles.primaryText}>{exporting ? "Exporting…" : "Export CSV"}</Text>
+          </Pressable>
+        }
+      />
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {!report ? (
         error ? (
@@ -184,31 +191,31 @@ export function AccessReview({ api, onBack }: Props) {
             <Text style={styles.link}>Retry</Text>
           </Pressable>
         ) : (
-          <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} />
+          <Spinner style={styles.spinner} />
         )
       ) : (
         <ScrollView contentContainerStyle={styles.body} testID="access-review">
           <Text style={styles.faint}>Generated {new Date(report.generatedAt).toLocaleString()}</Text>
           {s ? (
-            <Text style={styles.line}>
+            <Text style={styles.summary}>
               {s.people} people: {s.active} active, {s.disabled} disabled, {s.admins} admins, {s.activeWithoutMfa} active without a second factor,{" "}
               {s.scimManaged} from SCIM, {s.apiAccess} API tokens, {s.machines} machines.
               {s.serviceAccounts ? ` ${s.serviceAccounts} service accounts with ${s.serviceApiAccess ?? 0} live tokens.` : ""}
             </Text>
           ) : null}
           <View style={styles.card}>
-            <Text style={styles.section}>Sign off</Text>
+            <Text style={styles.cardTitle}>Sign off</Text>
             <Text style={styles.faint}>Recorded in the audit log as access_review.completed, with you as the reviewer and this report&apos;s digest.</Text>
             <TextInput
               style={styles.input}
               accessibilityLabel="Review notes"
               placeholder="Notes, e.g. what you changed (optional)"
-              placeholderTextColor={colors.textFaint}
+              placeholderTextColor={placeholder}
               value={notes}
               onChangeText={(t) => setNotes(t.slice(0, MAX_NOTES))}
               multiline
             />
-            <View style={styles.rowTop}>
+            <View style={styles.actions}>
               <Pressable
                 style={[styles.primaryBtn, saving && styles.busy]}
                 onPress={() => void signOff()}
@@ -218,8 +225,8 @@ export function AccessReview({ api, onBack }: Props) {
               >
                 <Text style={styles.primaryText}>{saving ? "Signing off…" : "Mark as reviewed"}</Text>
               </Pressable>
-              <Pressable onPress={() => void load()} accessibilityRole="button">
-                <Text style={styles.link}>Reload</Text>
+              <Pressable onPress={() => void load()} accessibilityRole="button" style={({ pressed }) => [styles.btn, pressed && styles.btnPressed]}>
+                <Text style={styles.btnText}>Reload</Text>
               </Pressable>
             </View>
             {signed && signed.digest === report.digest ? <Text style={styles.ok}>Signed off at {new Date(signed.at).toLocaleString()}.</Text> : null}
@@ -228,26 +235,36 @@ export function AccessReview({ api, onBack }: Props) {
           {report.groups.map((g) => (
             <View key={`${g.tenant ?? ""}/${g.team?.id ?? ""}`} style={styles.group}>
               <Text style={styles.section}>
-                {groupLabel(g)} <Text style={styles.dim}>({g.people.length})</Text>
+                {groupLabel(g)} <Text style={styles.count}>({g.people.length})</Text>
               </Text>
-              {g.people.map((p) => (
-                <Person key={p.id} p={p} />
-              ))}
+              <View style={styles.list}>
+                {g.people.map((p, i) => (
+                  <Person key={p.id} p={p} first={i === 0} />
+                ))}
+              </View>
             </View>
           ))}
           {report.serviceAccounts?.length ? (
             <View style={styles.group}>
               <Text style={styles.section}>
-                Service accounts <Text style={styles.dim}>({report.serviceAccounts.length})</Text>
+                Service accounts <Text style={styles.count}>({report.serviceAccounts.length})</Text>
               </Text>
-              {report.serviceAccounts.map((sa) => (
-                <ServiceAccount key={sa.id} s={sa} />
-              ))}
+              <View style={styles.list}>
+                {report.serviceAccounts.map((sa, i) => (
+                  <ServiceAccount key={sa.id} s={sa} first={i === 0} />
+                ))}
+              </View>
             </View>
           ) : null}
           <View style={styles.group}>
             <Text style={styles.section}>Past sign-offs</Text>
-            {report.reviews.length ? report.reviews.map((r) => <SignOff key={r.eventId} r={r} />) : <Text style={styles.faint}>None yet.</Text>}
+            <View style={styles.list}>
+              {report.reviews.length ? (
+                report.reviews.map((r, i) => <SignOff key={r.eventId} r={r} first={i === 0} />)
+              ) : (
+                <Text style={styles.none}>None yet.</Text>
+              )}
+            </View>
           </View>
         </ScrollView>
       )}
@@ -255,39 +272,42 @@ export function AccessReview({ api, onBack }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  primaryText: { color: "#111", fontSize: 15 },
-  busy: { opacity: 0.6 },
-  body: { padding: 16, gap: 14 },
-  card: { gap: 8, padding: 14, borderRadius: 14, borderWidth: 1, borderColor: colors.border },
-  group: { gap: 6 },
-  section: { color: colors.text, fontSize: 16, fontWeight: "600" },
-  person: { padding: 12, borderRadius: 14, gap: 3, backgroundColor: colors.bgSidebar },
-  review: { paddingVertical: 4, gap: 2 },
-  rowTop: { flexDirection: "row", alignItems: "center", gap: 8 },
-  name: { color: colors.text, fontSize: 15, fontWeight: "600", flexShrink: 1 },
-  line: { color: colors.text },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 12 },
-  tags: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  tag: { color: colors.textDim, fontSize: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 1 },
-  input: {
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-    minHeight: 60,
-  },
-  link: { color: colors.blueDot },
-  retry: { paddingHorizontal: 16, paddingVertical: 8 },
-  ok: { color: colors.text },
-  error: { color: colors.danger, paddingHorizontal: 16, paddingVertical: 8 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    headerBtn: { ...k.btn, ...k.btnSmall, ...k.primary },
+    primaryBtn: { ...k.btn, ...k.primary },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    btn: k.btn,
+    btnPressed: k.btnPressed,
+    btnText: k.btnText,
+    busy: k.disabled,
+    spinner: { marginTop: t.space.xl },
+    body: k.body,
+    summary: k.dim,
+    card: k.card,
+    cardTitle: k.cardTitle,
+    group: { gap: t.space.sm },
+    section: { ...k.section, marginBottom: 0 },
+    count: { fontWeight: t.font.weight.regular },
+    list: { ...k.card, gap: 0, paddingVertical: t.space.xs },
+    person: { paddingVertical: t.space.md, gap: t.space.xxs, borderTopWidth: hairline, borderTopColor: t.c.border },
+    personFirst: { borderTopWidth: 0 },
+    review: { paddingVertical: t.space.sm, gap: t.space.xxs, borderTopWidth: hairline, borderTopColor: t.c.border },
+    none: { ...k.faint, paddingVertical: t.space.sm },
+    rowTop: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
+    actions: k.actions,
+    name: { ...k.strong, flexShrink: 1 },
+    line: { color: t.c.text, ...type(t, "sm") },
+    dim: k.dim,
+    faint: k.faint,
+    tags: { ...k.tags, marginVertical: t.space.xxs },
+    tag: k.tag,
+    input: { ...k.input, ...k.inputMultiline },
+    link: k.link,
+    retry: { paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
+    ok: k.good,
+    error: { ...k.error, paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
+  });
 });

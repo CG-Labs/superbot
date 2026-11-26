@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useAnnounce } from "../src/announce";
 import { themedStyles, type } from "../src/theme";
-import { PillButton } from "./PillButton";
+import { PillButton } from "./ui";
 
 /** Runs a retry, busy until a returned promise settles, ignoring presses while it runs. */
 function useRetry(onRetry?: () => unknown): { busy: boolean; run: () => void } {

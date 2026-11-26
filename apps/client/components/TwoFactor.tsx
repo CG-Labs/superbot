@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { SvgXml } from "react-native-svg";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
-import { colors, hairline, themedStyles, themes, ThemeScope, type } from "../src/theme";
+import { hairline, themedStyles, themes, type, useTheme } from "../src/theme";
 import type { MfaPolicy, MfaProof, MfaSetup, MfaStatus } from "../src/types";
 import { Chips } from "./Chips";
+import { kit, Spinner } from "./ui";
 
 /** A typed code: six digits for the app, anything else is a recovery code. */
 export function proofFrom(input: string): MfaProof | null {
@@ -106,6 +107,8 @@ const POLICY_LABELS: { value: MfaPolicy; label: string }[] = [
  * protects sign-in codes and the password; single sign-on relies on your IdP's MFA.
  */
 export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boolean }) {
+  const styles = useStyles();
+  const t = useTheme();
   const [status, setStatus] = useState<MfaStatus | null>(null);
   const [setup, setSetup] = useState<MfaSetup | null>(null);
   const [codes, setCodes] = useState<string[] | null>(null);
@@ -184,23 +187,19 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
         </Text>
       ) : null}
       {!status ? (
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       ) : codes ? (
-        <ThemeScope scheme="dark">
-          <RecoveryCodes codes={codes} onDone={() => setCodes(null)} />
-        </ThemeScope>
+        <RecoveryCodes codes={codes} onDone={() => setCodes(null)} />
       ) : setup ? (
         <>
-          <ThemeScope scheme="dark">
-            <MfaSetupView setup={setup} />
-          </ThemeScope>
+          <MfaSetupView setup={setup} />
           <TextInput
             style={styles.input}
             inputMode="numeric"
             autoComplete="one-time-code"
             maxLength={6}
             placeholder="6-digit code"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             value={input}
             onChangeText={setInput}
             accessibilityLabel="Code from your authenticator app"
@@ -222,7 +221,7 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Code or recovery code"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             value={input}
             onChangeText={setInput}
             accessibilityLabel="Code or recovery code"
@@ -278,21 +277,24 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
   );
 }
 
-const styles = StyleSheet.create({
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  field: { gap: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: colors.border },
-  label: { color: colors.text, fontWeight: "500" },
-  text: { color: colors.text },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 13 },
-  error: { color: colors.danger },
-  row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
-  input: { backgroundColor: colors.bgBubble, borderColor: colors.border, borderWidth: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, color: colors.text, fontSize: 16 },
-  btn: { borderRadius: 10, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 14, paddingVertical: 8 },
-  btnText: { color: colors.text },
-  primary: { backgroundColor: colors.blue, borderColor: colors.blue },
-  primaryText: { color: "#fff", fontWeight: "600" },
-  dangerText: { color: colors.danger },
-  disabled: { opacity: 0.5 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    card: k.card,
+    cardTitle: k.cardTitle,
+    field: k.field,
+    label: k.label,
+    text: k.text,
+    dim: k.dim,
+    faint: k.faint,
+    error: k.error,
+    row: k.actions,
+    input: k.input,
+    btn: k.btn,
+    btnText: k.btnText,
+    primary: k.primary,
+    primaryText: k.primaryText,
+    dangerText: k.dangerText,
+    disabled: k.disabled,
+  });
 });

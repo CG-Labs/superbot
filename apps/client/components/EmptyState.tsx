@@ -1,7 +1,7 @@
 import React from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { themedStyles, type } from "../src/theme";
-import { PillButton } from "./PillButton";
+import { PillButton } from "./ui";
 
 export interface StateAction {
   label: string;

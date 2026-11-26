@@ -1,19 +1,21 @@
 import React from "react";
 import { Redirect, router, useLocalSearchParams } from "expo-router";
-import { ActivityIndicator, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { TeamView } from "../components/TeamView";
+import { kit, Spinner } from "../components/ui";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 
 /** Your team (ADR 0087, 0088, 0093). Everyone on one sees it; its owners and admins manage it and its plan. Stripe sends them back here. */
 export default function TeamScreen() {
+  const styles = useStyles();
   const { ready, api, me, canWrite } = useSuperBot();
   const { checkout } = useLocalSearchParams<{ checkout?: string }>();
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       </View>
     );
   }
@@ -26,7 +28,10 @@ export default function TeamScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  loading: { flex: 1, justifyContent: "center", backgroundColor: colors.bgMain },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: k.center,
+  });
 });

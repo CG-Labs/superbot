@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (26 Nov 2026). A slice of the UI overhaul workstream ([roadmap](../ROADMAP.md#ui-overhaul-grok-bot-aligned)), on the design system of [ADR 0335](0335-design-system-for-the-app-and-the-console.md). It covers the chat screen, the shell and the lists they show (the sidebar's Bots, approvals, a Bot's routines, the screen viewer). Settings, the admin screens, sign-in and onboarding are restyled in their own slices and take these components there.
+Accepted (26 Nov 2026). A slice of the UI overhaul workstream ([roadmap](../ROADMAP.md#ui-overhaul-grok-bot-aligned)), on the design system of [ADR 0335](0335-design-system-for-the-app-and-the-console.md). It covers the chat screen, the shell and the lists they show (the sidebar's Bots, approvals, a Bot's routines, the screen viewer). Settings and the admin screens ([ADR 0337](0337-a-shared-kit-for-settings-and-admin-screens.md)), sign-in ([ADR 0336](0336-sign-in-on-the-design-system.md)) and onboarding are restyled in their own slices and take these components there.
 
 ## Context
 
@@ -14,7 +14,7 @@ The app showed a bare spinner while anything loaded, a blank or dark screen whil
 
 All on the tokens, following the scheme or a `ThemeScope`, in `apps/client/components/`:
 
-- **`EmptyState`**: a glyph or art (a Bot's avatar), a title read as a heading, one line of help, and at most a primary and a secondary action (`PillButton`). `compact` fits it into the sidebar and panels.
+- **`EmptyState`**: a glyph or art (a Bot's avatar), a title read as a heading, one line of help, and at most a primary and a secondary action (`PillButton`, the shared kit's pill button as a component in `components/ui.tsx`, [ADR 0337](0337-a-shared-kit-for-settings-and-admin-screens.md)). `compact` fits it into the sidebar and panels.
 - **`ErrorState`** fills a screen or pane that couldn't load: what failed as the title, why in plain words, and "Try again". **`InlineError`** is the same in one line inside a list. A retry that returns a promise keeps the button busy ("Trying…") until it settles.
 - **Skeletons** (`Skeleton.tsx`): `ChatSkeleton`, `ListSkeleton` and `AppSkeleton` (the shell's outline while the app starts) replace spinners. Each is one element screen readers hear as busy, with a name ("Loading messages"), not a list of shapes. `ThinkingDots` replaces the spinner beside "Working…".
 - **Toasts** (`useToast`, provided at the root): one at a time at the top, error, success or info, with an optional action; errors and toasts with an action stay 6 seconds, others 4. Outside a provider, errors fall back to the dialog as before. Modals keep dialogs, since a toast at the root would sit behind them.

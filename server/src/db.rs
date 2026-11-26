@@ -10,7 +10,7 @@ use crate::secrets::{redact, sealed};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 mod chats;
@@ -2507,7 +2507,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 74] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 75] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2582,7 +2582,22 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 74] = [
     migrate_saml_group_roles_per_idp,
     migrate_scim_token_idp,
     migrate_two_approvers,
+    migrate_audit_export_held,
 ];
+
+/// The events an archive was sent only the sealed rows of (ADR 0330), with the region whose
+/// chat store kept their details: botd's own record, which the archive's check holds those
+/// lines to, and which a retried batch is cut from again.
+fn migrate_audit_export_held(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audit_export_held (
+          sink TEXT NOT NULL,
+          id INTEGER NOT NULL,
+          region TEXT NOT NULL,
+          PRIMARY KEY (sink, id)
+        ) WITHOUT ROWID;",
+    )
+}
 
 /// Two approvers for chosen roles (ADR 0320): how many different people approve a request
 /// for a role before it's given (1, as before, or 2), and the first of two approvals while
@@ -9846,6 +9861,11 @@ impl Db {
         self.select_audit_events(f, limit, oldest_first, true)
     }
 
+    /// [`chats::audit_kept_in`] on botd's connection (ADR 0330).
+    pub fn audit_kept_in(&self, from: i64, to: i64) -> rusqlite::Result<BTreeMap<i64, String>> {
+        chats::audit_kept_in(&self.c(), from, to)
+    }
+
     fn select_audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool, strict: bool) -> rusqlite::Result<Vec<AuditEvent>> {
         use rusqlite::types::Value as V;
         let mut sql = String::from("SELECT * FROM audit_events WHERE 1 = 1");
@@ -10049,6 +10069,7 @@ impl Db {
         // A record outlives its checkpoint while its timestamp event is still in the log, so that
         // event's export and check still have the token.
         tx.execute("DELETE FROM audit_checkpoints WHERE event_id <= ?1 AND (tsa_event_id IS NULL OR tsa_event_id <= ?1)", [last])?;
+        tx.execute("DELETE FROM audit_export_held WHERE id <= ?1", [last])?;
         let anchor = hash.map(|hash| crate::audit_chain::Link { id: last, hash });
         if let Some(a) = &anchor {
             crate::audit_chain::set_anchor(&tx, a)?;
@@ -10123,6 +10144,46 @@ impl Db {
             params![format!("audit_export:{sink}"), delivered.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Cuts the archive `sink`'s next batch, the events after `after` up to `last`, with the
+    /// ones it sends only the sealed rows of (ADR 0330). One transaction, so a retry or a
+    /// restart finds the batch and what it holds back together, or neither. `#held` says the
+    /// record is the batch's: a batch cut before it has none, and went whole.
+    pub fn cut_audit_export_batch(&self, sink: &str, after: i64, last: i64, held: &BTreeMap<i64, String>) -> rusqlite::Result<()> {
+        let c = self.c();
+        let tx = c.unchecked_transaction()?;
+        tx.execute("DELETE FROM audit_export_held WHERE sink = ?1 AND id > ?2", params![sink, after])?;
+        {
+            let mut s = tx.prepare("INSERT INTO audit_export_held (sink, id, region) VALUES (?1, ?2, ?3)")?;
+            for (id, region) in held.range(after + 1..=last) {
+                s.execute(params![sink, id, region])?;
+            }
+        }
+        for key in ["held", "batch"] {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![format!("audit_export:{sink}#{key}"), last.to_string()],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// What the archive `sink`'s batch up to `to` holds back, if botd recorded it when it cut
+    /// the batch (ADR 0330); None for a batch cut before that.
+    pub fn audit_export_held_for_batch(&self, sink: &str, after: i64, to: i64) -> rusqlite::Result<Option<BTreeMap<i64, String>>> {
+        if self.audit_export_cursor(&format!("{sink}#held")) != Some(to) {
+            return Ok(None);
+        }
+        self.audit_export_held(sink, after + 1, to).map(Some)
+    }
+
+    /// The events from `from` to `to` botd sent the archive `sink` only the sealed rows of,
+    /// with the region whose chat store kept their details then (ADR 0330).
+    pub fn audit_export_held(&self, sink: &str, from: i64, to: i64) -> rusqlite::Result<BTreeMap<i64, String>> {
+        let c = self.c();
+        let mut s = c.prepare_cached("SELECT id, region FROM audit_export_held WHERE sink = ?1 AND id BETWEEN ?2 AND ?3")?;
+        s.query_map(params![sink, from, to], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
     }
 
     // Machines (ADR 0025)
@@ -12306,6 +12367,29 @@ mod tests {
 
     fn all_events(db: &Db) -> Vec<AuditEvent> {
         db.audit_events(&audit::Filter::default(), 1000, false)
+    }
+
+    #[test]
+    fn an_archive_batch_is_cut_with_what_it_holds_back_and_retention_takes_both() {
+        let db = Db::open(&temp_path("audit-export-held").join("app.sqlite")).unwrap();
+        db.c().execute_batch(&format!("DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events; {}", audit_delete_trigger())).unwrap();
+        let ev = |at: i64| db.record_at(&audit::Event::new(audit::Actor::system("test"), "test.held"), at).unwrap();
+        let (old, young) = (ev(now() - 40 * 86_400_000), ev(now()));
+        db.set_audit_export_cursor("s3#batch", young).unwrap();
+        assert_eq!(db.audit_export_held_for_batch("s3", 0, young).unwrap(), None, "a batch cut before ADR 0330 has no record: it went whole");
+        let held = BTreeMap::from([(old, "gb-lon".to_string()), (young, "de-fra-2".to_string()), (young + 5, "gb-lon".to_string())]);
+        db.cut_audit_export_batch("s3", 0, young, &held).unwrap();
+        assert_eq!(db.audit_export_cursor("s3#batch"), Some(young));
+        let mine = BTreeMap::from([(old, "gb-lon".to_string()), (young, "de-fra-2".to_string())]);
+        assert_eq!(db.audit_export_held_for_batch("s3", 0, young).unwrap(), Some(mine), "only the batch's own events");
+        assert_eq!(db.audit_export_held_for_batch("s3", 0, young + 1).unwrap(), None, "another batch's record isn't this one's");
+        assert!(db.audit_export_held("other", 0, young).unwrap().is_empty(), "each sink has its own");
+        // Cut again after `old` was delivered: what it held after that is the new cut's.
+        db.cut_audit_export_batch("s3", old, young, &BTreeMap::new()).unwrap();
+        assert_eq!(db.audit_export_held("s3", 0, young + 5).unwrap(), BTreeMap::from([(old, "gb-lon".to_string())]));
+        db.set_audit_retention(Some(30));
+        db.prune_audit(None).unwrap();
+        assert!(db.audit_export_held("s3", 0, young).unwrap().is_empty(), "retention takes the record with the event");
     }
 
     #[test]

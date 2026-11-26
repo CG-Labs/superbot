@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   Modal,
   Pressable,
   ScrollView,
@@ -14,11 +13,12 @@ import type { SuperBotApi } from "../src/api";
 import { relativeTime, ROLES, signInMethod } from "../src/invite";
 import { fetchSsoProviders, type SsoProvider } from "../src/sso";
 import { endsLabel } from "../src/roles";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, useTheme } from "../src/theme";
 import type { AdminUser, CustomRole } from "../src/types";
 import { InviteUserForm } from "./InviteUserForm";
 import { SignupRequests } from "./SignupRequests";
 import { UserDetail } from "./UserDetail";
+import { kit, PageHeader, Spinner } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -34,6 +34,7 @@ export function matchesUser(u: AdminUser, q: string): boolean {
 }
 
 function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers: SsoProvider[]; selected: boolean; onPress: () => void }) {
+  const styles = useStyles();
   const label = (id: string) => providers.find((p) => p.id === id)?.label ?? id;
   return (
     <Pressable style={[styles.row, selected && styles.selected]} onPress={onPress} accessibilityRole="button" accessibilityLabel={`User ${u.name}`}>
@@ -74,6 +75,8 @@ function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers:
 
 /** The admin portal: requests for access, people, their roles, sign-in codes, sessions, SSO links, and Bot access (ADR 0021, 0022). */
 export function UsersAdmin({ api, meId, onBack }: Props) {
+  const styles = useStyles();
+  const t = useTheme();
   const { width } = useWindowDimensions();
   const wide = width >= 900;
   const [users, setUsers] = useState<AdminUser[] | null>(null);
@@ -124,27 +127,27 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
 
   return (
     <View style={styles.root}>
-      <View style={styles.header}>
-        <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
-          <Text style={styles.back}>‹ Bots</Text>
-        </Pressable>
-        <Text style={styles.title}>Users</Text>
-        <Pressable style={styles.primaryBtn} onPress={() => setInviting(true)} accessibilityRole="button">
-          <Text style={styles.primaryText}>Add user</Text>
-        </Pressable>
-      </View>
+      <PageHeader
+        title="Users"
+        onBack={onBack}
+        right={
+          <Pressable style={styles.primaryBtn} onPress={() => setInviting(true)} accessibilityRole="button">
+            <Text style={styles.primaryText}>Add user</Text>
+          </Pressable>
+        }
+      />
       <View style={styles.body}>
         <View style={wide ? styles.listPaneWide : styles.listPane}>
           <TextInput
             style={styles.search}
             placeholder="Search people"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             value={query}
             onChangeText={setQuery}
           />
           {error ? <Text style={styles.error}>{error}</Text> : null}
-          {users == null && !error ? <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} /> : null}
-          <ScrollView contentContainerStyle={{ gap: 4, paddingBottom: 24 }}>
+          {users == null && !error ? <Spinner style={{ marginTop: 20 }} /> : null}
+          <ScrollView contentContainerStyle={styles.list}>
             <SignupRequests
               api={api}
               onApproved={(id) => {
@@ -159,7 +162,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
           </ScrollView>
         </View>
         {wide ? (
-          <ScrollView style={styles.detailPane} contentContainerStyle={{ padding: 20 }}>
+          <ScrollView style={styles.detailPane} contentContainerStyle={styles.detailBody}>
             {detail ?? <Text style={styles.empty}>Pick someone to manage their role, sign-ins, and access.</Text>}
           </ScrollView>
         ) : null}
@@ -170,7 +173,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
             <Pressable style={styles.modalHeader} onPress={() => setSelectedId(null)} accessibilityRole="button">
               <Text style={styles.back}>‹ Users</Text>
             </Pressable>
-            <ScrollView contentContainerStyle={{ padding: 16, paddingRight: 20 }}>{detail}</ScrollView>
+            <ScrollView contentContainerStyle={styles.modalBody}>{detail}</ScrollView>
           </View>
         </Modal>
       ) : null}
@@ -184,8 +187,8 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
         testID="invite-modal"
       >
         <View style={styles.backdrop}>
-          <ScrollView style={styles.sheet} contentContainerStyle={{ padding: 20, gap: 8 }}>
-            <Text style={styles.title}>Add user</Text>
+          <ScrollView style={styles.sheet} contentContainerStyle={styles.sheetBody}>
+            <Text style={styles.sheetTitle}>Add user</Text>
             {inviting ? (
               <InviteUserForm
                 api={api}
@@ -204,43 +207,40 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  primaryText: { color: "#111", fontSize: 15 },
-  body: { flex: 1, flexDirection: "row" },
-  listPane: { flex: 1, padding: 12 },
-  listPaneWide: { width: 460, padding: 12, borderRightWidth: 1, borderRightColor: colors.border },
-  detailPane: { flex: 1 },
-  search: {
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-    marginBottom: 8,
-  },
-  row: { flexDirection: "row", gap: 12, padding: 12, borderRadius: 14 },
-  selected: { backgroundColor: colors.bgActive },
-  rowMain: { flex: 1, minWidth: 0, gap: 2 },
-  rowSide: { alignItems: "flex-end", gap: 2 },
-  name: { color: colors.text, fontSize: 16 },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 12 },
-  tags: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 },
-  tag: { color: colors.textDim, fontSize: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2 },
-  adminTag: { color: colors.blueDot, borderColor: "#24406e" },
-  disabledTag: { color: colors.danger, borderColor: "#5a2a2c" },
-  codeTag: { color: colors.warning, borderColor: "#5a4520" },
-  empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
-  error: { color: colors.danger, padding: 8 },
-  modalRoot: { flex: 1, backgroundColor: colors.bgMain, paddingTop: 32 },
-  modalHeader: { padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border, backgroundColor: colors.bgMain },
-  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "center", padding: 16 },
-  sheet: { flexGrow: 0, maxHeight: "90%", width: "100%", maxWidth: 560, alignSelf: "center", backgroundColor: colors.bgSidebar, borderRadius: 16 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    back: k.backText,
+    primaryBtn: { ...k.btn, ...k.btnSmall, ...k.primary },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    body: { flex: 1, flexDirection: "row" },
+    listPane: { flex: 1, padding: t.space.md },
+    listPaneWide: { width: 440, padding: t.space.md, backgroundColor: t.c.surface, borderRightWidth: hairline, borderRightColor: t.c.border },
+    detailPane: { flex: 1 },
+    detailBody: { padding: t.space.xl, width: "100%", maxWidth: 760, alignSelf: "center" },
+    list: { gap: t.space.xxs, paddingBottom: t.space.xl },
+    search: { ...k.search, marginBottom: t.space.sm },
+    row: { flexDirection: "row", gap: t.space.md, padding: t.space.md, borderRadius: t.radius.md },
+    selected: { backgroundColor: t.c.selected },
+    rowMain: { flex: 1, minWidth: 0, gap: t.space.xxs },
+    rowSide: { alignItems: "flex-end", gap: t.space.xxs },
+    name: { ...k.text, fontWeight: t.font.weight.medium },
+    dim: k.dim,
+    faint: k.faint,
+    tags: { ...k.tags, marginTop: t.space.xs },
+    tag: k.tag,
+    adminTag: k.tagAccent,
+    disabledTag: k.tagDanger,
+    codeTag: k.tagWarn,
+    empty: k.empty,
+    error: { ...k.error, padding: t.space.sm },
+    modalRoot: { flex: 1, backgroundColor: t.c.bg, paddingTop: t.space.xxl },
+    modalHeader: { ...k.header, minHeight: 0 },
+    modalBody: { padding: t.space.lg },
+    backdrop: k.backdrop,
+    sheet: k.sheet,
+    sheetBody: k.sheetBody,
+    sheetTitle: { ...k.title, flex: 0 },
+  });
 });
