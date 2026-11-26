@@ -25,11 +25,11 @@ The setting is `nameid` (the default, unchanged), `subject-id` or `pairwise-id`,
 
 The attribute is read only from the signed assertion's `AttributeStatement`s. It must appear once, with exactly one `AttributeValue` of plain text and NameFormat `uri` if one is given. XML whitespace around the value is stripped. The value must match the profile's grammar, and is lowercased. A missing attribute is `no_subject_id`. Anything else is `bad_subject_id`. Nothing is picked from several values or attributes.
 
-The scope must equal one of the IdP's `shibmd:Scope`s, from the metadata botd already checks (`regexp="true"` scopes are ignored, as for emails and groups). Otherwise the sign-in is `subject_id_scope`. Metadata with no scope vouches for none: an IdP outside a federation that sends the attribute must list its scopes. That's the profile's own rule, and without it any IdP of a federation could claim another's people. With one IdP it matters less, but the same rule keeps one code path and one meaning.
+The scope must equal one of the IdP's `shibmd:Scope`s, from the metadata botd already checks (`regexp="true"` scopes are ignored, as for emails and groups). They're read for this by the profile's scope grammar, lowercased, not as email domains, so a single-label scope like `campus` counts here though not for emails. Otherwise the sign-in is `subject_id_scope`. Metadata with no scope vouches for none: an IdP outside a federation that sends the attribute must list its scopes. That's the profile's own rule, and without it any IdP of a federation could claim another's people. With one IdP it matters less, but the same rule keeps one code path and one meaning.
 
 ### The NameID stays, for logout
 
-A NameID is still required, in any format, and kept as sent in the session's SAML login, as today. It's used only for single logout. An IdP's LogoutRequest names the transient NameID, not the attribute, so in attribute mode botd matches sessions by the stored NameID, exactly (it's opaque), with the IdP's issuer and any SessionIndexes. botd's own LogoutRequests, front or back channel, send the stored NameID back. `auth.slo` shows the person's `subject` and the `nameId`.
+A NameID is still required, in any format, and kept as sent in the session's SAML login, as today. It's used only for single logout. An IdP's LogoutRequest names the transient NameID, not the attribute, so botd matches sessions by the stored NameID, exactly (it's opaque), with the IdP's issuer and any SessionIndexes. It does so whatever the setting is now, so sessions made before the setting changed, either way, still end at the IdP's word. With an attribute set, the NameID names no identity, so only sessions with no stored NameID (from before botd kept them) are also matched by `issuer|NameID`; with `nameid`, all are, as before. botd's own LogoutRequests, front or back channel, send the stored NameID back. `auth.slo` shows the person's `subject` and the `nameId`.
 
 ### SP metadata
 
@@ -57,5 +57,5 @@ An identity a person types (`botctl user link`, the API) or SCIM sends as `exter
 - Federation IdPs that send only transient NameIDs (most new REFEDS and InCommon ones) can sign people in, making `IDP_ENTITY_IDS=all` useful.
 - An IdP can only speak for the scopes its federation registered for it.
 - `pairwise-id` gives SuperBot an identifier other services can't correlate with.
-- Switching an existing provider to an attribute changes every identity: people must be re-linked, or SCIM must resend `externalId`s. The guide says so.
+- Switching an existing provider to an attribute changes every identity: people must be re-linked by hand, since a SCIM `externalId` can't change once set. The guide says so.
 - The NameID check for transient formats is unchanged when the setting is `nameid`, so existing deployments see no difference.

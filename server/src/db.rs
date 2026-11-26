@@ -8766,38 +8766,30 @@ impl Db {
             .flatten()
     }
 
-    /// Revokes the live sessions provider `provider` signed in as `idp_subject` (`issuer|subject`),
-    /// for the IdP's LogoutRequest (ADR 0137). With `indexes`, only sessions of those IdP
-    /// sessions, and those whose IdP session isn't known (signed in before botd kept it). Only
-    /// sessions created by `before` (ms).
-    pub fn revoke_saml_sessions(&self, provider: &str, idp_subject: &str, indexes: &[String], before: i64, reason: &str) -> Vec<Session> {
-        let found: Vec<(Session, Option<String>)> = {
-            let c = self.c();
-            let mut s = c
-                .prepare(
-                    "SELECT s.*, m.session_index AS saml_session_index FROM sessions s LEFT JOIN saml_sessions m ON m.session_id = s.id
-                     WHERE s.idp_provider = ? AND s.idp_subject = ? AND s.revoked_at IS NULL AND s.created_at <= ? ORDER BY s.created_at, s.id",
-                )
-                .unwrap();
-            s.query_map(params![provider, idp_subject, before], |r| Ok((session_row(r)?, r.get("saml_session_index")?))).unwrap().filter_map(Result::ok).collect()
-        };
-        self.revoke_saml_found(found, indexes, reason)
-    }
-
-    /// `revoke_saml_sessions` for a provider that knows people by a subject identifier
-    /// attribute (ADR 0319): the IdP's LogoutRequest names its NameID, often transient, so the
-    /// sessions are those IdP `issuer` made with `name_id` exactly as it sent it.
-    pub fn revoke_saml_sessions_by_name_id(&self, provider: &str, issuer: &str, name_id: &str, indexes: &[String], before: i64, reason: &str) -> Vec<Session> {
+    /// Revokes the live sessions provider `provider` made from IdP `issuer`'s sign-ins that the
+    /// IdP's LogoutRequest for `name_id` names (ADR 0137): those kept with that NameID exactly
+    /// as the IdP sent it, whatever identity they're for (it may be a subject identifier
+    /// attribute's, ADR 0319), and those signed in as `idp_subject` (`issuer|NameID`). With
+    /// `by_attribute`, only sessions with no NameID kept (from before botd kept it) are found by
+    /// `idp_subject`, as a NameID then names no one. With `indexes`, only sessions of those IdP
+    /// sessions, and those whose IdP session isn't known. Only sessions created by `before` (ms).
+    #[allow(clippy::too_many_arguments)]
+    pub fn revoke_saml_sessions(&self, provider: &str, issuer: &str, name_id: &str, idp_subject: &str, by_attribute: bool, indexes: &[String], before: i64, reason: &str) -> Vec<Session> {
         let prefix = format!("{issuer}|");
         let found: Vec<(Session, Option<String>)> = {
             let c = self.c();
             let mut s = c
                 .prepare(
-                    "SELECT s.*, m.session_index AS saml_session_index FROM sessions s JOIN saml_sessions m ON m.session_id = s.id
-                     WHERE s.idp_provider = ? AND substr(s.idp_subject, 1, ?) = ? AND m.name_id = ? AND s.revoked_at IS NULL AND s.created_at <= ? ORDER BY s.created_at, s.id",
+                    "SELECT s.*, m.session_index AS saml_session_index FROM sessions s LEFT JOIN saml_sessions m ON m.session_id = s.id
+                     WHERE s.idp_provider = ? AND s.revoked_at IS NULL AND s.created_at <= ?
+                       AND ((m.name_id = ? AND substr(s.idp_subject, 1, ?) = ?) OR (s.idp_subject = ? AND (? = 0 OR m.session_id IS NULL)))
+                     ORDER BY s.created_at, s.id",
                 )
                 .unwrap();
-            s.query_map(params![provider, prefix.chars().count() as i64, prefix, name_id, before], |r| Ok((session_row(r)?, r.get("saml_session_index")?))).unwrap().filter_map(Result::ok).collect()
+            s.query_map(params![provider, before, name_id, prefix.chars().count() as i64, prefix, idp_subject, by_attribute], |r| Ok((session_row(r)?, r.get("saml_session_index")?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
         };
         self.revoke_saml_found(found, indexes, reason)
     }
@@ -12186,6 +12178,42 @@ mod tests {
         let listed = db.team_role_requests(&t.id, Some("pending"), 2);
         assert_eq!(listed.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), [mine.id.as_str()]);
         assert_eq!(db.team_role_requests_pending(&t.id), 1);
+    }
+
+    #[test]
+    fn an_idp_logout_finds_sessions_by_their_kept_name_id_whatever_named_the_person() {
+        let db = Db::open(&temp_path("saml-slo").join("app.sqlite")).unwrap();
+        let u = db.create_user(None, Some("a@example.com"), "A", Role::Member).unwrap();
+        const IDP: &str = "https://idp.example/saml";
+        let session = |subject: &str, kept: Option<&str>| {
+            let hash = format!("h{}", crate::short_id());
+            let s = db.create_session(&NewSession { user_id: &u.id, token_hash: &hash, kind: "cookie", method: "sso", idp_subject: Some(subject), idp_provider: Some("uni"), label: None, ip: None, user_agent: None, expires_at: now() + 60_000, mfa: None });
+            if let Some(n) = kept {
+                db.add_saml_session(&s.id, &SamlLogin { name_id: n.into(), ..Default::default() });
+            }
+            s.id
+        };
+        let logout = |name_id: &str, by_attribute: bool| {
+            let key = format!("{IDP}|{}", name_id.to_ascii_lowercase());
+            let mut ids: Vec<String> = db.revoke_saml_sessions("uni", IDP, name_id, &key, by_attribute, &[], now() + 1000, "saml_logout").into_iter().map(|s| s.id).collect();
+            ids.sort();
+            ids
+        };
+        // Made with SUBJECT=pairwise-id, ended after it went back to nameid, and the reverse.
+        let by_attr = session(&format!("{IDP}|q7@uni.example"), Some("_T1"));
+        assert_eq!(logout("_t1", false), Vec::<String>::new(), "kept NameIDs are matched exactly");
+        assert_eq!(logout("_T1", false), vec![by_attr.clone()]);
+        let by_name = session(&format!("{IDP}|00u1ada"), Some("00u1ADA"));
+        assert_eq!(logout("00u1ADA", true), vec![by_name]);
+        // With an attribute, a NameID names no one: only sessions from before NameIDs were kept.
+        let other = session(&format!("{IDP}|q8@uni.example"), Some("_t2"));
+        let legacy = session(&format!("{IDP}|q8@uni.example"), None);
+        assert_eq!(logout("q8@uni.example", true), vec![legacy]);
+        // Without one, as before: by identity too, without case.
+        assert_eq!(logout("Q8@uni.example", false), vec![other]);
+        // Only the IdP's own.
+        session("https://other.example|_t3", Some("_t3"));
+        assert_eq!(logout("_t3", false), Vec::<String>::new());
     }
 
     #[test]

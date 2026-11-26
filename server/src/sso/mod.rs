@@ -2460,37 +2460,30 @@ fn logout_decrypt_keys(app: &AppState, p: &Provider, encryption: Encryption) -> 
 /// with the binding it came over (`redirect`, `post` or `soap`).
 #[allow(clippy::too_many_arguments)]
 fn idp_signed_out(a: &Auth, app: &AppState, source: &Source, id: &str, idp: &saml_sp::IdpMetadata, request_id: &str, name_id: &str, session_indexes: &[String], issued_ms: i64, binding: &str) {
-    // With a subject identifier attribute (ADR 0319), the NameID isn't the identity: sessions
-    // are found by the NameID kept with each, as the IdP sent it.
-    let by_name_id = a.sso.provider(id).is_some_and(|p| p.subject_from().is_some());
+    // A session is the IdP's to end if it was made with this NameID, as the IdP sent it, also
+    // when it names the person by a subject identifier attribute (ADR 0319), set now or then.
+    // With an attribute set, the NameID names no one, so it finds no session by identity but
+    // those from before NameIDs were kept.
+    let by_attribute = a.sso.provider(id).is_some_and(|p| p.subject_from().is_some());
     let key = format!("{}|{}", idp.entity_id, saml::subject(name_id));
     let named = |l: Option<&db::SamlLogin>| session_indexes.is_empty() || l.and_then(|l| l.session_index.as_ref()).is_none_or(|i| session_indexes.contains(i));
-    let theirs = |h: &Handoff| match by_name_id {
-        true => h.claims.issuer == idp.entity_id && h.saml.as_ref().is_some_and(|l| l.name_id == name_id),
-        false => h.claims.key() == key,
-    };
+    let theirs = |h: &Handoff| (h.claims.issuer == idp.entity_id && h.saml.as_ref().is_some_and(|l| l.name_id == name_id)) || (!by_attribute && h.claims.key() == key);
     // Codes first, as when an admin revokes: a redemption holds them until its session exists.
     a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| !(h.provider == id && theirs(h) && named(h.saml.as_ref())));
     // Only sessions from before the request was issued: replayed after a restart, which
     // forgets used IDs, it finds nothing left to revoke.
-    let before = issued_ms + saml_sp::SKEW_MS;
-    let revoked = match by_name_id {
-        true => app.db.revoke_saml_sessions_by_name_id(id, &idp.entity_id, name_id, session_indexes, before, "saml_logout"),
-        false => app.db.revoke_saml_sessions(id, &key, session_indexes, before, "saml_logout"),
-    };
+    let revoked = app.db.revoke_saml_sessions(id, &idp.entity_id, name_id, &key, by_attribute, session_indexes, issued_ms + saml_sp::SKEW_MS, "saml_logout");
     let mut users: Vec<&str> = revoked.iter().map(|s| s.user_id.as_str()).collect();
     users.sort_unstable();
     users.dedup();
     let sessions: Vec<&str> = revoked.iter().map(|s| s.id.as_str()).collect();
-    let subject = match by_name_id {
-        true => revoked.first().and_then(|s| s.idp_subject.clone()),
-        false => Some(key),
-    };
+    let subject = revoked.first().and_then(|s| s.idp_subject.clone()).or_else(|| (!by_attribute).then(|| key.clone()));
+    let person = subject.as_deref().and_then(|s| s.strip_prefix(&format!("{}|", idp.entity_id)));
     let mut details = json!({
-        "provider": id, "idp": "saml", "issuer": idp.entity_id, "subject": subject.as_deref().and_then(|s| s.strip_prefix(&format!("{}|", idp.entity_id))), "requestId": request_id,
+        "provider": id, "idp": "saml", "issuer": idp.entity_id, "subject": person, "requestId": request_id,
         "sessionIndexes": session_indexes, "sessions": sessions, "users": users, "revoked": sessions.len(), "binding": binding,
     });
-    if by_name_id {
+    if subject.as_deref() != Some(key.as_str()) {
         details["nameId"] = json!(crate::audit::clip(name_id, 128));
     }
     let mut actor = slo_actor(id, subject);
@@ -2549,7 +2542,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     let loaded: Vec<Arc<saml_sp::IdpMetadata>> = p.listed_idps().iter().filter_map(|e| p.idp_loaded_for(e)).collect();
     let view = |m: &saml_sp::IdpMetadata| {
         let certs: Vec<Value> = m.certs.iter().map(cert).collect();
-        json!({ "entityId": m.entity_id, "name": m.name, "scopes": m.scopes, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age(&m.entity_id).map(|d| d.as_secs()), "validUntil": m.valid_until, "expired": !m.valid_at(now) })
+        json!({ "entityId": m.entity_id, "name": m.name, "scopes": m.scopes, "subjectScopes": m.subject_scopes, "ssoUrl": m.sso_url, "ssoBinding": m.sso_binding.as_str(), "sloUrl": m.slo.as_ref().map(|s| &s.location), "sloBinding": m.slo.as_ref().map(|s| s.binding.as_str()), "sloSoapUrl": m.slo_soap, "artifactResolutionUrls": m.artifact_resolution.iter().map(|(i, u)| json!({ "index": i, "url": u })).collect::<Vec<_>>(), "certificates": certs, "loadedSecondsAgo": p.idp_age(&m.entity_id).map(|d| d.as_secs()), "validUntil": m.valid_until, "expired": !m.valid_at(now) })
     };
     let idp = if several { None } else { loaded.first().map(|m| view(m)) };
     // Several IdPs (ADR 0282): each, loaded or not, in the order they're configured. Every IdP

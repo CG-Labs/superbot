@@ -2242,7 +2242,7 @@ fn saml_summary(v: &Value) -> String {
     }
     out += ":\n";
     if matches!(v["subject"].as_str(), Some("subject-id" | "pairwise-id")) {
-        let scopes: Vec<&str> = idp["scopes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let scopes: Vec<&str> = idp["subjectScopes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         out += &format!("    Subject scopes: {}\n", if scopes.is_empty() { "none (no one can sign in: the metadata lists no shibmd:Scope)".to_string() } else { scopes.join(", ") });
     }
     out += &idp_lines(idp, "    ");
@@ -4898,7 +4898,7 @@ mod tests {
         let mut scoped = v.clone();
         scoped["subject"] = json!("subject-id");
         assert!(saml_summary(&scoped).contains("from botctl:\n    Subject scopes: none (no one can sign in: the metadata lists no shibmd:Scope)\n    Sign-in URL: "));
-        scoped["idp"]["scopes"] = json!(["uni.example", "staff.uni.example"]);
+        scoped["idp"]["subjectScopes"] = json!(["uni.example", "staff.uni.example"]);
         assert!(saml_summary(&scoped).contains("    Subject scopes: uni.example, staff.uni.example\n"));
         let mut post = v.clone();
         post["idp"]["sloBinding"] = json!("post");

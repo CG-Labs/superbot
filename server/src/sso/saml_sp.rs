@@ -394,6 +394,9 @@ pub struct IdpMetadata {
     /// The email domains the metadata says the IdP speaks for (`shibmd:Scope`, ADR 0282).
     /// Regular-expression scopes are left out.
     pub scopes: Vec<String>,
+    /// The same `shibmd:Scope`s as subject identifier scopes (ADR 0319), lowercased: any the
+    /// profile's grammar allows, `campus` as well as `uni.example`.
+    pub subject_scopes: Vec<String>,
     /// The entity's categories, from its `mdattr:EntityAttributes` (ADR 0308): the values of
     /// `ENTITY_CATEGORY`, `ENTITY_CATEGORY_SUPPORT` and `ASSURANCE_CERTIFICATION`, as REFEDS
     /// Research and Scholarship, Sirtfi and hide-from-discovery are published.
@@ -716,7 +719,7 @@ fn read_idp(entity: Node, entity_id: &str, signs_requests: bool, binding: Reques
     if response == ResponseBinding::Artifact && artifact_resolution.is_empty() {
         return Err("the metadata has no SOAP ArtifactResolutionService on https: set SSO_<ID>_RESPONSE_BINDING=post for this provider, or turn on artifact resolution at the IdP".into());
     }
-    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution, valid_until: None, name: idp_name(entity, idp), scopes: scopes(entity, idp), categories: categories(entity) })
+    Ok(IdpMetadata { entity_id: entity_id.into(), sso_url, sso_binding, certs, slo, slo_soap, artifact_resolution, valid_until: None, name: idp_name(entity, idp), scopes: scopes(entity, idp, super::domain), subject_scopes: scopes(entity, idp, |s| subject_id_value(&format!("x@{s}")).map(|v| subject_id_scope(&v).to_string())), categories: categories(entity) })
 }
 
 /// The entity's categories: each value of its `ENTITY_CATEGORY`, `ENTITY_CATEGORY_SUPPORT`
@@ -754,15 +757,15 @@ fn idp_name(entity: Node, idp: Node) -> Option<String> {
     pick(ui).or_else(|| pick(org))
 }
 
-/// The IdP's `shibmd:Scope`s, on its `IDPSSODescriptor` or its entity, as domains. A
-/// `regexp="true"` scope is a pattern, not a domain, and isn't read.
-fn scopes(entity: Node, idp: Node) -> Vec<String> {
+/// The IdP's `shibmd:Scope`s, on its `IDPSSODescriptor` or its entity, as `read` takes them
+/// (domains, or subject identifier scopes). A `regexp="true"` scope is a pattern, and isn't read.
+fn scopes(entity: Node, idp: Node, read: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for n in extensions(idp).into_iter().chain(extensions(entity)).filter(|n| is(*n, SHIBMD, "Scope")) {
         if n.attribute("regexp").is_some_and(|r| r.trim() == "true" || r.trim() == "1") {
             continue;
         }
-        if let Some(d) = super::domain(&all_text(n)).filter(|d| !out.contains(d)) {
+        if let Some(d) = read(all_text(n).trim()).filter(|d| !out.contains(d)) {
             out.push(d);
         }
         if out.len() == MAX_SCOPES {
@@ -1778,7 +1781,7 @@ pub fn check_response_xml(xml: &str, e: &Expect) -> Result<Checked, Refused> {
         None => super::saml::subject(&nid.value),
         Some(name) => {
             let v = subject_attribute(assertion, name)?;
-            if !e.idp.scopes.iter().any(|s| s == subject_id_scope(&v)) {
+            if !e.idp.subject_scopes.iter().any(|s| s == subject_id_scope(&v)) {
                 return Err(Refused("subject_id_scope", None));
             }
             v
@@ -2652,6 +2655,10 @@ pub(crate) mod tests {
         let mut sub = r.clone();
         sub.attributes.last_mut().unwrap().1 = "8f2a91c4@staff.uni.example".into();
         assert_eq!(subject_of(&sub, Subject::SubjectId, uni).unwrap_err().0, "subject_id_scope");
+        sub.attributes.last_mut().unwrap().1 = "8f2a91c4@campus".into();
+        assert!(subject_of(&sub, Subject::SubjectId, &["Campus"]).is_ok(), "a scope needn't be a domain");
+        let m = parse_idp_metadata(&with_ui(&metadata(), "University A", &["campus", " uni.example ", "bad_scope", "-x.example"]), IDP, false).unwrap();
+        assert_eq!((m.scopes, m.subject_scopes), (vec!["uni.example".to_string()], vec!["campus".to_string(), "uni.example".to_string()]), "emails need domains; subjects the profile's scopes");
         let regexp = with_ui(&metadata(), "University A", &[]).replace("<mdui:UIInfo>", r#"<shibmd:Scope regexp="true">^.*\.example$</shibmd:Scope><mdui:UIInfo>"#);
         assert!(parse_idp_metadata(&regexp, IDP, false).unwrap().scopes.is_empty(), "a regular expression is no scope");
 
