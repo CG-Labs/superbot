@@ -112,7 +112,15 @@ describe("where your Bots run (ADR 0267)", () => {
   });
 });
 
-describe("chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors, usage records and audit details in the region's own database (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304, ADR 0316)", () => {
+describe("chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors, usage records and audit details in the region's own database (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304, ADR 0316, ADR 0321)", () => {
+  it("says the details of what others did about you are kept in the region too when the server says so (ADR 0321)", () => {
+    const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true, signIns: true, secrets: true, secondFactors: true, usageRecords: true, auditEvents: true, auditAbout: true } }));
+    expect(held.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets, your second factor, the usage records of your Bots' runs and the details of the audit log's entries about what you did and what others not held in another region did about you are kept in gb-lon, in a database of their own there.");
+    expect(held.warnings).toEqual([]);
+    const moving = residencyLines(view({ chats: { store: true, inRegion: false, moving: true, auditEvents: true, auditAbout: true } }));
+    expect(moving.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets, your second factor, the usage records of your Bots' runs and the details of the audit log's entries about what you did and what others not held in another region did about you are being moved to gb-lon's own database.");
+  });
+
   it("says the details of your audit events are kept in the region too when the server says so", () => {
     const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true, signIns: true, secrets: true, secondFactors: true, usageRecords: true, auditEvents: true } }));
     expect(held.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets, your second factor, the usage records of your Bots' runs and the details of the audit log's entries about what you did are kept in gb-lon, in a database of their own there.");
