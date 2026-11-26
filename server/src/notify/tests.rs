@@ -220,11 +220,14 @@ fn an_alert_only_for_its_audience_skips_the_list_and_the_webhook() {
     assert!(n.alert_plan(db, &a, &s).is_empty(), "no email while email is off, and no push without a provider");
     secrets::global().delete(webhook::URL).unwrap();
 
+    let long = format!("Note: {}", "word ".repeat(90));
+    a.lines = vec![long.clone()];
     a.app_link = n.links.page("settings");
     let notice = Notice { kind: NoticeKind::Alert, bot_id: String::new(), bot_name: String::new(), items: Vec::new(), more: 0, alert: Some(a) };
     let body = notice.email_body(None);
     assert!(body.contains("Open it in SuperBot: https://bots.example.com/app/settings") && body.contains("SuperBot tells whoever asked of this"), "{body}");
     assert!(!body.contains("Console") && !body.contains("notification email list"), "{body}");
+    assert!(body.contains(long.trim_end()), "lines kept whole: {body}");
 }
 
 struct Rig {

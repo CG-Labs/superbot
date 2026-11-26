@@ -437,11 +437,13 @@ async fn the_asker_hears_when_their_request_is_decided_or_lapses() {
     notify::save(&app.db, &notify::Settings { email: notify::EmailSettings { deciders: false, ..s.email }, ..s });
     let q = asked(port, &rae_auth, json!({ "role": peek, "hours": 2, "reason": "Quarterly check" })).await;
     until("the list's email of it", || Some(mailed(&mail)).filter(|m| m.len() >= 3)).await;
-    assert_eq!(call(port, "POST", &format!("/api/role-requests/{q}/deny"), &ana_auth, r#"{"note":"Ask your lead"}"#).await.0, 200);
+    let note = format!("Ask your lead. {}Then ask again.", "Read the runbook first. ".repeat(18));
+    assert!(note.chars().count() > 400 && note.chars().count() <= 500);
+    assert_eq!(call(port, "POST", &format!("/api/role-requests/{q}/deny"), &ana_auth, &json!({ "note": note }).to_string()).await.0, 200);
     until("the denial's email", || Some(mailed(&mail)).filter(|m| m.len() >= 4)).await;
     let m = last_to("decided-rae@example.com");
     assert!(m.headers.contains("Subject: [SuperBot] Your request for Audit peek was denied"), "{}", m.headers);
-    for line in ["Denied by decided-ana@example.com.", "Note: Ask your lead", "You asked for it across the server, for 2 hours."] {
+    for line in ["Denied by decided-ana@example.com.", &format!("Note: {note}"), "You asked for it across the server, for 2 hours."] {
         assert!(m.body.contains(line), "{line}: {}", m.body);
     }
 

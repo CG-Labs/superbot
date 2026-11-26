@@ -414,8 +414,12 @@ impl Notice {
         let mut out = String::new();
         if let (NoticeKind::Alert, Some(a)) = (self.kind, &self.alert) {
             out.push_str(&format!("{}\n\n", clip(&a.title)));
+            // A notice of someone's own request keeps its lines whole: a decider's note there
+            // runs to 500 characters.
+            let only = a.audience.as_ref().is_some_and(|w| w.only);
             for l in &a.lines {
-                out.push_str(&format!("  {}\n", clip(l)));
+                let l = if only { l.split_whitespace().collect::<Vec<_>>().join(" ") } else { clip(l) };
+                out.push_str(&format!("  {l}\n"));
             }
             if let Some(w) = a.audience.as_ref().filter(|w| w.only) {
                 if let Some(l) = &a.app_link {
