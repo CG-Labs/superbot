@@ -155,20 +155,21 @@ pub async fn view(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
     })))
 }
 
-/// What the app says about your chats, routines, approvals, Bots' memory, facts, sign-ins, own secrets, second factor and usage records (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304): whether
+/// What the app says about your chats, routines, approvals, Bots' memory, facts, sign-ins, own secrets, second factor, usage records and audit events' details (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304, ADR 0316): whether
 /// the region has a store, whether they are all in the region, whether some are still to
 /// move there, and how many backups of another region's store still hold them from before
 /// they moved out. `signIns`: the store keeps sign-ins too, which servers before ADR 0283 don't;
 /// `secrets`: and your own secrets, which servers before ADR 0293 don't; `secondFactors`: and
 /// your second factor, which servers before ADR 0299 don't; `usageRecords`: and the usage
-/// records of your runs, which servers before ADR 0304 don't.
+/// records of your runs, which servers before ADR 0304 don't; `auditEvents`: and the details
+/// of your audit events, which servers before ADR 0316 don't.
 fn chats_view(c: &Value) -> Value {
     let n = |k: &str| -> i64 { super::chat_stores::KINDS.iter().filter_map(|t| c[t][k].as_i64()).sum() };
     let moving = n("elsewhere") > 0 || (c["store"] == true && n("inServerDatabase") > 0);
     let earlier: i64 = c["earlierCopies"].as_array().into_iter().flatten().filter_map(|e| e["backups"].as_i64()).sum();
     json!({
         "store": c["store"], "inRegion": c["inRegion"], "moving": moving, "earlierBackups": earlier,
-        "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true,
+        "signIns": true, "secrets": true, "secondFactors": true, "usageRecords": true, "auditEvents": true,
     })
 }
 

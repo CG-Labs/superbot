@@ -166,10 +166,31 @@ pub fn insert_with(c: &Connection, cols: &[(&str, Sql)], hook: impl FnOnce(&Conn
     let s = seal(&prev, &fixed, &erasable);
     let names: Vec<&str> = FIXED.iter().chain(ERASABLE.iter()).chain(COLUMNS.iter()).copied().collect();
     let marks = vec!["?"; names.len()].join(", ");
+    let text = |name: &str| match get(name) {
+        Sql::Text(t) => Some(t),
+        _ => None,
+    };
+    let (kind, actor, behalf, target_type, target) = (text("actor_kind"), text("actor_id"), text("on_behalf_of"), text("target_type"), text("target_id"));
+    let person = crate::db::audit_person(kind.as_deref(), actor.as_deref(), behalf.as_deref(), target_type.as_deref(), target.as_deref());
+    // A pinned person's details go to their region's store; the row keeps its seal (ADR 0316).
+    let store = crate::db::audit_store_for(c, person)?;
     let mut values = fixed;
-    values.extend(erasable);
-    values.extend([s.prev, s.hash, s.salt, s.digest].map(Sql::Text));
-    c.execute(&format!("INSERT INTO audit_events ({}) VALUES ({marks})", names.join(", ")), rusqlite::params_from_iter(values))?;
+    match (store, person) {
+        (Some((region, schema)), Some(person)) => {
+            values.extend(ERASABLE.iter().map(|n| if *n == "details" { Sql::Text(crate::db::audit_placeholder(&region)) } else { Sql::Null }));
+            values.extend([Sql::Text(s.prev), Sql::Text(s.hash), Sql::Null, Sql::Text(s.digest)]);
+            c.execute(&format!("INSERT INTO main.audit_events ({}) VALUES ({marks})", names.join(", ")), rusqlite::params_from_iter(values))?;
+            let cols: Vec<&str> = ERASABLE.iter().copied().chain(["chain_salt"]).collect();
+            let mut moved = erasable;
+            moved.push(Sql::Text(s.salt));
+            crate::db::insert_audit_details(c, &schema, id, person, &cols, &moved)?;
+        }
+        _ => {
+            values.extend(erasable);
+            values.extend([s.prev, s.hash, s.salt, s.digest].map(Sql::Text));
+            c.execute(&format!("INSERT INTO main.audit_events ({}) VALUES ({marks})", names.join(", ")), rusqlite::params_from_iter(values))?;
+        }
+    }
     if let Some(tx) = tx {
         tx.commit()?;
     }
@@ -206,7 +227,13 @@ const MAX_RANGES: usize = 1_000;
 /// Records which rows an erasure cleared the salt of, as `[first, last]` id ranges, in as
 /// many events as that takes, all or none. Returns the last one's id.
 pub fn insert_erased(c: &Connection, pseudonym: &str, ids: &[i64]) -> rusqlite::Result<i64> {
-    let ranges = ranges(ids);
+    insert_erased_ranges(c, "erasure", ("user", pseudonym), &ranges(ids))
+}
+
+/// [`insert_erased`] for rows whose erasable fields went another way, as `[first, last]`
+/// ranges, written by `part` about `target`: details only a regional chat store held, lost
+/// with it (ADR 0316).
+pub fn insert_erased_ranges(c: &Connection, part: &str, target: (&str, &str), ranges: &[[i64; 2]]) -> rusqlite::Result<i64> {
     let mut parts: Vec<&[[i64; 2]]> = ranges.chunks(MAX_RANGES).collect();
     if parts.is_empty() {
         parts.push(&[]);
@@ -214,7 +241,7 @@ pub fn insert_erased(c: &Connection, pseudonym: &str, ids: &[i64]) -> rusqlite::
     let tx = if c.is_autocommit() { Some(rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?) } else { None };
     let mut last = 0;
     for rows in parts {
-        last = insert_system(c, "erasure", ERASED, ("user", pseudonym), &json!({ "rows": rows }))?;
+        last = insert_system(c, part, ERASED, target, &json!({ "rows": rows }))?;
     }
     if let Some(tx) = tx {
         tx.commit()?;
@@ -222,7 +249,8 @@ pub fn insert_erased(c: &Connection, pseudonym: &str, ids: &[i64]) -> rusqlite::
     Ok(last)
 }
 
-fn ranges(ids: &[i64]) -> Vec<[i64; 2]> {
+/// `ids` as sorted `[first, last]` ranges of consecutive ids.
+pub fn ranges(ids: &[i64]) -> Vec<[i64; 2]> {
     let mut ids = ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
