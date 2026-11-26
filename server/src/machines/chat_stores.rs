@@ -248,7 +248,7 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
 }
 
 /// The locks botd holds on its stores' files while it runs, so two botds can't share one.
-static LOCKS: std::sync::Mutex<Vec<(PathBuf, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
+static LOCKS: std::sync::Mutex<Vec<(PathBuf, database_encryption::DataDirLock)>> = std::sync::Mutex::new(Vec::new());
 
 /// Takes and keeps the lock on the store at `path` until `release_store_lock`.
 pub(super) fn hold_store_lock(path: &Path) -> Result<(), String> {
