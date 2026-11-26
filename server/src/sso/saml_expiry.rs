@@ -247,6 +247,7 @@ pub async fn check(app: &AppState, providers: &[Arc<Provider>], http: &reqwest::
                     crate::obs::log::log_warn!("SSO {}: IdP {entity} metadata: {e}", p.id);
                 }
             }
+            p.idp_refreshed().await;
             for (entity, e) in p.take_metadata_refusals() {
                 app.db.record(&super::metadata_refused(p, &entity, &e));
             }

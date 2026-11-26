@@ -3067,9 +3067,10 @@ async fn a_federation_aggregate_signs_people_in_at_its_listed_idps() {
     // What the federation serves: the aggregate, gzipped or not, and its ETag.
     let served = Arc::new(std::sync::Mutex::new((full, true, "\"v1\"".to_string())));
     let asked = Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+    let slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let md_port = listener.local_addr().unwrap().port();
-    let (s, a) = (served.clone(), asked.clone());
+    let (s, a, sl) = (served.clone(), asked.clone(), slow.clone());
     let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
         let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(String::from);
         a.lock().unwrap().push((h("if-none-match"), h("accept-encoding")));
@@ -3083,7 +3084,11 @@ async fn a_federation_aggregate_signs_people_in_at_its_listed_idps() {
         } else {
             ([("etag", etag)], xml.into_bytes()).into_response()
         };
-        std::future::ready(res)
+        let delay = if sl.load(std::sync::atomic::Ordering::Relaxed) { 3 } else { 0 };
+        async move {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            res
+        }
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
@@ -3124,8 +3129,14 @@ async fn a_federation_aggregate_signs_people_in_at_its_listed_idps() {
     assert!(v["from"].as_str().unwrap().ends_with("/federation.xml"), "{}", v["from"]);
 
     // A day later it hasn't changed: asked with its ETag, and not again until the next day.
+    // The sign-in that asks goes on with its good copy meanwhile.
     provider.age_idp(std::time::Duration::from_secs(25 * 3600));
+    slow.store(true, std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
     assert_eq!(sp.sign_in_at(IDP, |_| {}).await.0, 200);
+    assert!(started.elapsed() < std::time::Duration::from_millis(1_500), "waited {:?} for the download", started.elapsed());
+    provider.idp_refreshed().await;
+    slow.store(false, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(sp.sign_in_at(IDP_B, from_b).await.0, 200);
     assert_eq!((downloads(), asked.lock().unwrap()[1].0.as_deref()), (2, Some("\"v1\"")));
 
@@ -3133,6 +3144,7 @@ async fn a_federation_aggregate_signs_people_in_at_its_listed_idps() {
     *served.lock().unwrap() = (signed_aggregate(&aggregate(&without_b, week), signer(1), "#_agg"), false, "\"v2\"".into());
     provider.age_idp(std::time::Duration::from_secs(25 * 3600));
     assert_eq!(sp.sign_in_at(IDP, |_| {}).await.0, 200);
+    provider.idp_refreshed().await;
     assert!(provider.idp_loaded_for(IDP_B).is_none());
     let (code, head, _) = crate::tests::call_with(sp.port, "GET", &format!("/api/auth/sso/{}/start?idp={}", sp.id, url::form_urlencoded::byte_serialize(IDP_B.as_bytes()).collect::<String>()), "", "", "").await;
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_failed")));
@@ -3142,6 +3154,8 @@ async fn a_federation_aggregate_signs_people_in_at_its_listed_idps() {
     *served.lock().unwrap() = (signed_aggregate(&aggregate(&without_b, week), signer(0), "#_agg"), true, "\"v3\"".into());
     provider.age_idp(std::time::Duration::from_secs(25 * 3600));
     assert_eq!(sp.sign_in_at(IDP, |_| {}).await.0, 200, "the last good copy");
+    provider.idp_refreshed().await;
+    assert_eq!(sp.sign_in_at(IDP, |_| {}).await.0, 200, "audited at the next sign-in");
     let refused = &sp.audit("sso.saml_metadata_refused").await[0];
     assert_eq!(
         (refused["details"]["reason"].as_str(), refused["details"]["source"].as_str(), refused["details"]["kept"].as_bool(), &refused["details"]["entityId"]),

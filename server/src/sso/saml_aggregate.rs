@@ -24,6 +24,9 @@ const MAX_TOKEN: usize = 4 * 1024 * 1024;
 /// The largest `EntityDescriptor` copied out, as for metadata from anywhere else.
 const MAX_ENTITY: usize = super::saml_sp::MAX_METADATA;
 const MAX_SIGNATURE: usize = 64 * 1024;
+/// The most text before the root's signature, held until it's read: metadata has only a line
+/// break there.
+const MAX_HELD: usize = 64 * 1024;
 const MAX_DEPTH: usize = 128;
 const MAX_ATTRIBUTES: usize = 256;
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -657,6 +660,7 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
     let mut open: Vec<(String, Option<i64>)> = Vec::new();
     let mut root: Option<Element> = None;
     let mut held: Vec<Held> = Vec::new();
+    let mut held_len = 0;
     let mut main: Option<C14n> = None;
     let mut signature: Option<Signature> = None;
     let mut copy: Option<Copy> = None;
@@ -689,7 +693,13 @@ pub fn read(r: impl Read, wanted: &[String], certs: &[Cert], now_ms: i64) -> Res
                 if !in_signature {
                     match main.as_mut() {
                         Some(m) => m.text(&t),
-                        None => held.push(Held::Text(t)),
+                        None => {
+                            held_len += t.len();
+                            if held_len > MAX_HELD {
+                                return Err(bad("the aggregate has too much text before its signature"));
+                            }
+                            held.push(Held::Text(t));
+                        }
                     }
                 }
             }
@@ -1087,6 +1097,7 @@ mod tests {
         assert_eq!(swap(r#"Algorithm="http://www.w3.org/2001/04/xmlenc#sha256""#, r#"Algorithm="http://www.w3.org/2000/09/xmldsig#sha1""#), Err("weak_algorithm".into()));
         assert_eq!(swap("<ds:SignatureValue>", "<ds:SignatureValue>AAAA"), Err("bad_signature".into()));
         assert_eq!(swap("<ds:Signature ", "<md:Extensions/><ds:Signature "), Err("unsigned".into()), "the signature must come first");
+        assert_eq!(swap("<ds:Signature ", &format!("{}<ds:Signature ", "  \n<!---->".repeat(30_000))), Err("bad_metadata".into()), "only so much text is held for it");
         assert_eq!(swap("\n</md:EntitiesDescriptor>", &format!("<ds:Signature xmlns:ds=\"{}\"/>\n</md:EntitiesDescriptor>", xmldsig::DSIG)), Err("wrapped".into()), "a second signature");
         assert_eq!(swap(r#"ID="_agg""#, r#"ID="_other""#), Err("wrapped".into()), "a signature over something else");
         assert_eq!(read_ok(&good[..good.len() / 2], &[A]).err().as_deref(), Some("bad_metadata"), "cut short");

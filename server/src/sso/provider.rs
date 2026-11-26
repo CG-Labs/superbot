@@ -170,6 +170,88 @@ struct AggregateFetch {
     last_modified: Option<String>,
 }
 
+/// One download of a federation aggregate, with what it updates, so it can go on after the
+/// sign-in that started it has its answer.
+struct AggregateRefresh {
+    provider: String,
+    url: String,
+    entity_ids: Vec<String>,
+    sign_requests: bool,
+    request_binding: RequestBinding,
+    response_binding: ResponseBinding,
+    certs: Vec<xmldsig::Cert>,
+    idp: Arc<Mutex<IdpCopies>>,
+    refused: Arc<Mutex<Refusals>>,
+}
+
+impl AggregateRefresh {
+    /// Downloads the aggregate and replaces each IdP's copy with what it lists. An IdP
+    /// missing from it, or refused in it, loses its copy: the federation dropped it.
+    async fn run(&self, fetch: &mut AggregateFetch) -> Result<(), Invalid> {
+        let (id, url) = (&self.provider, &self.url);
+        let idp = || self.idp.lock().unwrap_or_else(|e| e.into_inner());
+        // Unchanged is only worth hearing when every copy from it is still good.
+        let now = crate::db::now();
+        let unchanged_ok = {
+            let idp = idp();
+            let held: Vec<&Arc<IdpMetadata>> = self.entity_ids.iter().filter_map(|e| idp.get(e).map(|(m, _)| m)).collect();
+            !held.is_empty() && held.iter().all(|m| m.valid_at(now))
+        };
+        let validators = unchanged_ok.then(|| (fetch.etag.clone(), fetch.last_modified.clone()));
+        match get_aggregate(url, &self.entity_ids, self.certs.clone(), validators).await {
+            Ok(None) => {
+                fetch.read = Some(Instant::now());
+                fetch.failed = None;
+                for (_, at) in idp().values_mut() {
+                    *at = Instant::now();
+                }
+            }
+            Ok(Some((read, etag, last_modified))) => {
+                *fetch = AggregateFetch { read: Some(Instant::now()), failed: None, etag, last_modified };
+                for f in &read.found {
+                    match saml_sp::load_aggregate_entity(f, self.sign_requests, self.request_binding, self.response_binding, crate::db::now()) {
+                        Ok(m) => {
+                            idp().insert(m.entity_id.clone(), (Arc::new(m), Instant::now()));
+                        }
+                        Err(e) => {
+                            crate::obs::log::log_warn!("SSO {id}: IdP {} in the aggregate at {url}: {e}", f.entity_id);
+                            idp().remove(&f.entity_id);
+                            if e.untrusted() {
+                                refuse(&self.refused, &f.entity_id, e);
+                            }
+                        }
+                    }
+                }
+                for (entity, why) in &read.problems {
+                    crate::obs::log::log_warn!("SSO {id}: IdP {entity} in the aggregate at {url}: {why}");
+                    idp().remove(entity);
+                }
+                let missing: Vec<&str> = self.entity_ids.iter().filter(|e| !read.found.iter().any(|f| f.entity_id == **e) && !read.problems.iter().any(|(p, _)| p == *e)).map(String::as_str).collect();
+                for entity in &missing {
+                    idp().remove(*entity);
+                }
+                if !missing.is_empty() {
+                    crate::obs::log::log_warn!("SSO {id}: the aggregate at {url} doesn't list {}: check SSO_{}_IDP_ENTITY_IDS", missing.join(", "), id.to_ascii_uppercase());
+                }
+            }
+            Err((e, refused)) => {
+                fetch.failed = Some((Instant::now(), e));
+                if let Some(r) = refused.filter(MetadataRefused::untrusted) {
+                    refuse(&self.refused, "", r);
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn refuse(refused: &Mutex<Refusals>, entity_id: &str, e: MetadataRefused) {
+    let mut refused = refused.lock().unwrap_or_else(|e| e.into_inner());
+    refused.retain(|(idp, _)| idp != entity_id);
+    refused.push((entity_id.to_string(), e));
+}
+
 /// How long a federation aggregate may take to download: eduGAIN's is about 100 MB.
 const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -183,12 +265,12 @@ pub struct Provider {
     pub jit_role: Option<Role>,
     cache: tokio::sync::Mutex<Cache>,
     /// Native SAML: each IdP's metadata, by entity ID, and when it was loaded.
-    idp: Mutex<HashMap<String, (Arc<IdpMetadata>, Instant)>>,
+    idp: Arc<Mutex<IdpCopies>>,
     /// Native SAML: held while an IdP's metadata is fetched, by entity ID, with that IdP's
     /// last failed fetch. One per IdP, so a slow answer for one doesn't hold up another.
     idp_fetch: Mutex<HashMap<String, Arc<IdpFetch>>>,
     /// Native SAML from a federation aggregate: its last download, for every IdP at once.
-    aggregate: tokio::sync::Mutex<AggregateFetch>,
+    aggregate: Arc<tokio::sync::Mutex<AggregateFetch>>,
     /// Native SAML: our signing key, once loaded or made (ADR 0137).
     pub(super) sp_key: Mutex<Option<Arc<SpKey>>>,
     /// Native SAML: our encryption key, likewise (ADR 0150).
@@ -198,8 +280,11 @@ pub struct Provider {
     pub(super) held: [Mutex<Option<Arc<super::saml_keys::Held>>>; 2],
     /// Native SAML: metadata from the URL refused for its signature or validity, not yet
     /// audited, by the IdP it was for.
-    metadata_refused: Mutex<Vec<(String, MetadataRefused)>>,
+    metadata_refused: Arc<Mutex<Refusals>>,
 }
+
+type IdpCopies = HashMap<String, (Arc<IdpMetadata>, Instant)>;
+type Refusals = Vec<(String, MetadataRefused)>;
 
 #[derive(Default)]
 struct Cache {
@@ -464,7 +549,7 @@ async fn get_aggregate(
 
 impl Provider {
     pub fn new(id: &str, label: &str, kind: Kind, client_id: &str, scopes: &str, jit_role: Option<Role>) -> Provider {
-        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Mutex::default(), idp_fetch: Mutex::default(), aggregate: Default::default(), sp_key: Mutex::default(), enc_key: Mutex::default(), held: Default::default(), metadata_refused: Mutex::default() }
+        Provider { id: id.into(), label: label.into(), kind, client_id: client_id.into(), scopes: scopes.into(), jit_role, cache: Default::default(), idp: Default::default(), idp_fetch: Mutex::default(), aggregate: Default::default(), sp_key: Mutex::default(), enc_key: Mutex::default(), held: Default::default(), metadata_refused: Default::default() }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -828,14 +913,8 @@ impl Provider {
         self.idp.lock().unwrap_or_else(|e| e.into_inner()).insert(m.entity_id.clone(), (Arc::new(m), Instant::now()));
     }
 
-    fn remove_idp(&self, entity_id: &str) {
-        self.idp.lock().unwrap_or_else(|e| e.into_inner()).remove(entity_id);
-    }
-
     fn refused(&self, entity_id: &str, e: MetadataRefused) {
-        let mut refused = self.metadata_refused.lock().unwrap_or_else(|e| e.into_inner());
-        refused.retain(|(idp, _)| idp != entity_id);
-        refused.push((entity_id.to_string(), e));
+        refuse(&self.metadata_refused, entity_id, e);
     }
 
     /// Native SAML: metadata from the URL refused since the last call, by the IdP it was
@@ -930,10 +1009,9 @@ impl Provider {
 
     /// Native SAML from a federation aggregate (ADR 0301): IdP `entity_id`'s metadata, from
     /// the aggregate at `url`, read at most daily for all the provider's IdPs at once, and
-    /// only when it changed. While it downloads, sign-ins at IdPs with a good copy go on with
-    /// it. A download costs the federation tens of MB, so after a failure it's retried at
-    /// most once per ten `gap`s. An IdP missing from the aggregate, or refused in it, loses
-    /// its copy: the federation dropped it.
+    /// only when it changed. Sign-ins at IdPs with a good copy go on with it while it
+    /// downloads, also the one that started the download. A download costs the federation
+    /// tens of MB, so after a failure it's retried at most once per ten `gap`s.
     async fn idp_from_aggregate(&self, gap: Duration, entity_id: &str, url: &str, stale: Option<Arc<IdpMetadata>>, expired: bool) -> Result<Arc<IdpMetadata>, Invalid> {
         let Kind::SamlSp { entity_ids, sign_requests, request_binding, response_binding, metadata_trust, .. } = &self.kind else {
             return Err(Invalid("not_configured"));
@@ -944,17 +1022,18 @@ impl Provider {
             None if expired => Err(Invalid("idp_metadata_expired")),
             None => Err(e),
         };
-        let mut fetch = match self.aggregate.try_lock() {
+        let valid = |m: &Option<Arc<IdpMetadata>>| m.as_ref().is_some_and(|m| m.valid_at(crate::db::now()));
+        let mut fetch = match self.aggregate.clone().try_lock_owned() {
             Ok(f) => f,
-            Err(_) if stale.as_ref().is_some_and(|m| m.valid_at(crate::db::now())) => return good(stale, Invalid("idp_bad_response")),
-            Err(_) => self.aggregate.lock().await,
+            Err(_) if valid(&stale) => return good(stale, Invalid("idp_bad_response")),
+            Err(_) => self.aggregate.clone().lock_owned().await,
         };
         let retry = gap * 10;
         let copy = self.idp_loaded_for(entity_id);
         let since = |at: Option<Instant>, d: Duration| at.is_some_and(|at| at.elapsed() < d);
         // Read today, by whoever held the lock just now or before: this IdP wasn't in it, or
         // its copy expired since, and reading it again so soon won't change that.
-        if since(fetch.read, META_TTL) && (copy.as_ref().is_none_or(|m| m.valid_at(crate::db::now())) || since(fetch.read, retry)) {
+        if since(fetch.read, META_TTL) && (copy.is_none() || valid(&copy) || since(fetch.read, retry)) {
             return good(copy, Invalid("idp_bad_response"));
         }
         if let Some((at, e)) = fetch.failed
@@ -962,55 +1041,28 @@ impl Provider {
         {
             return good(copy, e);
         }
-        let held: Vec<Arc<IdpMetadata>> = entity_ids.iter().filter_map(|e| self.idp_loaded_for(e)).collect();
-        // Unchanged is only worth hearing when every copy from it is still good.
-        let now = crate::db::now();
-        let validators = (!held.is_empty() && held.iter().all(|m| m.valid_at(now))).then(|| (fetch.etag.clone(), fetch.last_modified.clone()));
-        let certs = metadata_trust.as_ref().map(|t| t.certs.clone()).unwrap_or_default();
-        match get_aggregate(url, entity_ids, certs, validators).await {
-            Ok(None) => {
-                fetch.read = Some(Instant::now());
-                fetch.failed = None;
-                let mut idp = self.idp.lock().unwrap_or_else(|e| e.into_inner());
-                for (_, at) in idp.values_mut() {
-                    *at = Instant::now();
-                }
-            }
-            Ok(Some((read, etag, last_modified))) => {
-                *fetch = AggregateFetch { read: Some(Instant::now()), failed: None, etag, last_modified };
-                for f in &read.found {
-                    match saml_sp::load_aggregate_entity(f, *sign_requests, *request_binding, *response_binding, crate::db::now()) {
-                        Ok(m) => self.set_idp(m),
-                        Err(e) => {
-                            crate::obs::log::log_warn!("SSO {}: IdP {} in the aggregate at {url}: {e}", self.id, f.entity_id);
-                            self.remove_idp(&f.entity_id);
-                            if e.untrusted() {
-                                self.refused(&f.entity_id, e);
-                            }
-                        }
-                    }
-                }
-                for (idp, why) in &read.problems {
-                    crate::obs::log::log_warn!("SSO {}: IdP {idp} in the aggregate at {url}: {why}", self.id);
-                    self.remove_idp(idp);
-                }
-                let missing: Vec<&str> = entity_ids.iter().filter(|e| !read.found.iter().any(|f| f.entity_id == **e) && !read.problems.iter().any(|(p, _)| p == *e)).map(String::as_str).collect();
-                for idp in &missing {
-                    self.remove_idp(idp);
-                }
-                if !missing.is_empty() {
-                    crate::obs::log::log_warn!("SSO {}: the aggregate at {url} doesn't list {}: check SSO_{}_IDP_ENTITY_IDS", self.id, missing.join(", "), self.id.to_ascii_uppercase());
-                }
-            }
-            Err((e, refused)) => {
-                fetch.failed = Some((Instant::now(), e));
-                if let Some(r) = refused.filter(MetadataRefused::untrusted) {
-                    self.refused("", r);
-                }
-                return good(self.idp_loaded_for(entity_id), e);
-            }
+        let refresh = AggregateRefresh {
+            provider: self.id.clone(),
+            url: url.to_string(),
+            entity_ids: entity_ids.clone(),
+            sign_requests: *sign_requests,
+            request_binding: *request_binding,
+            response_binding: *response_binding,
+            certs: metadata_trust.as_ref().map(|t| t.certs.clone()).unwrap_or_default(),
+            idp: self.idp.clone(),
+            refused: self.metadata_refused.clone(),
+        };
+        if valid(&copy) {
+            tokio::spawn(async move { refresh.run(&mut fetch).await });
+            return good(copy, Invalid("idp_bad_response"));
         }
-        good(self.idp_loaded_for(entity_id), Invalid("idp_bad_response"))
+        let e = refresh.run(&mut fetch).await.err().unwrap_or(Invalid("idp_bad_response"));
+        good(self.idp_loaded_for(entity_id), e)
+    }
+
+    /// Waits for a federation aggregate download in progress, so what it loads is in use.
+    pub async fn idp_refreshed(&self) {
+        drop(self.aggregate.lock().await);
     }
 
     /// The discovery document, retried at most once per `gap` after a failure.
