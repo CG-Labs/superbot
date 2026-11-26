@@ -1,0 +1,124 @@
+# promtool test rules superbot-health-score.rules.test.yml
+rule_files:
+  - superbot-health-score.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Healthy and recorded each day: nothing.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_health_score{job="superbot",instance="a:8080"}'
+        values: '90x3000'
+      - series: 'superbot_health_score_band{job="superbot",instance="a:8080",band="healthy"}'
+        values: '1x3000'
+      - series: 'superbot_health_score_band{job="superbot",instance="a:8080",band="at_risk"}'
+        values: '0x3000'
+      - series: 'superbot_health_signal_at_risk{job="superbot",instance="a:8080",signal="backups"}'
+        values: '0x3000'
+      - series: 'superbot_health_score_recorded_timestamp_seconds{job="superbot",instance="a:8080"}'
+        values: '0x1439 86400x1439 172800x200'
+    alert_rule_test:
+      - eval_time: 40h
+        alertname: SuperBotHealthScoreAtRisk
+        exp_alerts: []
+      - eval_time: 40h
+        alertname: SuperBotHealthSignalAtRisk
+        exp_alerts: []
+      - eval_time: 40h
+        alertname: SuperBotHealthScoreFell
+        exp_alerts: []
+      - eval_time: 49h
+        alertname: SuperBotHealthScoreNotRecorded
+        exp_alerts: []
+
+  # The next day's record is at risk, with backups at risk: a ticket for each, at once.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_health_score_band{job="superbot",instance="a:8080",band="at_risk"}'
+        values: '0x1439 1x600'
+      - series: 'superbot_health_signal_at_risk{job="superbot",instance="a:8080",signal="backups"}'
+        values: '0x1439 1x600'
+      - series: 'superbot_health_signal_at_risk{job="superbot",instance="a:8080",signal="adoption"}'
+        values: '0x2040'
+    alert_rule_test:
+      - eval_time: 23h
+        alertname: SuperBotHealthScoreAtRisk
+        exp_alerts: []
+      - eval_time: 25h
+        alertname: SuperBotHealthScoreAtRisk
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: The customer health score is at risk
+              description: "The 30-day health score is below 50. Contact the customer's owner this week with a plan, and tell the support manager. botctl health-score shows each signal; docs/support/health-score.md says what to do about each."
+      - eval_time: 25h
+        alertname: SuperBotHealthSignalAtRisk
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+              signal: backups
+            exp_annotations:
+              summary: "A health score signal is at risk: backups"
+              description: "The backups signal of the customer health score is at risk. Call the customer before the next check-in; docs/support/health-score.md#backups says what to do."
+
+  # A 12-point fall is a ticket on one server, an 8-point one on another isn't.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_health_score{job="superbot",instance="a:8080"}'
+        values: '90x1439 78x200'
+      - series: 'superbot_health_score{job="superbot",instance="b:8080"}'
+        values: '90x1439 82x200'
+    alert_rule_test:
+      - eval_time: 23h
+        alertname: SuperBotHealthScoreFell
+        exp_alerts: []
+      - eval_time: 25h
+        alertname: SuperBotHealthScoreFell
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: The customer health score fell 10 points or more this week
+              description: "The 30-day health score is 12 points below its highest in the last 7 days. botctl health-score history shows which signals got worse; raise it at the next check-in, sooner for a signal at risk."
+
+  # Recording stopped: a ticket an hour after the newest day is 36 hours old.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_health_score_recorded_timestamp_seconds{job="superbot",instance="a:8080"}'
+        values: '0x3000'
+    alert_rule_test:
+      - eval_time: 36h30m
+        alertname: SuperBotHealthScoreNotRecorded
+        exp_alerts: []
+      - eval_time: 38h
+        alertname: SuperBotHealthScoreNotRecorded
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: botd hasn't recorded the health score for over a day
+              description: "The newest recorded health score is more than 36 hours old. botd's log says why (Health score history: couldn't record today's score); check the disk, and run botd support check."
+
+  # HEALTH_SCORE_HISTORY_DAYS=0: botd writes none of the series, and nothing fires. (While it
+  # records, botd writes a timestamp of 0 when it has no day it can read, as above.)
+  - interval: 1m
+    input_series:
+      - series: 'superbot_build_info{job="superbot",instance="a:8080",version="0.1.0"}'
+        values: '1x3000'
+    alert_rule_test:
+      - eval_time: 49h
+        alertname: SuperBotHealthScoreNotRecorded
+        exp_alerts: []
+      - eval_time: 49h
+        alertname: SuperBotHealthScoreAtRisk
+        exp_alerts: []

@@ -87,6 +87,18 @@ Or `GET /api/support/health-score/history?days=90` as an admin (1 to 3650 days),
 
 At a [health check](health-check.md), a fall of 10 points or more since the last check, or a signal that went from ok to at risk, is worth a line in the customer's record even if the band didn't change.
 
+## Alerts
+
+botd doesn't wait for the next check to say the score fell ([ADR 0307](../adr/0307-health-score-alerts.md)). When it records the day's score, it compares it with the day recorded before, and tells its alert channels once, on the day it shows, when:
+
+- **the band fell**: healthy to watch or at risk, or watch to at risk;
+- **a signal went at risk** that wasn't the day before, with what botd saw and the signal's section of this page;
+- **the score fell 10 points or more below the last [health check](health-check.md)'s**, on the day it crossed (a day recorded before the check doesn't count: it can't have told of a fall from it).
+
+The notice goes to the global email list and webhook of [approval notifications](../../deploy/README.md#approval-notifications), where botd's other alerts go, with a link to the console's Support tab. Each is recorded as `support.health_score_fell` (both days' scores and bands, the signals newly at risk, the check's score), so `botctl audit --action support.health_score_fell` lists them. Recovery isn't told. Alerts need the [history](#history): with `HEALTH_SCORE_HISTORY_DAYS=0` there's nothing to compare with. A customer's admin who gets one forwards it to their TAM, and the TAM calls before the next check-in ([TAM programme](tam.md#cadence)).
+
+For Prometheus, `/metrics` shows the newest recorded day: `superbot_health_score`, `superbot_health_score_band{band}` (1 for its band), `superbot_health_signal_at_risk{signal}` and `superbot_health_score_recorded_timestamp_seconds` (0 while botd records but has no day it can read, so a history that never records is alerted on too). [`superbot-health-score.rules.yml`](../../deploy/prometheus/superbot-health-score.rules.yml) turns them into tickets, never pages: the band at risk, a signal at risk, a fall of 10 points or more below the week's highest score, and no new record for 36 hours. A Provider that scrapes its customers' servers routes these to each customer's TAM.
+
 ## What it isn't
 
 - **Not a measure of support.** Tickets, response times and satisfaction live in the support system, which botd can't see. The [support report](support-report.md) counts tickets and response targets from its export; put it beside the score in the [review](qbr-template.md).

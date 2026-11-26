@@ -19,7 +19,8 @@
 //! move (`residency.chats_moved`), backs each store up daily in its folder, and says where
 //! a pin's data is for reports, the app and admins. Once a Bot's rows have left a store,
 //! botd rewrites that store's backups without them (ADR 0238), so a pin's data isn't left
-//! in another region's backups until they age out.
+//! in another region's backups until they age out. An admin can move a store to another
+//! folder in its region while botd runs (`chat_store_move`, ADR 0309).
 
 use super::ControlPlane;
 use super::server_data::{Policy, ServerData};
@@ -182,7 +183,7 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
     let key = database_encryption::installed();
     let mut rekeyed = 0;
     for (_, dir) in &s.dirs {
-        std::mem::forget(database_encryption::lock_data_dir(&dir.join("chats.sqlite"))?);
+        hold_store_lock(&dir.join("chats.sqlite"))?;
     }
     // Before anything rewrites a restored store, which its restore's note names by inode.
     let restored = super::chat_store_restore::audit_restores(db, &s.dirs);
@@ -244,6 +245,21 @@ pub fn open(db: &Db, s: &Settings, data_dir: &Path, previous: Option<&DbKey>, ke
         lines.push(format!("Regional chat stores: moved {} of {} Bots from {} to {}.", moved(&m), m.bots, place_name(&m.from), place_name(&m.to)));
     }
     Ok(Opened { lines, rekeyed, approvals, push_tokens, user_secrets, second_factors })
+}
+
+/// The locks botd holds on its stores' files while it runs, so two botds can't share one.
+static LOCKS: std::sync::Mutex<Vec<(PathBuf, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
+
+/// Takes and keeps the lock on the store at `path` until `release_store_lock`.
+pub(super) fn hold_store_lock(path: &Path) -> Result<(), String> {
+    let f = database_encryption::lock_data_dir(path)?;
+    LOCKS.lock().unwrap_or_else(|e| e.into_inner()).push((path.to_path_buf(), f));
+    Ok(())
+}
+
+/// Lets go of the lock on the store at `path`: a store moved away from it (ADR 0309).
+pub(super) fn release_store_lock(path: &Path) {
+    LOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(p, _)| p != path);
 }
 
 fn moved(m: &ChatMove) -> String {
@@ -647,6 +663,7 @@ pub fn finish_clearing<T>(db: &Db, cleared: Vec<(String, Result<Clearing, String
 /// store, copies them off the host where a region has a bucket (ADR 0246), and only then
 /// records the moves as cleared.
 pub async fn hourly(app: &AppState, cp: &ControlPlane) {
+    let _folders = super::chat_store_move::FOLDERS.lock().await;
     let (a, keep) = (app.clone(), cp.chat_stores.keep);
     let cleared = tokio::task::spawn_blocking(move || {
         backup_pass(&a.db, keep, now());
@@ -702,8 +719,9 @@ pub fn region_view(app: &App, cp: &ControlPlane, region: &str) -> Option<Value> 
 }
 
 /// Warnings for admins: stores whose newest backup is over a day old while they hold
-/// anything, stores whose backups have held rows that left them for over two checks, and
-/// stores whose backups' last copy off the host failed (ADR 0246).
+/// anything, stores whose backups have held rows that left them for over two checks,
+/// stores whose backups' last copy off the host failed (ADR 0246), and stores moved while
+/// botd ran to a folder REGION_DATA_DIRS doesn't name yet (ADR 0309).
 pub fn warnings(app: &App, cp: &ControlPlane, at: i64) -> Vec<String> {
     let copies = cp.chat_copies.as_deref().map(|c| c.warnings(&app.db.chat_stores())).unwrap_or_default();
     let counts = app.db.chat_store_counts();
@@ -730,7 +748,8 @@ pub fn warnings(app: &App, cp: &ControlPlane, at: i64) -> Vec<String> {
             format!("{}'s chat store's backups may still hold {} that left it; check botd's log for {CLEARED} failures (ADR 0238).", s.region, whose.join(" and "))
         })
     });
-    stale.chain(uncleared).chain(copies).collect()
+    let moved = super::chat_store_move::warnings(&app.db, cp);
+    stale.chain(uncleared).chain(copies).chain(moved).collect()
 }
 
 /// What of the Bots `owners` own, and of their own facts, is in a pin to `region`'s store, in

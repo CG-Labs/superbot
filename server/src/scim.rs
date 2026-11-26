@@ -967,7 +967,7 @@ fn sso_link(a: &Auth, t: &ScimToken, external_id: Option<&str>) -> ScimRes<Optio
 /// 0297), which the provider must still list; else the provider's own.
 fn linked_issuer(p: &crate::sso::Provider, t: &ScimToken) -> Result<(String, Option<String>), String> {
     match &t.sso_idp {
-        Some(idp) => p.issuer_at(idp).map(|i| (i, None)).map_err(|e| format!("This SCIM tenant links the IdP {idp} of {}: {e}. List it again, or provision its people with a new tenant.", p.id)),
+        Some(idp) => p.issuer_linked(idp).map(|i| (i, None)).map_err(|e| format!("This SCIM tenant links the IdP {idp} of {}: {e}. List it again, or provision its people with a new tenant.", p.id)),
         None if p.several_idps() => Err(format!(
             "This SCIM tenant links {pid}, which has several IdPs now, without saying whose NameIDs its externalIds are. Name it: botctl scim token create {} --sso {pid} --idp <entity ID>.",
             t.tenant,

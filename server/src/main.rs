@@ -59,6 +59,9 @@ mod handover;
 mod handover_http_tests;
 #[cfg(test)]
 mod harness_version_http_tests;
+mod health_alert;
+#[cfg(test)]
+mod health_alert_http_tests;
 mod health_check;
 #[cfg(test)]
 mod health_check_http_tests;
@@ -1268,6 +1271,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/team-networks", get(machines::team_network::list))
         .route("/machines/egress-policy", get(machines::egress_policy::get_server).put(machines::egress_policy::set_server))
         .route("/regions", get(machines::region::list))
+        .route("/regions/{region}/chat-store/move", post(machines::chat_store_move::move_http))
         .route("/machines/hosts", get(machines::hosts::list))
         .route("/machines/hosts/{name}/recover", post(machines::hosts::recover))
         .route("/machines/hosts/{name}/drain", put(machines::hosts::drain).delete(machines::hosts::undrain))

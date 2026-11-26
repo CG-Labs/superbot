@@ -108,10 +108,19 @@ impl Place {
             },
         };
         let c = database_encryption::open_read_only(&db_path, db_key.as_ref()).map_err(|e| format!("{}: {e}", db_path.display()))?;
-        let id: Option<String> = c.query_row("SELECT store_id FROM chat_stores WHERE region = ?1", [region], |r| r.get(0)).optional().unwrap_or(None);
-        let Some(id) = id else {
+        let rec: Option<(String, String)> = c.query_row("SELECT store_id, path FROM chat_stores WHERE region = ?1", [region], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap_or(None);
+        let Some((id, was)) = rec else {
             return Err(format!("botd has no chat store recorded for {region}, so there is no store to restore (ADR 0215)"));
         };
+        let here = folder.join("chats.sqlite");
+        if let (Format::Missing, Some(moved)) = (database_encryption::format(&here)?, crate::db::moved_to(&was, &here)?) {
+            return Err(format!(
+                "{region}'s chat store was moved to {} while botd ran, with its backups. Set {} to {region}={} first (ADR 0309)",
+                moved.display(),
+                chat_stores::SETTING,
+                moved.display()
+            ));
+        }
         let store = ChatStore { region: region.to_string(), schema: String::new(), path: folder.join("chats.sqlite"), id };
         drop(c);
         let sealed = masters.iter().filter_map(|k| {
@@ -1531,6 +1540,20 @@ mod tests {
         let mut s = w.settings(&[("REGION_DATA_DIRS", &format!("gb-lon={}", unrecorded.path().display()))]);
         s = Settings::new(None, None, s.vars().into_iter().map(|(k, v)| if k == "DATA_DIR" { (k, unrecorded.path().join("data").display().to_string()) } else { (k, v) }).collect());
         assert!(Place::locate(&s, "gb-lon").err().unwrap().contains("no botd database"));
+    }
+
+    #[test]
+    fn a_store_moved_while_botd_ran_is_found_only_once_the_settings_name_its_new_folder() {
+        let (w, db) = World::new();
+        let lon2 = w.t.path().join("lon-2");
+        std::fs::create_dir_all(&lon2).unwrap();
+        db.move_chat_store("gb-lon", &lon2.join("chats.sqlite"), None, None).unwrap();
+        drop(db);
+        crate::db::remove_store_files(&w.store());
+        let e = Place::locate(&w.settings(&[]), "gb-lon").err().unwrap();
+        assert!(e.contains(&format!("was moved to {} while botd ran", lon2.display())) && e.contains("ADR 0309"), "{e}");
+        let s = w.settings(&[("REGION_DATA_DIRS", &format!("gb-lon={},de-fra-2={}", lon2.display(), w.fra.display()))]);
+        assert_eq!(Place::locate(&s, "gb-lon").unwrap().store.path, lon2.join("chats.sqlite"));
     }
 
     #[tokio::test]

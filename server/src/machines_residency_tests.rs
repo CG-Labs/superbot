@@ -1359,3 +1359,92 @@ async fn a_pinned_persons_store_backups_are_copied_off_the_host_into_a_bucket_in
     let copied = audit(port, &admin, COPIED).await;
     assert_eq!((copied[0]["details"]["uploaded"].as_i64(), copied[0]["details"]["deleted"].as_i64()), (Some(1), Some(1)), "{copied:?}");
 }
+
+#[tokio::test]
+async fn an_admin_moves_a_regions_chat_store_to_another_folder_while_botd_runs() {
+    use crate::machines::chat_store_move::{NOTE, STORE_MOVED};
+    use crate::machines::chat_stores::{self, Settings};
+    let scratch = crate::db::Scratch::new();
+    let (lon, fra, lon2) = (scratch.path().join("lon"), scratch.path().join("fra"), scratch.path().join("lon-2"));
+    std::fs::create_dir_all(&lon).unwrap();
+    std::fs::create_dir_all(&fra).unwrap();
+    let settings = Settings { dirs: vec![("gb-lon".into(), lon.clone()), ("de-fra-2".into(), fra.clone())], keep: 7, forget: Vec::new() };
+    let set = settings.clone();
+    let (port, app, admin, cp) = linode_set(move |cp| cp.chat_stores = set).await;
+    let cipher = crate::secrets::sealed::cipher();
+    chat_stores::open(&app.db, &settings, &app.cfg.data_dir, None, chat_stores::Keys { current: &cipher, previous: None, forget: false, new_derived_keys: false }).unwrap();
+    let (ada, ada_s) = user_with(port, &admin, "ada@example.com", "member").await;
+    let bot = app.db.create_bot_owned("B", "#fff", "waddle", "claude", None, false, &ada, crate::acl::Visibility::Private).id;
+    app.db.add_message(&bot, "user", "chat-0309-before", None, false, None);
+    assert_eq!(call(port, "PUT", &format!("/api/users/{ada}/residency"), &admin, &pin("gb-lon", "DPA-1")).await.0, 200);
+    chat_stores::hourly(&app, &cp).await;
+    let rows = |p: &std::path::Path| rusqlite::Connection::open(p.join("chats.sqlite")).unwrap().query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(rows(&lon), 1);
+
+    // Only admins move a store, to an empty folder outside DATA_DIR and every store's own.
+    let path = "/api/regions/gb-lon/chat-store/move";
+    let to = |f: &std::path::Path| json!({ "folder": f }).to_string();
+    assert_eq!(call(port, "POST", path, &ada_s, &to(&lon2)).await.0, 403);
+    assert_eq!(call(port, "POST", path, &admin, r#"{"dir":"/x"}"#).await.0, 400);
+    assert_eq!(call(port, "POST", "/api/regions/us-east/chat-store/move", &admin, &to(&lon2)).await.0, 404);
+    let refused = |folder: String| {
+        let admin = admin.clone();
+        async move { call_json(port, "POST", path, &admin, &json!({ "folder": folder }).to_string()).await }
+    };
+    for (folder, why) in [
+        ("lon-2".to_string(), "absolute path"),
+        (format!("{}/../lon-2", lon.display()), "can't contain \"..\""),
+        (app.cfg.data_dir.join("lon").display().to_string(), "outside DATA_DIR"),
+        (lon.join("inner").display().to_string(), "gb-lon's store's own folder"),
+        (fra.display().to_string(), "de-fra-2's chat store's folder"),
+    ] {
+        let (code, body) = refused(folder.clone()).await;
+        assert!(code == 409 && body["error"].as_str().unwrap().contains(why), "{folder}: {code} {body}");
+    }
+    assert!(!lon.join("inner").exists() && !app.cfg.data_dir.join("lon").exists(), "folders made for a refused move are removed");
+    std::fs::create_dir_all(&lon2).unwrap();
+    std::fs::write(lon2.join("other.txt"), "x").unwrap();
+    let (code, body) = refused(lon2.display().to_string()).await;
+    assert!(code == 409 && body["error"].as_str().unwrap().contains("isn't empty"), "{body}");
+    std::fs::remove_file(lon2.join("other.txt")).unwrap();
+    let failed = audit(port, &admin, STORE_MOVED).await;
+    assert!(failed.iter().all(|e| e["outcome"] == "failure") && failed.len() == 6, "{failed:?}");
+
+    // Moved: the store and its backup are in the new folder, the old one keeps only a note,
+    // and the move is audited with what REGION_DATA_DIRS must say now.
+    let (code, m) = call_json(port, "POST", path, &admin, &to(&lon2)).await;
+    assert_eq!(code, 200, "{m}");
+    let want = format!("gb-lon={},de-fra-2={}", lon2.display(), fra.display());
+    assert_eq!((m["to"].as_str(), m["backups"].as_i64(), m["regionDataDirs"].as_str()), (Some(lon2.to_str().unwrap()), Some(1), Some(want.as_str())), "{m}");
+    assert!(m["next"].as_str().unwrap().contains(&format!("Set REGION_DATA_DIRS={want}")), "{m}");
+    assert_eq!(rows(&lon2), 1);
+    assert_eq!(std::fs::read_dir(lon2.join("backups")).unwrap().count(), 1);
+    let left: Vec<String> = std::fs::read_dir(&lon).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left, vec![NOTE.to_string()]);
+    assert!(std::fs::read_to_string(lon.join(NOTE)).unwrap().contains(&format!("Set REGION_DATA_DIRS to gb-lon={}", lon2.display())));
+    let moved = audit(port, &admin, STORE_MOVED).await;
+    assert_eq!((moved[0]["outcome"].as_str(), moved[0]["details"]["to"].as_str(), moved[0]["targetId"].as_str()), (Some("success"), Some(lon2.to_str().unwrap()), Some("gb-lon")), "{moved:?}");
+
+    // botd keeps going there: new messages, the report and the hourly check.
+    app.db.add_message(&bot, "user", "chat-0309-after", None, false, None);
+    assert_eq!(rows(&lon2), 2);
+    let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;
+    assert_eq!((r["status"].as_str(), r["chats"]["messages"]["inStore"].as_i64()), (Some("kept"), Some(2)), "{r}");
+    chat_stores::hourly(&app, &cp).await;
+    assert!(audit(port, &admin, chat_stores::BACKUP_FAILED).await.is_empty());
+
+    // Admins are told REGION_DATA_DIRS still names the old folder.
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    let w = regions["residency"]["warnings"].to_string();
+    assert!(w.contains(&format!("gb-lon's chat store was moved to {} while botd ran, but REGION_DATA_DIRS still names {}", lon2.display(), lon.display())), "{regions}");
+    let row = regions["regions"].as_array().unwrap().iter().find(|x| x["id"] == "gb-lon").unwrap()["chatStore"].clone();
+    assert_eq!((row["messages"].as_i64(), row["backups"].as_i64()), (Some(2), Some(1)), "{regions}");
+
+    // Moved back, the old folder's note is no obstacle and the warning goes.
+    let (code, m) = call_json(port, "POST", path, &admin, &to(&lon)).await;
+    assert_eq!((code, m["backups"].as_i64()), (200, Some(1)), "{m}");
+    assert_eq!(rows(&lon), 2);
+    assert!(!lon.join(NOTE).exists() && lon2.join(NOTE).exists() && !lon2.join("chats.sqlite").exists());
+    let (_, regions) = call_json(port, "GET", "/api/regions", &admin, "").await;
+    assert!(!regions["residency"]["warnings"].to_string().contains("was moved to"), "{regions}");
+}

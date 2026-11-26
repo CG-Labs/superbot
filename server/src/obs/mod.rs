@@ -293,6 +293,7 @@ pub fn render(app: &AppState) -> String {
     crate::database_encryption::render(app, &mut out);
     crate::audit_export::render(app, &mut out);
     crate::audit_checkpoint::render(app, &mut out);
+    crate::health_alert::render(app, &mut out);
     errors::render(&mut out);
     app.db.tracer().render(&mut out);
     out
