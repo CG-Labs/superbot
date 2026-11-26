@@ -111,7 +111,10 @@ register reads the security owner's policy register (docs/security/policy-regist
 JSON file kept outside this repository) and writes one bundle for the period (a month at
 most, judged as of its end) of what it shows: each role's holder and deputy every day, each policy's latest approval (by the
 role its header names, within a year, and with --policies, of the text in force),
-everyone's acknowledgements and training, the open risks and their reviews, a management
+everyone's acknowledgements and awareness training, engineers' secure-development
+training and everyone's screening before access, recorded by the people lead (ADR 0312;
+with --training docs/security/training, the courses' texts in force are recorded), the
+open risks and their reviews, a management
 review each quarter, vendors assessed before use and reviewed yearly, their SOC 2 or
 ISO 27001 reports reviewed in the year, still current, with complementary controls
 noted and findings treated as risks (ADR 0279), exceptions

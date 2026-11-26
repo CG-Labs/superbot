@@ -84,11 +84,11 @@ Where the master key is, as botd finds it: `SUPERBOT_MASTER_KEY`, `SUPERBOT_MAST
 
 ### backups
 
-The archives `superbot-backup` left in `BACKUP_DIR` ([backup and restore](../ops/backup-restore.md)): how many, the newest's age, whether it's encrypted, and whether they leave the host. With a store (`SERVER_BACKUP_S3_*` or the machine backups'), it reads botd's record of the copies it made (`botctl backups`): ok only when a finished copy is of the newest archive, a warning when the newest copy is older, there's none, or the record can't be read (then it says the copies are unconfirmed), with how many failed since. `SERVER_BACKUP_OFF_HOST=off` turns botd's copies off even with a store; copies you make yourself can't be seen here, so that's info, never ok. A warning past 26 hours (the daily timer missed) or when they stay on the host, a failure past 7 days; before an upgrade, none is a failure and none in the last hour a warning. Without `BACKUP_DIR` (no `--home` or `--env-file`), it says it didn't look.
+The archives `superbot-backup` left in `BACKUP_DIR` ([backup and restore](../ops/backup-restore.md)): how many, the newest's age, whether it's encrypted, and whether they leave the host. With a store (`SERVER_BACKUP_S3_*` or the machine backups'), it reads botd's record of the copies it made (`botctl backups`): ok only when a finished copy is of the newest archive, a warning when the newest copy is older, there's none, or the record can't be read (then it says the copies are unconfirmed), with how many failed since. `SERVER_BACKUP_OFF_HOST=off` turns botd's copies off even with a store; copies you make yourself can't be seen here, so that's info, never ok. A warning past 26 hours (the daily timer missed) or when they stay on the host, a failure past 7 days; before an upgrade, none is a failure and none in the last hour a warning. Without `BACKUP_DIR` (no `--home` or `--env-file`), it says it didn't look. What to do about each: the [backups runbook](runbook-backups.md#server-backups).
 
 ### license
 
-The [license](../../deploy/README.md#license) as botd would load it (`LICENSE_KEY`, `LICENSE_KEY_FILE` or `DATA_DIR/license.key`), checked offline. A failure with none or an invalid or ended one (SuperBot has no free tier: Bots don't run), a warning in its grace period or within 14 days of its end, info in testing mode.
+The [license](../../deploy/README.md#license) as botd would load it (`LICENSE_KEY`, `LICENSE_KEY_FILE` or `DATA_DIR/license.key`), checked offline. A failure with none or an invalid or ended one (SuperBot has no free tier: Bots don't run), a warning in its grace period or within 14 days of its end, info in testing mode. What to do: the [license runbook](runbook-license.md).
 
 ## The offline bundle
 
