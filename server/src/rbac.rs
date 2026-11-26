@@ -59,7 +59,8 @@ pub enum Perm {
     /// People: list, add and edit users, make sign-in codes, end sessions. Never admins, or
     /// anyone with an admin permission, and never roles (ADR 0123).
     ManageUsers,
-    /// People's Bots and routines: list them, resume paused routines, move a tier's Bots.
+    /// People's Bots and routines: list them, resume paused routines, hand a disabled
+    /// person's on, move a tier's Bots.
     ManageBots,
     /// The audit log and the access-review report, and their exports.
     ViewAudit,
@@ -140,7 +141,7 @@ impl Perm {
             Perm::Write => "Chat with Bots and change them, routines and your own settings.",
             Perm::Approve => "Approve or deny a Bot's risky tool call.",
             Perm::ManageUsers => "List, add, edit, enable and disable people, make sign-in codes and end sessions. Not admins or anyone with an admin permission, and not roles.",
-            Perm::ManageBots => "List anyone's Bots and routines, resume paused routines, and move a tier's Bots to its default harness.",
+            Perm::ManageBots => "List anyone's Bots and routines, resume paused routines, hand a disabled person's Bots and routines to someone else (not an admin's, nor to yourself), and move a tier's Bots to its default harness.",
             Perm::ViewAudit => "Read and export the audit log and the access-review report.",
             Perm::ManageBilling => "See everyone's plan and use, and the tiers.",
             Perm::ApproveSignups => "See, approve and reject sign-ups, as members or read-only.",
@@ -283,6 +284,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("POST", ["service-accounts"]) | ("DELETE", ["service-accounts", _]) => ManageUsers,
         ("POST", ["service-accounts", _, "tokens"] | ["service-accounts", _, "tokens", _, "rotate"]) => ManageUsers,
         ("GET", ["users", _, "bots" | "routines"]) | ("POST", ["users", _, "routines", "resume"]) => ManageBots,
+        // Handing a disabled person's Bots on (ADR 0315). The handler keeps a delegate off
+        // admins, the owner, custom-role holders, the primary Bot and themselves.
+        ("POST", ["users", _, "handover"]) => ManageBots,
         ("POST", ["tiers", _, "move-bots"]) => ManageBots,
         ("GET", ["audit"] | ["audit", "export.csv"] | ["access-review"] | ["access-review", "export.csv"]) => ViewAudit,
         ("GET", ["usage"] | ["tiers"] | ["users", _, "usage"]) => ManageBilling,
@@ -539,7 +543,10 @@ mod tests {
             ("GET", "/api/users/u1/bots", Perm::ManageBots),
             ("GET", "/api/users/u1/routines", Perm::ManageBots),
             ("POST", "/api/users/u1/routines/resume", Perm::ManageBots),
-            ("POST", "/api/users/u1/handover", Perm::Admin),
+            ("POST", "/api/users/u1/handover", Perm::ManageBots),
+            ("POST", "/api/users/a%40example.com/handover", Perm::ManageBots),
+            ("GET", "/api/users/u1/handover", Perm::Admin),
+            ("POST", "/api/users/u1/handover/u2", Perm::Admin),
             ("GET", "/api/users/a%40example.com/bots", Perm::ManageBots),
             ("GET", "/api/users/u1/identities", Perm::Admin),
             ("POST", "/api/users/u1/identities", Perm::Admin),
@@ -750,7 +757,6 @@ mod tests {
             ("PUT", "/api/users/u1/region", Perm::ManageMachines),
             ("GET", "/api/users/u1/machine/screens", Perm::Admin),
             ("DELETE", "/api/users/u1/machine/screens/b1", Perm::Admin),
-            ("POST", "/api/users/u1/handover", Perm::Admin),
             ("GET", "/api/users/u1/isolation", Perm::Admin),
             ("POST", "/api/users/u1/harness-login", Perm::Admin),
             ("DELETE", "/api/users/u1", Perm::Admin),

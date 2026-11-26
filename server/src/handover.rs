@@ -2,15 +2,16 @@
 //! `botctl`, or SCIM, pauses every routine that runs on their behalf: on their Bots, or
 //! written by them. The scheduler and the runner refuse a routine whose owner or author
 //! is disabled anyway. Paused routines come back only when an admin resumes them (or
-//! with `ROUTINES_ON_ENABLE=resume`), and an admin can hand a disabled user's Bots and
-//! routines to someone else. Design: docs/adr/0047-disabled-users-routines.md.
+//! with `ROUTINES_ON_ENABLE=resume`), and an admin, or someone holding `bots.manage`, can
+//! hand a disabled user's Bots and routines to someone else.
+//! Design: docs/adr/0047-disabled-users-routines.md, docs/adr/0315-bot-handover-under-bots-manage.md.
 
 use crate::acl::{Access, Viewer};
 use crate::audit::{Outcome, Who};
 use crate::db::{self, Db, Routine, User};
 use crate::rbac::Role;
 use crate::runner::App;
-use crate::users::need_user_key;
+use crate::users::{need_user_key, Caller, Delegate, OPERATOR};
 use crate::{bad, not_found, ApiError, AppState, Res};
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -149,7 +150,8 @@ pub async fn resume_for(State(app): State<AppState>, Extension(by): Extension<Wh
 /// `POST /api/users/{key}/handover {to, resumeRoutines?}`: gives a disabled user's Bots
 /// to `to`, and moves the routines they wrote (and the pauses held for them) to `to`
 /// where `to` can run that Bot. Routines stay paused unless `resumeRoutines` is true.
-pub async fn handover(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
+/// Admins, and people holding `bots.manage` within `delegate_limits` (ADR 0315).
+pub async fn handover(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
     let from = need_user_key(&app, &key)?;
     let to_key = v["to"].as_str().map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| bad("to must be a user id or email"))?;
     let resume_now = match &v["resumeRoutines"] {
@@ -160,11 +162,18 @@ pub async fn handover(State(app): State<AppState>, Extension(by): Extension<Who>
     let to = app.db.find_user(to_key).ok_or_else(|| not_found("User"))?;
     check(&from, &to)?;
     let bots: Vec<db::Bot> = app.db.bots().into_iter().filter(|b| b.owner_id == from.id).collect();
+    let via = (!c.admin()).then_some(VIA_DELEGATE);
+    if via.is_some() {
+        delegate_limits(&Delegate::new(&app, &c, &by), &c, &from, &to, &bots)?;
+    }
     let tier = app.tier_of(&to.id);
     if let Some(max) = tier.limits.max_bots {
         let have = app.db.bots().iter().filter(|b| b.owner_id == to.id).count();
         if have + bots.len() > max as usize {
-            let details = json!({ "reason": "tier_bot_limit", "to": to.id, "bots": bots.len(), "has": have, "tier": tier.name, "limit": max });
+            let mut details = json!({ "reason": "tier_bot_limit", "to": to.id, "bots": bots.len(), "has": have, "tier": tier.name, "limit": max });
+            if let Some(via) = via {
+                details["via"] = json!(via);
+            }
             app.db.record(&by.event("user.handover_refused").target("user", &from.id).outcome(Outcome::Denied).details(details));
             return Err(ApiError(
                 StatusCode::FORBIDDEN,
@@ -201,11 +210,34 @@ pub async fn handover(State(app): State<AppState>, Extension(by): Extension<Who>
     } else {
         Vec::new()
     };
-    record(&app, &by, &from, &to, &moved, &routines, &skipped, &resumed);
+    record(&app, &by, &from, &to, Moved { bots: &moved, routines: &routines, skipped: &skipped, resumed: &resumed }, via);
     if let Some(e) = refused {
         return Err(e);
     }
     Ok(Json(json!({ "from": from.id, "to": to.id, "bots": moved, "routines": routines, "skipped": skipped, "resumed": resumed })))
+}
+
+/// How a handover by someone holding `bots.manage` but not the admin role is audited.
+pub const VIA_DELEGATE: &str = "bots.manage";
+
+/// What a `bots.manage` holder may not hand over (ADR 0315), each refusal audited as a
+/// delegate limit: as a person only; never the Bots of an admin, the owner account or
+/// anyone with a custom role across the server (whom `users.manage` can't change either);
+/// never the primary Bot; and never to themselves.
+fn delegate_limits(d: &Delegate, c: &Caller, from: &User, to: &User, bots: &[db::Bot]) -> Res<()> {
+    let Some(me) = c.user.as_ref().filter(|u| !u.service) else {
+        return Err(d.refuse("service_account", None, "Only a signed-in person can hand Bots over, not a service account."));
+    };
+    if from.role == Role::Admin || from.role_id.is_some() || from.id == OPERATOR {
+        return Err(d.refuse("protected_user", Some(&from.id), "Only an admin can hand over the Bots of an admin, the owner, or someone with a custom role."));
+    }
+    if let Some(b) = bots.iter().find(|b| b.primary) {
+        return Err(d.refuse("primary_bot", Some(&from.id), &format!("{} owns the primary Bot ({}), which only an admin can hand over.", from.name, b.name)));
+    }
+    if to.id == me.id {
+        return Err(d.refuse("self", Some(&from.id), "You can't hand Bots over to yourself. An admin, or someone else with bots.manage, can."));
+    }
+    Ok(())
 }
 
 /// Who can hand over to whom: from a disabled user to an active one who can run Bots.
@@ -225,9 +257,18 @@ fn check(from: &User, to: &User) -> Res<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn record(app: &App, by: &Who, from: &User, to: &User, bots: &[String], routines: &[String], skipped: &[String], resumed: &[String]) {
-    let details = json!({ "to": to.id, "bots": bots, "routines": routines, "skipped": skipped, "resumed": resumed });
+struct Moved<'a> {
+    bots: &'a [String],
+    routines: &'a [String],
+    skipped: &'a [String],
+    resumed: &'a [String],
+}
+
+fn record(app: &App, by: &Who, from: &User, to: &User, m: Moved, via: Option<&str>) {
+    let mut details = json!({ "to": to.id, "bots": m.bots, "routines": m.routines, "skipped": m.skipped, "resumed": m.resumed });
+    if let Some(via) = via {
+        details["via"] = json!(via);
+    }
     app.db.record(&by.event("user.handed_over").target("user", &from.id).details(details));
 }
 
