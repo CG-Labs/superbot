@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useReducer, useRef, useState } from "react";
-import { AppState, Image, Modal, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { AppState, Modal, Platform, StyleSheet, View } from "react-native";
 import {
   availabilityFrom,
   availabilityProblem,
@@ -20,7 +20,8 @@ import {
 import { storeDelete, storeGet, storeSet } from "../src/auth";
 import { localAuth as deviceAuth, type LocalAuth } from "../src/localAuth";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
+import { Notice, PrimaryButton, SignInFrame, TextButton } from "./SignInParts";
 
 export interface LockStore {
   get(): Promise<string | null>;
@@ -251,7 +252,7 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
         {showLock ? (
           <LockScreen label={availability?.kind === "available" || availability?.kind === "not-enrolled" ? availability.label : null} message={message} stuck={stuck} busy={busy} onUnlock={() => void unlock()} onSignOut={() => void signOut()} />
         ) : (
-          <View style={[styles.fill, styles.cover]} testID="app-lock-cover" />
+          <Cover />
         )}
       </Modal>
     </AppLockContext.Provider>
@@ -269,42 +270,23 @@ interface LockScreenProps {
 
 function LockScreen({ label, message, stuck, busy, onUnlock, onSignOut }: LockScreenProps) {
   return (
-    <View style={[styles.fill, styles.lock]} accessibilityViewIsModal accessibilityLabel="SuperBot is locked">
-      <View style={styles.card}>
-        <Image source={require("../assets/images/icon.png")} style={styles.mark} accessibilityIgnoresInvertColors />
-        <Text style={styles.title}>SuperBot is locked</Text>
-        {message ? (
-          <Text style={stuck ? styles.error : styles.sub} accessibilityRole="alert">
-            {message}
-          </Text>
-        ) : (
-          <Text style={styles.sub}>{label ? `Use ${label} or your passcode to open it.` : "Use your passcode to open it."}</Text>
-        )}
-        {stuck ? null : (
-          <Pressable style={[styles.btn, busy && styles.busy]} disabled={busy} onPress={onUnlock} accessibilityRole="button" accessibilityLabel="Unlock">
-            <Text style={styles.btnText}>Unlock</Text>
-          </Pressable>
-        )}
-        <Pressable style={[stuck ? styles.btn : styles.secondary, busy && styles.busy]} disabled={busy} onPress={onSignOut} accessibilityRole="button" accessibilityLabel="Sign out">
-          <Text style={stuck ? styles.btnText : styles.secondaryText}>Sign out</Text>
-        </Pressable>
-      </View>
+    <View style={styles.fill} accessibilityViewIsModal accessibilityLabel="SuperBot is locked">
+      <SignInFrame title="SuperBot is locked" subtitle={stuck ? undefined : label ? `Use ${label} or your passcode to open it.` : "Use your passcode to open it."}>
+        {message ? <Notice tone="danger">{message}</Notice> : null}
+        {stuck ? <PrimaryButton label="Sign out" onPress={onSignOut} disabled={busy} /> : <PrimaryButton label="Unlock" onPress={onUnlock} disabled={busy} />}
+        {stuck ? null : <TextButton label="Sign out" onPress={onSignOut} disabled={busy} />}
+      </SignInFrame>
     </View>
   );
 }
 
+function Cover() {
+  const styles = useCoverStyles();
+  return <View style={styles.cover} testID="app-lock-cover" />;
+}
+
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  cover: { backgroundColor: colors.bgMain },
-  lock: { backgroundColor: colors.bgMain, justifyContent: "center", padding: 24 },
-  card: { maxWidth: 440, width: "100%", alignSelf: "center", alignItems: "center", gap: 12 },
-  mark: { width: 88, height: 88, borderRadius: 20, marginBottom: 8 },
-  title: { fontSize: 24, fontWeight: "700", color: colors.text },
-  sub: { color: colors.textDim, textAlign: "center" },
-  error: { color: colors.danger, textAlign: "center" },
-  btn: { marginTop: 8, backgroundColor: colors.blue, borderRadius: 12, paddingVertical: 14, alignItems: "center", alignSelf: "stretch" },
-  btnText: { color: "#fff", fontWeight: "600", fontSize: 16 },
-  secondary: { paddingVertical: 12, alignItems: "center", alignSelf: "stretch" },
-  secondaryText: { color: colors.textDim, fontSize: 15 },
-  busy: { opacity: 0.6 },
 });
+
+const useCoverStyles = themedStyles((t) => StyleSheet.create({ cover: { flex: 1, backgroundColor: t.c.bg } }));

@@ -1,8 +1,11 @@
 import React from "react";
 import { render, screen, userEvent } from "@testing-library/react-native";
 import { proofFrom, TwoFactorCard, type MfaApi } from "../TwoFactor";
+import { themes } from "../../src/theme";
 import type { MfaStatus } from "../../src/types";
 
+let mockScheme: "light" | "dark" | null = null;
+jest.mock("react-native/Libraries/Utilities/useColorScheme", () => ({ __esModule: true, default: () => mockScheme }));
 jest.mock("../../src/dialogs", () => ({ confirmAsync: jest.fn(async () => true) }));
 
 const off: MfaStatus = { enabled: false, enabledAt: null, pending: false, recoveryCodesLeft: 0, required: false, policy: "off", policyPinned: false };
@@ -40,6 +43,17 @@ describe("TwoFactorCard", () => {
     await user.press(screen.getByText("I saved them"));
     expect(screen.getByTestId("mfa-state")).toHaveTextContent("On, with 10 recovery codes left.");
     expect(screen.queryByText("Required for")).not.toBeOnTheScreen();
+  });
+
+  it("keeps the recovery codes dark in the dark-only settings card, even on a light device", async () => {
+    mockScheme = "light";
+    const user = userEvent.setup();
+    await render(<TwoFactorCard api={fakeApi(on)} />);
+    await user.press(await screen.findByText("New recovery codes"));
+    await user.type(screen.getByLabelText("Code or recovery code"), "654321");
+    await user.press(screen.getByText("Make new codes"));
+    expect(await screen.findByText("ccccc-ddddd")).toHaveStyle({ color: themes.dark.c.text });
+    mockScheme = null;
   });
 
   it("needs a code to turn it off, and hides that when it's required", async () => {

@@ -48,6 +48,12 @@ The `error` on these events is a kind, never the store's words:
 | `store error` | Rare here: what the store holds can't be read as a value, such as one that isn't text |
 | `read-only` | Rare here: something tried to write to the external store, which botd only reads. Saving a key in the app goes to the sealed store instead |
 
+## Change events lost
+
+With `VAULT_EVENTS=1` or `GCP_SECRET_MANAGER_EVENTS`, botd reads a secret again as soon as the store says it changed. `SuperBotSecretsChangeEventsDown` means it lost the events and couldn't subscribe again for 10 minutes; `SuperBotSecretsChangeEventsFlapping` means it lost them 6 or more times in an hour, reading every cached secret again after each. Runs carry on either way: a rotation reaches new runs within `SECRETS_CACHE_SECONDS` instead of at once, and `botctl secrets refresh` lands one now. Severity 3, or 2 while a rotation after a leak is waiting on it.
+
+`botctl secrets backend` says how long the events have been followed or not, and the last reason they were lost; the `secret.vault_events` or `secret.gcp_events` failures above have the same. Usually: botd's policy lacks `subscribe` (Vault) or `roles/pubsub.subscriber` (Pub/Sub); a proxy or load balancer in front of Vault doesn't pass WebSocket upgrades or closes connections idle for 30 seconds; the subscription was deleted; or the store is down. The setup is in [following Vault's change events](../ops/vault.md#following-vaults-change-events) and [following Secret Manager's](../ops/cloud-secrets.md#following-secret-managers-change-events).
+
 ## Short-lived credentials for each run
 
 Each run's leases, STS sessions or tokens are made as it starts (`secret.lease_issued`), renewed while it lasts (`secret.lease_renewed`, Vault only) and revoked (`secret.lease_revoked`) or, where the cloud can't revoke, released with their expiry (`secret.lease_released`) when it ends. A failure to make one refuses the run; a renewal that fails stops the run when its lease ends.

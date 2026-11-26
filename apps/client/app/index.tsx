@@ -6,10 +6,11 @@ import { codeFromHash } from "../src/invite";
 import { approvalParam } from "../src/notifications";
 import { botParam } from "../src/push";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { useTheme } from "../src/theme";
 
 export default function Index() {
   const { ready, api, inviteCode, offerInviteCode } = useSuperBot();
+  const t = useTheme();
   // An invite link's `#code=` (ADR 0021): the router keeps the fragment as a param and
   // writes it back to the address bar, so it is taken here and the URL replaced without it.
   const params = useLocalSearchParams<{ "#"?: string; approval?: string; bot?: string }>();
@@ -26,8 +27,8 @@ export default function Index() {
 
   if (!ready) {
     return (
-      <View style={{ flex: 1, justifyContent: "center", backgroundColor: colors.bgMain }}>
-        <ActivityIndicator color={colors.textDim} />
+      <View style={{ flex: 1, justifyContent: "center", backgroundColor: t.c.bg }}>
+        <ActivityIndicator color={t.c.textMuted} />
       </View>
     );
   }
