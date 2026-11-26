@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, waitFor } from "@testing-library/react-native";
+import { act, render, screen, userEvent, waitFor } from "@testing-library/react-native";
 import { ResidencyCard } from "../ResidencyCard";
 import { ApiError } from "../../src/api";
 import { MARKDOWN } from "../../src/fileTypes";
@@ -35,10 +35,14 @@ describe("ResidencyCard (ADR 0168)", () => {
 
   it("says when it couldn't load, and tries again", async () => {
     const api = fakeApi(mine);
-    api.myResidency.mockRejectedValueOnce(new ApiError("Server error", 500));
+    let fail: (e: Error) => void = () => {};
+    api.myResidency.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
     const user = userEvent.setup();
     await render(<ResidencyCard api={api} />);
-    expect(await screen.findByText("Couldn't load your data's residency: Server error")).toBeOnTheScreen();
+    expect(screen.getByRole("progressbar", { name: "Loading your data's residency" })).toBeOnTheScreen();
+    await act(async () => fail(new ApiError("Server error", 500)));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load your data's residency. Server error");
+    expect(screen.getByRole("heading", { name: "Data residency" })).toBeOnTheScreen();
     await user.press(screen.getByRole("button", { name: "Try again" }));
     expect(await screen.findByText(/Your data is pinned to gb-lon/)).toBeOnTheScreen();
     expect(api.myResidency).toHaveBeenCalledTimes(2);
@@ -68,6 +72,7 @@ describe("ResidencyCard (ADR 0168)", () => {
     const user = userEvent.setup();
     await rerender(<ResidencyCard api={api} save={jest.fn()} />);
     await user.press(await screen.findByRole("button", { name: "Download the team's report" }));
-    expect(await screen.findByText(/Try again in 60 seconds/)).toBeOnTheScreen();
+    expect(await screen.findByRole("alert")).toHaveTextContent("You can get 5 residency reports every 10 minutes. Try again in 60 seconds.");
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 });

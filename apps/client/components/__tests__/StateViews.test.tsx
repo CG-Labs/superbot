@@ -5,7 +5,7 @@ import { ConnectionBanner, RECONNECT_GRACE_MS, useConnectionStatus } from "../Co
 import { EmptyState } from "../EmptyState";
 import { ErrorState, InlineError } from "../ErrorState";
 import { PillButton } from "../ui";
-import { AppSkeleton, ChatSkeleton, ListSkeleton, ThinkingDots } from "../Skeleton";
+import { AppSkeleton, BusyDots, ChatSkeleton, ListSkeleton, PageSkeleton, ThinkingDots } from "../Skeleton";
 import { TOAST_LONG_MS, TOAST_MS, ToastProvider, useToast, type ToastApi } from "../Toast";
 import { ApiError } from "../../src/api";
 import { showError } from "../../src/dialogs";
@@ -101,6 +101,8 @@ describe("skeletons", () => {
     ["Loading messages", <ChatSkeleton key="c" />],
     ["Loading routines", <ListSkeleton key="l" label="Loading routines" />],
     ["Loading SuperBot", <AppSkeleton key="a" />],
+    ["Loading your plan", <PageSkeleton key="p" label="Loading your plan" />],
+    ["Saving", <BusyDots key="b" label="Saving" />],
   ])("are one busy element named %s for screen readers", async (name, el) => {
     await render(el);
     const group = screen.getByRole("progressbar", { name });
@@ -109,6 +111,7 @@ describe("skeletons", () => {
 
   it.each([
     ["skeletons", <ChatSkeleton key="c" />],
+    ["page skeletons", <PageSkeleton key="p" />],
     ["thinking dots", <ThinkingDots key="d" />],
   ])("%s move, and hold still when the device asks for reduced motion", async (_, el) => {
     let running = 0;
@@ -126,6 +129,11 @@ describe("skeletons", () => {
     await render(el);
     await act(async () => {});
     expect(running).toBe(0);
+  });
+
+  it("stand in for a screen waiting for the saved session (ADR 0345)", async () => {
+    await render(<PageSkeleton />);
+    expect(screen.getByRole("progressbar", { name: "Loading" })).toBeBusy();
   });
 
   it("keep the thinking dots away from screen readers", async () => {

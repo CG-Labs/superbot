@@ -76,7 +76,7 @@ jobs:
           jq -r 'select(.reason == "compiler-artifact" and .target.name == "botd" and .target.kind == ["bin"] and .profile.test) | .executable' \
             /tmp/build.json >/tmp/test-bin
           test -x "$(cat /tmp/test-bin)"
-      - name: No Bot reaches another user's folder or logins, or botd's files (Claude Code, Pi, Hermes Agent)
+      - name: No Bot reaches another user's folder, logins or screen, or botd's files (Claude Code, Pi, Hermes Agent)
         run: |
           sudo apt-get update -qq
           sudo deploy/test-isolation.sh --yes target/debug/superbot-run "$(cat /tmp/test-bin)"

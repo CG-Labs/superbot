@@ -1,17 +1,19 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { ApiError, type SuperBotApi } from "../src/api";
+import { errorText, friendlyError } from "../src/errors";
 import { hoursLabel, requestChoices, requestDraftError, requestStatusLabel } from "../src/roles";
-import { themedStyles, useTheme } from "../src/theme";
+import { themedStyles } from "../src/theme";
 import type { MyRoleRequests, RequestableRole } from "../src/types";
 import { Chips } from "./Chips";
-import { kit, Spinner } from "./ui";
+import { EmptyState } from "./EmptyState";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit, usePlaceholder } from "./ui";
 
 export type RoleRequestsApi = Pick<SuperBotApi, "myRoleRequests" | "requestRole" | "withdrawRoleRequest">;
 
 type Scope = "org" | "team";
-
-const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 /** The scope to start on: across the server if it may be asked for there, else the team. */
 function firstScope(r: RequestableRole | undefined): Scope {
@@ -25,7 +27,7 @@ function firstScope(r: RequestableRole | undefined): Scope {
  */
 export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
   const styles = useStyles();
-  const t = useTheme();
+  const placeholder = usePlaceholder();
   const [view, setView] = useState<MyRoleRequests | null | undefined>(undefined);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [roleId, setRoleId] = useState("");
@@ -42,7 +44,7 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
       setView(await api.myRoleRequests());
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) setView(null);
-      else setLoadError(message(e));
+      else setLoadError(errorText(e, "Couldn't load the roles you may request"));
     }
   }, [api]);
 
@@ -68,19 +70,10 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
   if (view === undefined) {
     return (
       <View style={styles.card} accessibilityLabel="Request access">
-        <Text style={styles.cardTitle}>Request access</Text>
-        {loadError ? (
-          <>
-            <Text style={styles.error} accessibilityRole="alert">
-              {`Couldn't load the roles you may request: ${loadError}`}
-            </Text>
-            <Pressable style={styles.btn} onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Try again">
-              <Text style={styles.btnText}>Try again</Text>
-            </Pressable>
-          </>
-        ) : (
-          <Spinner />
-        )}
+        <Text style={styles.cardTitle} role="heading">
+          Request access
+        </Text>
+        {loadError ? <InlineError message={loadError} onRetry={load} /> : <ListSkeleton label="Loading the roles you may request" rows={2} />}
       </View>
     );
   }
@@ -97,7 +90,7 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
       setNotice(await action());
       await load();
     } catch (e) {
-      setError(message(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(false);
     }
@@ -120,7 +113,9 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
   const now = Date.now();
   return (
     <View style={styles.card} accessibilityLabel="Request access">
-      <Text style={styles.cardTitle}>Request access</Text>
+      <Text style={styles.cardTitle} role="heading">
+        Request access
+      </Text>
       {view.requestable.length ? (
         <>
           <Text style={styles.dim}>Ask for a role for a while, with a reason. An admin approves it, and it ends by itself.</Text>
@@ -152,33 +147,38 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
             value={reason}
             onChangeText={setReason}
             placeholder="Why you need it (an admin sees this)"
-            placeholderTextColor={t.c.textFaint}
+            placeholderTextColor={placeholder}
             maxLength={500}
             multiline
             editable={!busy}
             accessibilityLabel="Why you need it"
           />
-          <Pressable style={[styles.btn, (busy || !!invalid) && styles.busy]} disabled={busy || !!invalid} onPress={ask} accessibilityRole="button" accessibilityLabel="Ask for it">
+          <Pressable
+            style={[styles.btn, (busy || !!invalid) && styles.busy]}
+            disabled={busy || !!invalid}
+            onPress={ask}
+            accessibilityRole="button"
+            accessibilityLabel="Ask for it"
+            aria-busy={busy}
+          >
             <Text style={styles.btnText}>{busy ? "Asking…" : "Ask for it"}</Text>
           </Pressable>
           {reason && invalid ? <Text style={styles.faint}>{invalid}</Text> : null}
         </>
       ) : (
-        <Text style={styles.dim}>No role may be requested now.</Text>
+        <EmptyState compact title="No role may be requested now" message="Your requests are below." />
       )}
       {notice ? (
         <Text style={styles.good} accessibilityRole="alert">
           {notice}
         </Text>
       ) : null}
-      {error ? (
-        <Text style={styles.error} accessibilityRole="alert">
-          {error}
-        </Text>
-      ) : null}
+      {error ? <InlineError message={error} /> : null}
       {view.requests.length ? (
         <View style={styles.list}>
-          <Text style={styles.sectionTitle}>Your requests</Text>
+          <Text style={styles.sectionTitle} role="heading">
+            Your requests
+          </Text>
           {view.requests.map((q) => (
             <View key={q.id} style={styles.row}>
               <View style={{ flex: 1 }}>
@@ -208,7 +208,6 @@ const useStyles = themedStyles((t) => {
     sectionTitle: { ...k.section, marginTop: 0, marginBottom: 0, paddingHorizontal: 0 },
     line: k.text,
     good: k.good,
-    error: k.error,
     warn: k.warn,
     dim: k.dim,
     faint: k.faint,

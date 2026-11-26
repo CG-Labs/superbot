@@ -652,8 +652,8 @@ async fn main() {
     }
     let screen_addr = screen::init_listen_addr(&env("SCREEN_ADDR", "")).unwrap_or_else(|e| exit(e));
     let chromium_sandbox = chromium::parse_sandbox(&env("SUPERBOT_CHROMIUM_SANDBOX", "")).unwrap_or_else(|e| exit(e));
-    // Screens are X displays botd's account runs; any local account could open them.
-    let screens = if isolation.is_some() { None } else { paths::child(&data_dir, "screens").and_then(screen::Screens::from_env) };
+    // With per-user accounts each screen runs as its run's account (ADR 0342).
+    let screens = paths::child(&data_dir, "screens").and_then(|d| screen::Screens::from_env(d, isolation.is_some()));
     if let Some(s) = &screens {
         s.check_ports().unwrap_or_else(|e| exit(format!("Screens: {e}")));
     }
@@ -1077,10 +1077,10 @@ async fn main() {
     log_info!(
         "Screens: {}.",
         match (app.screens.is_some(), app.isolation().is_some()) {
-            (true, _) if screen_addr.is_loopback() => "on".to_string(),
-            (true, _) => format!("on (viewers listen on {screen_addr}, SCREEN_ADDR)"),
-            (false, true) => "off (per-user screens don't exist yet, so ISOLATION=users turns them off)".into(),
-            (false, false) => "off (install Xvfb and openbox to turn them on)".into(),
+            (true, false) if screen_addr.is_loopback() => "on".to_string(),
+            (true, false) => format!("on (viewers listen on {screen_addr}, SCREEN_ADDR)"),
+            (true, true) => format!("on (each runs as its run's per-user account; viewers listen on {screen_addr})"),
+            (false, _) => "off (install Xvfb and openbox to turn them on)".into(),
         }
     );
     // The image's Chromium (ADR 0107); a bash install's Chrome for Testing keeps agent-browser's own choice.
@@ -2907,6 +2907,12 @@ pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::U
     if let Some(sa) = &bot.service_account_id {
         service_accounts::note_released(app, by, sa, std::slice::from_ref(id), "bot_owner_changed");
     }
+    // With per-user accounts its screens are the old owner's account's: they go, and the new owner's start fresh.
+    if app.isolation().is_some()
+        && let Some(screens) = &app.screens
+    {
+        screens.remove(id).await;
+    }
     acl_changed(app, by, id, true).await;
     // It runs on the new owner's machine now: teammates may have no use for the old one.
     machines::offboard::check_owner(app, by, &bot.owner_id);
@@ -3151,12 +3157,12 @@ fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
     Some(Caller { principal: Principal::User(u.role), grants: app.db.user_perms(&u), user: Some(u), ..c.clone() })
 }
 
-/// With teammates' own users on machines (ADR 0048), whose screen of `bot` a caller
-/// gets: a teammate their own, the owner theirs; an admin the owner's, or a teammate's
-/// with `?for=<user>`. A Bot's token gets the screen of the person its run is for.
-/// None: the owner's.
-fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<Option<String>> {
-    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users()) && app.shared_bots() == acl::SharedBots::Isolated;
+/// With teammates' own users on machines (ADR 0048), or their own accounts on this
+/// server (ADR 0064, 0342), as `on` says for where `bot` runs: whose screen of it a
+/// caller gets. A teammate their own, the owner theirs; an admin the owner's, or a
+/// teammate's with `?for=<user>`. A Bot's token gets the screen of the person its run
+/// is for. None: the owner's.
+fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>, on: bool) -> Res<Option<String>> {
     let me = match (&c.user, &c.bot) {
         (Some(u), _) => Some(u.id.clone()),
         // A Bot a service account keeps runs as its owner, on their screen (ADR 0222).
@@ -3165,7 +3171,11 @@ fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<
     };
     let admin = c.principal == Principal::User(Role::Admin);
     let who = match asked.map(str::trim).filter(|u| !u.is_empty()) {
-        Some(u) if !on => return Err(bad(format!("Screens are per teammate only with MACHINE_TEAMMATE_USERS=on, so there's no screen for {u}."))),
+        Some(u) if !on => {
+            return Err(bad(format!(
+                "Screens are per teammate only when teammates' runs have their own users (MACHINE_TEAMMATE_USERS=on, or ISOLATION_TEAMMATES on this server), so there's no screen for {u}."
+            )));
+        }
         Some(u) if admin || me.as_deref() == Some(u) => Some(u.to_string()),
         Some(_) => return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can open someone else's screen of this Bot.".into())),
         None if on && !admin => me,
@@ -3190,7 +3200,12 @@ async fn screen_info(
 ) -> Res {
     // The link gives control of the screen.
     let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Operate)?;
-    let for_user = screen_for(&app, &c, &bot, q.get("for").map(String::as_str))?;
+    let on_machine = !matches!(machines::screens::target(&app, &bot).await, Ok(None));
+    let per_teammate = match on_machine {
+        true => app.control_plane.get().is_some_and(|cp| cp.teammate_users()) && app.shared_bots() == acl::SharedBots::Isolated,
+        false => app.teammate_accounts(),
+    };
+    let for_user = screen_for(&app, &c, &bot, q.get("for").map(String::as_str), per_teammate)?;
     // A Bot on its owner's machine is shown from there or not at all (ADR 0045). Its
     // screen may change hands while this waits on it, so access is checked again then.
     let still = || match caller_now(&app, &a, &c) {
@@ -3202,15 +3217,55 @@ async fn screen_info(
     }
     let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());
     let screens = app.screens.as_ref().filter(|_| screen::on_path("voxl")).ok_or_else(off)?;
-    let info = screens.ensure(&id, |b| app.is_running(b)).await;
-    let info = info.ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, "All screens are in use. Try again when a Bot finishes.".into()))?;
+    let (owner, _in_use) = match app.isolation() {
+        Some(_) => {
+            let (o, in_use) = screen_owner(&app, &bot, for_user.as_deref(), &by).await?;
+            (Some(o), in_use)
+        }
+        None => (None, None),
+    };
+    let info = match screens.ensure(&id, owner.as_ref(), |b| app.is_running(b)).await {
+        Ok(info) => info,
+        Err(e) if e == screen::ALL_BUSY || owner.is_none() => {
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "All screens are in use. Try again when a Bot finishes.".into()));
+        }
+        Err(e) => {
+            let d = json!({ "reason": e, "owner": bot.owner_id, "forUser": for_user });
+            app.db.record(&by.event("screen.start_failed").target("bot", &id).bot(&id).outcome(Outcome::Failure).details(d));
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "The screen didn't start. An admin can check the audit log (screen.start_failed).".into()));
+        }
+    };
     still()?;
     // A frame loaded before voxl listens gets the proxy's 502 and stays blank, so only hand out a link that works.
     if !screen::wait_for_port(info.port, 50).await {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "The screen is still starting. Try again in a moment.".into()));
     }
-    // The proxy in front serves /screen/<port>/ from that local voxl port.
+    // The proxy in front serves /screen/<port>/ from that local voxl port (or botd's, piping to an account's).
     Ok(Json(json!({ "url": format!("/screen/{}/?token={}", info.port, info.token) })))
+}
+
+/// With per-user accounts (ADR 0342): the account `bot`'s screen for `for_user` (None:
+/// its owner) runs as, made now if it's new, as that person's run would make it. A
+/// teammate's account is held from removal until the screen has started.
+async fn screen_owner<'a>(app: &'a AppState, bot: &db::Bot, for_user: Option<&str>, by: &Who) -> Res<(screen::Owner, Option<teammate_removals::InUse<'a>>)> {
+    let unavailable = |m: &str| ApiError(StatusCode::SERVICE_UNAVAILABLE, m.into());
+    let iso = app.isolation().cloned().ok_or_else(|| unavailable("Per-user accounts are off."))?;
+    let space = accounts::Space::of(&bot.owner_id, for_user);
+    let in_use = match space.teammate() {
+        Some(t) => Some(
+            teammate_removals::enter(app, &bot.owner_id, t)
+                .ok_or_else(|| unavailable("Your account for these Bots on this server is being removed. Try again in a few minutes."))?,
+        ),
+        None => None,
+    };
+    let no_account = || unavailable("Couldn't set up the account this screen runs as. An admin can check the server log.");
+    app.ensure_space(space, by).await.map_err(|_| no_account())?;
+    iso.make_bot_dirs_in(space, &bot.id).map_err(|e| {
+        log_warn!("Screens: couldn't make a Bot's folders in its account's folder: {e}");
+        no_account()
+    })?;
+    let owner = screen::Owner::new(&iso, space, &bot.id).ok_or_else(no_account)?;
+    Ok((owner, in_use))
 }
 
 // A Bot hands its screen to the user: `botctl handoff`. Waits for "Done".

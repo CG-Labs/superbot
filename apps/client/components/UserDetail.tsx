@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
+import { errorText, friendlyError } from "../src/errors";
 import { CODE_TTLS, formatExpiry, relativeTime, ROLES, signInMethod } from "../src/invite";
 import { overLimits, planUsageLines } from "../src/plan";
 import type { SsoProvider } from "../src/sso";
@@ -10,7 +11,9 @@ import type { AdminUser, CustomRole, LoginCode, Role, SessionView, TeammateAccou
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
-import { kit, Spinner, usePlaceholder } from "./ui";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -29,16 +32,25 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   const styles = useStyles();
   return (
     <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{title}</Text>
+      <Text style={styles.sectionTitle} role="heading">
+        {title}
+      </Text>
       {children}
     </View>
   );
 }
 
-function Button({ label, onPress, danger, disabled }: { label: string; onPress: () => void; danger?: boolean; disabled?: boolean }) {
+function Button({ label, name, onPress, danger, disabled }: { label: string; name?: string; onPress: () => void; danger?: boolean; disabled?: boolean }) {
   const styles = useStyles();
   return (
-    <Pressable style={({ pressed }) => [styles.btn, danger && styles.dangerBtn, pressed && styles.pressed, disabled && styles.disabled]} disabled={disabled} onPress={onPress}>
+    <Pressable
+      style={({ pressed }) => [styles.btn, danger && styles.dangerBtn, pressed && styles.pressed, disabled && styles.disabled]}
+      disabled={disabled}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={name}
+      accessibilityState={{ disabled: !!disabled }}
+    >
       <Text style={[styles.btnText, danger && styles.dangerText]}>{label}</Text>
     </Pressable>
   );
@@ -77,16 +89,6 @@ function workOutcome(t: TeammateAccounts | null): string {
   return "their work goes to the Bots' owner";
 }
 
-function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
-  const styles = useStyles();
-  return (
-    <View style={styles.line}>
-      <Text style={[styles.error, styles.grow]}>{message}</Text>
-      <Button label="Retry" onPress={onRetry} />
-    </View>
-  );
-}
-
 export function UserDetail({ api, user, meId, providers, roles = [], onChanged }: Props) {
   const styles = useStyles();
   const placeholder = usePlaceholder();
@@ -110,14 +112,13 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
   const active = user.status === "active";
 
   const loadExtras = useCallback(async () => {
-    const failed = (err: unknown) => (err instanceof Error ? err.message : "Couldn't load");
     setSessionsError(null);
     setBotsError(null);
     setTeammatesError(null);
     await Promise.all([
-      api.userSessions(user.id).then(setSessions, (err) => setSessionsError(failed(err))),
-      api.userBots(user.id).then(setBots, (err) => setBotsError(failed(err))),
-      api.teammateAccounts(user.id).then(setTeammates, (err) => setTeammatesError(failed(err))),
+      api.userSessions(user.id).then(setSessions, (err) => setSessionsError(errorText(err, "Couldn't load sessions"))),
+      api.userBots(user.id).then(setBots, (err) => setBotsError(errorText(err, "Couldn't load Bot access"))),
+      api.teammateAccounts(user.id).then(setTeammates, (err) => setTeammatesError(errorText(err, "Couldn't load teammate accounts"))),
     ]);
   }, [api, user.id]);
 
@@ -133,7 +134,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
       await onChanged();
       await loadExtras();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed");
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
@@ -206,7 +207,9 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
   return (
     <View style={styles.wrap}>
       <View style={styles.head}>
-        <Text style={styles.name}>{user.name}</Text>
+        <Text style={styles.name} role="heading">
+          {user.name}
+        </Text>
         <Text style={styles.dim}>{user.email ?? "No email"}</Text>
         <Text style={styles.faint}>
           {user.breakGlass ? "Owner (break-glass) · " : ""}
@@ -214,7 +217,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
           {user.lastLogin?.authMethod ? ` with ${signInMethod(user.lastLogin.authMethod, user.lastLogin.idpProvider && providerLabel(user.lastLogin.idpProvider))}` : ""}
         </Text>
       </View>
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <InlineError message={error} /> : null}
 
       <Section title="Role">
         <Chips options={ROLES.map((r) => ({ value: r.role, label: r.label }))} value={user.role} onChange={(r) => void setRole(r)} disabled={busy || locked} />
@@ -252,7 +255,13 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
       <Section title="Status">
         <View style={styles.line}>
           <Text style={styles.rowText}>{active ? "Active" : "Disabled: can't sign in"}</Text>
-          <Button label={active ? "Disable" : "Enable"} danger={active} disabled={busy || locked} onPress={() => void toggleStatus()} />
+          <Button
+            label={active ? "Disable" : "Enable"}
+            name={`${active ? "Disable" : "Enable"} ${user.name}`}
+            danger={active}
+            disabled={busy || locked}
+            onPress={() => void toggleStatus()}
+          />
         </View>
       </Section>
 
@@ -268,7 +277,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
             </Text>
             <View style={styles.row}>
               <Chips options={CODE_TTLS.map((t) => ({ value: t.minutes, label: t.label }))} value={ttl} onChange={setTtl} disabled={busy || !active} />
-              <Button label="New code" disabled={busy || !active} onPress={() => void newCode()} />
+              <Button label="New code" name={`New sign-in code for ${user.name}`} disabled={busy || !active} onPress={() => void newCode()} />
             </View>
           </>
         )}
@@ -277,13 +286,13 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
       <Section title="Sessions">
         {sessionsError ? (
           <>
-            <LoadFailed message={sessionsError} onRetry={() => void loadExtras()} />
+            <InlineError message={sessionsError} onRetry={loadExtras} />
             <View style={styles.row}>
-              <Button label="Sign out everywhere" danger disabled={busy} onPress={() => void signOutEverywhere()} />
+              <Button label="Sign out everywhere" name={`Sign ${user.name} out everywhere`} danger disabled={busy} onPress={() => void signOutEverywhere()} />
             </View>
           </>
         ) : sessions == null ? (
-          <Spinner />
+          <ListSkeleton label={`Loading ${user.name}'s sessions`} rows={2} />
         ) : (
           <>
             {sessions.length ? (
@@ -300,7 +309,13 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
               <Text style={styles.dim}>Not signed in anywhere.</Text>
             )}
             <View style={styles.row}>
-              <Button label="Sign out everywhere" danger disabled={busy || (!sessions.length && !user.pendingCodes)} onPress={() => void signOutEverywhere()} />
+              <Button
+                label="Sign out everywhere"
+                name={`Sign ${user.name} out everywhere`}
+                danger
+                disabled={busy || (!sessions.length && !user.pendingCodes)}
+                onPress={() => void signOutEverywhere()}
+              />
             </View>
           </>
         )}
@@ -311,7 +326,9 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
           <Text style={styles.rowText}>
             {user.mfa?.enabled ? `On since ${new Date(user.mfa.enabledAt ?? 0).toLocaleDateString()}` : "Off"}
           </Text>
-          {user.mfa?.enabled && !self ? <Button label="Reset" danger disabled={busy} onPress={() => void resetMfa()} /> : null}
+          {user.mfa?.enabled && !self ? (
+            <Button label="Reset" name={`Reset ${user.name}'s two-factor authentication`} danger disabled={busy} onPress={() => void resetMfa()} />
+          ) : null}
         </View>
         {user.mfa?.enabled && self ? <Text style={styles.faint}>Turn yours off in Settings. Another admin can reset it.</Text> : null}
       </Section>
@@ -325,7 +342,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
                   {providerLabel(i.provider)} · {identityName(i, providers)}
                   <Text style={styles.faint}> · used {relativeTime(i.lastLoginAt).toLowerCase()}</Text>
                 </Text>
-                <Button label="Unlink" disabled={busy} onPress={() => void unlink(i.id, providerLabel(i.provider))} />
+                <Button label="Unlink" name={`Unlink ${providerLabel(i.provider)}`} disabled={busy} onPress={() => void unlink(i.id, providerLabel(i.provider))} />
               </View>
             ))}
           </View>
@@ -359,7 +376,12 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
               />
             ) : null}
             <View style={styles.row}>
-              <Button label="Link" disabled={busy || !subject.trim() || !linkProvider} onPress={link} />
+              <Button
+                label="Link"
+                name={`Link ${providerLabel(linkProvider)} account`}
+                disabled={busy || !subject.trim() || !linkProvider}
+                onPress={link}
+              />
             </View>
           </View>
         ) : (
@@ -369,9 +391,9 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
 
       <Section title="Bot access">
         {botsError ? (
-          <LoadFailed message={botsError} onRetry={() => void loadExtras()} />
+          <InlineError message={botsError} onRetry={loadExtras} />
         ) : bots == null ? (
-          <Spinner />
+          <ListSkeleton label={`Loading ${user.name}'s Bot access`} rows={2} />
         ) : bots.bots.length ? (
           <View style={styles.list}>
             {bots.bots.map((b) => (
@@ -396,7 +418,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
 
       {teammatesError ? (
         <Section title="Teammate accounts here">
-          <LoadFailed message={teammatesError} onRetry={() => void loadExtras()} />
+          <InlineError message={teammatesError} onRetry={loadExtras} />
         </Section>
       ) : teammates && (teammates.accounts.length || teammates.removals.length) ? (
         <Section title="Teammate accounts here">
@@ -410,7 +432,13 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
                     {mine ? `${personName(a.teammate)}, for these Bots` : `For ${personName(a.owner)}'s Bots`}
                     <Text style={styles.faint}> · {a.removal ? removalStatus(a.removal) : a.wanted ? "in use" : "no longer has access"}</Text>
                   </Text>
-                  <Button label="Remove" danger disabled={busy} onPress={() => void removeTeammate(a.owner.id, a.teammate.id, who)} />
+                  <Button
+                    label="Remove"
+                    name={`Remove ${who}'s account here`}
+                    danger
+                    disabled={busy}
+                    onPress={() => void removeTeammate(a.owner.id, a.teammate.id, who)}
+                  />
                 </View>
               );
             })}

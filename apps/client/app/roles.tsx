@@ -3,7 +3,8 @@ import { Redirect } from "expo-router";
 import { StyleSheet, View } from "react-native";
 import { RolesAdmin } from "../components/RolesAdmin";
 import { RouteNotice, RouteScreen, useGoBack } from "../components/Shell";
-import { kit, Spinner } from "../components/ui";
+import { PageSkeleton } from "../components/Skeleton";
+import { kit } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { useSuperBot } from "../src/SuperBotContext";
 import { themedStyles } from "../src/theme";
@@ -16,7 +17,7 @@ export default function RolesScreen() {
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <Spinner />
+        <PageSkeleton />
       </View>
     );
   }

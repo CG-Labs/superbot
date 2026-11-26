@@ -165,7 +165,8 @@ describe("AuditLog", () => {
   it("opens with the filters of a link, and shows them", async () => {
     const api = fakeApi([{ events: [], nextBefore: null }]);
     await render(<AuditLog api={api as unknown as SuperBotApi} onBack={jest.fn()} initial={{ bot: "gone" }} botName={() => undefined} />);
-    expect(await screen.findByText("No events match.")).toBeOnTheScreen();
+    expect(await screen.findByRole("heading", { name: "No events match" })).toBeOnTheScreen();
+    expect(screen.getByText("Change or clear the filters to see more.")).toBeOnTheScreen();
     expect(api.audit).toHaveBeenCalledWith("bot=gone", undefined);
     expect(screen.getByText("Hide filters · 1")).toBeOnTheScreen();
     expect(screen.getByRole("radio", { name: "gone" })).toBeChecked();
@@ -195,7 +196,7 @@ describe("AuditLog", () => {
 
   it("filters by whole days, and says what's wrong with a bad date without asking", async () => {
     const { api, user } = await open([{ events: [], nextBefore: null }]);
-    expect(await screen.findByText("No events match.")).toBeOnTheScreen();
+    expect(await screen.findByRole("heading", { name: "No events match" })).toBeOnTheScreen();
     await user.press(screen.getByText("Filters"));
     await user.type(screen.getByLabelText("From"), "2026-11-01");
     await user.type(screen.getByLabelText("To"), "2026-11-02");
@@ -312,9 +313,54 @@ describe("AuditLog", () => {
     api.auditCsv.mockRejectedValueOnce(new ApiError("Admins only", 403));
     const user = userEvent.setup();
     await render(<AuditLog api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
-    expect(await screen.findByText("Admins only")).toBeOnTheScreen();
+    expect(await screen.findByText("Couldn't load the audit log. Admins only")).toBeOnTheScreen();
     await user.press(screen.getByText("Export CSV"));
-    expect(await screen.findAllByText("Admins only")).toHaveLength(2);
+    expect(await screen.findByText("Admins only")).toBeOnTheScreen();
+    expect(screen.getAllByRole("alert")).toHaveLength(2);
     expect(saveCsv).not.toHaveBeenCalled();
+  });
+
+  it("shows a skeleton while the log loads, then a retry that loads it", async () => {
+    const api = fakeApi([{ events: [ev(1)], nextBefore: null }]);
+    let fail: (e: Error) => void = () => {};
+    api.audit.mockImplementationOnce(() => new Promise<AuditPage>((_, reject) => (fail = reject)));
+    const user = userEvent.setup();
+    await render(<AuditLog api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
+    expect(await screen.findByRole("progressbar", { name: "Loading the audit log" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load the audit log. Can't reach the server. Check your connection and try again.");
+    expect(screen.queryByRole("heading", { name: "No events match" })).toBeNull();
+    await user.press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Audit event 1: bot.created")).toBeOnTheScreen();
+    expect(api.audit).toHaveBeenLastCalledWith("", undefined);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps the rows when an older page fails, and retries that page", async () => {
+    const { api, user } = await open([{ events: [ev(3)], nextBefore: 3 }]);
+    await screen.findByLabelText("Audit event 3: bot.created");
+    api.audit.mockRejectedValueOnce(new ApiError("HTTP 502", 502));
+    await user.press(screen.getByText("Load more"));
+    expect(await screen.findByText("Couldn't load older events. The server had a problem. Try again in a moment.")).toBeOnTheScreen();
+    expect(screen.getByLabelText("Audit event 3: bot.created")).toBeOnTheScreen();
+    api.audit.mockResolvedValueOnce({ events: [ev(2)], nextBefore: null });
+    await user.press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Audit event 2: bot.created")).toBeOnTheScreen();
+    expect(api.audit).toHaveBeenLastCalledWith("", 3);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says when nothing has been recorded, without filters to change", async () => {
+    await open([{ events: [], nextBefore: null }]);
+    expect(await screen.findByRole("heading", { name: "No events match" })).toBeOnTheScreen();
+    expect(screen.getByText("Nothing has been recorded yet.")).toBeOnTheScreen();
+  });
+
+  it("shows a bad filter as an alert", async () => {
+    const { user } = await open([{ events: [], nextBefore: null }]);
+    await screen.findByRole("heading", { name: "No events match" });
+    await user.press(screen.getByRole("button", { name: "Filters" }));
+    await fireEvent.changeText(screen.getByLabelText("From"), "later");
+    expect(screen.getByRole("alert")).toHaveTextContent('"later" isn\'t a date. Use YYYY-MM-DD.');
   });
 });

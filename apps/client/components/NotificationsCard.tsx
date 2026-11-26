@@ -1,11 +1,14 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
+import { errorText, friendlyError } from "../src/errors";
 import { FORMAT_LABELS, MAX_DELAY_SECONDS, MAX_THROTTLE_SECONDS, parseRecipients, parseSeconds, secondsLabel, testSummary, webhookUrlProblem } from "../src/notifications";
 import { themedStyles } from "../src/theme";
 import type { BotNotificationsPatch, BotNotificationsView, NotificationsPatch, NotificationsView, NotifyDetail, NotifyFormat } from "../src/types";
 import { Chips } from "./Chips";
-import { kit, Spinner, usePlaceholder } from "./ui";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit, usePlaceholder } from "./ui";
 
 export type NotificationsApi = Pick<SuperBotApi, "notifications" | "patchNotifications" | "testNotifications" | "botNotifications" | "patchBotNotifications">;
 
@@ -23,10 +26,6 @@ const ON_OFF = [
   { value: "off", label: "Off" },
 ] as const;
 
-function message(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
 /**
  * Who hears about a pending approval when no app is open (ADR 0061): email through the
  * server's SMTP settings and a webhook (Slack-compatible or signed JSON). Admins only.
@@ -38,6 +37,7 @@ export function NotificationsCard({ api, bot }: Props) {
   const [view, setView] = useState<NotificationsView | undefined>(undefined);
   const [botView, setBotView] = useState<BotNotificationsView | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [to, setTo] = useState("");
@@ -53,9 +53,9 @@ export function NotificationsCard({ api, bot }: Props) {
       setTo(v.settings.email.to.join(", "));
       setDelay(String(v.settings.delaySeconds));
       setThrottle(String(v.settings.throttleSeconds));
-      setError(null);
+      setLoadError(null);
     } catch (e) {
-      setError(message(e));
+      setLoadError(errorText(e, "Couldn't load notifications"));
     }
   }, [api, botId]);
 
@@ -71,7 +71,7 @@ export function NotificationsCard({ api, bot }: Props) {
       const said = await fn();
       setNotice(said || done);
     } catch (e) {
-      setError(message(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -93,8 +93,10 @@ export function NotificationsCard({ api, bot }: Props) {
   if (!view || (bot && !botView)) {
     return (
       <View style={styles.card} accessibilityLabel="Notifications">
-        <Text style={styles.cardTitle}>Notifications</Text>
-        {error ? <Text style={styles.error}>{error}</Text> : <Spinner />}
+        <Text style={styles.cardTitle} role="heading">
+          Notifications
+        </Text>
+        {loadError ? <InlineError message={loadError} onRetry={load} /> : <ListSkeleton label="Loading notifications" rows={2} />}
       </View>
     );
   }
@@ -109,11 +111,8 @@ export function NotificationsCard({ api, bot }: Props) {
           {notice}
         </Text>
       ) : null}
-      {error ? (
-        <Text style={styles.error} accessibilityRole="alert">
-          {error}
-        </Text>
-      ) : null}
+      {loadError ? <InlineError message={loadError} onRetry={load} /> : null}
+      {error ? <InlineError message={error} /> : null}
     </>
   );
   const urlProblem = url.trim() ? webhookUrlProblem(url) : null;
@@ -141,6 +140,7 @@ export function NotificationsCard({ api, bot }: Props) {
               onPress={() => save(url.trim())}
               accessibilityRole="button"
               accessibilityLabel="Save webhook URL"
+              aria-busy={busy === "url"}
             >
               <Text style={styles.primaryText}>{busy === "url" ? "Saving…" : "Save URL"}</Text>
             </Pressable>
@@ -157,7 +157,14 @@ export function NotificationsCard({ api, bot }: Props) {
     </>
   );
   const testButton = (
-    <Pressable style={[styles.btn, styles.self, locked && styles.busy]} disabled={locked} onPress={() => void test()} accessibilityRole="button" accessibilityLabel="Send a test notification">
+    <Pressable
+      style={[styles.btn, styles.self, locked && styles.busy]}
+      disabled={locked}
+      onPress={() => void test()}
+      accessibilityRole="button"
+      accessibilityLabel="Send a test notification"
+      aria-busy={busy === "test"}
+    >
       <Text style={styles.btnText}>{busy === "test" ? "Sending…" : "Send a test"}</Text>
     </Pressable>
   );
@@ -183,7 +190,9 @@ export function NotificationsCard({ api, bot }: Props) {
     const noEmail = r.deciders.filter((d) => !d.hasEmail).map((d) => d.name);
     return (
       <View style={styles.card} accessibilityLabel="Notifications">
-        <Text style={styles.cardTitle}>Notifications for {bot.name}</Text>
+        <Text style={styles.cardTitle} role="heading">
+          Notifications for {bot.name}
+        </Text>
         <Text style={styles.dim}>{reach.length ? `Its next approval goes to ${reach.join(" and ")}.` : "Its approvals notify nobody: they wait in the app."}</Text>
         {r.deciders.length ? <Text style={styles.faint}>People who can answer: {r.deciders.map((d) => d.name).join(", ")}.</Text> : null}
         {noEmail.length && s.email.deciders ? <Text style={styles.faint}>No email address for {noEmail.join(", ")}.</Text> : null}
@@ -231,7 +240,9 @@ export function NotificationsCard({ api, bot }: Props) {
 
   return (
     <View style={styles.card} accessibilityLabel="Notifications">
-      <Text style={styles.cardTitle}>Notifications</Text>
+      <Text style={styles.cardTitle} role="heading">
+        Notifications
+      </Text>
       <Text style={styles.dim}>
         When a Bot waits for approval, tell someone who can answer, even with no app open. Each notice links to the approval and shows what its card shows.
       </Text>
@@ -269,6 +280,7 @@ export function NotificationsCard({ api, bot }: Props) {
             onPress={() => "to" in parsedTo && void patch("to", "Addresses saved.", { email: { to: parsedTo.to } })}
             accessibilityRole="button"
             accessibilityLabel="Save email addresses"
+            aria-busy={busy === "to"}
           >
             <Text style={styles.primaryText}>{busy === "to" ? "Saving…" : "Save addresses"}</Text>
           </Pressable>
@@ -329,6 +341,7 @@ export function NotificationsCard({ api, bot }: Props) {
             onPress={() => "seconds" in d && "seconds" in t && void patch("timing", "Timing saved.", { delaySeconds: d.seconds, throttleSeconds: t.seconds })}
             accessibilityRole="button"
             accessibilityLabel="Save timing"
+            aria-busy={busy === "timing"}
           >
             <Text style={styles.primaryText}>{busy === "timing" ? "Saving…" : "Save"}</Text>
           </Pressable>
@@ -357,7 +370,6 @@ const useStyles = themedStyles((t) => {
     field: k.field,
     label: k.label,
     good: k.good,
-    error: k.error,
     warn: k.warn,
     dim: k.dim,
     faint: k.faint,

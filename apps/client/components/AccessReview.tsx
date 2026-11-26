@@ -15,10 +15,14 @@ import {
   signInsLabel,
 } from "../src/accessReview";
 import { ApiError, type SuperBotApi } from "../src/api";
+import { friendlyError } from "../src/errors";
 import { saveCsv } from "../src/saveCsv";
 import { hairline, themedStyles, type } from "../src/theme";
 import type { AccessReview as Report, AccessReviewPerson, AccessReviewServiceAccount, AccessReviewSignOff } from "../src/types";
-import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
+import { EmptyState } from "./EmptyState";
+import { ErrorState, InlineError } from "./ErrorState";
+import { PageSkeleton } from "./Skeleton";
+import { kit, PageHeader, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -113,6 +117,8 @@ export function AccessReview({ api, onBack }: Props) {
   const placeholder = usePlaceholder();
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Why the report didn't load, in plain words; kept apart from export failures so it can offer a retry. */
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [saving, setSaving] = useState(false);
   const [signError, setSignError] = useState<string | null>(null);
@@ -120,12 +126,13 @@ export function AccessReview({ api, onBack }: Props) {
   const [exporting, setExporting] = useState(false);
 
   const load = useCallback(async () => {
+    setLoadError(null);
     setError(null);
     setSignError(null);
     try {
       setReport(await api.accessReview());
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't load the access review");
+      setLoadError(friendlyError(err));
     }
   }, [api]);
 
@@ -143,7 +150,7 @@ export function AccessReview({ api, onBack }: Props) {
       await saveCsv(fileName ?? csvFileName(Date.now()), csv, "Export access review");
     } catch (err) {
       const stale = err instanceof ApiError && err.status === 409;
-      setError(stale ? "Access changed since this report loaded. Reload it before exporting." : err instanceof Error ? err.message : "Export failed");
+      setError(stale ? "Access changed since this report loaded. Reload it before exporting." : friendlyError(err, "Export failed. Try again."));
     } finally {
       setExporting(false);
     }
@@ -160,7 +167,7 @@ export function AccessReview({ api, onBack }: Props) {
       setReport({ ...report, reviews: [r, ...report.reviews] });
     } catch (err) {
       const stale = err instanceof ApiError && err.status === 409;
-      setSignError(stale ? "Access changed since this report loaded. Reload it and review it again." : err instanceof Error ? err.message : "Couldn't sign off");
+      setSignError(stale ? "Access changed since this report loaded. Reload it and review it again." : friendlyError(err, "Couldn't sign off. Try again."));
     } finally {
       setSaving(false);
     }
@@ -184,14 +191,17 @@ export function AccessReview({ api, onBack }: Props) {
           </Pressable>
         }
       />
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error || (report && loadError) ? (
+        <View style={styles.notices}>
+          {report && loadError ? <InlineError message={`Couldn't load the access review. ${loadError}`} onRetry={load} /> : null}
+          {error ? <InlineError message={error} /> : null}
+        </View>
+      ) : null}
       {!report ? (
-        error ? (
-          <Pressable onPress={() => void load()} accessibilityRole="button" style={styles.retry}>
-            <Text style={styles.link}>Retry</Text>
-          </Pressable>
+        loadError ? (
+          <ErrorState title="Couldn't load the access review" message={loadError} onRetry={load} />
         ) : (
-          <Spinner style={styles.spinner} />
+          <PageSkeleton label="Loading the access review" />
         )
       ) : (
         <ScrollView contentContainerStyle={styles.body} testID="access-review">
@@ -204,7 +214,9 @@ export function AccessReview({ api, onBack }: Props) {
             </Text>
           ) : null}
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>Sign off</Text>
+            <Text style={styles.cardTitle} role="heading">
+              Sign off
+            </Text>
             <Text style={styles.faint}>Recorded in the audit log as access_review.completed, with you as the reviewer and this report&apos;s digest.</Text>
             <TextInput
               style={styles.input}
@@ -230,11 +242,11 @@ export function AccessReview({ api, onBack }: Props) {
               </Pressable>
             </View>
             {signed && signed.digest === report.digest ? <Text style={styles.ok}>Signed off at {new Date(signed.at).toLocaleString()}.</Text> : null}
-            {signError ? <Text style={styles.error}>{signError}</Text> : null}
+            {signError ? <InlineError message={signError} /> : null}
           </View>
           {report.groups.map((g) => (
             <View key={`${g.tenant ?? ""}/${g.team?.id ?? ""}`} style={styles.group}>
-              <Text style={styles.section}>
+              <Text style={styles.section} role="heading">
                 {groupLabel(g)} <Text style={styles.count}>({g.people.length})</Text>
               </Text>
               <View style={styles.list}>
@@ -246,7 +258,7 @@ export function AccessReview({ api, onBack }: Props) {
           ))}
           {report.serviceAccounts?.length ? (
             <View style={styles.group}>
-              <Text style={styles.section}>
+              <Text style={styles.section} role="heading">
                 Service accounts <Text style={styles.count}>({report.serviceAccounts.length})</Text>
               </Text>
               <View style={styles.list}>
@@ -257,12 +269,14 @@ export function AccessReview({ api, onBack }: Props) {
             </View>
           ) : null}
           <View style={styles.group}>
-            <Text style={styles.section}>Past sign-offs</Text>
+            <Text style={styles.section} role="heading">
+              Past sign-offs
+            </Text>
             <View style={styles.list}>
               {report.reviews.length ? (
                 report.reviews.map((r, i) => <SignOff key={r.eventId} r={r} first={i === 0} />)
               ) : (
-                <Text style={styles.none}>None yet.</Text>
+                <EmptyState compact glyph="+" title="No sign-offs yet" message="Mark this report as reviewed to record the first one." />
               )}
             </View>
           </View>
@@ -283,7 +297,6 @@ const useStyles = themedStyles((t) => {
     btnPressed: k.btnPressed,
     btnText: k.btnText,
     busy: k.disabled,
-    spinner: { marginTop: t.space.xl },
     body: k.body,
     summary: k.dim,
     card: k.card,
@@ -295,7 +308,6 @@ const useStyles = themedStyles((t) => {
     person: { paddingVertical: t.space.md, gap: t.space.xxs, borderTopWidth: hairline, borderTopColor: t.c.border },
     personFirst: { borderTopWidth: 0 },
     review: { paddingVertical: t.space.sm, gap: t.space.xxs, borderTopWidth: hairline, borderTopColor: t.c.border },
-    none: { ...k.faint, paddingVertical: t.space.sm },
     rowTop: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
     actions: k.actions,
     name: { ...k.strong, flexShrink: 1 },
@@ -305,9 +317,7 @@ const useStyles = themedStyles((t) => {
     tags: { ...k.tags, marginVertical: t.space.xxs },
     tag: k.tag,
     input: { ...k.input, ...k.inputMultiline },
-    link: k.link,
-    retry: { paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
     ok: k.good,
-    error: { ...k.error, paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
+    notices: { gap: t.space.sm, paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
   });
 });

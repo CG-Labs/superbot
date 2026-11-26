@@ -3,6 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-
 import type { SuperBotApi } from "../src/api";
 import { checkoutNotice, limitSummary, openBillingPage } from "../src/billing";
 import { confirmAsync } from "../src/dialogs";
+import { errorText, friendlyError } from "../src/errors";
 import { defaultEnd, endChoices, endNear, endsAt } from "../src/roles";
 import {
   appliesLine,
@@ -27,8 +28,11 @@ import {
 import { hairline, themedStyles, type } from "../src/theme";
 import type { CustomRoleRef, MyTeamInvite, RoleRequest, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
 import { Chips } from "./Chips";
+import { EmptyState } from "./EmptyState";
+import { ErrorState, InlineError } from "./ErrorState";
 import { RequestRow } from "./RolesAdmin";
-import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
+import { BusyDots, PageSkeleton } from "./Skeleton";
+import { kit, PageHeader, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -45,8 +49,6 @@ interface Props {
 /** After a successful checkout, how often and how many times to look for Stripe's confirmation. */
 export const TEAM_CONFIRM_EVERY_MS = 3000;
 const CONFIRM_TRIES = 20;
-
-const message = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
 /** Giving a teammate one of the team's custom roles, for how long (ADR 0254). */
 function GiveRole({
@@ -81,7 +83,7 @@ function GiveRole({
         <Pressable style={styles.primaryBtn} disabled={busy} onPress={() => onGive(choice.id, ends)} accessibilityRole="button">
           <Text style={styles.primaryText}>Give {choice.name}</Text>
         </Pressable>
-        <Pressable style={styles.btn} disabled={busy} onPress={onCancel} accessibilityRole="button">
+        <Pressable style={styles.btn} disabled={busy} onPress={onCancel} accessibilityRole="button" accessibilityLabel="Cancel giving a team role">
           <Text style={styles.btnText}>Cancel</Text>
         </Pressable>
       </View>
@@ -193,9 +195,13 @@ function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage
   const change = manage && b.canChange !== false;
   return (
     <View style={styles.section} testID="team-plan">
-      <Text style={styles.sectionTitle}>Plan</Text>
+      <Text style={styles.sectionTitle} role="heading">
+        Plan
+      </Text>
       <View style={styles.card}>
-        <Text style={styles.name}>{b.plan ? `${b.plan.label} plan` : "No team plan"}</Text>
+        <Text style={styles.name} role="heading">
+          {b.plan ? `${b.plan.label} plan` : "No team plan"}
+        </Text>
         <Text style={styles.dim}>{teamPlanLine(b)}</Text>
         {status ? <Text style={styles.dim}>{status}</Text> : null}
         {seats ? <Text style={[styles.status, styles[seats.tone]]}>{seats.text}</Text> : null}
@@ -208,7 +214,9 @@ function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage
       {change && !b.plan
         ? b.plans?.map((p) => (
             <View key={p.name} style={styles.card}>
-              <Text style={styles.name}>{p.label}</Text>
+              <Text style={styles.name} role="heading">
+                {p.label}
+              </Text>
               <Text style={styles.faint}>{limitSummary(p.limits).join(" · ")}</Text>
               <Pressable style={[styles.primaryBtn, styles.self]} disabled={busy} onPress={() => onBuy(p.name)} accessibilityRole="link" accessibilityLabel={`Buy ${p.label} for the team`} accessibilityHint="Opens Stripe Checkout to pay">
                 <Text style={styles.primaryText}>Buy {p.label} for the team</Text>
@@ -229,6 +237,8 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
   const [team, setTeam] = useState<Team | null | undefined>(undefined);
   const [invites, setInvites] = useState<MyTeamInvite[]>([]);
   const [error, setError] = useState<string | null>(null);
+  /** The team didn't load: alone it fills the screen, after a refresh it sits above what's already shown. */
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Exclude<TeamRole, "owner">>("member");
@@ -248,14 +258,14 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
         try {
           waiting = (await api.teamRoleRequests("pending")).requests;
         } catch (e) {
-          failed = message(e, "Couldn't load them");
+          failed = errorText(e, "Couldn't load requests for team roles");
         }
       }
       setRequests(waiting);
       setRequestsError(failed);
+      setLoadError(null);
     } catch (e) {
-      setError(message(e, "Couldn't load your team"));
-      setTeam((t) => t ?? null);
+      setLoadError(e);
     }
   }, [api]);
 
@@ -282,7 +292,7 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
     try {
       await fn();
     } catch (e) {
-      setError(message(e, "That didn't work"));
+      setError(friendlyError(e, "That didn't work. Try again."));
     } finally {
       setBusy(false);
       await load();
@@ -342,36 +352,60 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
 
   return (
     <View style={styles.root}>
-      <PageHeader title={team ? team.name : "Team"} onBack={onBack} right={busy ? <Spinner /> : null} />
+      <PageHeader title={team ? team.name : "Team"} onBack={onBack} right={busy ? <BusyDots label="Saving" /> : null} />
       <ScrollView contentContainerStyle={styles.body}>
         {notice ? (
           <Text style={[styles.status, notice.good ? styles.ok : styles.dim]} accessibilityRole="alert">
             {notice.text}
           </Text>
         ) : null}
-        {error ? (
-          <Text style={styles.error} accessibilityRole="alert">
-            {error}
-          </Text>
+        {team !== undefined && loadError ? <InlineError message={errorText(loadError, "Couldn't refresh your team")} onRetry={load} /> : null}
+        {error ? <InlineError message={error} /> : null}
+        {team === undefined ? (
+          loadError ? (
+            <ErrorState title="Couldn't load your team" message={friendlyError(loadError)} onRetry={load} />
+          ) : (
+            <PageSkeleton label="Loading your team" inset={false} />
+          )
         ) : null}
-        {team === undefined ? <Spinner style={styles.loading} /> : null}
 
-        {team === null ? <Text style={styles.empty}>You aren't on a team.</Text> : null}
+        {team === null ? (
+          <EmptyState
+            compact
+            glyph="+"
+            title="You aren't on a team"
+            message={
+              invites.length && canWrite
+                ? "Join a team from one of your invites below."
+                : "Ask a team's owner or admin to invite you with the email you sign in with."
+            }
+          />
+        ) : null}
         {team === null && invites.length ? (
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Invites for you</Text>
+            <Text style={styles.sectionTitle} role="heading">
+              Invites for you
+            </Text>
             {invites.map((i) => (
               <View key={i.id} style={styles.card} accessibilityLabel={`Invite to ${i.team.name ?? i.team.id}`}>
-                <Text style={styles.name}>{i.team.name ?? i.team.id}</Text>
+                <Text style={styles.name} role="heading">
+                  {i.team.name ?? i.team.id}
+                </Text>
                 <Text style={styles.dim}>
                   As {TEAM_ROLE_LABEL[i.role].toLowerCase()} · until {new Date(i.expiresAt).toLocaleDateString()}
                 </Text>
                 {canWrite ? (
                   <View style={styles.actions}>
-                    <Pressable style={styles.primaryBtn} disabled={busy} onPress={() => accept(i)} accessibilityRole="button">
+                    <Pressable style={styles.primaryBtn} disabled={busy} onPress={() => accept(i)} accessibilityRole="button" accessibilityLabel={`Join ${i.team.name ?? i.team.id}`}>
                       <Text style={styles.primaryText}>Join</Text>
                     </Pressable>
-                    <Pressable style={styles.btn} disabled={busy} onPress={() => run(() => api.declineTeamInvite(i.id))} accessibilityRole="button">
+                    <Pressable
+                      style={styles.btn}
+                      disabled={busy}
+                      onPress={() => run(() => api.declineTeamInvite(i.id))}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Decline invite to ${i.team.name ?? i.team.id}`}
+                    >
                       <Text style={styles.btnText}>Decline</Text>
                     </Pressable>
                   </View>
@@ -395,7 +429,9 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
 
             {manage ? (
               <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Invite a teammate</Text>
+                <Text style={styles.sectionTitle} role="heading">
+                  Invite a teammate
+                </Text>
                 <View style={styles.card}>
                   <Text style={styles.faint}>They join when they accept, signed in with this email.{team.machines ? " Joining gives them a machine of their own." : ""}</Text>
                   <TextInput
@@ -441,15 +477,14 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
 
             {manage && requestsError ? (
               <View style={styles.section}>
-                <Text style={styles.error} accessibilityRole="alert">{`Couldn't load requests for team roles: ${requestsError}`}</Text>
-                <Pressable style={[styles.btn, styles.self]} disabled={busy} onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Load requests again">
-                  <Text style={styles.btnText}>Try again</Text>
-                </Pressable>
+                <InlineError message={requestsError} onRetry={load} retryLabel="Load requests again" />
               </View>
             ) : null}
             {manage && requests.length ? (
               <View style={styles.section} testID="team-role-requests">
-                <Text style={styles.sectionTitle}>Requests for team roles ({requests.length})</Text>
+                <Text style={styles.sectionTitle} role="heading">
+                  Requests for team roles ({requests.length})
+                </Text>
                 <Text style={styles.faint}>Approving gives the role in this team only, for the hours asked or fewer, and it ends by itself.</Text>
                 {requests.map((q) => (
                   <RequestRow
@@ -467,11 +502,17 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
             ) : null}
 
             <View style={styles.section}>
-              <Text style={styles.sectionTitle}>People</Text>
+              <Text style={styles.sectionTitle} role="heading">
+                People
+              </Text>
               <View style={styles.list}>
-                {team.members.map((m, i) => (
-                  <MemberRow key={m.id} m={m} first={i === 0} team={team} meId={meId} manage={manage} busy={busy} onRole={changeRole} onRemove={remove} onGiveRole={giveRole} onTakeRole={takeRole} />
-                ))}
+                {team.members.length ? (
+                  team.members.map((m, i) => (
+                    <MemberRow key={m.id} m={m} first={i === 0} team={team} meId={meId} manage={manage} busy={busy} onRole={changeRole} onRemove={remove} onGiveRole={giveRole} onTakeRole={takeRole} />
+                  ))
+                ) : (
+                  <EmptyState compact glyph="+" title="No one on the team yet" message={manage ? "Invite a teammate above." : "People show here once they join."} />
+                )}
               </View>
             </View>
 
@@ -498,7 +539,6 @@ const useStyles = themedStyles((t) => {
   return StyleSheet.create({
     root: k.root,
     body: k.body,
-    loading: { marginTop: t.space.xl },
     section: { gap: t.space.sm },
     sectionTitle: { ...k.section, marginTop: t.space.sm, marginBottom: 0 },
     list: { ...k.card, gap: 0, paddingVertical: t.space.xs },
@@ -530,7 +570,5 @@ const useStyles = themedStyles((t) => {
     inviteRow: k.row,
     rolePanel: { ...k.inset, marginTop: t.space.xs },
     link: { ...k.link, ...type(t, "sm") },
-    empty: k.empty,
-    error: k.error,
   });
 });

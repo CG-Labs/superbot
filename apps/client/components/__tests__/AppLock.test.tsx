@@ -304,6 +304,19 @@ describe("App lock (ADR 0078)", () => {
     expect(screen.queryByText("SuperBot is locked")).toBeNull();
   });
 
+  it("holds Unlock busy, label and all, while the prompt is open", async () => {
+    const auth = fakeAuth();
+    let answer: (r: { success: true }) => void = () => {};
+    auth.authenticate.mockImplementationOnce(() => new Promise((r) => (answer = r)));
+    await show({ auth, store: fakeStore(serializeLockSettings({ enabled: true, lockAfter: 0 })) });
+    const unlock = await screen.findByRole("button", { name: "Unlock" });
+    expect(unlock).toBeBusy();
+    expect(unlock).toBeDisabled();
+    expect(within(unlock).getByText("Unlock")).toBeOnTheScreen();
+    await act(async () => answer({ success: true }));
+    await waitFor(() => expect(screen.queryByText("SuperBot is locked")).toBeNull());
+  });
+
   it("fails safe when the prompt says biometrics were removed", async () => {
     const auth = fakeAuth({ enrolled: false, level: 1 }, [{ success: false, error: "passcode_not_set" }]);
     await show({ auth, store: fakeStore(serializeLockSettings({ enabled: true, lockAfter: 0 })) });

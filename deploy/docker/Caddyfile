@@ -34,11 +34,15 @@
 		file_server
 	}
 	# Bots' screens (docs/computer.md): /screen/<port>/ is that screen's viewer in the botd
-	# container, which listens there with SCREEN_ADDR=0.0.0.0. Its own token guards it.
+	# container, which listens there with SCREEN_ADDR=0.0.0.0. Its own token guards it. The
+	# app's session cookie stays here: a viewer never needs it, and a port a Bot's account
+	# listens on must never see it (docs/adr/0342-per-user-screens-on-one-server.md).
 	@screen path_regexp screen ^/screen/(69[0-9][0-9])/
 	handle @screen {
 		uri strip_prefix /screen/{re.screen.1}
-		reverse_proxy botd:{re.screen.1}
+		reverse_proxy botd:{re.screen.1} {
+			header_up -Cookie
+		}
 	}
 	# Everything else: botd's console at /console/, /login, /api, /healthz, /status.
 	handle {

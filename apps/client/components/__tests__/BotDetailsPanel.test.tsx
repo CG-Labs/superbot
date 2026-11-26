@@ -1,8 +1,10 @@
 import React from "react";
+import * as RN from "react-native";
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { BotDetailsPanel } from "../BotDetailsPanel";
 import { hasAccess } from "../../src/access";
 import * as dialogs from "../../src/dialogs";
+import { themes } from "../../src/theme";
 import type { BotAccess, BotView, Routine } from "../../src/types";
 
 const mockCtx: Record<string, unknown> = {
@@ -311,5 +313,46 @@ describe("BotDetailsPanel", () => {
     Object.assign(mockCtx, { bots: [kept], activeId: "b", fetchRoutines: jest.fn(async () => []) });
     await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
     expect(await screen.findByText("Kept by service account CI: its runs reach only what that account may")).toBeOnTheScreen();
+  });
+
+  it.each(["light", "dark"] as const)("follows the device's %s setting, on the sheet's surface over the overlay", async (scheme) => {
+    const spy = jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    Object.assign(mockCtx, { bots: [bot("b", "Bob")], activeId: "b", fetchRoutines: jest.fn(async () => []) });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    const c = themes[scheme].c;
+    const sheet = screen.getByTestId("bot-details");
+    expect(sheet).toHaveStyle({ backgroundColor: c.surface });
+    expect(sheet.parent).toHaveStyle({ backgroundColor: c.overlay });
+    expect(screen.getByLabelText("Bot name")).toHaveStyle({ color: c.text });
+    expect(screen.getByText("+ New routine")).toHaveStyle({ color: c.accentText });
+    expect(screen.getByRole("button", { name: "Delete bot" })).toHaveStyle({ backgroundColor: c.dangerSoft });
+    expect(screen.getByText("Delete bot")).toHaveStyle({ color: c.danger });
+    spy.mockRestore();
+  });
+
+  it("marks its sections as headings and names its fields and switches", async () => {
+    const patchBot = jest.fn(async () => {});
+    const setBotPolicy = jest.fn(async () => {});
+    Object.assign(mockCtx, {
+      bots: [{ ...shared("manage"), policyOverride: true, policy: "bypass" }],
+      activeId: "b",
+      fetchRoutines: jest.fn(async () => []),
+      patchBot,
+      setBotPolicy,
+      policy: { mode: "ask" },
+    });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+
+    for (const name of ["Routines", "Computer", "Settings", "Sharing"]) expect(screen.getByRole("heading", { name })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Close details" })).toBeOnTheScreen();
+    expect(screen.getByLabelText("Bot name")).toHaveDisplayValue("Bob");
+    await act(async () => fireEvent(screen.getByRole("switch", { name: "Hide from sidebar" }), "valueChange", true));
+    expect(patchBot).toHaveBeenCalledWith("b", { hidden: true });
+    await act(async () => fireEvent(screen.getByRole("switch", { name: "Ask before risky actions" }), "valueChange", true));
+    expect(setBotPolicy).toHaveBeenCalledWith("b", "ask");
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Use the default for all Bots (ask)" })));
+    expect(setBotPolicy).toHaveBeenLastCalledWith("b", null);
+    expect(screen.getByRole("button", { name: "Delete bot" })).toBeOnTheScreen();
+    Object.assign(mockCtx, { policy: undefined });
   });
 });

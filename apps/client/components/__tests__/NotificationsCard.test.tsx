@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, within } from "@testing-library/react-native";
+import { act, render, screen, userEvent, within } from "@testing-library/react-native";
 import { NotificationsCard, type NotificationsApi } from "../NotificationsCard";
 import type { BotNotificationsPatch, BotNotificationsView, BotNotifySettings, NotificationsPatch, NotificationsView } from "../../src/types";
 jest.setTimeout(20_000);
@@ -122,11 +122,37 @@ describe("NotificationsCard (ADR 0061)", () => {
     expect(within(screen.getByLabelText("Email")).getByRole("radio", { name: "On" })).toBeDisabled();
   });
 
+  it("shows a skeleton while it loads, then a retry that loads it", async () => {
+    const api = fakeApi();
+    let fail: (e: Error) => void = () => {};
+    api.notifications.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<NotificationsCard api={api} />);
+    expect(screen.getByRole("heading", { name: "Notifications" })).toBeOnTheScreen();
+    expect(screen.getByRole("progressbar", { name: "Loading notifications" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load notifications. Can't reach the server. Check your connection and try again.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Email addresses")).toBeOnTheScreen();
+    expect(api.notifications).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says why a change failed, without a retry", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    api.patchNotifications.mockRejectedValueOnce(new Error("Email needs an SMTP server"));
+    await render(<NotificationsCard api={api} />);
+    await user.press(within(await screen.findByLabelText("Email")).getByRole("radio", { name: "On" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Email needs an SMTP server");
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
   it("sets a Bot's own webhook and puts its email back to the default", async () => {
     const api = fakeApi();
     const user = userEvent.setup();
     await render(<NotificationsCard api={api} bot={{ id: "b1", name: "Scout" }} />);
     expect(await screen.findByText("Its approvals notify nobody: they wait in the app.")).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Notifications for Scout" })).toBeOnTheScreen();
     expect(screen.getByText("No email address for Bo.")).toBeOnTheScreen();
 
     const email = screen.getByLabelText("Email for this Bot");

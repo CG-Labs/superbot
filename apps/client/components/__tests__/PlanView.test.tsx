@@ -119,8 +119,66 @@ describe("PlanView (ADR 0042)", () => {
     const user = userEvent.setup();
     await render(<PlanView api={api} onBack={jest.fn()} open={open} />);
     await user.press(await screen.findByRole("link", { name: "Upgrade to Pro" }));
-    expect(await screen.findByText("Stripe couldn't open the checkout just now.")).toBeOnTheScreen();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Stripe couldn't open the checkout just now.");
     expect(open).not.toHaveBeenCalled();
+  });
+
+  it("shows a skeleton while the plan loads, and a retry that loads it when it can't", async () => {
+    const api = fakeApi(billing());
+    let fail: (e: Error) => void = () => {};
+    api.billing.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<PlanView api={api} onBack={jest.fn()} />);
+    expect(screen.getByRole("progressbar", { name: "Loading your plan" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent(/^Couldn't load your plan/);
+    expect(screen.getByText("Can't reach the server. Check your connection and try again.")).toBeOnTheScreen();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("Starter plan")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps the plan on screen when a refresh fails, with a retry", async () => {
+    jest.useFakeTimers();
+    try {
+      const api = fakeApi(billing());
+      await render(<PlanView api={api} onBack={jest.fn()} checkout="success" />);
+      expect(await screen.findByText("Starter plan")).toBeOnTheScreen();
+      api.billing.mockRejectedValueOnce(new ApiError("HTTP 503", 503));
+      await act(async () => {
+        jest.advanceTimersByTime(CONFIRM_EVERY_MS);
+      });
+      expect(screen.getByText("Couldn't refresh your plan. The server had a problem. Try again in a moment.")).toHaveProp("role", "alert");
+      expect(screen.getByText("Starter plan")).toBeOnTheScreen();
+      const calls = api.billing.mock.calls.length;
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+      expect(api.billing.mock.calls.length).toBe(calls + 1);
+      expect(screen.queryByText(/Couldn't refresh your plan/)).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("reads the plan's cards and sections as headings", async () => {
+    await render(<PlanView api={fakeApi(billing({ emails: { on: true, usage: true } }), usage)} onBack={jest.fn()} />);
+    expect(await screen.findByRole("heading", { name: "Starter plan" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Usage this period" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Emails" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Plans" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Pro" })).toBeOnTheScreen();
+  });
+
+  it("keeps the billing link's name while it opens, and marks it busy", async () => {
+    const api = fakeApi(billing({ subscription: { status: "active", tier: "starter", periodEnd: null }, portal: true }));
+    let done: () => void = () => {};
+    const open = jest.fn(() => new Promise<void>((r) => (done = r)));
+    await render(<PlanView api={api} onBack={jest.fn()} open={open} />);
+    await userEvent.setup().press(await screen.findByRole("link", { name: "Manage billing" }));
+    const link = screen.getByRole("link", { name: "Manage billing" });
+    expect(link).toHaveTextContent("Opening…");
+    expect(link).toBeBusy();
+    await act(async () => done());
+    expect(screen.getByRole("link", { name: "Manage billing" })).not.toBeBusy();
   });
 
   it("thanks people back from Stripe, and shows the new plan once Stripe confirms it", async () => {

@@ -2,12 +2,16 @@ import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
+import { errorText, friendlyError } from "../src/errors";
 import { ACTION_LABELS, ACTIONS, classChoice, minutesLabel, newRule, parseTimeout, ruleProblem, RULE_TOOLS, sortRules, toolLabel } from "../src/policy";
 import { hairline, themedStyles } from "../src/theme";
 import type { Policy, PolicyAction, PolicyMode, PolicyPatch, PolicyRule, PolicyView } from "../src/types";
 import { Chips } from "./Chips";
+import { EmptyState } from "./EmptyState";
+import { ErrorState, InlineError } from "./ErrorState";
 import { NotificationsCard, type NotificationsApi } from "./NotificationsCard";
-import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
+import { PageSkeleton } from "./Skeleton";
+import { kit, PageHeader, usePlaceholder } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "policyView" | "patchGlobalPolicy" | "patchBotPolicy" | "resetBotPolicy" | "addPolicyRule" | "deletePolicyRule">;
@@ -27,10 +31,6 @@ const MODE_LABELS: Record<PolicyMode, string> = { ask: "Ask", bypass: "Bypass" }
 const onOff = (on: boolean) => (on ? "On" : "Off");
 const HARNESS_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", hermes: "Hermes Agent" };
 
-function message(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
 /**
  * The approval policy (ADR 0007, 0049): the mode, an action per risky class, how long an
  * approval waits, and the allow/deny rules. Global, or one Bot's on top of it.
@@ -43,6 +43,8 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
   /** The global policy under a Bot's, for the "Default (…)" choices. */
   const [global, setGlobal] = useState<Policy | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
+  /** The policy didn't load: alone it fills the screen, after a refresh it sits above what's already shown. */
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [timeout, setTimeoutText] = useState("");
@@ -57,9 +59,9 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
       const [v, g] = await Promise.all([api.policyView(botId), botId ? api.policyView() : Promise.resolve(undefined)]);
       setView(v);
       setGlobal(g?.policy ?? v.policy);
-      setError(null);
+      setLoadError(null);
     } catch (e) {
-      setError(message(e));
+      setLoadError(e);
     }
   }, [api, botId]);
 
@@ -80,7 +82,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
       await fn();
       setNotice(done);
     } catch (e) {
-      setError(message(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -103,12 +105,10 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
     return (
       <View style={styles.root}>
         {header}
-        {error ? (
-          <Text style={[styles.error, styles.pad]} accessibilityRole="alert">
-            {error}
-          </Text>
+        {loadError ? (
+          <ErrorState title="Couldn't load the policy" message={friendlyError(loadError)} onRetry={load} />
         ) : (
-          <Spinner style={styles.loading} />
+          <PageSkeleton label="Loading the policy" />
         )}
       </View>
     );
@@ -209,20 +209,21 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
             {notice}
           </Text>
         ) : null}
-        {error ? (
-          <Text style={styles.error} accessibilityRole="alert">
-            {error}
-          </Text>
-        ) : null}
+        {loadError ? <InlineError message={errorText(loadError, "Couldn't refresh the policy")} onRetry={load} /> : null}
+        {error ? <InlineError message={error} /> : null}
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Mode</Text>
+          <Text style={styles.cardTitle} role="heading">
+            Mode
+          </Text>
           <Chips options={modeOptions} value={bot && o?.mode === undefined ? "inherit" : view.policy.mode} onChange={(m) => void setMode(m)} disabled={locked} />
           {view.policy.mode === "bypass" ? <Text style={styles.warn}>Bypass: Bots run everything without asking, and the actions below don't apply. Dev only.</Text> : null}
         </View>
 
         <View style={styles.card} accessibilityLabel="Sandbox">
-          <Text style={styles.cardTitle}>Sandbox</Text>
+          <Text style={styles.cardTitle} role="heading">
+            Sandbox
+          </Text>
           <Text style={styles.dim}>
             The harness's own sandbox, on top of approvals: commands write only in the workspace, temp folders, the Bot's memory, and package caches. It
             holds in Bypass too.
@@ -237,7 +238,9 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
         </View>
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Risky actions</Text>
+          <Text style={styles.cardTitle} role="heading">
+            Risky actions
+          </Text>
           {view.classes.map((c) => {
             const options = [
               ...(bot ? [{ value: "inherit" as const, label: `Default (${ACTION_LABELS[g.classes[c.id] ?? "ask"]})` }] : []),
@@ -254,7 +257,9 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
         </View>
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Time to answer</Text>
+          <Text style={styles.cardTitle} role="heading">
+            Time to answer
+          </Text>
           <Text style={styles.dim}>
             An approval nobody answers is denied after {minutesLabel(view.policy.timeoutMinutes)}
             {bot && o?.timeoutMinutes === undefined ? " (the default)" : ""}.
@@ -277,6 +282,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
                   onPress={saveTimeout}
                   accessibilityRole="button"
                   accessibilityLabel="Save time to answer"
+                  aria-busy={busy === "timeout"}
                 >
                   <Text style={styles.primaryText}>{busy === "timeout" ? "Saving…" : "Save"}</Text>
                 </Pressable>
@@ -303,7 +309,9 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
         ) : null}
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Rules</Text>
+          <Text style={styles.cardTitle} role="heading">
+            Rules
+          </Text>
           <Text style={styles.dim}>
             Deny rules refuse a matching call, whatever else is set. Allow rules skip asking, but never override an action set to Deny. Patterns match the
             command, path, or address: * is any text, ? one character.
@@ -321,6 +329,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
                       onPress={() => void removeRule(r)}
                       accessibilityRole="button"
                       accessibilityLabel={`Delete rule ${r.pattern}`}
+                      aria-busy={busy === `rule:${r.id}`}
                     >
                       <Text style={styles.dangerText}>{busy === `rule:${r.id}` ? "Deleting…" : "Delete"}</Text>
                     </Pressable>
@@ -333,13 +342,20 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
               </View>
             ))
           ) : (
-            <Text style={styles.faint}>No rules yet.</Text>
+            <EmptyState
+              compact
+              glyph="+"
+              title="No rules yet"
+              message={canEdit ? "Add one below to always allow or deny calls that match it." : "Risky calls follow the actions above."}
+            />
           )}
         </View>
 
         {canEdit ? (
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>{bot ? `Add a rule for ${bot.name}` : "Add a rule for all Bots"}</Text>
+            <Text style={styles.cardTitle} role="heading">
+              {bot ? `Add a rule for ${bot.name}` : "Add a rule for all Bots"}
+            </Text>
             <View accessibilityLabel="Rule action">
               <Chips
                 options={[
@@ -393,6 +409,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
                 onPress={() => void addRule()}
                 accessibilityRole="button"
                 accessibilityLabel="Add rule"
+                aria-busy={busy === "rule:add"}
               >
                 <Text style={styles.primaryText}>{busy === "rule:add" ? "Adding…" : "Add rule"}</Text>
               </Pressable>
@@ -410,11 +427,8 @@ const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
     root: k.root,
-    loading: { marginTop: t.space.xxl },
-    pad: { padding: t.space.lg },
     body: k.body,
     good: k.good,
-    error: k.error,
     warn: k.warn,
     dim: k.dim,
     faint: k.faint,

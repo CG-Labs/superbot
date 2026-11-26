@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, waitFor } from "@testing-library/react-native";
+import { act, render, screen, userEvent, waitFor } from "@testing-library/react-native";
 import { RolesAdmin } from "../RolesAdmin";
 import { ApiError, type SuperBotApi } from "../../src/api";
 import type { AdminUser, CustomRole, RoleRequest, RolesView, Team } from "../../src/types";
@@ -163,6 +163,74 @@ describe("RolesAdmin (ADR 0132)", () => {
   });
 });
 
+describe("RolesAdmin: loading, empty and error states (ADR 0345)", () => {
+  it("shows a skeleton while roles load, then an error that tries again", async () => {
+    const api = mockApi();
+    let fail: (e: Error) => void = () => {};
+    api.roles.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await show(api);
+    expect(screen.getByRole("progressbar", { name: "Loading roles" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load rolesCan't reach the server. Check your connection and try again.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Role Support")).toBeOnTheScreen();
+    expect(api.roles).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("titles the lists, says when there are no custom roles, and marks the picked role", async () => {
+    const api = mockApi();
+    api.roles.mockResolvedValue({ ...VIEW, roles: [] });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByRole("heading", { name: "No custom roles yet" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Built in" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Custom" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Role Member" })).not.toBeSelected();
+    await u.press(screen.getByRole("button", { name: "Role Member" }));
+    expect(screen.getByRole("button", { name: "Role Member" })).toBeSelected();
+    expect(screen.getByRole("heading", { name: "Can do" })).toBeOnTheScreen();
+  });
+
+  it("shows a skeleton while holders load, and a retry when they don't", async () => {
+    const api = mockApi();
+    let fail: (e: Error) => void = () => {};
+    api.role.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Role Support"));
+    expect(screen.getByRole("progressbar", { name: "Loading who has it" })).toBeOnTheScreen();
+    await act(async () => fail(new ApiError("HTTP 500", 500)));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load who has it. The server had a problem. Try again in a moment.");
+    await u.press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Take away from Sam")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says when nobody holds the role and there are no teams", async () => {
+    const api = mockApi();
+    api.role.mockResolvedValue({ ...SUPPORT, users: 0, teamMembers: 0, holders: { users: [], teams: [] } });
+    api.teams.mockResolvedValue([]);
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Role Support"));
+    expect(await screen.findByRole("heading", { name: "Nobody has it across the server" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "No teams yet" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Within a team" })).toBeOnTheScreen();
+  });
+
+  it("shows a failed save as an alert in plain words", async () => {
+    const api = mockApi();
+    api.updateRole.mockRejectedValueOnce(new ApiError("HTTP 403", 403));
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Role Support"));
+    await u.press(screen.getByRole("checkbox", { name: "audit.view" }));
+    await u.press(screen.getByLabelText("Save"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("You don't have access to that.");
+  });
+});
+
 describe("RolesAdmin: time-bound roles (ADR 0197)", () => {
   const NOW = Date.UTC(2026, 10, 23, 12);
   beforeEach(() => jest.spyOn(Date, "now").mockReturnValue(NOW));
@@ -314,8 +382,8 @@ describe("RolesAdmin: requests for roles (ADR 0209)", () => {
     api.roleRequests.mockResolvedValueOnce({ requests: [request()], pending: 1, pendingDays: 7 });
     const u = userEvent.setup();
     await show(api);
-    expect(await screen.findByText("Couldn't load requests for roles: Server error")).toBeTruthy();
-    await u.press(screen.getByLabelText("Load requests again"));
+    expect(await screen.findByText("Couldn't load requests for roles. Server error")).toBeTruthy();
+    await u.press(screen.getByRole("button", { name: "Try again" }));
     expect(await screen.findByText("Requests (1)")).toBeTruthy();
     expect(screen.queryByText(/Couldn't load requests/)).toBeNull();
   });

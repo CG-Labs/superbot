@@ -1,5 +1,5 @@
 import React from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
+import { Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import { hairline, type Theme, themedStyles, type, useTheme } from "../src/theme";
 
 const build = (t: Theme) =>
@@ -252,7 +252,11 @@ export function Card({
   const ui = useUi();
   return (
     <View style={[ui.card, style]} accessibilityLabel={accessibilityLabel} testID={testID}>
-      {title ? <Text style={ui.cardTitle}>{title}</Text> : null}
+      {title ? (
+        <Text style={ui.cardTitle} role="heading">
+          {title}
+        </Text>
+      ) : null}
       {children}
     </View>
   );
@@ -298,12 +302,6 @@ export function PillButton({ label, onPress, tone = "secondary", busy, busyLabel
       <Text style={[ui.btnText, tone === "primary" && ui.primaryText]}>{text}</Text>
     </Pressable>
   );
-}
-
-/** A spinner in the muted text colour. */
-export function Spinner({ style }: { style?: StyleProp<ViewStyle> }) {
-  const t = useTheme();
-  return <ActivityIndicator color={t.c.textMuted} style={style} />;
 }
 
 /** The placeholder colour for text fields. */

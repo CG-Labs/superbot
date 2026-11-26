@@ -4,10 +4,12 @@ import { errorText } from "../src/errors";
 import { useReducedMotion } from "../src/motion";
 import { focusFirst } from "../src/notifications";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors, ThemeScope, themedStyles, type } from "../src/theme";
+import { hairline, themedStyles, type } from "../src/theme";
 import type { Approval, ApprovalScope } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { EmptyState } from "./EmptyState";
+import { InlineError } from "./ErrorState";
+import { kit } from "./ui";
 
 interface Props {
   visible: boolean;
@@ -70,7 +72,7 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
       <View style={styles.row}>
         {can("admin") ? (
           <>
-            <Switch value={remember} onValueChange={setRemember} />
+            <Switch value={remember} onValueChange={setRemember} aria-label={`Remember for ${bot?.name ?? "this Bot"}`} />
             <Text style={[styles.dim, { flex: 1 }]}>Remember for {bot?.name ?? "this Bot"}</Text>
           </>
         ) : (
@@ -79,11 +81,7 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
         <Text style={styles.faint}>Denied in {minutesLeft(a)}</Text>
       </View>
       {canRun ? <Text style={styles.faint}>{forRun}</Text> : null}
-      {error ? (
-        <Text style={styles.error} role="alert">
-          {error}
-        </Text>
-      ) : null}
+      {error ? <InlineError message={error} /> : null}
       {canDecide ? (
       <View style={styles.actions}>
         <Pressable style={({ pressed }) => [styles.btn, pressed && styles.pressed]} disabled={busy} onPress={() => void decide(false)} accessibilityRole="button">
@@ -108,11 +106,12 @@ export function ApprovalsInbox({ visible, onClose, onOpenPolicy, focusId }: Prop
   const ask = policy?.mode !== "bypass";
   const { list, gone } = focusFirst(approvals, focusId);
   const reduceMotion = useReducedMotion();
+  const styles = useStyles();
 
   return (
     <Modal visible={visible} animationType={reduceMotion ? "none" : "slide"} transparent onRequestClose={onClose}>
       <View style={styles.backdrop}>
-        <View style={styles.panel}>
+        <View style={styles.panel} testID="approvals-sheet">
           <View style={styles.titleRow}>
             <Text style={styles.title} role="heading">
               Approvals
@@ -124,32 +123,27 @@ export function ApprovalsInbox({ visible, onClose, onOpenPolicy, focusId }: Prop
             </Pressable>
           </View>
           {gone ? (
-            <Text style={styles.faint} accessibilityRole="alert">
+            <Text style={styles.note} accessibilityRole="alert">
               That approval isn't waiting anymore: someone answered it, or it timed out.
             </Text>
           ) : null}
-          <ScrollView contentContainerStyle={{ gap: 12 }}>
+          <ScrollView contentContainerStyle={styles.list}>
             {list.length ? (
-              <ThemeScope scheme="dark">
-                {list.map((a) => (
-                  <ApprovalCard key={a.id} approval={a} />
-                ))}
-              </ThemeScope>
+              list.map((a) => <ApprovalCard key={a.id} approval={a} />)
             ) : (
-              <ThemeScope scheme="dark">
-                <EmptyState compact glyph="✓" title="You're all caught up" message="Nothing is waiting for you. Bots ask here before risky actions." />
-              </ThemeScope>
+              <EmptyState compact glyph="✓" title="You're all caught up" message="Nothing is waiting for you. Bots ask here before risky actions." />
             )}
           </ScrollView>
           <View style={styles.row}>
             <Text style={[styles.dim, { flex: 1 }]}>Ask before risky actions (all Bots)</Text>
             <Switch
+              aria-label="Ask before risky actions (all Bots)"
               value={ask}
               disabled={!can("admin")}
               onValueChange={(v) => void setGlobalPolicy(v ? "ask" : "bypass")}
             />
           </View>
-          {!ask ? <Text style={styles.faint}>Bypass: Bots run everything without asking. Dev only.</Text> : null}
+          {!ask ? <Text style={styles.note}>Bypass: Bots run everything without asking. Dev only.</Text> : null}
           {onOpenPolicy ? (
             <Pressable style={styles.row} onPress={onOpenPolicy} accessibilityRole="button">
               <Text style={styles.link}>{can("admin") ? "Edit risky actions, timeout, and rules ›" : "See risky actions, timeout, and rules ›"}</Text>
@@ -161,23 +155,30 @@ export function ApprovalsInbox({ visible, onClose, onOpenPolicy, focusId }: Prop
   );
 }
 
-const styles = StyleSheet.create({
-  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
-  panel: {
-    backgroundColor: colors.bgSidebar,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    padding: 20,
-    maxHeight: "85%",
-    gap: 12,
-  },
-  titleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600" },
-  close: { color: colors.textDim, fontSize: 22 },
-  row: { flexDirection: "row", alignItems: "center", gap: 10 },
-  dim: { color: colors.textDim },
-  link: { color: colors.blueDot },
-  faint: { color: colors.textFaint, fontSize: 13 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    backdrop: { ...k.backdrop, justifyContent: "flex-end", padding: 0 },
+    panel: {
+      backgroundColor: t.c.surface,
+      borderTopLeftRadius: t.radius.lg,
+      borderTopRightRadius: t.radius.lg,
+      borderWidth: hairline,
+      borderBottomWidth: 0,
+      borderColor: t.c.border,
+      padding: t.space.xl,
+      maxHeight: "85%",
+      gap: t.space.md,
+    },
+    titleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+    title: { color: t.c.text, ...type(t, "xl"), fontWeight: t.font.weight.semibold },
+    close: { color: t.c.textMuted, fontSize: 22 },
+    list: { gap: t.space.md },
+    row: { flexDirection: "row", alignItems: "center", gap: t.space.md },
+    dim: { color: t.c.textMuted, ...type(t, "md") },
+    note: k.dim,
+    link: { color: t.c.accentText, ...type(t, "md") },
+  });
 });
 
 const useCardStyles = themedStyles((t) =>
@@ -222,6 +223,5 @@ const useCardStyles = themedStyles((t) =>
     pressed: { opacity: 0.7 },
     dim: { color: t.c.textMuted },
     faint: { color: t.c.textFaint, ...type(t, "sm") },
-    error: { color: t.c.danger },
   }),
 );

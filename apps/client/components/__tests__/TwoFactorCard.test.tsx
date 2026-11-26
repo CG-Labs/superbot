@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent } from "@testing-library/react-native";
+import { act, render, screen, userEvent } from "@testing-library/react-native";
 import { proofFrom, TwoFactorCard, type MfaApi } from "../TwoFactor";
 import { themes } from "../../src/theme";
 import type { MfaStatus } from "../../src/types";
@@ -69,6 +69,35 @@ describe("TwoFactorCard", () => {
     await render(<TwoFactorCard api={fakeApi({ ...on, required: true })} />);
     expect(await screen.findByText("New recovery codes")).toBeOnTheScreen();
     expect(screen.queryByText("Turn off")).not.toBeOnTheScreen();
+  });
+
+  it("shows a skeleton while it loads, then a retry that loads it", async () => {
+    const api = fakeApi(off);
+    let fail: (e: Error) => void = () => {};
+    api.mfaStatus.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<TwoFactorCard api={api} />);
+    expect(screen.getByRole("heading", { name: "Two-factor authentication" })).toBeOnTheScreen();
+    expect(screen.getByRole("progressbar", { name: "Loading two-factor authentication" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load two-factor authentication. Can't reach the server. Check your connection and try again.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("Off.")).toBeOnTheScreen();
+    expect(api.mfaStatus).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("names its buttons, and says why a step failed without a retry", async () => {
+    const api = fakeApi(on);
+    api.mfaDisable.mockRejectedValueOnce(new Error("That code didn't match."));
+    const user = userEvent.setup();
+    await render(<TwoFactorCard api={api} />);
+    expect(await screen.findByRole("button", { name: "New recovery codes" })).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Turn off two-factor authentication" }));
+    await user.type(screen.getByLabelText("Code or recovery code"), "000000");
+    expect(screen.getByRole("button", { name: "Cancel turning off two-factor authentication" })).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Turn off two-factor authentication" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("That code didn't match.");
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
   it("lets admins set the policy unless the server pins it", async () => {

@@ -1,6 +1,8 @@
 import React from "react";
+import * as RN from "react-native";
 import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
 import { ScreenViewer } from "../ScreenViewer";
+import { themes } from "../../src/theme";
 import type { Message } from "../../src/types";
 
 jest.mock("../ScreenFrame", () => ({
@@ -19,7 +21,40 @@ const handoff: Message = {
   at: 1,
 };
 
+afterEach(() => jest.restoreAllMocks());
+
 describe("ScreenViewer", () => {
+  it.each(["light", "dark"] as const)("follows the %s scheme, with the skeleton on a visible ground", async (scheme) => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    const c = themes[scheme].c;
+    await render(<ScreenViewer botId="b1" botName="Ada" fetchUrl={() => new Promise<string>(() => {})} onClose={jest.fn()} />);
+    const title = screen.getByRole("heading", { name: "Ada's screen" });
+    expect(title).toHaveStyle({ color: c.text });
+    expect(screen.root).toHaveStyle({ backgroundColor: c.bg });
+    expect(screen.getByRole("progressbar", { name: "Starting Ada's screen" })).toHaveStyle({ backgroundColor: c.surface });
+    expect(screen.getByRole("button", { name: "Take over" })).toHaveStyle({ backgroundColor: c.raised });
+    expect(screen.getByRole("button", { name: "Take over" })).toBeDisabled();
+  });
+
+  it("fills Give back and Done with the accent", async () => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue("light");
+    await render(
+      <ScreenViewer
+        botId="b1"
+        botName="Ada"
+        fetchUrl={jest.fn().mockResolvedValue("https://h/screen/6901/?token=a")}
+        onClose={jest.fn()}
+        initialControl
+        handoff={handoff}
+        onHandoffDone={jest.fn().mockResolvedValue(undefined)}
+      />,
+    );
+    await screen.findByTestId("screen-frame");
+    expect(screen.getByRole("button", { name: "Give back" })).toHaveStyle({ backgroundColor: themes.light.c.accent });
+    expect(screen.getByRole("button", { name: "Done, hand back to Bot" })).toHaveStyle({ backgroundColor: themes.light.c.accent });
+    expect(screen.getByText("Done")).toHaveStyle({ color: themes.light.c.onAccent });
+  });
+
   it("shows the live view read-only until the user takes over", async () => {
     const user = userEvent.setup();
     const fetchUrl = jest.fn().mockResolvedValue("https://bots.example.com/screen/6901/?token=t");
