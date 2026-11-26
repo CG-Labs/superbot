@@ -1185,7 +1185,7 @@ if grep -q '^AUTH_PASSWORD=' <<<"$given"; then fail "a .env with a password was 
 if grep -q 'ACCESS_KEY_ID' <<<"$given"; then fail "a key not given to the installer was set: $given"; fi
 mcheck ok BACKUP_AGE_GENERATE=true BACKUP_AGE_RECIPIENTS=age1given >/dev/null || fail "the settings check with recipients stopped the install"
 grep -qxF SUPERBOT_BACKUP_AGE_RECIPIENTS=age1given "$T/mbundle/args" || fail "given recipients weren't judged as given: $(cat "$T/mbundle/args")"
-if grep -q made-by-the-installer "$T/mbundle/args"; then fail "given recipients were judged with the installer's: $(cat "$T/mbundle/args")"; fi
+if grep -q made-by-the-installer "$T/mbundle/args"; then fail "a stand-in was set beside given recipients: $(cat "$T/mbundle/args")"; fi
 mcheck ok BACKUP_AGE_GENERATE=true BACKUP_ENCRYPTION=off >/dev/null || fail "the settings check for plain backups stopped the install"
 if grep -q RECIPIENTS=made "$T/mbundle/args"; then fail "a key was assumed for plain backups"; fi
 echo 'MACHINE_CONTROL_URL=https://10.0.0.5:8443' >"$MH/superbot/.env"
