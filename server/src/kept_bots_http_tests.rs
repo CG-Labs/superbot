@@ -327,6 +327,10 @@ async fn several_bots_go_together_or_not_at_all() {
     assert_eq!((refused[0]["targetId"].as_str(), refused[0]["details"]["reason"].as_str(), refused[0]["details"]["batch"].clone()), (Some(main.as_str()), Some("primary_bot"), json!(2)), "{refused:?}");
     assert_eq!(keep_all(port, &ana_auth, &sa, &[&ledger, &beas_private]).await.0, 404, "she can't see it");
     assert_eq!(keep_all(port, &ana_auth, &sa, &[&ledger, &beas_shared]).await.0, 403, "she uses it but doesn't manage it");
+    assert_eq!(keep_all(port, &ana_auth, &sa, &[&ledger, "nope"]).await.0, 404);
+    let refused = events(port, &admin, "bot.keep_refused").await;
+    let seen: Vec<(&str, &str, Value)> = refused[..3].iter().map(|e| (e["targetId"].as_str().unwrap(), e["details"]["reason"].as_str().unwrap(), e["details"]["batch"].clone())).collect();
+    assert_eq!(seen, [("nope", "bot_not_found", json!(2)), (beas_shared.as_str(), "bot_not_managed", json!(2)), (beas_private.as_str(), "bot_not_found", json!(2))], "{refused:?}");
     let (code, v) = keep_all(port, &admin, &sa, &[&ledger, &beas_shared]).await;
     assert_eq!(code, 409, "an admin may, but only the account owner's Bots: {v}");
     assert_eq!(events(port, &admin, "bot.keep_refused").await[0]["details"]["reason"], "service_account_owner");

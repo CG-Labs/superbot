@@ -76,14 +76,20 @@ pub fn keepable(app: &AppState, c: &Caller, by: &Who, sa: &db::ServiceAccount) -
 /// Records `bot.keep_refused` for `bot` and service account `key` with `reason`, `extra`,
 /// and `batch` (how many Bots the request named) when it came from `POST .../kept-bots`.
 fn refused(app: &AppState, by: &Who, bot: &db::Bot, key: &str, batch: Option<usize>, reason: &str, extra: Value) {
-    let mut d = json!({ "reason": reason, "serviceAccount": key, "owner": bot.owner_id });
+    refused_id(app, by, &bot.id, Some(&bot.owner_id), key, batch, reason, extra);
+}
+
+/// `refused` by the Bot's id, for one that may not exist.
+#[allow(clippy::too_many_arguments)]
+fn refused_id(app: &AppState, by: &Who, bot: &str, owner: Option<&str>, key: &str, batch: Option<usize>, reason: &str, extra: Value) {
+    let mut d = json!({ "reason": reason, "serviceAccount": key, "owner": owner });
     if let (Some(d), Value::Object(e)) = (d.as_object_mut(), extra) {
         d.extend(e);
     }
     if let Some(n) = batch {
         d["batch"] = json!(n);
     }
-    app.db.record(&by.event("bot.keep_refused").target("bot", &bot.id).bot(&bot.id).outcome(Outcome::Denied).details(d));
+    app.db.record(&by.event("bot.keep_refused").target("bot", bot).bot(bot).outcome(Outcome::Denied).details(d));
 }
 
 /// What stops `c` handing `bot` to service account `key` whoever it is: `c` doesn't decide
@@ -110,11 +116,11 @@ fn owners_own(app: &AppState, c: &Caller, by: &Who, bot: &db::Bot, sa: &db::Serv
     Ok(())
 }
 
-/// The audit, the old keeper's release and the access change once `bot` was handed to `sa`;
-/// nothing when it already kept it.
-async fn note_handed(app: &AppState, by: &Who, bot: &db::Bot, sa: &db::ServiceAccount, handed: &Handed, batch: Option<usize>) {
+/// The audit and the old keeper's release once `bot` was handed to `sa`. False, doing
+/// nothing, when it already kept it; else its access changed and `acl_changed` is owed.
+fn note_handed(app: &AppState, by: &Who, bot: &db::Bot, sa: &db::ServiceAccount, handed: &Handed, batch: Option<usize>) -> bool {
     if handed.from.as_deref() == Some(sa.user.id.as_str()) {
-        return;
+        return false;
     }
     // The account it took over from stops keeping it, and the run it has going there
     // (with the owner's keys) stops.
@@ -126,7 +132,7 @@ async fn note_handed(app: &AppState, by: &Who, bot: &db::Bot, sa: &db::ServiceAc
         details["batch"] = json!(n);
     }
     app.db.record(&by.event("bot.service_account_assigned").target("bot", &bot.id).bot(&bot.id).details(details));
-    crate::acl_changed(app, by, &bot.id, handed.from.is_some()).await;
+    true
 }
 
 const ERASING: &str = "Its owner is being erased. Try again once that's done.";
@@ -163,7 +169,9 @@ pub async fn put(State(app): State<AppState>, Extension(c): Extension<Caller>, E
             ApiError(StatusCode::CONFLICT, "This Bot was deleted or given another owner meanwhile.".into())
         }
     })?;
-    note_handed(&app, &by, &bot, &sa, &handed, None).await;
+    if note_handed(&app, &by, &bot, &sa, &handed, None) {
+        crate::acl_changed(&app, &by, &id, handed.from.is_some()).await;
+    }
     let after = crate::need_bot(&app, &id)?;
     let access = crate::viewer(&app, &c, &by).access(&app.db, &after);
     Ok(Json(access_view(&app, &c, &after, access)))
@@ -206,7 +214,14 @@ pub async fn put_many(State(app): State<AppState>, Extension(c): Extension<Calle
     let n = Some(ids.len());
     let mut bots = Vec::with_capacity(ids.len());
     for id in &ids {
-        let (bot, _) = crate::need_bot_access(&app, &c, &by, id, Access::Manage).map_err(|e| about(id, e))?;
+        let (bot, _) = crate::need_bot_access(&app, &c, &by, id, Access::Manage).map_err(|e| {
+            // Also as a refused handover, so the batch shows up beside the others; the
+            // reply stays the same 404 or 403.
+            let reason = if e.0 == StatusCode::NOT_FOUND { "bot_not_found" } else { "bot_not_managed" };
+            let owner = app.db.bot(id).map(|b| b.owner_id);
+            refused_id(&app, &by, id, owner.as_deref(), &sa.user.id, n, reason, json!({}));
+            about(id, e)
+        })?;
         may_hand(&app, &c, &by, &bot, &sa.user.id, n).and_then(|_| owners_own(&app, &c, &by, &bot, &sa, n)).map_err(|e| about(id, e))?;
         bots.push(bot);
     }
@@ -232,15 +247,20 @@ pub async fn put_many(State(app): State<AppState>, Extension(c): Extension<Calle
             }
         }
     })?;
+    // Every old keeper's run stops before any access change is sent out, so a slow one
+    // can't leave the others running for accounts that no longer keep their Bots.
     let (mut changed, mut unchanged) = (Vec::new(), Vec::new());
     for (bot, h) in bots.iter().zip(&handed) {
-        if h.from.as_deref() == Some(sa.user.id.as_str()) {
-            unchanged.push(&bot.id);
+        if note_handed(&app, &by, bot, &sa, h, n) {
+            changed.push((&bot.id, h.from.is_some()));
         } else {
-            changed.push(&bot.id);
+            unchanged.push(&bot.id);
         }
-        note_handed(&app, &by, bot, &sa, h, n).await;
     }
+    for (id, narrowed) in &changed {
+        crate::acl_changed(&app, &by, id, *narrowed).await;
+    }
+    let changed: Vec<_> = changed.into_iter().map(|(id, _)| id).collect();
     let mut out = service_accounts::detail(&app, &c, &by, &sa);
     out["handed"] = json!(changed);
     out["unchanged"] = json!(unchanged);
