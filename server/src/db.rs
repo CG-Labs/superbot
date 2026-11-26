@@ -6386,6 +6386,17 @@ impl Db {
     /// when the role isn't requestable or allows fewer hours, when they have a pending
     /// request for it in this scope, `max_pending` pending requests of any kind, or made
     /// `max_daily` requests in the last day, withdrawn ones too.
+    /// Whether a request's first approval (ADR 0320) still counts, judged by `counts` on what
+    /// an approval now would read. False without one, or once its approver or the role is gone.
+    pub fn first_approval_counts(&self, q: &RoleRequest, counts: impl FnOnce(&RequestState) -> bool) -> bool {
+        let Some(f) = &q.first else { return false };
+        let (Some(role), Some(user), Some(first)) = (self.custom_role(&q.role_id), self.user(&q.user_id), self.user(&f.by)) else { return false };
+        let in_team = |u: &str| q.team_id.as_ref().and_then(|t| self.team_member(u).filter(|m| &m.team_id == t));
+        let (member, first_member) = (in_team(&q.user_id), in_team(&first.id));
+        let from_idp = q.team_id.is_some() && Self::idp_team_role_in(&self.c(), &q.user_id).unwrap_or(false);
+        counts(&RequestState { request: q, role: &role, user: &user, member: member.as_ref(), from_idp, first: Some((&first, first_member.as_ref())) })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_role_request(&self, user_id: &str, role_id: &str, team_id: Option<&str>, hours: i64, reason: &str, expires_at: i64, max_pending: usize, max_daily: usize) -> Result<RoleRequest, RoleRequestError> {
         let err = |e: rusqlite::Error| RoleRequestError::Db(e.to_string());

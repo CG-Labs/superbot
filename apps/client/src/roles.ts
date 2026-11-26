@@ -180,9 +180,9 @@ export function requestDraftError(draft: { role: string; reason: string }): stri
   return null;
 }
 
-/** Whether a pending request waits for the second of two approvals (ADR 0320). */
+/** Whether a pending request waits for the second of two approvals (ADR 0320): a first approval that still counts. */
 export function awaitsSecond(q: Pick<RoleRequest, "approvals" | "firstApproval">): boolean {
-  return (q.approvals ?? 1) >= 2 && !!q.firstApproval;
+  return (q.approvals ?? 1) >= 2 && !!q.firstApproval && q.firstApproval.counts !== false;
 }
 
 /** The most hours a request can be approved for now: as asked, or the first approval's (ADR 0320). */
@@ -190,11 +190,12 @@ export function approveCap(q: Pick<RoleRequest, "hours" | "approvals" | "firstAp
   return awaitsSecond(q) && q.firstApproval ? Math.min(q.hours, q.firstApproval.hours) : q.hours;
 }
 
-/** "First approved by Ana for 4 hours: “note”", or null without a first approval that still matters. */
+/** "First approved by Ana for 4 hours: “note”", why it no longer counts, or null without one that matters. */
 export function firstApprovalLabel(q: Pick<RoleRequest, "approvals" | "firstApproval">): string | null {
   const f = q.firstApproval;
-  if (!f || !awaitsSecond(q)) return null;
+  if (!f || (q.approvals ?? 1) < 2) return null;
   const who = f.by.name || f.by.email || f.by.id;
+  if (!awaitsSecond(q)) return `${who}'s first approval no longer counts: they can't approve it now, so the next approval is the first`;
   return `First approved by ${who} for ${hoursLabel(f.hours)}${f.note ? `: “${f.note}”` : ""}`;
 }
 

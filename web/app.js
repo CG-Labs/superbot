@@ -763,7 +763,8 @@ const endsText = (h) => (h.expiresAt ? ` · until ${esc(fmt(h.expiresAt))}` : ""
 const hoursText = (h) => (h % 24 === 0 ? `${h / 24} day${h === 24 ? "" : "s"}` : `${h} hour${h === 1 ? "" : "s"}`);
 const SHORTER = [720, 168, 72, 24, 8, 4, 1];
 // Two approvers (ADR 0320): the second approves for the first's hours or fewer, and never the first approver.
-const awaitsSecond = (q) => (q.approvals || 1) >= 2 && !!q.firstApproval;
+// A first approval whose approver can't approve now (`counts: false`) is replaced by the next one.
+const awaitsSecond = (q) => (q.approvals || 1) >= 2 && !!q.firstApproval && q.firstApproval.counts !== false;
 function requestCard(q) {
   const where = q.team ? `in ${esc(q.team.name || "their team")}` : "across the server";
   const yours = q.user?.id === me.user?.id;
@@ -773,10 +774,12 @@ function requestCard(q) {
   const choices = [[cap, `${hoursText(cap)} (${second ? "as first approved" : "as asked"})`], ...SHORTER.filter((h) => h < cap).map((h) => [h, hoursText(h)])];
   const f = second ? q.firstApproval : null;
   const gaveFirst = f && f.by.id === me.user?.id;
+  const void_ = needsTwo && !second && q.firstApproval ? q.firstApproval : null;
   return `<div class="card" data-request="${esc(q.id)}">
     <div class="bar">${q.user ? who(q.user) : "Someone"} <span class="sub">asks for <b>${esc(q.role?.name || "a role")}</b> for ${esc(hoursText(q.hours))}, ${where} · lapses ${esc(fmt(q.expiresAt))}${needsTwo ? " · needs two approvers" : ""}</span></div>
     <p class="hint">“${esc(q.reason)}”${q.current ? ` · has ${esc(q.current.name)} now` : ""}${q.role?.applies?.length ? ` · adds ${esc(q.role.applies.join(", "))}` : ""}</p>
     ${f ? `<p class="sub">First approved by ${who(f.by)} for ${esc(hoursText(f.hours))}${f.note ? `: “${esc(f.note)}”` : ""}. Waiting for a second approver.</p>` : ""}
+    ${void_ ? `<p class="sub">${who(void_.by)}'s first approval no longer counts: they can't approve it now, so the next approval is the first.</p>` : ""}
     ${yours ? '<p class="sub">Your own request: another admin decides it.</p>' : `<form class="bar" data-act="decide-request" autocomplete="off">
       ${gaveFirst ? '<span class="sub">You gave the first approval. Someone else gives the second.</span>' : `<select name="hours" title="How long it's given for, from now">${choices.map(([h, label]) => `<option value="${h}">${esc(label)}</option>`).join("")}</select>`}
       <input name="note" class="wide" placeholder="Note (optional, they see it)" maxlength="500" />

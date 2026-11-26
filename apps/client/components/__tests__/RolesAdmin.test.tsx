@@ -411,6 +411,20 @@ describe("RolesAdmin: two approvers for chosen roles (ADR 0320)", () => {
     await waitFor(() => expect(api.approveRoleRequest).toHaveBeenCalledWith("q1", { hours: 4, note: undefined }));
   });
 
+  it("treats a first approval that no longer counts as none", async () => {
+    const api = mockApi();
+    api.roleRequests.mockResolvedValue({ requests: [request({ firstApproval: { ...first, counts: false } })], pending: 1, pendingDays: 7 });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByText(/Ada's first approval no longer counts/)).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "8 hours (as asked)" })).toBeTruthy();
+    expect(screen.getByText("Approve (1 of 2)")).toBeTruthy();
+    await u.press(screen.getByLabelText("Approve Cy's request"));
+    await waitFor(() => expect(api.approveRoleRequest).toHaveBeenCalledWith("q1", { hours: 8, note: undefined }));
+    const { confirmAsync } = jest.requireMock("../../src/dialogs");
+    expect(confirmAsync).toHaveBeenLastCalledWith("Approve Cy's request for Root?", expect.stringContaining("Yours is the first"), "Approve");
+  });
+
   it("leaves the second approval to someone else, but lets the first approver deny", async () => {
     const api = mockApi();
     api.roleRequests.mockResolvedValue({ requests: [request({ firstApproval: { ...first, by: { id: "me", name: "Me" } } })], pending: 1, pendingDays: 7 });

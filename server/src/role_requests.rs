@@ -152,6 +152,8 @@ pub fn view(app: &App, q: &RoleRequest) -> Value {
         "firstApproval": q.first.as_ref().map(|f| json!({
             "by": app.db.user(&f.by).map_or_else(|| json!({ "id": f.by }), |u| person_view(&u)),
             "at": f.at, "hours": f.hours, "note": f.note,
+            // False once its approver couldn't approve now: the next approval replaces it.
+            "counts": q.status == "pending" && app.db.first_approval_counts(q, first_counts),
         })),
     });
     if q.status == "pending" {

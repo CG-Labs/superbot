@@ -270,12 +270,19 @@ describe("two approvers (ADR 0320)", () => {
     // Lowered back to one approver: the next approval gives it, as asked.
     expect(awaitsSecond({ ...q, approvals: 1, firstApproval: first })).toBe(false);
     expect(approveCap({ ...q, approvals: 1, firstApproval: first })).toBe(8);
+    // One whose approver can't approve now no longer caps it, nor waits for a second.
+    expect(awaitsSecond({ ...q, firstApproval: { ...first, counts: false } })).toBe(false);
+    expect(approveCap({ ...q, firstApproval: { ...first, counts: false } })).toBe(8);
+    expect(awaitsSecond({ ...q, firstApproval: { ...first, counts: true } })).toBe(true);
   });
 
   it("says who gave the first approval and what a request waits for", () => {
     expect(firstApprovalLabel(q)).toBeNull();
     expect(firstApprovalLabel({ ...q, firstApproval: first })).toBe("First approved by Ada for 4 hours");
     expect(firstApprovalLabel({ ...q, firstApproval: { ...first, note: "ok" } })).toBe("First approved by Ada for 4 hours: “ok”");
+    expect(firstApprovalLabel({ ...q, firstApproval: { ...first, counts: false } })).toBe("Ada's first approval no longer counts: they can't approve it now, so the next approval is the first");
+    expect(firstApprovalLabel({ ...q, approvals: 1, firstApproval: first })).toBeNull();
+    expect(requestStatusLabel({ ...q, firstApproval: { ...first, counts: false } }, NOW)).toBe("Waiting for two approvers · lapses in 7 days");
     expect(requestStatusLabel(q, NOW)).toBe("Waiting for two approvers · lapses in 7 days");
     expect(requestStatusLabel({ ...q, firstApproval: first }, NOW)).toBe("Approved once, waiting for a second approver · lapses in 7 days");
     expect(requestStatusLabel({ ...q, approvals: 1 }, NOW)).toBe("Waiting for an admin · lapses in 7 days");

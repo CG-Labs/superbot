@@ -729,7 +729,8 @@ export interface RoleRequest {
   /** How many different people approve it (ADR 0320). Servers from before leave it out: 1. */
   approvals?: number;
   /** The first of two approvals: the second can't give more than `hours`. */
-  firstApproval?: { by: { id: string; name?: string; email?: string | null }; at: number; hours: number; note: string | null } | null;
+  /** `counts` is false once its approver couldn't approve now; the next approval replaces it (ADR 0320). */
+  firstApproval?: { by: { id: string; name?: string; email?: string | null }; at: number; hours: number; note: string | null; counts?: boolean } | null;
 }
 
 /** Whether you may ask for a role in one scope, and why not. */

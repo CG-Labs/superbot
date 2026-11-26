@@ -88,6 +88,7 @@ async fn a_role_needing_two_approvals_is_given_only_by_a_second_approver() {
     // Still pending for every admin, showing who gave the first approval; the asker sees it too.
     let (_, pending) = json_call(port, "GET", "/api/role-requests", &ana_auth, "").await;
     assert_eq!((pending["pending"].as_i64(), pending["requests"][0]["firstApproval"]["by"]["id"].as_str(), pending["requests"][0]["approvals"].as_i64()), (Some(1), Some("operator"), Some(2)), "{pending}");
+    assert_eq!(pending["requests"][0]["firstApproval"]["counts"], true, "{pending}");
     let (_, mine) = json_call(port, "GET", "/api/me/role-requests", &bo_auth, "").await;
     assert_eq!((mine["requests"][0]["status"].as_str(), mine["requests"][0]["firstApproval"]["hours"].as_i64()), (Some("pending"), Some(6)), "{mine}");
 
@@ -137,6 +138,9 @@ async fn a_first_approval_counts_only_while_its_approver_could_still_approve() {
     let id = asked(port, &bo_auth, json!({ "role": root, "hours": 8, "reason": "Rebuild" })).await;
     assert_eq!(approve(port, &ana_auth, &id, json!({ "hours": 2 })).await.0, 200);
     assert_eq!(call(port, "PATCH", &format!("/api/users/{ana}"), &admin, r#"{"role":"member"}"#).await.0, 200);
+    let (_, listed) = json_call(port, "GET", "/api/role-requests", &cy_auth, "").await;
+    let shown = &listed["requests"][0]["firstApproval"];
+    assert_eq!((shown["by"]["id"].as_str(), shown["counts"].as_bool()), (Some(ana.as_str()), Some(false)), "shown, but no longer counting: {listed}");
     let (code, v) = approve(port, &cy_auth, &id, json!({})).await;
     assert_eq!((code, v["request"]["status"].as_str(), v["request"]["firstApproval"]["by"]["id"].as_str()), (200, Some("pending"), Some(cy.as_str())), "{v}");
     assert_eq!(v["request"]["firstApproval"]["hours"], 8, "the hours asked, not the stale approval's: {v}");
@@ -212,6 +216,8 @@ async fn team_owners_and_admins_give_either_approval_within_their_team() {
     assert_eq!(json_call(port, "POST", &team_at(&q, "approve"), &eve_auth, "{}").await.0, 200);
     // But a team admin who's since become a plain member no longer counts.
     assert_eq!(call(port, "PUT", &format!("/api/teams/{alpha}/members/{eve}"), &admin, r#"{"role":"member"}"#).await.0, 200);
+    let (_, mine) = json_call(port, "GET", "/api/team/role-requests", &ada_auth, "").await;
+    assert_eq!(mine["requests"][0]["firstApproval"]["counts"], false, "{mine}");
     let (code, v) = approve(port, &admin, &q, json!({})).await;
     assert_eq!((code, v["request"]["status"].as_str(), v["request"]["firstApproval"]["by"]["id"].as_str()), (200, Some("pending"), Some("operator")), "{v}");
     assert_eq!(events(port, &admin, "role.request_first_approved").await[0]["details"]["replaced"]["by"], eve.as_str());
