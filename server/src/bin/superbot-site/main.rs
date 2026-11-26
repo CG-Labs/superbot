@@ -330,7 +330,8 @@ fn build_into(args: &Args, dir: &Path) -> Result<Summary, Vec<String>> {
         write(dir, &page.out, docs_page(&pages, page, &indented, &args.repo_url).as_bytes()).map_err(one)?;
     }
     write(dir, "docs/index.html", docs_index(&pages, &args.repo_url).as_bytes()).map_err(one)?;
-    write(dir, "index.html", landing::landing(&plans, &args.contact_url, &args.repo_url).as_bytes()).map_err(one)?;
+    let server_landing = fs::read_to_string(args.repo.join("site/index.html")).map_err(|e| vec![format!("site/index.html: {e}")])?;
+    write(dir, "index.html", landing::landing(&plans, &server_landing, &args.contact_url, &args.repo_url).map_err(one)?.as_bytes()).map_err(one)?;
     assets.sort();
     assets.dedup();
     assets.push(("site/assets/site.css".into(), "assets/site.css".into()));
@@ -429,7 +430,7 @@ mod tests {
     fn a_broken_link_fails_the_build() {
         let repo = tmp("repo");
         let src = self::repo();
-        for f in ["deploy/README.md", "SECURITY.md", "CHANGELOG.md", "deploy/tiers.example.json", "site/assets/site.css", "site/assets/mark.svg"] {
+        for f in ["deploy/README.md", "SECURITY.md", "CHANGELOG.md", "deploy/tiers.example.json", "site/index.html", "site/assets/site.css", "site/assets/mark.svg"] {
             fs::create_dir_all(repo.join(f).parent().unwrap()).unwrap();
             fs::copy(src.join(f), repo.join(f)).unwrap();
         }
@@ -437,6 +438,7 @@ mod tests {
         for f in ["deploy/README.md", "SECURITY.md", "CHANGELOG.md"] {
             fs::write(repo.join(f), "# Page\n").unwrap();
         }
+        fs::write(repo.join("deploy/README.md"), "# Page\n\n## Air-gapped (no internet)\n").unwrap();
         // Sections the landing page and footer link to.
         for (f, body) in [("docs/security/README.md", "# Pack\n"), ("docs/ops/backup.md", "# Backups\n"), ("docs/adr/0001-a.md", "# 0001: A\n")] {
             fs::create_dir_all(repo.join(f).parent().unwrap()).unwrap();

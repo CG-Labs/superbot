@@ -31,7 +31,7 @@ async fn the_site_is_public_and_the_console_moved_to_its_own_path() {
         ("/", "text/html", "Your always-on AI team"),
         ("/index.html", "text/html", "Your always-on AI team"),
         ("/get-started", "text/html", "Request access"),
-        ("/site/site.css", "text/css", "--blue: #2f72e4"),
+        ("/site/site.css", "text/css", "--c-accent: #2563eb"),
         ("/site/get-started.js", "text/javascript", "/api/signups"),
         ("/site/mark.svg", "image/svg+xml", "<svg"),
     ] {

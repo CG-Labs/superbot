@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { css, withTokens } from "./tokens.mjs";
+import { css, targets, withTokens } from "./tokens.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tokens = JSON.parse(fs.readFileSync(path.join(root, "src/tokens.json"), "utf8"));
@@ -25,4 +25,13 @@ test("replaces only its own block, and puts it first when there is none", () => 
   assert.equal(withTokens(once, block), once);
   const edited = once.replace("--c-bg: #faf9f7;", "--c-bg: #000000;");
   assert.equal(withTokens(edited, block), once);
+});
+
+test("the console and the landing page carry the same block", () => {
+  const block = css(tokens);
+  assert.deepEqual(targets, ["web/styles.css", "site/assets/site.css"]);
+  for (const target of targets) {
+    const text = fs.readFileSync(path.resolve(root, "../..", target), "utf8");
+    assert.ok(text.includes(block), target);
+  }
 });

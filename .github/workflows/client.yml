@@ -6,12 +6,14 @@ on:
       - "apps/client/**"
       - "web/index.html"
       - "web/styles.css"
+      - "site/assets/site.css"
       - ".github/workflows/client.yml"
   pull_request:
     paths:
       - "apps/client/**"
       - "web/index.html"
       - "web/styles.css"
+      - "site/assets/site.css"
       - ".github/workflows/client.yml"
 
 permissions:
