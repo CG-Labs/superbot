@@ -2,7 +2,8 @@
 //! (ADR 0144) once a UTC day, keeps `HEALTH_SCORE_HISTORY_DAYS` of them (400 by default,
 //! 0 to stop), and shows the trend: `GET /api/support/health-score/history` (admins),
 //! `botctl health-score history`, the console's Support tab, and
-//! `health-score-history.json` in the support bundle.
+//! `health-score-history.json` in the support bundle. Each recorded day is compared with
+//! the one before for health score alerts (`health_alert`, ADR 0307).
 //!
 //! Each day keeps only the score, its band and each signal's status, never the counts or
 //! reason codes behind them, so a review deck can quote it as it is.
