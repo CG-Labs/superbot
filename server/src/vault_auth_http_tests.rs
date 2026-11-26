@@ -125,3 +125,52 @@ async fn admins_see_cloud_logins_never_the_keys_or_signatures() {
         crate::secrets::redact::forget(v);
     }
 }
+
+#[tokio::test]
+async fn admins_see_instance_identity_logins_never_the_token_document_or_nonce() {
+    let (port, app, admin, _) = serve_app().await;
+    let (url, f) = stand_in();
+    let gce_mount = format!("gcp-gce-http-{}", random_hex(6));
+    let ec2_mount = format!("aws-ec2-http-{}", random_hex(6));
+    let name = format!("IDENTITY_HTTP_{}_TOKEN", random_hex(4).to_uppercase());
+    let value = format!("identity-http-value-{}", random_hex(8));
+    put(&f, &format!("bots/{name}"), &value);
+    use crate::secrets::SecretStore;
+
+    // GCE: the VM's identity token; a role Vault doesn't bind is refused.
+    let host = url.trim_start_matches("http://").to_string();
+    let gce = |role: &'static str| vault(&url, &[("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce"), ("VAULT_GCP_MOUNT", &gce_mount), ("VAULT_GCP_ROLE", role), ("GCE_METADATA_HOST", &host)], Duration::ZERO);
+    let jwts = f.jwts.lock().unwrap().len();
+    assert_eq!(gce("superbot").get(&name).unwrap().unwrap().expose(), value);
+    assert!(gce("nobody").check().is_err());
+    let tokens: Vec<String> = f.jwts.lock().unwrap()[jwts..].iter().map(|j| j.2.clone()).collect();
+    assert_eq!(tokens.len(), 1);
+
+    // EC2: the instance's identity document and botd's nonce; another nonce is refused.
+    let nonce = format!("ec2-http-nonce-{}", random_hex(12));
+    let other = format!("ec2-http-other-{}", random_hex(12));
+    let ec2 = |n: &str| vault(&url, &[("VAULT_AUTH", "aws"), ("VAULT_AWS_TYPE", "ec2"), ("VAULT_AWS_MOUNT", &ec2_mount), ("VAULT_AWS_NONCE", n), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", &url)], Duration::ZERO);
+    assert!(ec2(&nonce).check().is_ok());
+    assert!(ec2(&other).check().is_err());
+
+    flush_audit_for(&app.db, &[&gce_mount, &ec2_mount, &name]);
+    let logins: Vec<Value> = events(port, &admin, "action=secret.vault_login").await.into_iter().filter(|e| e["targetId"] == gce_mount.as_str() || e["targetId"] == ec2_mount.as_str()).collect();
+    let got: Vec<_> = logins.iter().map(|e| (e["targetId"].as_str().unwrap(), e["outcome"].as_str(), e["details"].clone())).collect();
+    assert_eq!(got.len(), 4, "{logins:?}");
+    assert!(got.contains(&(gce_mount.as_str(), Some("success"), json!({ "method": "gcp", "type": "gce", "role": "superbot" }))), "{got:?}");
+    assert!(got.contains(&(gce_mount.as_str(), Some("failure"), json!({ "method": "gcp", "type": "gce", "role": "nobody", "error": "unavailable" }))), "{got:?}");
+    assert!(got.contains(&(ec2_mount.as_str(), Some("success"), json!({ "method": "aws", "type": "ec2" }))), "{got:?}");
+    assert!(got.contains(&(ec2_mount.as_str(), Some("failure"), json!({ "method": "aws", "type": "ec2", "error": "unavailable" }))), "{got:?}");
+
+    let (_, all) = call(port, "GET", "/api/audit?action=secret.*&limit=500", &admin, "").await;
+    let pkcs7 = crate::secrets::vault::tests::ec2_pkcs7();
+    for leaked in [value.as_str(), nonce.as_str(), other.as_str(), &pkcs7[..64], tokens[0].as_str(), "hvs."] {
+        assert!(!all.contains(leaked), "{leaked} reached the audit log");
+    }
+    let (_, member) = user_with(port, &admin, "noa@example.com", "member").await;
+    let (code, _) = call(port, "GET", "/api/audit?action=secret.vault_login", &member, "").await;
+    assert_eq!(code, 403);
+    for v in [value.as_str(), nonce.as_str(), other.as_str()] {
+        crate::secrets::redact::forget(v);
+    }
+}

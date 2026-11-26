@@ -8,7 +8,10 @@
 //! tokens (`VAULT_AUTH=kubernetes`) or any OIDC/JWT issuer (`VAULT_AUTH=jwt`, ADR 0159),
 //! read again at each login, or botd's cloud identity (ADR 0260): `VAULT_AUTH=aws`, an STS
 //! request signed with botd's own AWS keys; `gcp`, a JWT Google signs as its service
-//! account; `azure`, its managed identity's token. botd logs in again before the token's lease runs out and
+//! account; `azure`, its managed identity's token; or the instance's own identity, signed
+//! by its cloud (ADR 0298): `gcp` with `VAULT_GCP_TYPE=gce`, the VM's identity token from the
+//! metadata server; `aws` with `VAULT_AWS_TYPE=ec2`, the instance's PKCS#7 identity document
+//! and a nonce. botd logs in again before the token's lease runs out and
 //! once more when Vault refuses it, in `VAULT_AUTH_NAMESPACE` if the auth method is
 //! mounted somewhere other than the secrets. Requests run on a runtime of their own
 //! (`http::Worker`). It is also the `leases::Issuer` of `VAULT_RUN_CREDENTIALS`: a new
@@ -73,6 +76,13 @@ pub enum Auth {
     /// Vault's `azure` method: botd's Entra ID token for the mount's `resource`, with the
     /// VM's subscription, resource group and name from instance metadata if `instance`.
     Azure { mount: String, role: String, instance: bool, entra: Box<azure::Entra> },
+    /// Vault's `gcp` method, `gce` type (ADR 0298): the VM's identity token for
+    /// `http://vault/<role>`, with the instance's details, from the metadata server.
+    Gce { mount: String, role: String, google: Box<gcp::Google> },
+    /// Vault's `aws` method, `ec2` type (ADR 0298): the instance's PKCS#7 identity document
+    /// and the nonce every login after Vault's first must repeat. `role` None: the role
+    /// named after the instance's AMI.
+    Ec2 { mount: String, role: Option<String>, nonce: Zeroizing<String>, identity: aws::InstanceIdentity },
 }
 
 impl Auth {
@@ -82,9 +92,19 @@ impl Auth {
             Auth::Token { .. } => "token",
             Auth::AppRole { .. } => "approle",
             Auth::Jwt { method, .. } => method.as_str(),
-            Auth::Aws { .. } => "aws",
-            Auth::Gcp { .. } => "gcp",
+            Auth::Aws { .. } | Auth::Ec2 { .. } => "aws",
+            Auth::Gcp { .. } | Auth::Gce { .. } => "gcp",
             Auth::Azure { .. } => "azure",
+        }
+    }
+
+    /// The method's login type in audit details, for the instance identity types only, so
+    /// the `iam` type's events stay as ADR 0260 made them.
+    fn login_type(&self) -> Option<&'static str> {
+        match self {
+            Auth::Gce { .. } => Some("gce"),
+            Auth::Ec2 { .. } => Some("ec2"),
+            _ => None,
         }
     }
 }
@@ -160,6 +180,8 @@ fn aws_sts(var: &dyn Fn(&str) -> String) -> Result<(String, url::Url, String), S
 pub fn sign_in_reaches(var: &dyn Fn(&str) -> String) -> Result<Vec<(&'static str, String, &'static str)>, String> {
     let mut out = Vec::new();
     match var("VAULT_AUTH").trim() {
+        "aws" if var("VAULT_AWS_TYPE").trim() == "ec2" => out.extend(aws::instance_identity_reach(var)?),
+        "gcp" if var("VAULT_GCP_TYPE").trim() == "gce" => out.extend(gcp::sign_in_reaches(var, "VAULT_GCP_CREDENTIALS", "metadata")?),
         "aws" => {
             let (_, _, sts) = aws_sts(var)?;
             if aws::chosen_source(var, "VAULT_AWS_CREDENTIALS")? == "web-identity" {
@@ -198,6 +220,51 @@ fn aws_auth(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Aut
     super::keep_from_bots(source.reserved(), source.settings());
     let creds = aws::Credentials::new("AWS (for Vault)", "vault", source)?;
     Ok(Auth::Aws { mount: path_setting("VAULT_AWS_MOUNT", &var("VAULT_AWS_MOUNT"), "aws")?, role, region, sts_url, server_id, creds: Box::new(creds) })
+}
+
+/// The shortest and longest `VAULT_AWS_NONCE`: long enough not to guess, short enough to be
+/// a setting.
+const NONCE_LEN: std::ops::RangeInclusive<usize> = 16..=128;
+
+/// `VAULT_AUTH=aws` with `VAULT_AWS_TYPE=ec2` (ADR 0298): the instance's identity document
+/// and botd's nonce, which Vault ties to the instance at its first login. The `iam` type's
+/// settings would be ignored, so they are refused.
+fn ec2_auth(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Auth, String> {
+    for k in ["VAULT_AWS_REGION", "VAULT_AWS_HEADER_VALUE", "VAULT_AWS_CREDENTIALS"] {
+        if !var(k).trim().is_empty() {
+            return Err(format!("{k} is for VAULT_AWS_TYPE=iam; the ec2 type sends the instance's identity document and signs nothing, so leave {k} out"));
+        }
+    }
+    let nonce = store.get("VAULT_AWS_NONCE").map_err(|e| format!("VAULT_AWS_NONCE: {e}"))?;
+    let nonce = nonce.map(|v| Zeroizing::new(v.expose().trim().to_string())).filter(|v| !v.is_empty());
+    let nonce = nonce.ok_or("VAULT_AWS_TYPE=ec2 needs VAULT_AWS_NONCE (or VAULT_AWS_NONCE_FILE), a random value botd sends with every login, such as the output of openssl rand -hex 32; Vault refuses a later login without the first one's")?;
+    if !NONCE_LEN.contains(&nonce.len()) || !nonce.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\') {
+        return Err(format!("VAULT_AWS_NONCE must be {} to {} printable characters with no spaces or quotes, such as the output of openssl rand -hex 32", NONCE_LEN.start(), NONCE_LEN.end()));
+    }
+    super::redact::register(&nonce);
+    let role = match var("VAULT_AWS_ROLE").trim() {
+        "" => None,
+        r => Some(role_setting("VAULT_AWS_ROLE", r)?),
+    };
+    let identity = aws::InstanceIdentity::from_env(var, "VAULT_AWS_TYPE=ec2")?;
+    Ok(Auth::Ec2 { mount: path_setting("VAULT_AWS_MOUNT", &var("VAULT_AWS_MOUNT"), "aws")?, role, nonce, identity })
+}
+
+/// `VAULT_AUTH=gcp` with `VAULT_GCP_TYPE=gce` (ADR 0298): the VM's identity token, which only
+/// the metadata server makes, for the VM's own service account.
+fn gce_auth(var: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Auth, String> {
+    match var("VAULT_GCP_CREDENTIALS").trim() {
+        "" | "metadata" => {}
+        other => return Err(format!("VAULT_GCP_TYPE=gce logs in with the VM's identity token from the metadata server, so VAULT_GCP_CREDENTIALS must be metadata (or unset), not {other:?}")),
+    }
+    if !var("VAULT_GCP_SERVICE_ACCOUNT").trim().is_empty() {
+        return Err("VAULT_GCP_SERVICE_ACCOUNT is for VAULT_GCP_TYPE=iam; the gce type's token is for the VM's own service account, so leave it out".into());
+    }
+    Ok(Auth::Gce {
+        mount: path_setting("VAULT_GCP_MOUNT", &var("VAULT_GCP_MOUNT"), "gcp")?,
+        role: required_role(var, "gcp", "VAULT_GCP_ROLE")?,
+        google: Box::new(gcp::Google::from_env(var, store, "VAULT_GCP_CREDENTIALS", "metadata", "Google (for Vault)")?),
+    })
 }
 
 /// A namespace for logins only: `root` for none, else a Vault path.
@@ -290,19 +357,27 @@ impl Config {
                 jwt(JwtMethod::Kubernetes, "VAULT_KUBERNETES_MOUNT", "VAULT_KUBERNETES_ROLE", file)?
             }
             "jwt" => jwt(JwtMethod::Jwt, "VAULT_JWT_MOUNT", "VAULT_JWT_ROLE", var("VAULT_JWT_FILE"))?,
-            "aws" => aws_auth(var, store)?,
-            "gcp" => Auth::Gcp {
-                mount: path_setting("VAULT_GCP_MOUNT", &var("VAULT_GCP_MOUNT"), "gcp")?,
-                role: required_role(var, "gcp", "VAULT_GCP_ROLE")?,
-                signer: match var("VAULT_GCP_SERVICE_ACCOUNT").trim() {
-                    "" => None,
-                    a => Some(signer_setting(a)?),
+            "aws" => match var("VAULT_AWS_TYPE").trim() {
+                "" | "iam" => aws_auth(var, store)?,
+                "ec2" => ec2_auth(var, store)?,
+                other => return Err(format!("VAULT_AWS_TYPE must be iam (the default) or ec2, not {other:?}")),
+            },
+            "gcp" => match var("VAULT_GCP_TYPE").trim() {
+                "" | "iam" => Auth::Gcp {
+                    mount: path_setting("VAULT_GCP_MOUNT", &var("VAULT_GCP_MOUNT"), "gcp")?,
+                    role: required_role(var, "gcp", "VAULT_GCP_ROLE")?,
+                    signer: match var("VAULT_GCP_SERVICE_ACCOUNT").trim() {
+                        "" => None,
+                        a => Some(signer_setting(a)?),
+                    },
+                    iam: match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
+                        "" => gcp::IAM_CREDENTIALS.to_string(),
+                        e => super::http::base_url("GCP_IAM_CREDENTIALS_ENDPOINT", e, gcp::IAM_CREDENTIALS)?,
+                    },
+                    google: Box::new(gcp::Google::from_env(var, store, "VAULT_GCP_CREDENTIALS", &var("VAULT_GCP_CREDENTIALS"), "Google (for Vault)")?),
                 },
-                iam: match var("GCP_IAM_CREDENTIALS_ENDPOINT").trim() {
-                    "" => gcp::IAM_CREDENTIALS.to_string(),
-                    e => super::http::base_url("GCP_IAM_CREDENTIALS_ENDPOINT", e, gcp::IAM_CREDENTIALS)?,
-                },
-                google: Box::new(gcp::Google::from_env(var, store, "VAULT_GCP_CREDENTIALS", &var("VAULT_GCP_CREDENTIALS"), "Google (for Vault)")?),
+                "gce" => gce_auth(var, store)?,
+                other => return Err(format!("VAULT_GCP_TYPE must be iam (the default) or gce, not {other:?}")),
             },
             "azure" => {
                 let resource = match var("VAULT_AZURE_RESOURCE").trim() {
@@ -556,6 +631,24 @@ impl Inner {
                 };
                 self.login(mount, Some(role), body).await?
             }
+            Auth::Gce { mount, role, google } => {
+                let body = async {
+                    // As Vault Agent asks for it; Vault checks that the audience ends in `vault/<role>`.
+                    let jwt = google.instance_identity(&format!("http://vault/{role}")).await.map_err(Error::Unavailable)?;
+                    Ok(jwt_body(&jwt, Some(role)))
+                };
+                self.login(mount, Some(role), body).await?
+            }
+            Auth::Ec2 { mount, role, nonce, identity } => {
+                let body = async {
+                    let mut body = json!({ "pkcs7": identity.pkcs7().await?, "nonce": nonce.as_str() });
+                    if let Some(r) = role {
+                        body["role"] = json!(r);
+                    }
+                    Ok(Zeroizing::new(body.to_string()))
+                };
+                self.login(mount, role.as_deref(), body).await?
+            }
         };
         let value = t.value.clone();
         *self.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
@@ -622,7 +715,14 @@ impl Inner {
                 .map_err(|e| unavailable(what, e))?;
             let status = res.status();
             if !status.is_success() {
-                return Err(Error::Unavailable(format!("Vault: {what} at auth/{mount} answered {status}")));
+                // Vault's text can echo what was sent, so only a hint of ours.
+                let hint = match &self.cfg.auth {
+                    Auth::Ec2 { .. } if status == reqwest::StatusCode::BAD_REQUEST => {
+                        "; Vault's log has the reason, often a nonce other than the one it took at this instance's first login (VAULT_AWS_NONCE changed, or another client logged in first) or a role not bound to this instance"
+                    }
+                    _ => "",
+                };
+                return Err(Error::Unavailable(format!("Vault: {what} at auth/{mount} answered {status}{hint}")));
             }
             let v: Value = res.json().await.map_err(|e| unavailable(what, e))?;
             let value = v["auth"]["client_token"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| Error::Unavailable(format!("Vault: {what} gave no token")))?;
@@ -633,6 +733,9 @@ impl Inner {
         }
         .await;
         let mut details = json!({ "method": method });
+        if let Some(t) = self.cfg.auth.login_type() {
+            details["type"] = json!(t);
+        }
         if let Some(role) = role {
             details["role"] = json!(role);
         }
@@ -906,6 +1009,11 @@ impl Provider for Vault {
                 let vm = if *instance { ", with the VM's details" } else { "" };
                 format!("Azure login as role {role} at auth/{mount}, a token for {} from {}{vm}", entra.resource(), entra.describe())
             }
+            Auth::Gce { mount, role, google } => format!("GCP login (gce) as role {role} at auth/{mount}, the VM's identity token of {}", google.describe()),
+            Auth::Ec2 { mount, role, identity, .. } => {
+                let role = role.as_deref().map_or_else(|| "the role named after its AMI".to_string(), |r| format!("role {r}"));
+                format!("AWS login (ec2) as {role} at auth/{mount}, the instance's signed identity document from {} with the nonce in VAULT_AWS_NONCE", identity.describe())
+            }
         };
         let auth_ns = match &c.auth_namespace {
             AuthNamespace::Same => String::new(),
@@ -993,7 +1101,25 @@ pub(crate) mod tests {
         azure_resources: Mutex<Vec<String>>,
         /// Each `azure` login's body, its token taken out.
         azure_logins: Mutex<Vec<Value>>,
+        /// Each identity token the stand-in metadata server made: (audience, format).
+        identities: Mutex<Vec<(String, String)>>,
+        /// Answers the next identity token request with this status instead, once.
+        identity_status: AtomicUsize,
+        /// The nonce the `aws` mount took at the instance's first `ec2` login.
+        ec2_nonce: Mutex<Option<String>>,
+        /// The role of each `ec2` login Vault let in.
+        ec2_logins: Mutex<Vec<String>>,
     }
+
+    /// The instance's PKCS#7 identity document as IMDS gives it: base64 in lines of 64.
+    pub(crate) fn ec2_pkcs7() -> String {
+        let doc = json!({ "accountId": "123456789012", "imageId": EC2_AMI, "instanceId": "i-0abc1234def567890", "region": "eu-west-2", "pendingTime": "2026-11-25T08:00:00Z" });
+        let b64 = base64::engine::general_purpose::STANDARD.encode(format!("stand-in signature over {doc}"));
+        b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The role an `ec2` login with none is for: the one named after the instance's AMI.
+    const EC2_AMI: &str = "ami-0abcdef1234567890";
 
     pub(crate) type F = Arc<Fake>;
 
@@ -1112,6 +1238,23 @@ pub(crate) mod tests {
                 return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["error making upstream request: the stand-in's text"] })));
             }
             "aws"
+        } else if let Some(pkcs7) = body.get("pkcs7").and_then(Value::as_str) {
+            // As Vault's `ec2` type: the document without its line breaks, and the nonce of
+            // the instance's first login, which Vault keeps in its access list.
+            if pkcs7 != ec2_pkcs7().replace('\n', "") {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["failed to parse the pkcs7: the stand-in's text"] })));
+            }
+            let nonce = body["nonce"].as_str().unwrap_or_default().to_string();
+            {
+                let mut taken = f.ec2_nonce.lock().unwrap();
+                match taken.as_deref() {
+                    None => *taken = Some(nonce),
+                    Some(n) if n == nonce => {}
+                    Some(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["client nonce mismatch: the stand-in's text"] }))),
+                }
+            }
+            f.ec2_logins.lock().unwrap().push(body["role"].as_str().unwrap_or(EC2_AMI).to_string());
+            "ec2"
         } else if mount == "approle" {
             if body["role_id"] != "role-1" || body["secret_id"] != "secret-id-1" {
                 return (StatusCode::BAD_REQUEST, Json(json!({ "errors": ["invalid role or secret ID"] })));
@@ -1239,6 +1382,32 @@ pub(crate) mod tests {
         imds_role(s, Path(String::new()), h).await
     }
 
+    async fn imds_pkcs7(h: HeaderMap) -> (StatusCode, String) {
+        if h.get("x-aws-ec2-metadata-token").and_then(|v| v.to_str().ok()) != Some("imds-session-v") {
+            return (StatusCode::UNAUTHORIZED, String::new());
+        }
+        (StatusCode::OK, ec2_pkcs7())
+    }
+
+    /// Google's metadata server's identity tokens: the `gcp` mount's `gce` type accepts one for
+    /// the role its audience names, and only with the instance's details (`format=full`).
+    async fn google_identity(State(f): State<F>, Query(q): Query<HashMap<String, String>>, h: HeaderMap) -> (StatusCode, String) {
+        if h.get("metadata-flavor").and_then(|v| v.to_str().ok()) != Some("Google") {
+            return (StatusCode::FORBIDDEN, String::new());
+        }
+        if let s @ 1.. = f.identity_status.swap(0, Ordering::SeqCst) {
+            return (StatusCode::from_u16(s as u16).unwrap(), "the stand-in's text".into());
+        }
+        let (audience, format) = (q.get("audience").cloned().unwrap_or_default(), q.get("format").cloned().unwrap_or_default());
+        f.identities.lock().unwrap().push((audience.clone(), format.clone()));
+        let token = jwt("botd@acme-prod.iam.gserviceaccount.com", 3600);
+        // Only the `superbot` role is bound to this VM, as Vault's `bound_service_accounts` would do.
+        if audience == "http://vault/superbot" && format == "full" {
+            f.jwts.lock().unwrap().push(("gcp".into(), Some("superbot".into()), token.clone()));
+        }
+        (StatusCode::OK, token)
+    }
+
     /// Google's metadata server: botd's token and its account's email.
     async fn google_token(State(f): State<F>, h: HeaderMap) -> (StatusCode, Json<Value>) {
         if h.get("metadata-flavor").and_then(|v| v.to_str().ok()) != Some("Google") {
@@ -1315,6 +1484,8 @@ pub(crate) mod tests {
             .route("/latest/api/token", axum::routing::put(imds_token))
             .route("/latest/meta-data/iam/security-credentials/", axum::routing::get(imds_roles))
             .route("/latest/meta-data/iam/security-credentials/{role}", axum::routing::get(imds_role))
+            .route("/latest/dynamic/instance-identity/pkcs7", axum::routing::get(imds_pkcs7))
+            .route("/computeMetadata/v1/instance/service-accounts/default/identity", axum::routing::get(google_identity))
             .route("/computeMetadata/v1/instance/service-accounts/default/token", axum::routing::get(google_token))
             .route("/computeMetadata/v1/instance/service-accounts/default/email", axum::routing::get(google_email))
             .route("/v1/projects/-/serviceAccounts/{rest}", axum::routing::post(sign_jwt))
@@ -1829,6 +2000,93 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gce_logs_in_with_the_vms_identity_token_and_no_iam_permission() {
+        let (url, f) = stand_in();
+        put(&f, "server/SMTP_PASSWORD", "gce-login-smtp-1");
+        let host = url.trim_start_matches("http://").to_string();
+        let mount = format!("gcp-gce-{}", crate::random_hex(4));
+        let base = [("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce"), ("VAULT_GCP_ROLE", "superbot"), ("VAULT_GCP_MOUNT", mount.as_str()), ("GCE_METADATA_HOST", host.as_str())];
+        let s = vault(&url, &base, Duration::ZERO);
+        assert!(s.describe().contains(&format!("GCP login (gce) as role superbot at auth/{mount}, the VM's identity token of the metadata server's service account at {host}")), "{}", s.describe());
+        assert_eq!(s.get("SMTP_PASSWORD").unwrap().unwrap().expose(), "gce-login-smtp-1");
+        assert_eq!(*f.identities.lock().unwrap(), [("http://vault/superbot".to_string(), "full".to_string())], "for the role, with the instance's details Vault binds roles to");
+        assert!(f.signed.lock().unwrap().is_empty() && f.google_tokens.lock().unwrap().is_empty(), "no signJwt and no access token: botd needs no IAM permission");
+        let token = f.jwts.lock().unwrap().last().unwrap().2.clone();
+        let ev = audited(&mount);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].details, json!({ "method": "gcp", "type": "gce", "role": "superbot" }));
+        assert!(!format!("{ev:?}").contains(&token), "never the token");
+
+        // Two thirds through Vault's lease, botd logs in again with a new identity token.
+        f.lease.store(3, Ordering::SeqCst);
+        let s = vault(&url, &base, Duration::ZERO);
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(s.get("SMTP_PASSWORD").unwrap().is_some());
+        assert_eq!(f.identities.lock().unwrap().len(), 3);
+        f.lease.store(3600, Ordering::SeqCst);
+
+        // A VM with no service account: named, never the metadata server's text, and nothing sent to Vault.
+        let logins = f.logins.load(Ordering::SeqCst);
+        f.identity_status.store(404, Ordering::SeqCst);
+        let e = vault(&url, &base, Duration::ZERO).check().err().unwrap().to_string();
+        assert!(e.contains("identity token answered 404") && e.contains("service account?") && !e.contains("stand-in"), "{e}");
+        assert_eq!(f.logins.load(Ordering::SeqCst), logins);
+        assert!(audited(&mount).iter().any(|e| e.outcome == Outcome::Failure && e.details["type"] == "gce" && e.details["error"] == "unavailable"));
+
+        // A role Vault doesn't bind to this VM: refused, and the read fails closed.
+        let e = vault(&url, &[base[0], base[1], ("VAULT_GCP_ROLE", "nobody"), base[3], base[4]], Duration::ZERO).check().err().unwrap().to_string();
+        assert!(e.contains(&format!("GCP login at auth/{mount} answered 403")), "{e}");
+        redact::forget("gce-login-smtp-1");
+    }
+
+    #[test]
+    fn ec2_logs_in_with_the_instances_identity_document_and_its_nonce() {
+        let (url, f) = stand_in();
+        put(&f, "bots/EC2_LOGIN_API_KEY", "ec2-login-value-1");
+        let mount = format!("aws-ec2-{}", crate::random_hex(4));
+        let nonce = format!("ec2-nonce-{}", crate::random_hex(16));
+        let base = [("VAULT_AUTH", "aws"), ("VAULT_AWS_TYPE", "ec2"), ("VAULT_AWS_MOUNT", mount.as_str()), ("VAULT_AWS_NONCE", nonce.as_str()), ("AWS_EC2_METADATA_SERVICE_ENDPOINT", url.as_str())];
+        let s = vault(&url, &base, Duration::ZERO);
+        let described = s.describe();
+        assert!(described.contains(&format!("AWS login (ec2) as the role named after its AMI at auth/{mount}, the instance's signed identity document from IMDSv2 at {url} with the nonce in VAULT_AWS_NONCE")), "{described}");
+        assert!(!described.contains(&nonce));
+        assert_eq!(s.get("EC2_LOGIN_API_KEY").unwrap().unwrap().expose(), "ec2-login-value-1");
+        assert_eq!(*f.ec2_logins.lock().unwrap(), [EC2_AMI], "no role: the one named after the AMI");
+        assert_eq!(f.ec2_nonce.lock().unwrap().as_deref(), Some(nonce.as_str()), "botd's own nonce, so a restart can log in again");
+        let ev = audited(&mount);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].details, json!({ "method": "aws", "type": "ec2" }));
+        assert_eq!(redact::text(&nonce), redact::MARK, "the nonce is masked wherever it turns up");
+
+        // Vault revokes botd's token: the next login repeats the nonce, which Vault takes.
+        f.tokens.lock().unwrap().clear();
+        assert!(s.get("EC2_LOGIN_API_KEY").unwrap().is_some());
+        // As does another botd started with the same settings, here for a named role.
+        let s = vault(&url, &[base[0], base[1], base[2], base[3], base[4], ("VAULT_AWS_ROLE", "superbot")], Duration::ZERO);
+        assert!(s.get("EC2_LOGIN_API_KEY").unwrap().is_some());
+        assert_eq!(*f.ec2_logins.lock().unwrap(), [EC2_AMI, EC2_AMI, "superbot"]);
+
+        // Another nonce: Vault refuses it, and the error says what to look at, never either nonce.
+        let other = format!("ec2-other-{}", crate::random_hex(16));
+        let e = vault(&url, &[base[0], base[1], base[2], ("VAULT_AWS_NONCE", other.as_str()), base[4]], Duration::ZERO).check().err().unwrap().to_string();
+        assert!(e.contains(&format!("AWS login at auth/{mount} answered 400")) && e.contains("VAULT_AWS_NONCE changed"), "{e}");
+        assert!(!e.contains(&other) && !e.contains(&nonce) && !e.contains("stand-in"), "{e}");
+        let logged = format!("{:?}", audited(&mount));
+        assert!(audited(&mount).iter().any(|e| e.outcome == Outcome::Failure && e.details["type"] == "ec2"), "{logged}");
+        assert!(!logged.contains(&nonce) && !logged.contains(&other) && !logged.contains(&ec2_pkcs7()[..64]), "no nonce or document in the audit log");
+
+        // No metadata service: fails closed before Vault is asked.
+        let logins = f.logins.load(Ordering::SeqCst);
+        let e = vault(&url, &[base[0], base[1], base[2], base[3], ("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:9")], Duration::ZERO).check().err().unwrap().to_string();
+        assert!(e.contains("AWS (for Vault): the instance identity document"), "{e}");
+        assert_eq!(f.logins.load(Ordering::SeqCst), logins);
+        for v in ["ec2-login-value-1", nonce.as_str(), other.as_str()] {
+            redact::forget(v);
+        }
+    }
+
+    #[test]
     fn jwt_files_that_cant_be_used_fail_closed_before_anything_is_sent() {
         let (url, f) = stand_in();
         let expired = jwt("system:serviceaccount:superbot:botd", -120);
@@ -1970,6 +2228,13 @@ pub(crate) mod tests {
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "r"), ("VAULT_GCP_SERVICE_ACCOUNT", "not-an-email")], "VAULT_GCP_SERVICE_ACCOUNT must be"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "r"), ("VAULT_GCP_CREDENTIALS", "service-account-key")], "VAULT_GCP_CREDENTIALS=service-account-key needs GCP_SERVICE_ACCOUNT_KEY_FILE"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "r"), ("GCP_IAM_CREDENTIALS_ENDPOINT", "http://iam.example.com")], "GCP_IAM_CREDENTIALS_ENDPOINT"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_ROLE", "r"), ("VAULT_GCP_TYPE", "gke")], "VAULT_GCP_TYPE must be iam (the default) or gce"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce")], "needs VAULT_GCP_ROLE"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce"), ("VAULT_GCP_ROLE", "r"), ("VAULT_GCP_CREDENTIALS", "service-account-key")], "VAULT_GCP_CREDENTIALS must be metadata"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce"), ("VAULT_GCP_ROLE", "r"), ("VAULT_GCP_SERVICE_ACCOUNT", "a@p.iam.gserviceaccount.com")], "VAULT_GCP_SERVICE_ACCOUNT is for VAULT_GCP_TYPE=iam"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce"), ("VAULT_GCP_ROLE", "r"), ("GCE_METADATA_HOST", "a/b")], "GCE_METADATA_HOST must be"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_TYPE", "pkcs7")], "VAULT_AWS_TYPE must be iam (the default) or ec2"),
+            (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_TYPE", "ec2")], "VAULT_AWS_TYPE=ec2 needs VAULT_AWS_NONCE"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure")], "needs VAULT_AZURE_ROLE"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "r"), ("VAULT_AZURE_CREDENTIALS", "msi")], "VAULT_AZURE_CREDENTIALS must be managed-identity"),
             (vec![("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "r"), ("VAULT_AZURE_RESOURCE", "a b")], "VAULT_AZURE_RESOURCE must be"),
@@ -2009,6 +2274,36 @@ pub(crate) mod tests {
         assert!(matches!(&c.auth, Auth::Gcp { mount, signer: None, iam, .. } if mount == "gcp" && iam == gcp::IAM_CREDENTIALS));
         let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "azure"), ("VAULT_AZURE_ROLE", "superbot"), ("VAULT_AUTH_NAMESPACE", "admin")]), &none).unwrap();
         assert!(matches!(&c.auth, Auth::Azure { mount, instance: false, entra, .. } if mount == "azure" && entra.resource() == AZURE_RESOURCE));
+        // Nor does the gce type: the metadata server makes its token.
+        let c = Config::from_env(&settings(&[("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "gcp"), ("VAULT_GCP_TYPE", "gce"), ("VAULT_GCP_ROLE", "superbot"), ("VAULT_GCP_CREDENTIALS", "metadata")]), &none).unwrap();
+        assert!(matches!(&c.auth, Auth::Gce { mount, role, google } if mount == "gcp" && role == "superbot" && google.method() == "metadata"));
+
+        // The ec2 type needs its nonce, from the environment or a file, and none of the iam type's settings.
+        let ec2 = [("VAULT_ADDR", "https://v"), ("VAULT_AUTH", "aws"), ("VAULT_AWS_TYPE", "ec2")];
+        for bad in ["short-nonce", "has a space in it, so no", "quote\"d-0123456789abcdef"] {
+            let e = Config::from_env(&settings(&ec2), &EnvStore::fixed(&[("VAULT_AWS_NONCE", bad)])).err().unwrap();
+            assert!(e.contains("VAULT_AWS_NONCE must be 16 to 128 printable characters") && !e.contains(bad), "{bad}: {e}");
+        }
+        let nonce = "0123456789abcdef-settings";
+        let good = EnvStore::fixed(&[("VAULT_AWS_NONCE", nonce)]);
+        for (extra, err) in [
+            (("VAULT_AWS_REGION", "eu-west-2"), "VAULT_AWS_REGION is for VAULT_AWS_TYPE=iam"),
+            (("VAULT_AWS_HEADER_VALUE", "vault.example.com"), "VAULT_AWS_HEADER_VALUE is for VAULT_AWS_TYPE=iam"),
+            (("VAULT_AWS_CREDENTIALS", "instance-profile"), "VAULT_AWS_CREDENTIALS is for VAULT_AWS_TYPE=iam"),
+            (("VAULT_AWS_ROLE", "a b"), "VAULT_AWS_ROLE must be"),
+            (("AWS_EC2_METADATA_DISABLED", "true"), "AWS_EC2_METADATA_DISABLED is true"),
+            (("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://169.254.169.254/latest"), "AWS_EC2_METADATA_SERVICE_ENDPOINT"),
+        ] {
+            let e = Config::from_env(&settings(&[ec2[0], ec2[1], ec2[2], extra]), &good).err().unwrap();
+            assert!(e.contains(err), "{extra:?}: {e}");
+        }
+        let c = Config::from_env(&settings(&ec2), &good).unwrap();
+        assert!(matches!(&c.auth, Auth::Ec2 { mount, role: None, nonce: n, .. } if mount == "aws" && n.as_str() == nonce));
+        let file = token_file("vault-ec2-nonce", &format!("{nonce}\n"));
+        let from_file = EnvStore::fixed(&[("VAULT_AWS_NONCE_FILE", file.to_str().unwrap())]);
+        let c = Config::from_env(&settings(&ec2), &from_file).unwrap();
+        assert!(matches!(&c.auth, Auth::Ec2 { nonce: n, .. } if n.as_str() == nonce), "read from VAULT_AWS_NONCE_FILE, its line break trimmed");
+        redact::forget(nonce);
     }
 
     #[test]
@@ -2025,7 +2320,7 @@ pub(crate) mod tests {
         let keys = EnvStore::fixed(&[("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"), ("AWS_SECRET_ACCESS_KEY", "vault-bots-aws-secret")]);
         Config::from_env(&settings(&aws), &keys).unwrap();
         redact::forget("vault-bots-aws-secret");
-        for name in ["VAULT_TOKEN", "VAULT_SECRET_ID", "VAULT_ROLE_ID", "VAULT_JWT", "VAULT_KUBERNETES_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GCP_SERVICE_ACCOUNT_KEY", "AZURE_CLIENT_SECRET"] {
+        for name in ["VAULT_TOKEN", "VAULT_SECRET_ID", "VAULT_ROLE_ID", "VAULT_JWT", "VAULT_KUBERNETES_TOKEN", "VAULT_AWS_NONCE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GCP_SERVICE_ACCOUNT_KEY", "AZURE_CLIENT_SECRET"] {
             assert!(super::super::check_name(name).is_err(), "{name} is reserved");
             let s = Secrets::new(vec![Box::new(EnvStore::fixed(&[(name, "hvs.0123456789abcdef")]))]);
             assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty() && s.list().unwrap().is_empty(), "{name}");
