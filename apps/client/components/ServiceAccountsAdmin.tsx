@@ -317,7 +317,9 @@ function AccountDetail({
   const keptBots = full?.keptBotList ?? [];
   const keepable = full?.keepable ?? [];
   const left = Math.max(0, (view.maxKeptBots ?? 20) - keptBots.length);
-  const picked = keepable.filter((k) => handing.includes(k.id));
+  // Only picks still offered, and no more than it has room for now: a reload may drop some
+  // (a new owner) or fill the room.
+  const picked = keepable.filter((k) => handing.includes(k.id)).slice(0, left);
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -446,14 +448,15 @@ function AccountDetail({
                 Hand it {left > 1 ? `up to ${left}` : "one"} of {sa.owner?.name || "its owner"}&apos;s Bots to manage:
               </Text>
               {keepable.map((b) => {
-                const on = handing.includes(b.id);
-                const off = busy || (!on && handing.length >= left);
+                const ids = picked.map((p) => p.id);
+                const on = ids.includes(b.id);
+                const off = busy || (!on && ids.length >= left);
                 return (
                   <Pressable
                     key={b.id}
                     style={styles.perm}
                     disabled={off}
-                    onPress={() => setHanding(on ? handing.filter((id) => id !== b.id) : [...handing, b.id])}
+                    onPress={() => setHanding(on ? ids.filter((id) => id !== b.id) : [...ids, b.id])}
                     accessibilityRole="checkbox"
                     accessibilityState={{ checked: on, disabled: off }}
                     accessibilityLabel={`Hand over ${b.name}`}

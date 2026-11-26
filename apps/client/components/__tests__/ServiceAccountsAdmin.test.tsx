@@ -176,6 +176,29 @@ describe("ServiceAccountsAdmin (ADR 0143, 0152)", () => {
     expect(confirmAsync).toHaveBeenLastCalledWith("Let HR sync keep 2 Bots?", expect.stringMatching(/^Notes, Wiki\..*Nightly stops keeping Notes\.$/), "Hand over 2 Bots");
   });
 
+  it("forgets picks a reload no longer offers, so they don't hold up others", async () => {
+    const api = mockApi({ ...VIEW, maxKeptBots: 3 });
+    const bot = (id: string, name: string) => ({ id, name, visibility: "private" as const, keptBy: null });
+    let state = { keptBotList: [bot("b1", "Ledger")], keepable: [bot("b2", "Notes"), bot("b3", "Wiki"), bot("b4", "Extra")] };
+    api.serviceAccount.mockImplementation(async () => ({ ...SA, tokenList: [TOKEN], ...state }));
+    const u = userEvent.setup();
+    await open(api, u);
+    await u.press(screen.getByLabelText("Hand over Notes"));
+    await u.press(screen.getByLabelText("Hand over Wiki"));
+    expect(screen.getByLabelText("Hand over Extra")).toBeDisabled();
+
+    // Still room for two, but Notes and Wiki are no longer offered.
+    state = { keptBotList: [bot("b5", "Other")], keepable: [bot("b4", "Extra"), bot("b1", "Ledger")] };
+    await u.press(screen.getByLabelText("Take Ledger back"));
+    await screen.findByLabelText("Take Other back");
+    expect(screen.getByLabelText("Hand over Extra")).toBeEnabled();
+    expect(screen.getByLabelText("Hand it over")).toBeDisabled();
+    await u.press(screen.getByLabelText("Hand over Extra"));
+    await u.press(screen.getByLabelText("Hand it over"));
+    await waitFor(() => expect(api.keepBot).toHaveBeenCalledWith("b4", "sa1"));
+    expect(api.keepBots).not.toHaveBeenCalled();
+  });
+
   it("doesn't take a Bot back when they say no, and offers none past the limit", async () => {
     const api = mockApi({ ...VIEW, maxKeptBots: 1 });
     api.serviceAccount.mockImplementation(async () => ({
