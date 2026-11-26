@@ -149,7 +149,7 @@ It prints what machines get (the control plane, their upkeep, each bundle and wh
 ==> License: 0.2.0 would run Bots with this server's license: Licensed to Acme Ltd (business, 25 seats) until 2027-03-31.
 ```
 
-`--dry-run` says what it found and goes on, and with `--testing-mode` Bots run anyway, so it only says so. A new install with `--license-file` says whether the bundle's botd takes the key, and goes on either way. A bundle's botd from before this check is skipped with a warning. To check a key by hand, such as a renewal before you install it, with the bundle's botd or the installed one:
+`--dry-run` says what it found and goes on, and with `--testing-mode` Bots run anyway, so it doesn't stop (a rollback still keeps a renewal, as below). A new install with `--license-file` says whether the bundle's botd takes the key, and goes on either way. A bundle's botd from before this check is skipped with a warning. To check a key by hand, such as a renewal before you install it, with the bundle's botd or the installed one:
 
 ```sh
 sudo -u superbot <bundle>/bin/botd license check --home ~superbot --key-file renewal.key
