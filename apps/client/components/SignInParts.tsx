@@ -1,6 +1,5 @@
 import React, { useState } from "react";
 import {
-  ActivityIndicator,
   Image,
   KeyboardAvoidingView,
   Platform,
@@ -68,7 +67,6 @@ export function Field({ label, ...input }: { label: string } & TextInputProps) {
 
 /** The one accent-filled button on a step. */
 export function PrimaryButton({ label, onPress, busy = false, disabled = false }: { label: string; onPress: () => void; busy?: boolean; disabled?: boolean }) {
-  const t = useTheme();
   const styles = useStyles();
   const off = busy || disabled;
   return (
@@ -79,8 +77,9 @@ export function PrimaryButton({ label, onPress, busy = false, disabled = false }
       accessibilityRole="button"
       accessibilityLabel={label}
       accessibilityState={{ disabled: off, busy }}
+      aria-busy={busy}
     >
-      {busy ? <ActivityIndicator color={t.c.onAccent} /> : <Text style={styles.primaryText}>{label}</Text>}
+      <Text style={styles.primaryText}>{label}</Text>
     </Pressable>
   );
 }

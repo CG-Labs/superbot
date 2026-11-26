@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen, userEvent } from "@testing-library/react-native";
+import { fireEvent, render, screen, userEvent, within } from "@testing-library/react-native";
 import { Divider, Field, Notice, PrimaryButton, SignInFrame, TextButton } from "../SignInParts";
 import { themes } from "../../src/theme";
 
@@ -82,8 +82,16 @@ describe("buttons and notices", () => {
     expect(onPress).toHaveBeenCalledTimes(1);
 
     await rerender(<PrimaryButton label="Connect" onPress={onPress} busy />);
-    expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
-    expect(screen.queryByText("Connect")).not.toBeOnTheScreen();
+    const busy = screen.getByRole("button", { name: "Connect" });
+    expect(busy).toBeDisabled();
+    expect(busy).toBeBusy();
+    expect(within(busy).getByText("Connect")).toBeOnTheScreen();
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    await user.press(busy);
+    expect(onPress).toHaveBeenCalledTimes(1);
+
+    await rerender(<PrimaryButton label="Connect" onPress={onPress} />);
+    expect(screen.getByRole("button", { name: "Connect" })).not.toBeBusy();
   });
 
   it("disables a text button", async () => {
