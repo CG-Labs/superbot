@@ -22,7 +22,7 @@ When a start has no `idp`, botd sends the browser to the service. This comes aft
 
 ### A discovery response endpoint of its own
 
-`GET /api/auth/sso/<id>/discovery` takes the service's answer, `entityID`. It does nothing but pass the pick on. It sends the browser to `/api/auth/sso/<id>/start?<the same parameters>&idp=<entityID>`, so every check stays in one place: an IdP not listed, or with `all` not in the aggregate, fails as `unknown_idp`. A provider that isn't there, one IdP, or too many tries also go to the start, which refuses or signs in as it would anyway.
+`GET /api/auth/sso/<id>/discovery` takes the service's answer, `entityID`. It does nothing but pass the pick on. It sends the browser to `/api/auth/sso/<id>/start?<the same parameters>&idp=<entityID>`, so every check stays in one place: an IdP not listed, or with `all` not in the aggregate, fails as `unknown_idp`. A provider that isn't ready, one IdP, or too many tries also go to the start, which refuses or signs in as it would anyway. A provider id nobody configured is not found (404): the redirect is only ever made from a configured provider's id, never from what the path says.
 
 With no pick (the person gave up at the service, or it sent no answer), the endpoint shows botd's own chooser. That chooser's links go to the start with `idp`. With every IdP, its search box comes back to `/discovery`, not to `/start`, which would send the browser to the service again. So a service that never answers can't make a loop, and the person still gets in.
 

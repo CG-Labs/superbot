@@ -3912,9 +3912,11 @@ async fn a_federations_discovery_service_picks_the_idp_and_botd_checks_the_pick(
     assert!(page.contains(&format!("/api/auth/sso/{}/start?session=cookie&amp;idp={}", sp.id, enc(IDP_B))), "{page}");
     assert_eq!(get(format!("/api/auth/sso/{}/discovery?session=cookie&entityID=", sp.id)).await.0, 200, "an empty answer is no answer");
 
-    // A provider that isn't there goes to its start, which says so.
-    let (code, head, _) = get("/api/auth/sso/nope/discovery?entityID=x".into()).await;
-    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/api/auth/sso/nope/start?idp=x")));
+    // A provider that isn't there is not found: no redirect is made from the path.
+    for path in ["/api/auth/sso/nope/discovery?entityID=x", "/api/auth/sso/%2F%2Fevil.example/discovery?entityID=x"] {
+        let (code, head, _) = get(path.into()).await;
+        assert_eq!((code, header(&head, "location")), (404, None), "{path}");
+    }
 
     // Picked elsewhere (a portal's link, an IdP-initiated restart): no detour.
     assert_eq!(sp.start_at(IDP).await.3, SSO_URL);

@@ -1315,17 +1315,19 @@ const DISCOVERY_ANSWER: &str = "entityID";
 /// the browser back (ADR 0314), the `DiscoveryResponse` in our metadata. The service only picks:
 /// its pick goes to this provider's start as `idp`, checked there like a chooser link's, with the
 /// sign-in's own parameters. With no pick (the person gave up there), botd's own chooser, whose
-/// search comes back here rather than to the service again. Anything else (an unknown provider,
-/// one IdP, too many tries) goes to the start, which refuses or signs in as it would.
+/// search comes back here rather than to the service again. Anything else (not ready, one IdP,
+/// too many tries) goes to the start, which refuses or signs in as it would. A provider that
+/// isn't configured is not found, so no URL is made from what the path says.
 pub async fn discovery(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let Some(p) = a.sso.provider(&id) else { return not_found("SSO provider").into_response() };
     let carry = carried(&q);
-    let start = format!("/api/auth/sso/{id}/start");
+    let start = format!("/api/auth/sso/{}/start", p.id);
     let blocked = a.limiter.blocked(source.ip.as_deref().unwrap_or_default(), db::now()).is_some();
     let picked = q.get(DISCOVERY_ANSWER).filter(|e| !e.is_empty());
-    match a.sso.provider(&id).filter(|p| p.ready() && p.saml_sp() && p.several_idps()) {
+    match Some(p).filter(|p| p.ready() && p.saml_sp() && p.several_idps()) {
         Some(p) if !blocked && picked.is_none() => {
             p.every_idp_read(a.sso.refresh_gap).await;
-            no_store(chooser(p, &q, &format!("/api/auth/sso/{id}/discovery")))
+            no_store(chooser(p, &q, &format!("/api/auth/sso/{}/discovery", p.id)))
         }
         _ => {
             let mut to = carry;
