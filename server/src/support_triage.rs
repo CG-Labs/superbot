@@ -55,16 +55,16 @@ pub const HEALTH_CHECK_GUIDES: [(&str, &str); 16] = [
     ("actions", "support/health-score.md#the-signals"),
     ("incidents", "support/incident-review.md#the-review-draft"),
     ("saml", "support/runbook-saml.md"),
-    ("scim", "sso/scim.md"),
+    ("scim", "support/runbook-scim.md"),
     ("roles", "support/runbook-custom-roles.md"),
-    ("backups", "ops/backup-restore.md"),
+    ("backups", "support/runbook-backups.md"),
     ("machine_recovery", "ops/machine-recovery.md"),
     ("residency", "support/runbook-residency.md"),
     ("restore_drill", "support/tam.md#cadence"),
     ("egress", "support/runbook-run-limits-egress.md"),
     ("approvals", "support/runbook-approvals-stuck.md"),
     ("usage", "support/tiers.md"),
-    ("license", "support/health-score.md#license"),
+    ("license", "support/runbook-license.md"),
     ("tickets", "support/support-report.md"),
     ("changes", "support/tam.md#what-a-tam-does"),
 ];
@@ -668,6 +668,9 @@ fn signal_rules(score: &Value, out: &mut Vec<Finding>) {
                 if refused.iter().any(|(c, _)| c.starts_with("egress")) || u64_at(facts, "runLimited") > 0 {
                     x = x.runbook("support/runbook-run-limits-egress.md");
                 }
+                if refused.iter().any(|(c, _)| c == "unlicensed") {
+                    x = x.runbook("support/runbook-license.md#bots-stopped");
+                }
                 if !refused.is_empty() {
                     x.summary.push_str(&format!(" Refused: {}.", counted(&refused)));
                 }
@@ -681,8 +684,12 @@ fn signal_rules(score: &Value, out: &mut Vec<Finding>) {
                         x = x.runbook(b);
                     }
                 }
-                if u64_at(facts, "scimFailed") > 0 || u64_at(facts, "scimTenantsExpiring") > 0 || !scim.is_empty() {
-                    x = x.runbook("sso/scim.md");
+                let stopped = u64_at(facts, "scimTenantsExpiring") > 0 || scim.iter().any(|(c, _)| c == "revoked_token" || c == "expired_token");
+                if stopped {
+                    x = x.runbook("support/runbook-scim.md#provisioning-stopped");
+                }
+                if (u64_at(facts, "scimFailed") > 0 && !stopped) || scim.iter().any(|(c, _)| c != "revoked_token" && c != "expired_token") {
+                    x = x.runbook("support/runbook-scim.md#reasons-and-fixes");
                 }
                 let mut why = Vec::new();
                 if !sso.is_empty() {
@@ -697,13 +704,25 @@ fn signal_rules(score: &Value, out: &mut Vec<Finding>) {
                 x.runbook("support/health-score.md#identity")
             }
             "backups" => {
-                let x = if risk { f(Level::Fail, Some(2)) } else { f(Level::Warn, None) };
-                x.runbook("support/runbook-machine-down.md").runbook("ops/backup-restore.md")
+                let mut x = if risk { f(Level::Fail, Some(2)) } else { f(Level::Warn, None) };
+                let server = &facts["server"];
+                if server.is_null() || server["offHost"] == false || server["breach"] == true || server["ageHours"].is_null() {
+                    x = x.runbook("support/runbook-backups.md#server-backups");
+                }
+                if u64_at(facts, "machineRpoBreaches") > 0 || u64_at(facts, "machineBackupsFailed") > 0 {
+                    x = x.runbook("support/runbook-backups.md#machine-backups");
+                }
+                if x.runbooks.is_empty() { x.runbook("support/runbook-backups.md") } else { x }
             }
             "approvals" => f(if risk { Level::Warn } else { Level::Info }, risk.then_some(3)).runbook("support/runbook-approvals-stuck.md"),
             "license" => {
-                let x = if risk { f(Level::Fail, Some(2)) } else { f(Level::Info, Some(4)) };
-                x.runbook("support/health-score.md#license").next("Renewals and seats go to the account owner; `botctl license` on the server shows the detail.")
+                let next = "Renewals and seats go to the account owner; `botctl license` on the server shows the detail.";
+                if facts["usable"] == false {
+                    f(Level::Fail, Some(1)).runbook("support/runbook-license.md#bots-stopped").next(format!("Bots don't run for anyone until a usable license is installed. {next}"))
+                } else {
+                    let x = if risk { f(Level::Fail, Some(2)) } else { f(Level::Info, Some(4)) };
+                    x.runbook("support/runbook-license.md").next(next)
+                }
             }
             _ => f(if risk { Level::Warn } else { Level::Info }, None),
         };
@@ -755,13 +774,16 @@ fn audit_group(action: &str) -> (&'static str, &'static str, Option<&'static str
     if action.contains("residency") || action == "user.region_change_refused" {
         return ("residency", "residency refusals", Some("support/runbook-residency.md#refusals-and-fixes"));
     }
+    if action.starts_with("server.backup") || action.starts_with("machine.backup") || action == "machine.rpo_breached" {
+        return ("backups", "backup failures", Some("support/runbook-backups.md"));
+    }
     match family {
         "auth" | "sso" => ("sign_in", "sign-in failures", None),
-        "scim" => ("scim", "SCIM provisioning failures", Some("sso/scim.md")),
+        "scim" => ("scim", "SCIM provisioning failures", Some("support/runbook-scim.md#reasons-and-fixes")),
         "access" | "role" => ("access", "access denials", Some("support/runbook-custom-roles.md#why-a-holder-is-refused")),
         "approval" => ("approvals", "approval failures", Some("support/runbook-approvals-stuck.md")),
         "harness" => ("harness", "harness failures", Some("support/runbook-harness-outage.md")),
-        "license" => ("license", "license refusals", Some("support/health-score.md#license")),
+        "license" => ("license", "license refusals", Some("support/runbook-license.md")),
         "machine" | "isolation" if action != "machine.run_limited" => ("machines", "machine failures", Some("support/runbook-machine-down.md")),
         _ if matches!(action, "bot.run_refused" | "routine.run_refused" | "machine.run_limited" | "usage.token_limit_reached") => {
             ("run_limits", "runs refused or held to limits", Some("support/runbook-run-limits-egress.md"))
@@ -944,10 +966,12 @@ fn check_rules(check: &Value, out: &mut Vec<Finding>) {
             ("botd", _) if not_running => (Level::Fail, Some(1), "support/runbook-machine-down.md#the-server-itself"),
             ("data_dir" | "database" | "master_key", "fail") => (Level::Fail, Some(1), "support/runbook-server-restore.md"),
             ("disk", "fail") => (Level::Fail, Some(1), "support/runbook-machine-down.md#the-server-itself"),
-            ("backups", "fail") => (Level::Fail, Some(2), "ops/backup-restore.md"),
-            ("license", "fail") => (Level::Fail, Some(2), "support/health-score.md#license"),
+            ("backups", "fail") => (Level::Fail, Some(2), "support/runbook-backups.md#server-backups"),
+            ("license", "fail") => (Level::Fail, Some(1), "support/runbook-license.md#bots-stopped"),
             (_, "fail") => (Level::Fail, Some(2), "support/support-check.md#the-checks"),
             ("database" | "disk", "warn") => (Level::Warn, Some(3), "support/support-check.md#the-checks"),
+            ("backups", "warn") => (Level::Warn, None, "support/runbook-backups.md#server-backups"),
+            ("license", "warn") => (Level::Warn, None, "support/runbook-license.md"),
             (_, "warn") => (Level::Warn, None, "support/support-check.md#the-checks"),
             _ => continue,
         };
@@ -1450,7 +1474,7 @@ mod tests {
         let t = triage(&online(vec![("health-score.json", score)]), &opts()).unwrap();
         let id = find(&t, "signal.identity");
         assert_eq!((id.level, id.severity), (Level::Fail, Some(2)));
-        assert_eq!(id.runbooks, ["support/runbook-saml.md#reasons-and-fixes", "support/runbook-sign-in.md#reasons-and-fixes", "sso/scim.md", "support/health-score.md#identity"]);
+        assert_eq!(id.runbooks, ["support/runbook-saml.md#reasons-and-fixes", "support/runbook-sign-in.md#reasons-and-fixes", "support/runbook-scim.md#reasons-and-fixes", "support/health-score.md#identity"]);
         assert!(id.summary.ends_with("Reasons: sign-in bad_signature ×30, not_linked ×4; SCIM uniqueness ×7."), "{}", id.summary);
         assert_eq!(find(&t, "signal.backups").severity, Some(2));
         let runs = find(&t, "signal.runs");
@@ -1460,6 +1484,56 @@ mod tests {
         assert_eq!(find(&t, "signal.adoption").severity, None);
         assert!(!ids(&t).contains(&"signal.approvals"));
         assert!(find(&t, "score.at_risk").next.as_ref().unwrap().contains("support manager"));
+    }
+
+    /// ADR 0313: SCIM, backups and the license open their own runbooks, at the section
+    /// for what the signal's facts show.
+    #[test]
+    fn scim_backups_and_license_open_their_runbooks() {
+        let signal = |id: &str, status: &str, facts: Value| json!({ "id": id, "label": id, "status": status, "summary": "s", "facts": facts });
+        let run = |signals: Vec<Value>| triage(&online(vec![("health-score.json", json!({ "score": 70, "band": "watch", "signals": signals }))]), &opts()).unwrap();
+
+        let stopped = run(vec![signal("identity", "risk", json!({ "scimFailed": 3, "scimReasons": [{ "code": "revoked_token", "count": 3 }] }))]);
+        assert_eq!(find(&stopped, "signal.identity").runbooks, ["support/runbook-scim.md#provisioning-stopped", "support/health-score.md#identity"]);
+        let ending = run(vec![signal("identity", "watch", json!({ "scimTenantsExpiring": 1 }))]);
+        assert_eq!(find(&ending, "signal.identity").runbooks, ["support/runbook-scim.md#provisioning-stopped", "support/health-score.md#identity"]);
+        let both = run(vec![signal("identity", "risk", json!({ "scimFailed": 9, "scimReasons": [{ "code": "expired_token", "count": 2 }, { "code": "status_403", "count": 7 }] }))]);
+        assert_eq!(
+            find(&both, "signal.identity").runbooks,
+            ["support/runbook-scim.md#provisioning-stopped", "support/runbook-scim.md#reasons-and-fixes", "support/health-score.md#identity"]
+        );
+
+        let server = |facts: Value| find(&run(vec![signal("backups", "risk", facts)]), "signal.backups").runbooks.clone();
+        let breach = json!({ "server": { "offHost": true, "breach": true, "ageHours": 40, "rpoHours": 26 }, "machineRpoBreaches": 0, "machineBackupsFailed": 0 });
+        assert_eq!(server(breach), ["support/runbook-backups.md#server-backups"]);
+        let machines = json!({ "server": { "offHost": true, "breach": false, "ageHours": 3, "rpoHours": 26 }, "machineRpoBreaches": 2, "machineBackupsFailed": 1 });
+        assert_eq!(server(machines), ["support/runbook-backups.md#machine-backups"]);
+        let none = json!({ "server": null, "machineRpoBreaches": 1, "machineBackupsFailed": 0 });
+        assert_eq!(server(none), ["support/runbook-backups.md#server-backups", "support/runbook-backups.md#machine-backups"]);
+        assert_eq!(server(json!({})), ["support/runbook-backups.md#server-backups"], "no server facts: not set up");
+
+        let gone = run(vec![signal("license", "risk", json!({ "mode": "expired", "usable": false, "seatsUsed": 4, "seats": 0 }))]);
+        let l = find(&gone, "signal.license");
+        assert_eq!((l.level, l.severity, l.runbooks.clone()), (Level::Fail, Some(1), vec!["support/runbook-license.md#bots-stopped"]));
+        assert!(l.next.as_ref().unwrap().starts_with("Bots don't run for anyone"), "{l:?}");
+        let grace = run(vec![signal("license", "risk", json!({ "mode": "grace", "usable": true }))]);
+        let l = find(&grace, "signal.license");
+        assert_eq!((l.level, l.severity, l.runbooks.clone()), (Level::Fail, Some(2), vec!["support/runbook-license.md"]));
+
+        let unlicensed = run(vec![signal("runs", "watch", json!({ "refusedReasons": [{ "code": "unlicensed", "count": 5 }] }))]);
+        assert!(find(&unlicensed, "signal.runs").runbooks.contains(&"support/runbook-license.md#bots-stopped"));
+    }
+
+    #[test]
+    fn backup_failures_are_their_own_group() {
+        for action in ["server.backup_copy_failed", "server.backup_rpo_breached", "machine.backup_failed", "machine.backups_failed", "machine.rpo_breached", "machine.backups_delete_failed", "machine.backups_delete_refused"] {
+            assert_eq!(audit_group(action).0, "backups", "{action}");
+            assert_eq!(audit_group(action).2, Some("support/runbook-backups.md"), "{action}");
+        }
+        assert_eq!(audit_group("machine.residency_refused").0, "residency", "a pin's refusals stay with residency");
+        assert_eq!(audit_group("machine.restore_failed").0, "machines", "restores are the machine runbook's");
+        assert_eq!(audit_group("scim.request_failed").2, Some("support/runbook-scim.md#reasons-and-fixes"));
+        assert_eq!(audit_group("license.seat_refused").2, Some("support/runbook-license.md"));
     }
 
     #[test]
@@ -1558,7 +1632,11 @@ mod tests {
         assert_eq!(find(&t, "check.database").runbooks, ["support/runbook-server-restore.md"]);
         assert_eq!(find(&t, "check.disk").severity, Some(3));
         assert_eq!((find(&t, "check.backups").level, find(&t, "check.backups").severity), (Level::Warn, None));
+        assert_eq!(find(&t, "check.backups").runbooks, ["support/runbook-backups.md#server-backups"]);
         assert!(!ids(&t).contains(&"check.license"));
+        let unlicensed = check(json!([{ "id": "license", "status": "fail", "summary": "No license is installed" }]));
+        let l = find(&triage(&offline(unlicensed, "x\n"), &opts()).unwrap(), "check.license").clone();
+        assert_eq!((l.level, l.severity, l.runbooks), (Level::Fail, Some(1), vec!["support/runbook-license.md#bots-stopped"]), "Bots don't run");
         assert_eq!(find(&t, "logs.problems").summary, "2 lines that report a failure in the newest 3 log lines; most frequent: ×1 Error: schema # is newer | ×1 database is locked");
         assert!(t.questions().iter().any(|q| q.contains("`botctl support-bundle` too")));
         assert_eq!(t.severity().unwrap().0, 1);
@@ -1661,7 +1739,7 @@ mod tests {
             "Monthly health check: 3 items open beside the score and setup: Incidents closed and reviewed (incidents); SCIM tokens working (scim); From a newer botd (newer_item)"
         );
         assert_eq!(f.evidence, "health-check.json items");
-        assert_eq!(f.runbooks, ["support/health-check.md", "support/incident-review.md#the-review-draft", "sso/scim.md"], "guides from botctl's table, never the bundle's");
+        assert_eq!(f.runbooks, ["support/health-check.md", "support/incident-review.md#the-review-draft", "support/runbook-scim.md"], "guides from botctl's table, never the bundle's");
         let saml = find(&t, "health_check.saml");
         assert_eq!((saml.level, saml.severity), (Level::Warn, None), "it hasn't ended yet");
         assert_eq!(saml.summary, "Native SAML certificate ending: Ending within 60 days with nothing to replace it: okta [31m's the IdP's signing certificate in 9 days.");
