@@ -3975,8 +3975,8 @@ async fn people_known_by_subject_id_sign_in_and_out_with_a_new_name_id_each_time
     let xml = test_idp::with_soap_slo(&test_idp::with_slo(&test_idp::with_ui(&test_idp::metadata(), "University A", &["uni.example"])), &soap_url);
     let sp = serve_importing(&[("SUBJECT", "subject-id")], |a| a.limiter = users::Limiter::new(1000, 60_000), &xml).await;
     let md = http().get(format!("http://127.0.0.1:{}/api/auth/sso/{}/metadata", sp.port, sp.id)).send().await.unwrap().text().await.unwrap();
-    assert!(md.contains(&format!(r#"Name="{SUBJECT_ID_REQ}""#)) && md.contains("<saml:AttributeValue>subject-id</saml:AttributeValue>"), "{md}");
-    assert!(md.contains(&format!("<md:NameIDFormat>{TRANSIENT}</md:NameIDFormat>")), "{md}");
+    assert!(md.contains(&format!(r#"Name="{SUBJECT_ID_REQ}""#)) && md.contains("<saml:AttributeValue>subject-id</saml:AttributeValue>"), "asks for subject-id");
+    assert!(md.contains(&format!("<md:NameIDFormat>{TRANSIENT}</md:NameIDFormat>")), "transient NameIDs");
     assert_eq!(sp.view().await["subject"], "subject-id");
 
     // Not linked yet: the failure names the attribute's value, not the throwaway NameID.
@@ -4035,7 +4035,7 @@ async fn people_known_by_subject_id_sign_in_and_out_with_a_new_name_id_each_time
     assert_eq!(code, 200, "{body}");
     assert_eq!(sp.audited("auth.slo_response", 0).await["outcome"], "success");
     let sent = stub.last().1;
-    assert!(sent.contains(">_t2</saml:NameID>") && sent.contains(TRANSIENT) && !sent.contains("8f2a91c4"), "{sent}");
+    assert!(sent.contains(">_t2</saml:NameID>") && sent.contains(TRANSIENT) && !sent.contains("8f2a91c4"), "the kept transient NameID, not the subject-id");
     assert_eq!(sp.who(&second).await, None);
 }
 
