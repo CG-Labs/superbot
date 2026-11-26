@@ -182,10 +182,15 @@ pub async fn handover(State(app): State<AppState>, Extension(c): Extension<Calle
         }
     }
     // A refusal midway (someone took a slot meanwhile) still moves the routines of the
-    // Bots already given, so none is left with the new owner but held for the old.
-    let (mut moved, mut refused) = (Vec::new(), None);
+    // Bots already given, so none is left with the new owner but held for the old. One
+    // given to someone else meanwhile stays theirs: the checks above were about `from`.
+    let (mut moved, mut changed, mut refused) = (Vec::new(), Vec::new(), None);
     for b in &bots {
         if let Err(e) = crate::give_bot(&app, &by, b, &to).await {
+            if app.db.bot(&b.id).is_some_and(|now| now.owner_id != from.id) {
+                changed.push(b.id.clone());
+                continue;
+            }
             refused = Some(e);
             break;
         }
@@ -210,11 +215,11 @@ pub async fn handover(State(app): State<AppState>, Extension(c): Extension<Calle
     } else {
         Vec::new()
     };
-    record(&app, &by, &from, &to, Moved { bots: &moved, routines: &routines, skipped: &skipped, resumed: &resumed }, via);
+    record(&app, &by, &from, &to, Moved { bots: &moved, changed: &changed, routines: &routines, skipped: &skipped, resumed: &resumed }, via);
     if let Some(e) = refused {
         return Err(e);
     }
-    Ok(Json(json!({ "from": from.id, "to": to.id, "bots": moved, "routines": routines, "skipped": skipped, "resumed": resumed })))
+    Ok(Json(json!({ "from": from.id, "to": to.id, "bots": moved, "ownerChanged": changed, "routines": routines, "skipped": skipped, "resumed": resumed })))
 }
 
 /// How a handover by someone holding `bots.manage` but not the admin role is audited.
@@ -226,7 +231,7 @@ pub const VIA_DELEGATE: &str = "bots.manage";
 /// never the primary Bot; and never to themselves.
 fn delegate_limits(d: &Delegate, c: &Caller, from: &User, to: &User, bots: &[db::Bot]) -> Res<()> {
     let Some(me) = c.user.as_ref().filter(|u| !u.service) else {
-        return Err(d.refuse("service_account", None, "Only a signed-in person can hand Bots over, not a service account."));
+        return Err(d.refuse("service_account", Some(&from.id), "Only a signed-in person can hand Bots over, not a service account."));
     };
     if from.role == Role::Admin || from.role_id.is_some() || from.id == OPERATOR {
         return Err(d.refuse("protected_user", Some(&from.id), "Only an admin can hand over the Bots of an admin, the owner, or someone with a custom role."));
@@ -259,13 +264,14 @@ fn check(from: &User, to: &User) -> Res<()> {
 
 struct Moved<'a> {
     bots: &'a [String],
+    changed: &'a [String],
     routines: &'a [String],
     skipped: &'a [String],
     resumed: &'a [String],
 }
 
 fn record(app: &App, by: &Who, from: &User, to: &User, m: Moved, via: Option<&str>) {
-    let mut details = json!({ "to": to.id, "bots": m.bots, "routines": m.routines, "skipped": m.skipped, "resumed": m.resumed });
+    let mut details = json!({ "to": to.id, "bots": m.bots, "ownerChanged": m.changed, "routines": m.routines, "skipped": m.skipped, "resumed": m.resumed });
     if let Some(via) = via {
         details["via"] = json!(via);
     }

@@ -36,6 +36,8 @@ We chose option 2.
 
 The limits are checked after ADR 0047's own rules and before the plan check, so the answer to "is this person active" or "can `to` run Bots" is the same for everyone.
 
+**Only from the person decided about.** The limits are checked once, before the Bots move one by one, and moving one can wait on its screen. If someone gives one of the remaining Bots to someone else meanwhile (an admin, to an admin), the handover must not take it from them on checks made about the leaver. So each Bot moves only while it still has the owner the caller read (`Db::move_bot`, one conditional `UPDATE`, inside the same stop that ends its work). A Bot that changed hands is left with its new owner, listed in `ownerChanged` in the reply and in `user.handed_over`, and the rest move as usual. This holds for admins too, and for giving one Bot away (`PATCH /api/bots/{id}/access {owner}`), which now answers 409 rather than take a Bot from an owner the admin didn't see.
+
 A delegate's handover is audited as before (`user.handed_over`, `bot.owner_changed`, `routine.handed_over`, `routine.resumed`, `user.handover_refused`), with the delegate as actor, and `user.handed_over` and `user.handover_refused` carry `via: "bots.manage"`, so an auditor can tell a delegated handover from an admin's without reading the actor's role at the time. An admin's events don't carry `via`.
 
 `bots.manage` stays in `rbac::REACHES_ADMINS`: listing admins' Bots and resuming routines on them still reach admins, so SCIM and SAML groups still can't give it. The handover itself doesn't reach admins.
@@ -53,7 +55,8 @@ A delegate's handover is audited as before (`user.handed_over`, `bot.owner_chang
 
 - A helpdesk, IT or offboarding role (`member` + `bots.manage`, or a time-bound one asked for and approved, ADR 0209) offboards a leaver's Bots and routines end to end without a server admin: list, hand over, resume.
 - An admin's, the owner's, a custom-role holder's and the primary Bot's handovers stay with admins, as does handing to yourself.
-- No migration, setting or new event. Clients that read `user.handed_over` see one new optional field, `via`.
+- No migration, setting or new event. Clients that read `user.handed_over` see a new optional field, `via`, and a new list, `ownerChanged` (empty unless a Bot changed hands during the handover), which the reply carries too.
+- Giving one Bot away answers 409 when its owner changed since the request read it.
 - ADR 0272's remaining follow-ups are unchanged and not started: two approvers for chosen roles, handing several Bots to a service account at once, and a per-role switch for what teams may give.
 
 ## Tests
@@ -62,5 +65,7 @@ A delegate's handover is audited as before (`user.handed_over`, `bot.owner_chang
 - `handover_http_tests.rs`, on the real router:
   - `someone_with_bots_manage_hands_a_disabled_persons_bots_on_without_an_admin`: a plain member is refused; a holder can't hand to themselves (audited `self`, nothing moved) and gets ADR 0047's 409 for an active person; a handover to someone else with `resumeRoutines` moves the Bot, makes the routine theirs and running, and is audited with the holder as actor and `via: "bots.manage"`; an admin's handover carries no `via`.
   - `bots_manage_never_hands_over_an_admins_a_custom_role_holders_or_the_primary_bot`: each refused with its limit and nothing moved, not even the primary Bot's owner's other Bots; an admin then hands each over.
-  - `a_service_account_with_bots_manage_hands_nothing_over`: its token lists the leaver's routines but is refused the handover (`service_account`).
+  - `a_service_account_with_bots_manage_hands_nothing_over`: its token lists the leaver's routines but is refused the handover (`service_account`, naming the leaver).
+  - `a_bot_that_changed_hands_meanwhile_stays_with_its_new_owner`: moving a Bot on a stale read of its owner is a 409 and leaves it with its new owner, with no plan refusal recorded.
+- `db` unit test: `move_bot` does nothing when the Bot's owner isn't the one given, and still keeps the plan's cap.
 - ADR 0047's tests are unchanged and pass: a plain member is still refused, admins' handovers are as before.

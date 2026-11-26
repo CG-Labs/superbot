@@ -349,6 +349,23 @@ async fn a_service_account_with_bots_manage_hands_nothing_over() {
     let (code, res) = call(port, "POST", &format!("/api/users/{ada}/handover"), &tok, &json!({ "to": cal }).to_string()).await;
     assert!(code == 403 && res.contains("service account"), "{code} {res}");
     let denied = &events(port, &admin, "action=access.denied").await[0];
-    assert_eq!(denied["details"]["limit"].as_str(), Some("service_account"), "{denied}");
+    assert_eq!((denied["details"]["limit"].as_str(), denied["details"]["user"].as_str()), (Some("service_account"), Some(ada.as_str())), "{denied}");
     assert_eq!(app.db.bot(&adas.id).unwrap().owner_id, ada);
+}
+
+/// A handover decides about one person's Bots; one given to someone else meanwhile (say,
+/// by an admin, while the handover waits on another Bot's screen) is never taken from them.
+#[tokio::test]
+async fn a_bot_that_changed_hands_meanwhile_stays_with_its_new_owner() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let (boss, _) = user_with(port, &admin, "boss@example.com", "admin").await;
+    let (cal, _) = user_with(port, &admin, "cal@example.com", "member").await;
+    let stale = bot(&app, "Ada's", &ada);
+    assert_eq!(call(port, "PATCH", &format!("/api/bots/{}/access", stale.id), &admin, &json!({ "owner": boss }).to_string()).await.0, 200);
+    let by = audit::Who { actor: audit::Actor::system("test"), source: Default::default() };
+    let err = crate::give_bot(&app, &by, &stale, &app.db.user(&cal).unwrap()).await.unwrap_err();
+    assert_eq!((err.0, err.1.as_str()), (StatusCode::CONFLICT, crate::OWNER_CHANGED));
+    assert_eq!(app.db.bot(&stale.id).unwrap().owner_id, boss);
+    assert!(events(port, &admin, "action=bot.transfer_refused").await.is_empty(), "not a plan refusal");
 }
