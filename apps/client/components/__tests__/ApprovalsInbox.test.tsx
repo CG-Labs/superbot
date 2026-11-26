@@ -101,6 +101,25 @@ describe("ApprovalCard: approve for this run (ADR 0051)", () => {
     expect(screen.getByText(/That approval isn't waiting anymore/)).toBeOnTheScreen();
   });
 
+  it("says you're all caught up when nothing waits, and names its close button", async () => {
+    as("member");
+    const onClose = jest.fn();
+    Object.assign(mockCtx, { approvals: [], policy: { mode: "ask" } });
+    await render(<ApprovalsInbox visible onClose={onClose} />);
+    expect(screen.getByRole("heading", { name: "You're all caught up" })).toBeOnTheScreen();
+    expect(screen.getByText(/Nothing is waiting for you/)).toBeOnTheScreen();
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Close approvals" })));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("puts a failed answer into plain words", async () => {
+    as("member");
+    decideApproval.mockRejectedValueOnce(new TypeError("Failed to fetch") as never);
+    await render(<ApprovalCard approval={PUSH} />);
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Approve" })));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't send your answer. Can't reach the server. Check your connection and try again.");
+  });
+
   it("says when only the exact call is covered", () => {
     expect(runScopeText({ ...PUSH, runScope: { covers: ["Deletes outside the workspace"], exact: true } })).toBe(
       "For this run, this exact call won't ask again until the task ends. Nothing is saved as a rule.",

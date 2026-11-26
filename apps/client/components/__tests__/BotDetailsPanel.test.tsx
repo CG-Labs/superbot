@@ -57,6 +57,30 @@ describe("BotDetailsPanel", () => {
     expect(screen.queryByText("Ada's digest")).not.toBeOnTheScreen();
   });
 
+  it("shows routines loading, then why they couldn't load, with a retry", async () => {
+    let fail!: (err: Error) => void;
+    const fetchRoutines = jest
+      .fn()
+      .mockImplementationOnce(() => new Promise<Routine[]>((_, reject) => (fail = reject)))
+      .mockResolvedValueOnce([routine("rb", "b", "Morning digest")]);
+    Object.assign(mockCtx, { bots: [bot("b", "Bob")], activeId: "b", fetchRoutines, canWrite: true, can: () => true });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.getByRole("progressbar", { name: "Loading routines" })).toBeOnTheScreen();
+
+    await act(async () => fail(new TypeError("Network request failed")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load routines. Can't reach the server. Check your connection and try again.");
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+    expect(await screen.findByText("Morning digest")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("explains routines when a Bot has none", async () => {
+    Object.assign(mockCtx, { bots: [bot("b", "Bob")], activeId: "b", fetchRoutines: jest.fn(async () => []), canWrite: true, can: () => true });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(await screen.findByRole("heading", { name: "No routines yet" })).toBeOnTheScreen();
+    expect(screen.getByText("Routines run on a schedule, like a morning summary from Bob.")).toBeOnTheScreen();
+  });
+
   it("drops routines that belong to another Bot", async () => {
     Object.assign(mockCtx, {
       bots: [bot("b", "Bob")],

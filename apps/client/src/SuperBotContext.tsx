@@ -32,6 +32,7 @@ import { createBody, patchBody, type RoutineDraft } from "./routines";
 import { signInWithSso } from "./sso";
 import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
+import { endUnsent } from "./unsent";
 import type {
   Approval,
   ApprovalScope,
@@ -94,7 +95,8 @@ interface SuperBotContextValue {
   logout: () => Promise<void>;
   refresh: (reloadMessages?: boolean) => Promise<void>;
   loadMessages: (botId: string) => Promise<void>;
-  sendText: (text: string, answer?: { messageId: number; option: number }) => Promise<void>;
+  /** Sends to `botId`, or to the open Bot when it's left out. */
+  sendText: (text: string, answer?: { messageId: number; option: number }, botId?: string) => Promise<void>;
   /** Answers a choice or handoff card on the card's own Bot. Rejects (and undoes) on failure. */
   answerQuestion: (message: Message, option: number) => Promise<void>;
   createBot: (body: { name: string; color: string; shape: string; harness?: string }) => Promise<BotView>;
@@ -339,6 +341,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
           // A revoked session closes the stream; a quick request tells that apart from a network drop.
           if (client.hasSession) void client.verify().catch(() => {});
         },
+        () => setConnected(true),
       );
       setConnected(true);
     },
@@ -347,6 +350,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
 
   const reset = () => {
     sseRef.current?.close();
+    endUnsent(clientRef.current);
     clientRef.current = null;
     setApi(null);
     offerInviteCode(null);
@@ -478,9 +482,10 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const sendText = async (text: string, answer?: { messageId: number; option: number }) => {
-    if (!api || !activeId || !text.trim()) return;
-    await api.sendMessage(activeId, text.trim(), answer);
+  const sendText = async (text: string, answer?: { messageId: number; option: number }, botId?: string) => {
+    const id = botId ?? activeId;
+    if (!api || !id || !text.trim()) return;
+    await api.sendMessage(id, text.trim(), answer);
   };
 
   const answerQuestion = async (message: Message, option: number) => {
