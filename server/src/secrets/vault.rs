@@ -449,6 +449,8 @@ struct Inner {
     cfg: Config,
     http: reqwest::Client,
     token: Mutex<Option<Token>>,
+    /// The change stream's state, with `VAULT_EVENTS=1` (ADR 0318).
+    events: Arc<events::Status>,
 }
 
 /// Clones share one client, token and runtime: the store and the run credentials' issuer.
@@ -544,7 +546,7 @@ fn aws_body(keys: &aws::Keys, role: Option<&str>, region: &str, sts_url: &url::U
 impl Vault {
     pub fn new(cfg: Config) -> Result<Vault, String> {
         let http = super::http::client("Vault", cfg.ca.as_deref().map(|pem| ("VAULT_CACERT", pem)), false)?;
-        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None) }), worker: Arc::new(Worker::new("Vault", "vault")?) })
+        Ok(Vault { inner: Arc::new(Inner { cfg, http, token: Mutex::new(None), events: Arc::default() }), worker: Arc::new(Worker::new("Vault", "vault")?) })
     }
 
     /// Runs `f` on Vault's runtime and waits for it (`http::Worker::run`).
@@ -1071,6 +1073,10 @@ impl Provider for Vault {
         }
         events::start(self, store)?;
         Ok(true)
+    }
+
+    fn watch_status(&self) -> Option<external::WatchStatus> {
+        self.inner.events.view()
     }
 }
 
