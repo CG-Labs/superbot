@@ -176,6 +176,7 @@ fn every_link_in_the_playbooks_resolves() {
     files.push(repo().join("docs/adr/0289-escalations-due-now-from-the-ticket-exports.md"));
     files.push(repo().join("docs/adr/0295-tam-cadence-across-accounts.md"));
     files.push(repo().join("docs/adr/0307-health-score-alerts.md"));
+    files.push(repo().join("docs/adr/0313-runbooks-for-scim-backups-and-the-license.md"));
     let bad: Vec<String> = files.iter().flat_map(|f| broken(f)).collect();
     assert!(bad.is_empty(), "broken links:\n{}", bad.join("\n"));
 }
@@ -687,6 +688,145 @@ fn the_health_score_page_documents_its_alerts() {
     assert_eq!(rules.matches("severity: ticket").count(), 4, "the score changes once a day: nothing pages");
     assert!(read("tam.md").contains("(health-score.md#alerts)"), "tam.md doesn't point at the alerts");
     assert!(read("README.md").contains("(health-score.md#alerts)"), "README.md doesn't point at the alerts");
+}
+
+/// The code of a source file under `server/src/`, without its unit tests.
+fn source(path: &str) -> String {
+    let full = fs::read_to_string(repo().join("server/src").join(path)).unwrap_or_else(|e| panic!("server/src/{path}: {e}"));
+    full.split("#[cfg(test)]\nmod tests").next().unwrap().to_string()
+}
+
+/// A runbook section's inline code, from its heading to the next.
+fn codes_in(md: &str, heading: &str) -> HashSet<String> {
+    let section = md.split(&format!("\n{heading}\n")).nth(1).unwrap_or_else(|| panic!("no \"{heading}\"")).split("\n## ").next().unwrap();
+    section.split('`').skip(1).step_by(2).map(String::from).collect()
+}
+
+/// ADR 0313: every reason botd records on `scim.request_failed` (`insufficient_scope`, a
+/// `scimType` in snake case, or `status_` and the status when there's none) is in the SCIM
+/// runbook's table, with the two the health score names for tokens it no longer accepts.
+#[test]
+fn the_scim_runbook_explains_every_reason_botd_records() {
+    let mut files = vec!["scim.rs".to_string()];
+    let mut sub: Vec<String> = fs::read_dir(repo().join("server/src/scim"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .map(|p| format!("scim/{}", p.file_name().unwrap().to_string_lossy()))
+        .collect();
+    sub.sort();
+    files.extend(sub);
+    let mut reasons: HashSet<String> = ["insufficient_scope", "revoked_token", "expired_token"].map(String::from).into();
+    for f in &files {
+        for r in source(f).split("ScimError::new(StatusCode::").skip(1) {
+            let (status, rest) = r.split_once(", ").unwrap();
+            if let Some(t) = rest.strip_prefix("Some(\"") {
+                let t = t.split('"').next().unwrap();
+                reasons.insert(t.chars().flat_map(|c| if c.is_ascii_uppercase() { vec!['_', c.to_ascii_lowercase()] } else { vec![c] }).collect());
+            } else {
+                let code = match status {
+                    "NOT_FOUND" | "UNAUTHORIZED" => continue,
+                    "BAD_REQUEST" => 400,
+                    "FORBIDDEN" => 403,
+                    "METHOD_NOT_ALLOWED" => 405,
+                    "CONFLICT" => 409,
+                    "PAYLOAD_TOO_LARGE" => 413,
+                    "TOO_MANY_REQUESTS" => 429,
+                    "INTERNAL_SERVER_ERROR" => 500,
+                    "NOT_IMPLEMENTED" => 501,
+                    "SERVICE_UNAVAILABLE" => 503,
+                    other => panic!("{f}: a SCIM error with status {other}: add it here and to runbook-scim.md"),
+                };
+                reasons.insert(format!("status_{code}"));
+            }
+        }
+    }
+    assert!(reasons.len() >= 15 && reasons.contains("uniqueness") && reasons.contains("status_501"), "the reasons: {reasons:?}");
+    let table = codes_in(&read("runbook-scim.md"), "## Reasons and fixes");
+    let mut missing: Vec<&String> = reasons.iter().filter(|r| !table.contains(*r)).collect();
+    missing.sort();
+    assert!(missing.is_empty(), "runbook-scim.md's reasons and fixes don't explain {missing:?}");
+}
+
+/// ADR 0313: the license runbook explains every mode a license can be in, every reason a
+/// key isn't one (its token's, the setting's, and an install's refusal), and every
+/// `license.*` audit action.
+#[test]
+fn the_license_runbook_explains_every_mode_reason_and_action() {
+    let page = read("runbook-license.md");
+    let token = source("license/token.rs");
+    let code = token.split("pub fn code(self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
+    let mut reasons: Vec<String> = code.split("=> \"").skip(1).map(|r| r.split('"').next().unwrap().to_string()).collect();
+    let lic = source("license/mod.rs");
+    reasons.extend(lic.split("Problem { code: \"").skip(1).map(|r| r.split('"').next().unwrap().to_string()));
+    reasons.extend(lic.split("refuse(\"").skip(1).map(|r| r.split('"').next().unwrap().to_string()));
+    assert!(reasons.len() >= 11 && reasons.contains(&"unknown_key".to_string()) && reasons.contains(&"set_in_env".to_string()), "the reasons: {reasons:?}");
+    let table = codes_in(&page, "## Reasons and fixes");
+    for r in &reasons {
+        assert!(table.contains(r), "runbook-license.md's reasons and fixes don't explain {r}");
+    }
+    let modes_enum = lic.split("pub enum Mode {").nth(1).unwrap().split('}').next().unwrap();
+    let modes: Vec<String> = modes_enum.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).map(|l| l.trim_end_matches(',').to_lowercase()).collect();
+    assert_eq!(modes, ["unlicensed", "active", "grace", "expired", "invalid"], "the modes");
+    let table = codes_in(&page, "## Modes");
+    for m in &modes {
+        assert!(table.contains(m), "runbook-license.md's modes don't explain {m}");
+    }
+    let actions: HashSet<&str> = ["event(\"license.", "), \"license."].iter().flat_map(|p| lic.split(p).skip(1)).map(|r| r.split('"').next().unwrap()).collect();
+    assert!(actions.len() >= 5, "the actions: {actions:?}");
+    for a in actions {
+        assert!(page.contains(&format!("`license.{a}`")), "runbook-license.md doesn't mention license.{a}");
+    }
+}
+
+/// ADR 0313: every failure botd audits for server and machine backups is in the backups
+/// runbook, where bundle triage's `audit.backups` points.
+#[test]
+fn the_backups_runbook_names_every_backup_failure() {
+    let page = read("runbook-backups.md");
+    let mut failures = HashSet::new();
+    for (file, prefixes) in [
+        ("server_backups.rs", &["\"server.backup_"][..]),
+        ("machines/backup.rs", &["\"machine.backup"][..]),
+        ("machines/mod.rs", &["\"machine.backup"][..]),
+        ("machines/recovery.rs", &["\"machine.rpo_"][..]),
+    ] {
+        let code = source(file);
+        for p in prefixes {
+            for (i, _) in code.match_indices(p) {
+                let action = code[i + 1..].split('"').next().unwrap();
+                if ["_failed", "_breached", "_refused"].iter().any(|s| action.ends_with(s)) {
+                    failures.insert(action.to_string());
+                }
+            }
+        }
+    }
+    assert!(failures.len() >= 7 && failures.contains("server.backup_rpo_breached") && failures.contains("machine.rpo_breached"), "the failures: {failures:?}");
+    for f in &failures {
+        assert!(page.contains(&format!("`{f}`")), "runbook-backups.md doesn't name {f}");
+    }
+    let triage = source("support_triage.rs");
+    assert!(triage.contains("(\"backups\", \"backup failures\", Some(\"support/runbook-backups.md\"))"), "triage's audit.backups points at the runbook");
+}
+
+/// ADR 0313: the health score's SCIM, backups and license playbooks, the health check's
+/// items and the index point at their runbooks.
+#[test]
+fn scim_backups_and_license_have_runbooks() {
+    let score = read("health-score.md");
+    for (signal, book) in [("identity", "runbook-scim.md"), ("backups", "runbook-backups.md"), ("license", "runbook-license.md")] {
+        let section = score.split(&format!("\n### `{signal}`\n")).nth(1).unwrap().split("\n#").next().unwrap();
+        assert!(section.contains(&format!("({book}")), "health-score.md's {signal} doesn't point at {book}");
+    }
+    let check = source("health_check.rs");
+    for (item, book) in [("scim", "runbook-scim.md"), ("backups", "runbook-backups.md"), ("license", "runbook-license.md")] {
+        let line = check.lines().find(|l| l.trim_start().starts_with(&format!("item(\"{item}\""))).unwrap();
+        assert!(line.contains(&format!("\"docs/support/{book}\"")), "the health check's {item} item's guide isn't {book}");
+    }
+    let index = read("README.md");
+    for book in ["runbook-scim.md", "runbook-backups.md", "runbook-license.md"] {
+        assert!(index.contains(&format!("]({book})")), "README.md's runbooks don't list {book}");
+    }
 }
 
 /// ADR 0131, 0243: the support bundle's page lists every file `support::build` writes,

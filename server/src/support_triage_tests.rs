@@ -91,7 +91,7 @@ fn it_reads_the_online_bundle_botd_makes() {
         assert!(check.summary.contains(open), "{open}: {}", check.summary);
     }
     assert!(!check.summary.contains("(setup)") && !check.summary.contains("(score)"), "shown above: {}", check.summary);
-    assert!(check.runbooks.contains(&"support/incident-review.md#the-review-draft") && check.runbooks.contains(&"ops/backup-restore.md"), "{:?}", check.runbooks);
+    assert!(check.runbooks.contains(&"support/incident-review.md#the-review-draft") && check.runbooks.contains(&"support/runbook-backups.md"), "{:?}", check.runbooks);
     assert!(!ids(&t).contains(&"health_check.saml"), "no native SAML provider");
 
     assert!(t.testing, "tests run in testing mode");
