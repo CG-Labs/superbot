@@ -1051,6 +1051,11 @@ impl Provider for Vault {
         self.run(move |i| async move { i.list(scope).await })
     }
 
+    fn read_at(&self, scope: Scope, name: &str, index: Option<&str>) -> Result<Option<Zeroizing<String>>, Error> {
+        let (name, index) = (name.to_string(), index.map(str::to_string));
+        self.run(move |i| async move { i.read(scope, &name, index.as_deref()).await })
+    }
+
     fn watch(&self, store: std::sync::Weak<external::ExternalStore>) -> Result<bool, Error> {
         if !self.inner.cfg.events {
             return Ok(false);

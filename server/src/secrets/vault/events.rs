@@ -9,7 +9,10 @@
 //! - The first subscription is made at startup, and botd doesn't start without it.
 //! - Before the token it was made with is due, or when botd's token changes, and at least
 //!   hourly, a new subscription is opened before the old one is closed and read to its end,
-//!   so no event falls between them.
+//!   so no event falls between them. When the old token may have stopped events early (botd
+//!   has a new one, or the renewal came after the token's time), everything is read again.
+//! - Each change is read again where it is applied, one after another, after the store's
+//!   epoch moves, so neither a read in flight nor the change's own can cache over a newer one.
 //! - botd pings every 30 s; a stream whose server answered a ping once and then stops
 //!   answering is lost. A lost stream is subscribed to again, waiting 1 s, then twice as long
 //!   each time up to a minute.
@@ -53,6 +56,8 @@ mod timing {
     pub const PONG_WAIT: Duration = Duration::from_secs(75);
     pub const BACKOFF_START: Duration = Duration::from_secs(1);
     pub const MIN_RESUBSCRIBE: Duration = Duration::from_secs(10);
+    /// Longest a frame botd sends may take to go out before the stream counts as lost.
+    pub const WRITE_WAIT: Duration = Duration::from_secs(10);
 }
 #[cfg(test)]
 mod timing {
@@ -61,6 +66,7 @@ mod timing {
     pub const PONG_WAIT: Duration = Duration::from_millis(350);
     pub const BACKOFF_START: Duration = Duration::from_millis(50);
     pub const MIN_RESUBSCRIBE: Duration = Duration::from_millis(500);
+    pub const WRITE_WAIT: Duration = Duration::from_millis(300);
 }
 use timing::*;
 
@@ -246,8 +252,9 @@ pub(crate) fn seen(text: &str, cfg: &Config, users: bool) -> Option<Seen> {
 
 /// What the stream tells the thread that applies it to the store.
 enum Note {
-    Changed { scope: Scope, name: String, event: String, got: Result<Option<Zeroizing<String>>, Error> },
-    /// Subscribed again after a gap: events may have been missed.
+    Changed { scope: Scope, name: String, event: String, index: Option<String> },
+    /// Subscribed again after a gap, or after a token that may have stopped events early:
+    /// events may have been missed.
     Resumed,
 }
 
@@ -259,16 +266,21 @@ struct Subscribed {
     token: Zeroizing<String>,
     /// When to subscribe again: before that token is due.
     due: Instant,
+    /// The token may be past its time by `due` (a lease shorter than `MIN_RESUBSCRIBE`), so
+    /// the next subscription reads everything again.
+    late: bool,
 }
 
 impl Inner {
     /// Subscribes to `EVENTS`; when Vault refuses the token, gets a new one and asks once more.
+    /// A token file is read each time, as Vault Agent may have written a new token to it.
     async fn subscribe(&self) -> Result<Subscribed, Error> {
-        for fresh in [false, true] {
+        let file = matches!(self.cfg.auth, Auth::Token { file: Some(_), .. });
+        for fresh in [file, true] {
             let token = self.token(fresh).await?;
             if let Some(io) = self.subscribe_with(&token, fresh).await? {
-                let due = self.due_for(&token).await;
-                return Ok(Subscribed { io, token, due });
+                let (due, late) = self.due_for(&token).await;
+                return Ok(Subscribed { io, token, due, late });
             }
         }
         unreachable!("the second pass returns")
@@ -312,8 +324,9 @@ impl Inner {
 
     /// When to subscribe again with a new token: before `token` is due, as botd logs in
     /// again (two thirds of the way through its lease), or two thirds of the way through a
-    /// given token's TTL; within `MIN_RESUBSCRIBE` and `RESUBSCRIBE` from now.
-    async fn due_for(&self, token: &str) -> Instant {
+    /// given token's TTL; within `MIN_RESUBSCRIBE` and `RESUBSCRIBE` from now. True when
+    /// that is later than the token allows.
+    async fn due_for(&self, token: &str) -> (Instant, bool) {
         let now = Instant::now();
         let due = match &self.cfg.auth {
             Auth::Token { .. } => match self.token_life(token, "auth/token/lookup-self", reqwest::Method::GET, None, true).await {
@@ -322,27 +335,34 @@ impl Inner {
             },
             _ => self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|t| t.value.as_str() == token).and_then(|t| t.renew_at),
         };
-        due.unwrap_or(now + RESUBSCRIBE).clamp(now + MIN_RESUBSCRIBE, now + RESUBSCRIBE)
+        let due = due.unwrap_or(now + RESUBSCRIBE);
+        (due.clamp(now + MIN_RESUBSCRIBE, now + RESUBSCRIBE), due < now + MIN_RESUBSCRIBE)
     }
 
     /// Whether botd still uses `token`: when it has a new one (Vault refused the old, or Vault
-    /// Agent rotated the file), a stream made with the old one may stop without a word.
+    /// Agent wrote a new one to the file), a stream made with the old one may stop without a word.
     fn uses(&self, token: &str) -> bool {
-        self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|t| t.value.as_str() == token)
+        let cached = self.token.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|t| t.value.as_str() == token);
+        let file = match &self.cfg.auth {
+            Auth::Token { file: Some(path), .. } => std::fs::read_to_string(path).ok().map(Zeroizing::new),
+            _ => None,
+        };
+        cached && file.is_none_or(|f| f.trim().is_empty() || f.trim() == token)
     }
 
-    /// Reads what `text` announces a change to, if botd reads that name, and hands the answer on.
-    async fn announce(&self, text: &str, users: bool, tx: &Tx) {
+    /// Hands on what `text` announces a change to, if botd reads that name; it is read again
+    /// where the changes are applied, one after another.
+    fn announce(&self, text: &str, users: bool, tx: &Tx) {
         let Some(s) = seen(text, &self.cfg, users) else { return };
-        let got = self.read(s.scope.clone(), &s.name, s.index.as_deref()).await;
-        let _ = tx.send(Note::Changed { scope: s.scope, name: s.name, event: s.event, got });
+        let _ = tx.send(Note::Changed { scope: s.scope, name: s.name, event: s.event, index: s.index });
     }
 }
 
 /// Why a stream stopped being followed.
 enum End {
-    /// Time for a new subscription; the old one still works.
-    Due,
+    /// Time for a new subscription; the old one still works. `catch_up`: it may have
+    /// stopped delivering events already, so read everything again once the new one is open.
+    Due { catch_up: bool },
     Lost(String),
     /// Nothing applies changes any more: the store is gone.
     Stopped,
@@ -356,6 +376,7 @@ struct Stream {
     task: tokio::task::JoinHandle<()>,
     token: Zeroizing<String>,
     due: Instant,
+    late: bool,
     /// Vault answered a ping on this stream, so from then on it must keep doing so.
     answers: bool,
     /// Since when a ping has waited for its answer.
@@ -382,22 +403,30 @@ impl Stream {
                 }
             }
         });
-        Stream { writer, rx, task, token: s.token, due: s.due, answers: false, waiting: None }
+        Stream { writer, rx, task, token: s.token, due: s.due, late: s.late, answers: false, waiting: None }
     }
 
+    /// Sends a frame, within `WRITE_WAIT`: a peer that stops reading can't hold botd here.
     async fn send(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
         let mask: [u8; 4] = crate::random_bytes(4).try_into().unwrap_or_default();
-        self.writer.write_all(&frame(opcode, payload, Some(mask))).await?;
-        self.writer.flush().await
+        let bytes = frame(opcode, payload, Some(mask));
+        let write = async {
+            self.writer.write_all(&bytes).await?;
+            self.writer.flush().await
+        };
+        tokio::time::timeout(WRITE_WAIT, write).await.unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
     }
 
     /// Follows the stream until it is due, lost, or no longer needed.
     async fn follow(&mut self, inner: &Inner, users: bool, tx: &Tx) -> End {
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + PING, PING);
+        let due = tokio::time::sleep_until(self.due.into());
+        tokio::pin!(due);
         loop {
             tokio::select! {
+                () = &mut due => return End::Due { catch_up: self.late },
                 m = self.rx.recv() => match m {
-                    Some(Ok(Frame::Text(t))) => inner.announce(&t, users, tx).await,
+                    Some(Ok(Frame::Text(t))) => inner.announce(&t, users, tx),
                     Some(Ok(Frame::Binary)) => {}
                     Some(Ok(Frame::Ping(p))) => {
                         if self.send(PONG_OP, &p).await.is_err() {
@@ -416,8 +445,8 @@ impl Stream {
                     if tx.is_closed() {
                         return End::Stopped;
                     }
-                    if Instant::now() >= self.due || !inner.uses(&self.token) {
-                        return End::Due;
+                    if !inner.uses(&self.token) {
+                        return End::Due { catch_up: true };
                     }
                     if self.answers && self.waiting.is_some_and(|at| at.elapsed() >= PONG_WAIT) {
                         return End::Lost("Vault stopped answering pings".into());
@@ -434,11 +463,11 @@ impl Stream {
     /// Closes the stream once a new one is open, reading the events still on their way
     /// until Vault closes its side or `DRAIN` is up.
     async fn finish(mut self, inner: &Inner, users: bool, tx: &Tx) {
-        let _ = self.send(CLOSE, &1000u16.to_be_bytes()).await;
         let until = tokio::time::Instant::now() + DRAIN;
+        let _ = tokio::time::timeout_at(until, self.send(CLOSE, &1000u16.to_be_bytes())).await;
         while let Ok(Some(Ok(f))) = tokio::time::timeout_at(until, self.rx.recv()).await {
             match f {
-                Frame::Text(t) => inner.announce(&t, users, tx).await,
+                Frame::Text(t) => inner.announce(&t, users, tx),
                 Frame::Close => break,
                 _ => {}
             }
@@ -464,12 +493,20 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
             match stream.follow(&inner, users, &tx).await {
                 End::Stopped => return,
                 End::Lost(why) => break why,
-                End::Due => match inner.subscribe().await {
-                    Ok(new) => std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await,
-                    // The old stream still works: keep it, and try again a little later.
+                End::Due { catch_up } => match inner.subscribe().await {
+                    Ok(new) => {
+                        std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await;
+                        if catch_up {
+                            log_info!("Vault: subscribed to change events with a new token; reading every cached secret again, as the old token may have stopped them early (ADR 0306).");
+                            let _ = tx.send(Note::Resumed);
+                        }
+                    }
+                    // The old stream may still work: keep it, and try again a little later. Its
+                    // token may run out meanwhile, so the next one reads everything again.
                     Err(e) => {
                         log_warn!("Vault: couldn't renew the subscription to change events ({e}); keeping the current one (ADR 0306).");
                         stream.due = Instant::now() + MIN_RESUBSCRIBE;
+                        stream.late = true;
                     }
                 },
             }
@@ -514,8 +551,8 @@ fn apply(store: Weak<ExternalStore>, mut rx: mpsc::UnboundedReceiver<Note>) {
     while let Some(note) = rx.blocking_recv() {
         let Some(store) = store.upgrade() else { return };
         match note {
-            Note::Changed { scope, name, event, got } => {
-                let Some(entry) = store.changed(&scope, &name, got) else { continue };
+            Note::Changed { scope, name, event, index } => {
+                let Some(entry) = store.changed(&scope, &name, index.as_deref()) else { continue };
                 let folder = scope.folder('/');
                 if entry.restart {
                     log_warn!("Vault: {name} in {folder} changed ({event}), but botd read it at startup and keeps the old value until it restarts (ADR 0291).");
@@ -927,6 +964,62 @@ pub(crate) mod tests {
         wait_for(|| get(&x, "EVENTS_MOVED_TOKEN").as_deref() == Some("events-moved-2"));
         redact::forget("events-moved-1");
         redact::forget("events-moved-2");
+    }
+
+    /// botd read every cached answer again, `name` among them, as after a gap.
+    fn caught_up(name: &str) -> bool {
+        audited("vault").iter().any(|e| {
+            e.action == "secret.cache_refreshed" && e.details["trigger"] == "vault-events-resumed" && e.details["entries"].as_array().is_some_and(|a| a.iter().any(|x| x["name"] == name))
+        })
+    }
+
+    #[test]
+    fn a_new_token_in_the_file_gets_a_new_subscription_and_a_catch_up() {
+        let (url, f) = stand_in();
+        f.tokens.lock().unwrap().extend(["hvs.agent-1".to_string(), "hvs.agent-2".to_string()]);
+        let file = super::super::tests::token_file("vault-events-agent", "hvs.agent-1\n");
+        put(&f, "bots/EVENTS_AGENT_TOKEN", "events-agent-1");
+        let x = store(&url, &[("VAULT_TOKEN_FILE", file.to_str().unwrap())], "3600");
+        x.check().unwrap();
+        x.watch().unwrap();
+        assert_eq!(get(&x, "EVENTS_AGENT_TOKEN").as_deref(), Some("events-agent-1"));
+
+        // Vault Agent writes a new token; the old one may already be revoked, its stream quiet.
+        put(&f, "bots/EVENTS_AGENT_TOKEN", "events-agent-2");
+        std::fs::write(&file, "hvs.agent-2\n").unwrap();
+        wait_for(|| f.events.subscriptions.load(Ordering::SeqCst) >= 2 && f.events.closes.load(Ordering::SeqCst) >= 1);
+        assert_eq!(*f.events.tokens.lock().unwrap(), ["hvs.agent-1", "hvs.agent-2"]);
+        wait_for(|| caught_up("EVENTS_AGENT_TOKEN"));
+        assert_eq!(get(&x, "EVENTS_AGENT_TOKEN").as_deref(), Some("events-agent-2"), "a change with no event, read again");
+        assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"));
+        std::thread::sleep(PING * 3);
+        assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 2, "once per new token");
+        redact::forget("events-agent-1");
+        redact::forget("events-agent-2");
+    }
+
+    #[test]
+    fn a_renewal_that_comes_late_reads_everything_again() {
+        let (url, f) = stand_in();
+        f.lease.store(1, Ordering::SeqCst);
+        put(&f, "bots/EVENTS_LATE_TOKEN", "events-late-1");
+        let x = store(&url, &[("VAULT_AUTH", "approle"), ("VAULT_ROLE_ID", "role-1"), ("VAULT_SECRET_ID", "secret-id-1")], "3600");
+        x.check().unwrap();
+        x.watch().unwrap();
+        assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-1"));
+
+        // Vault won't take a new subscription when it is due: the old one is kept past its token.
+        f.events.status.store(503, Ordering::SeqCst);
+        put(&f, "bots/EVENTS_LATE_TOKEN", "events-late-2");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 1);
+        assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-1"));
+        f.events.status.store(0, Ordering::SeqCst);
+        wait_for(|| caught_up("EVENTS_LATE_TOKEN"));
+        assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-2"));
+        assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "the old stream never broke");
+        redact::forget("events-late-1");
+        redact::forget("events-late-2");
     }
 
     #[test]

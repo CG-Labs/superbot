@@ -122,6 +122,11 @@ pub trait Provider: Send + Sync {
     fn describe(&self) -> String;
     /// The value of `name` in `scope`, or None if there is none.
     fn read(&self, scope: Scope, name: &str) -> Result<Option<Zeroizing<String>>, Error>;
+    /// `read`, from a backend that has seen at least `index`, the position of the change
+    /// that announced it (`changed`); backends without one just read.
+    fn read_at(&self, scope: Scope, name: &str, _index: Option<&str>) -> Result<Option<Zeroizing<String>>, Error> {
+        self.read(scope, name)
+    }
     /// Names in `scope`. Never values.
     fn list(&self, scope: Scope) -> Result<Vec<String>, Error>;
     /// Starts telling `store` of changes as the backend announces them (`ExternalStore::changed`),
@@ -466,12 +471,14 @@ impl ExternalStore {
         self.provider.watch(Arc::downgrade(self))
     }
 
-    /// The backend announced a change to `name` in `scope`, and read it again as `got`
-    /// (ADR 0306). The answer replaces what was cached as a read would (audited, redacted,
-    /// fail closed when `got` is an error), and the folder's list is dropped so a name that
-    /// came or went shows at its next use. A read already in flight can't cache over it.
-    /// None when the store doesn't read that name there (another folder's, user folders off).
-    pub fn changed(&self, scope: &Scope, name: &str, got: Result<Option<Zeroizing<String>>, Error>) -> Option<Refreshed> {
+    /// The backend announced a change to `name` in `scope` at `index` (ADR 0306): reads it
+    /// again, from a backend that has seen the change. The answer replaces what was cached as
+    /// a read would (audited, redacted, fail closed on an error), and the folder's list is
+    /// dropped so a name that came or went shows at its next use. Like a refresh, it moves the
+    /// epoch before reading, so neither a read already in flight nor this one can cache over
+    /// a newer answer. None when the store doesn't read that name there (another folder's,
+    /// user folders off).
+    pub fn changed(&self, scope: &Scope, name: &str, index: Option<&str>) -> Option<Refreshed> {
         if !scope.holds(name) || (scope.user_id().is_some() && !self.user_folders) {
             return None;
         }
@@ -479,6 +486,7 @@ impl ExternalStore {
         let started = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let old = self.values.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|(_, v)| v.clone());
         let at_startup = self.startup.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        let got = self.provider.read_at(scope.clone(), name, index);
         let now = self.took(scope, name, started, got);
         self.names.lock().unwrap_or_else(|e| e.into_inner()).remove(scope);
         Some(Refreshed::compared(name.to_string(), scope, old.as_ref(), at_startup.as_ref(), &now))
@@ -1518,6 +1526,44 @@ pub(crate) mod tests {
         assert!(x.names().unwrap().contains(&"RO_NEW_TOKEN".to_string()), "the refresh's list is the cached one");
         assert_eq!(f.lists.load(Ordering::SeqCst), lists);
         for v in ["ro-old-1", "ro-new-1", "ro-added-1"] {
+            redact::forget(v);
+        }
+    }
+
+    #[test]
+    fn a_change_read_never_caches_over_a_newer_answer() {
+        // A read in flight before the change can't cache what it read over the change's.
+        let (f, x) = fake(&[(Scope::Bots, "CH_TOKEN", "ch-old-1")], Duration::from_secs(3600));
+        let (started, release) = f.pause_next();
+        let slow = {
+            let x = Arc::clone(&x);
+            std::thread::spawn(move || x.get("CH_TOKEN").unwrap().unwrap().expose().to_string())
+        };
+        started.recv().unwrap();
+        f.values.lock().unwrap().insert((Scope::Bots, "CH_TOKEN".into()), "ch-new-1".into());
+        assert_eq!(x.changed(&Scope::Bots, "CH_TOKEN", None).unwrap().result, Change::Found);
+        release.send(()).unwrap();
+        assert_eq!(slow.join().unwrap(), "ch-old-1");
+        assert_eq!(x.get("CH_TOKEN").unwrap().unwrap().expose(), "ch-new-1");
+
+        // Nor can the change's own read over a refresh that began while it was reading.
+        let (started, release) = f.pause_next();
+        let change = {
+            let x = Arc::clone(&x);
+            std::thread::spawn(move || x.changed(&Scope::Bots, "CH_TOKEN", None).unwrap().result)
+        };
+        started.recv().unwrap();
+        f.values.lock().unwrap().insert((Scope::Bots, "CH_TOKEN".into()), "ch-newer-1".into());
+        x.refresh(Some(&["CH_TOKEN".to_string()])).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(change.join().unwrap(), Change::Unchanged, "it read the value from before the refresh");
+        let reads = f.reads.load(Ordering::SeqCst);
+        assert_eq!(x.get("CH_TOKEN").unwrap().unwrap().expose(), "ch-newer-1", "the refresh's answer stays cached");
+        assert_eq!(f.reads.load(Ordering::SeqCst), reads);
+
+        assert!(x.changed(&Scope::Server, "CH_TOKEN", None).is_none(), "a name of another folder");
+        assert!(x.changed(&user("ua1"), "CH_TOKEN", None).is_none(), "user folders off");
+        for v in ["ch-old-1", "ch-new-1", "ch-newer-1"] {
             redact::forget(v);
         }
     }
