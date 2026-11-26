@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/instal
 
 ## Air-gapped (no internet)
 
-Install or upgrade from an offline bundle with `sudo bash install.sh --offline <bundle> --bundle-sha256 <hex> --domain <name> --tls-cert <pem> --tls-key <pem>`: nothing is downloaded or built, and Caddy uses your certificate. Every release has bundles for x86_64 and aarch64 attached. For Compose, `deploy/offline-bundle.sh load <bundle>` loads its images, or `deploy/offline-bundle.sh push <bundle> --registry <your registry>` copies them to your own registry with their signed digests, signatures and attestations (give one bundle per arch to put up the signed multi-arch index). See [docs/ops/air-gapped.md](../docs/ops/air-gapped.md).
+Install or upgrade from an offline bundle with `sudo bash install.sh --offline <bundle> --bundle-sha256 <hex> --domain <name> --tls-cert <pem> --tls-key <pem>`: nothing is downloaded or built, and Caddy uses your certificate. Every release has bundles for x86_64 and aarch64 attached. For Compose, `deploy/offline-bundle.sh load <bundle>` loads its images and, in the stack's folder, checks the stack's settings and license against the new botd before you switch (`check-compose`), or `deploy/offline-bundle.sh push <bundle> --registry <your registry>` copies them to your own registry with their signed digests, signatures and attestations (give one bundle per arch to put up the signed multi-arch index). See [docs/ops/air-gapped.md](../docs/ops/air-gapped.md).
 
 ## From a local checkout
 
