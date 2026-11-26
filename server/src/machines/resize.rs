@@ -264,6 +264,7 @@ fn alert(app: &AppState, m: &Machine, title: &str, why: &str) {
         target_type: "machine".into(),
         target_id: m.id.clone(),
         link: None,
+        ..Default::default()
     };
     notify::alert(app, a, "machines");
 }
