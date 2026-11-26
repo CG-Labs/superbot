@@ -616,6 +616,7 @@ cmd_load() {
   [[ $# -eq 0 ]] || { shift; COMPOSE_OPTS=("$@"); }
   verify_args "${args[@]}"
   command -v docker >/dev/null 2>&1 || die "load needs docker"
+  local recorded_sha=$OFFLINE_BUNDLE_SHA256
   offline_unpack_bundle "$BUNDLE" "$OFFLINE_TMP"
   local tar name ref found=false
   for tar in "$OFFLINE_DIR"/images/*.tar; do
@@ -636,7 +637,12 @@ cmd_load() {
   local ref
   ref=$(cat "$OFFLINE_DIR/images/superbot.ref" 2>/dev/null) || return 0
   load_hermes_notice "$ref"
-  if compose_stack_here; then
+  # The check runs the image with the stack's secrets and data, so only when the bundle was
+  # checked against something the operator chose, as push: its verified signature, or a
+  # --sha256 from where it was published. A .sha256 file beside it could have been replaced.
+  if [[ "$OFFLINE_SIGNED" != true && -z "$recorded_sha" ]] && compose_stack_here; then
+    warn "Not checking the Compose stack against $ref: this bundle was checked only against the .sha256 beside it, which could have been replaced with it. Give --sha256 <recorded sha-256> (or its signature with cosign), or check the image yourself once you trust it: $0 check-compose --image $ref (docs/ops/air-gapped.md#upgrading-with-compose)"
+  elif compose_stack_here; then
     compose_upgrade_check "$ref"
     log "To switch the stack to it: SUPERBOT_VERSION=$OFFLINE_VERSION in .env (or SUPERBOT_IMAGE=$ref), then docker compose up -d"
   else
@@ -748,7 +754,7 @@ compose_upgrade_check() {
         tail -n +2 <<<"$refused" | sed 's/^/    and: /' >&2
         die "Nothing in the stack has changed: keep it on the image it runs. Change what botd names in .env (the running botd reads it again only when Compose recreates it), then check again: $0 check-compose --image $image ($doc)"
         ;;
-      *) warn "botd $what check didn't run in $image (status $rc), so the stack's settings weren't checked: $(compose_err)" ;;
+      *) die "botd $what check didn't finish in $image (status $rc), so the stack's settings weren't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)" ;;
     esac
   fi
 
@@ -786,7 +792,9 @@ compose_upgrade_check() {
       grep -E '^  ' <<<"$out" | sed -n '2,$p' >&2 || true
       die "Nothing in the stack has changed: keep it on the image it runs. Ask CG-Labs for a license key that release takes, check it with $0 check-compose --image $image --key-file <file>, then install it with botctl license install, now if the running botd takes it too, else right after you switch ($doc)"
       ;;
-    *) warn "botd license check didn't run in $image (status $rc), so the license wasn't checked: $(compose_err)" ;;
+    *)
+      die "botd license check didn't finish in $image (status $rc), so the license wasn't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)"
+      ;;
   esac
 }
 

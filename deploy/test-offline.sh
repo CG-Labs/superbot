@@ -913,8 +913,17 @@ for want in "botd from new:2 wouldn't start with this stack's settings: SSO: SSO
   grep -Fq -- "$want" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "a refused setting didn't say: $want"; }
 done
 if grep -q "args=license" "$CS/log"; then fail "the license was checked after a refused setting"; fi
+csays new:2 settings 137 ""
+if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose passed when botd settings check didn't finish"; fi
+grep -Fq "botd settings check didn't finish in new:2 (status 137), so the stack's settings weren't checked" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "a settings check that didn't finish wasn't said"; }
+if grep -q "args=license" "$CS/log"; then fail "the license was checked after a settings check that didn't finish"; fi
 csays new:2 settings 0 "$OK_SETTINGS"
-ok "check-compose stops on settings the new botd would refuse, naming each, before anything else"
+csays new:2 license 3 ""
+if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose passed when botd license check couldn't read the license"; fi
+grep -Fq "botd license check didn't finish in new:2 (status 3), so the license wasn't checked" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "a license check that didn't finish wasn't said"; }
+if grep -q "To switch the stack" "$T/cc.log"; then fail "check-compose said how to switch after a check that didn't finish"; fi
+csays new:2 license 0 "$OK_LICENSE"
+ok "check-compose stops on settings the new botd would refuse, naming each, before anything else, and on a check that doesn't finish"
 
 cimage mid:2 machines license
 csays mid:2 machines 0 "botd would start with these machine settings."
@@ -982,20 +991,25 @@ touch "$CS/exists"
 ok "check-compose checks the image Compose would run without --image, and refuses images Compose wouldn't run botd from, images not here, a stack it can't read or that never ran botd, and bad options"
 
 REF=reg.test/cg/superbot:1.0.0
+IB_SHA=$(awk '{ print $1 }' "$IB.sha256")
 cimage "$REF" settings license
 csays "$REF" settings 0 "$OK_SETTINGS"
 csays "$REF" license 0 "$OK_LICENSE"
-cstack load "$IB" -- -p stack >"$T/cl.log" 2>&1 || { cat "$T/cl.log" >&2; fail "load into a stack the new botd would start failed"; }
+cstack load "$IB" >"$T/cl.log" 2>&1 || { cat "$T/cl.log" >&2; fail "load checked only against the .sha256 beside it failed"; }
+grep -Fq "Not checking the Compose stack against $REF: this bundle was checked only against the .sha256 beside it" "$T/cl.log" || { cat "$T/cl.log" >&2; fail "load didn't say why it left the stack unchecked"; }
+grep -Fq "check-compose --image $REF" "$T/cl.log" || fail "load didn't say how to check the stack itself"
+if grep -q "^run " "$CS/log" 2>/dev/null; then fail "load ran an image from a bundle checked only against the .sha256 beside it with the stack's data"; fi
+cstack load "$IB" --sha256 "$IB_SHA" -- -p stack >"$T/cl.log" 2>&1 || { cat "$T/cl.log" >&2; fail "load into a stack the new botd would start failed"; }
 grep -Fqx "run image=$REF opts=-p stack args=settings check stdin=" "$CS/log" || { cat "$CS/log" >&2; fail "load didn't check the loaded image against the stack"; }
 grep -Fq "To switch the stack to it: SUPERBOT_VERSION=$VERSION in .env (or SUPERBOT_IMAGE=$REF), then docker compose up -d" "$T/cl.log" || { cat "$T/cl.log" >&2; fail "load didn't say how to switch the stack"; }
 csays "$REF" settings 1 "botd wouldn't start with these settings: Status page: STATUS_PAGE must be on or off"
-if cstack load "$IB" >"$T/cl.log" 2>&1; then fail "load passed a stack the loaded botd wouldn't start"; fi
+if cstack load "$IB" --sha256 "$IB_SHA" >"$T/cl.log" 2>&1; then fail "load passed a stack the loaded botd wouldn't start"; fi
 grep -Fq "botd from $REF wouldn't start with this stack's settings: Status page: STATUS_PAGE must be on or off" "$T/cl.log" || { cat "$T/cl.log" >&2; fail "load didn't say what the loaded botd refuses"; }
 rm -f "$CS/exists"
-cstack load "$IB" >"$T/cl.log" 2>&1 || { cat "$T/cl.log" >&2; fail "load with no stack here failed"; }
+cstack load "$IB" --sha256 "$IB_SHA" >"$T/cl.log" 2>&1 || { cat "$T/cl.log" >&2; fail "load with no stack here failed"; }
 grep -Fq "Before you switch a Compose stack to $REF, check it from the stack's folder: " "$T/cl.log" || { cat "$T/cl.log" >&2; fail "load with no stack didn't say how to check one"; }
 if grep -q "^run " "$CS/log" 2>/dev/null; then fail "load ran botd with no stack to check"; fi
-ok "load checks the loaded image against the Compose stack it runs in, and stops when botd wouldn't start; with no stack, it says how to check one"
+ok "load checks the loaded image against the Compose stack it runs in, only for a bundle checked against a recorded --sha256 or its signature, and stops when botd wouldn't start; with no stack, it says how to check one"
 
 ibuild "$T/iown" --image own=own-image:2 --allow-unsigned >"$T/iown.log" 2>&1 || { cat "$T/iown.log" >&2; fail "a local image didn't bundle"; }
 [[ "$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest")" == "$OWN" ]] || fail "the local image wasn't bundled from docker save"
