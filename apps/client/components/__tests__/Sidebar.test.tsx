@@ -1,7 +1,7 @@
 import React from "react";
-import { render, screen, userEvent } from "@testing-library/react-native";
-import { Sidebar } from "../Sidebar";
-import type { Me } from "../../src/types";
+import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
+import { botRowLabel, Sidebar } from "../Sidebar";
+import type { BotView, Me } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
 
@@ -131,5 +131,89 @@ describe("Sidebar secrets entry (ADR 0044)", () => {
     await render(<Sidebar {...setup(me)} onOpenSecrets={onOpenSecrets} />);
     await user.press(screen.getByText("Your secrets"));
     expect(onOpenSecrets).toHaveBeenCalledTimes(1);
+  });
+});
+
+const bot = (id: string, name: string, extra: Partial<BotView> = {}): BotView => ({
+  id,
+  name,
+  color: "#f5f5f5",
+  shape: "waddle",
+  harness: "claude",
+  primary: false,
+  hidden: false,
+  unread: false,
+  working: false,
+  ...extra,
+});
+const MEMBER: Me = { name: "Alex", role: "member", permissions: ["account", "read", "review", "write", "approve"] };
+const READONLY: Me = { name: "Rae", role: "readonly", permissions: ["account", "read", "review"] };
+
+describe("Sidebar Bots for screen readers", () => {
+  it("names each Bot with what's waiting on it", () => {
+    expect(botRowLabel(bot("a", "Ada"), { unread: false, needsYou: false })).toBe("Ada");
+    expect(botRowLabel(bot("a", "Ada", { working: true }), { unread: true, needsYou: false })).toBe("Ada, Working, unread");
+    expect(botRowLabel(bot("a", "Ada", { working: true }), { unread: false, needsYou: true })).toBe("Ada, needs you on its screen");
+  });
+
+  it("labels the rows, marks the open one, and counts waiting approvals", async () => {
+    const props = setup(MEMBER);
+    Object.assign(mockCtx, {
+      bots: [bot("m", "Main", { primary: true }), bot("a", "Ada", { unread: true }), bot("b", "Bob")],
+      activeId: "b",
+      handoffs: { m: { id: 1 } },
+      approvals: [{ id: "x" }, { id: "y" }],
+    });
+    await render(<Sidebar {...props} />);
+    expect(screen.getByRole("button", { name: "Main, needs you on its screen" })).not.toBeSelected();
+    expect(screen.getByRole("button", { name: "Ada, unread" })).not.toBeSelected();
+    expect(screen.getByRole("button", { name: "Bob" })).toBeSelected();
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Ada, unread" })));
+    expect(props.onSelectBot).toHaveBeenCalledWith("a");
+    expect(screen.getByRole("button", { name: "Approvals, 2 waiting" })).toBeOnTheScreen();
+  });
+});
+
+describe("Sidebar empty states", () => {
+  it("offers a first Bot when there are none", async () => {
+    const props = setup(MEMBER);
+    await render(<Sidebar {...props} />);
+    expect(screen.getByRole("heading", { name: "No Bots yet" })).toBeOnTheScreen();
+    // The empty state's button, beside the "+" at the top.
+    const buttons = screen.getAllByRole("button", { name: "New Bot" });
+    expect(buttons).toHaveLength(2);
+    await act(async () => fireEvent.press(buttons[1]));
+    expect(props.onNewBot).toHaveBeenCalledTimes(1);
+  });
+
+  it("tells read-only people where shared Bots appear, with nothing to press", async () => {
+    const props = setup(READONLY);
+    mockCtx.canWrite = false;
+    await render(<Sidebar {...props} />);
+    expect(screen.getByText("Bots shared with you show up here.")).toBeOnTheScreen();
+    expect(screen.queryByRole("button", { name: "New Bot" })).toBeNull();
+  });
+
+  it("suggests more Bots beside the main one", async () => {
+    const props = setup(MEMBER);
+    mockCtx.bots = [bot("m", "Main", { primary: true })];
+    await render(<Sidebar {...props} />);
+    expect(screen.getByRole("heading", { name: "Just Main so far" })).toBeOnTheScreen();
+  });
+
+  it("clears a search that matches nothing", async () => {
+    const props = setup(MEMBER);
+    Object.assign(mockCtx, { bots: [bot("a", "Ada")], filter: "zz" });
+    await render(<Sidebar {...props} />);
+    expect(screen.getByText("No Bots match “zz”.")).toBeOnTheScreen();
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Clear search" })));
+    expect(mockCtx.setFilter).toHaveBeenCalledWith("");
+  });
+
+  it("explains an empty hidden list", async () => {
+    const props = setup(MEMBER);
+    Object.assign(mockCtx, { bots: [bot("a", "Ada")], showHidden: true });
+    await render(<Sidebar {...props} />);
+    expect(screen.getByRole("heading", { name: "No hidden Bots" })).toBeOnTheScreen();
   });
 });

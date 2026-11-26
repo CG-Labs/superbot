@@ -37,16 +37,16 @@ export function ErrorState({ title = "Something went wrong", message, onRetry, r
   const styles = useStyles();
   const { busy, run } = useRetry(onRetry);
   return (
-    <View style={styles.full} role="alert" testID="error-state">
+    <View style={styles.full} testID="error-state">
       <View style={styles.circle} importantForAccessibility="no-hide-descendants" accessibilityElementsHidden>
         <Text style={styles.glyph} maxFontSizeMultiplier={1.2}>
           !
         </Text>
       </View>
-      <Text role="heading" style={styles.title}>
-        {title}
-      </Text>
-      <Text style={styles.message}>{message}</Text>
+      <View accessible role="alert" aria-live="assertive" style={styles.words}>
+        <Text style={styles.title}>{title}</Text>
+        <Text style={styles.message}>{message}</Text>
+      </View>
       {onRetry ? (
         <View style={styles.actions}>
           <PillButton tone="primary" label={retryLabel} busy={busy} busyLabel="Trying…" onPress={run} />
@@ -61,8 +61,10 @@ export function InlineError({ message, onRetry, retryLabel = "Try again" }: Omit
   const styles = useStyles();
   const { busy, run } = useRetry(onRetry);
   return (
-    <View style={styles.inline} role="alert" testID="inline-error">
-      <Text style={styles.inlineText}>{message}</Text>
+    <View style={styles.inline} testID="inline-error">
+      <Text style={styles.inlineText} role="alert" aria-live="polite">
+        {message}
+      </Text>
       {onRetry ? (
         <Pressable
           role="button"
@@ -93,6 +95,7 @@ const useStyles = themedStyles((t) =>
       marginBottom: t.space.xs,
     },
     glyph: { color: t.c.danger, fontSize: 26, lineHeight: 30, fontWeight: t.font.weight.bold },
+    words: { alignItems: "center", gap: t.space.sm },
     title: { color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold, textAlign: "center" },
     message: { color: t.c.textMuted, ...type(t, "md"), textAlign: "center", maxWidth: 380 },
     actions: { marginTop: t.space.md },

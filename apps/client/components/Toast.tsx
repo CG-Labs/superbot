@@ -91,13 +91,10 @@ function ToastView({ toast, onDismiss }: { toast: Shown; onDismiss: () => void }
 
   return (
     <View pointerEvents="box-none" style={[styles.layer, { top: top + t.space.sm }]}>
-      <Animated.View
-        role={tone === "error" ? "alert" : "status"}
-        aria-live={tone === "error" ? "assertive" : "polite"}
-        style={[styles.toast, tone === "error" ? styles.error : tone === "success" ? styles.success : styles.info, motion]}
-        testID="toast"
-      >
-        <Text style={[styles.message, fg]}>{toast.message}</Text>
+      <Animated.View style={[styles.toast, tone === "error" ? styles.error : tone === "success" ? styles.success : styles.info, motion]} testID="toast">
+        <Text role={tone === "error" ? "alert" : "status"} aria-live={tone === "error" ? "assertive" : "polite"} style={[styles.message, fg]}>
+          {toast.message}
+        </Text>
         {toast.action ? (
           <Pressable
             role="button"

@@ -1,6 +1,7 @@
 import React from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { ChatView, peerLabel } from "../ChatView";
+import { ToastProvider } from "../Toast";
 import { copyText } from "../../src/clipboard";
 import { themes } from "../../src/theme";
 import type { BotView, Message } from "../../src/types";
@@ -52,6 +53,8 @@ describe("ChatView", () => {
     mockCtx.activeId = "b";
     mockCtx.messages = { b: list };
     mockCtx.sendText = undefined;
+    mockCtx.stopBot = undefined;
+    mockCtx.loadMessages = jest.fn(async () => {});
   });
 
   it("shows a managed plan instead of a model picker, except to admins", async () => {
@@ -141,5 +144,94 @@ describe("ChatView", () => {
 
     await act(async () => fireEvent(box, "blur"));
     expect(box.parent).not.toHaveStyle(accent);
+  });
+
+  it("shows the chat's outline while its history loads", async () => {
+    let done!: () => void;
+    mockCtx.messages = {};
+    mockCtx.loadMessages = jest.fn(() => new Promise<void>((r) => (done = r)));
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    expect(screen.getByRole("progressbar", { name: "Loading messages" })).toBeOnTheScreen();
+
+    mockCtx.messages = { b: list };
+    await act(async () => done());
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByText("All green")).toBeOnTheScreen();
+  });
+
+  it("says why a chat couldn't load and tries again", async () => {
+    mockCtx.messages = {};
+    mockCtx.loadMessages = jest
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockImplementationOnce(async () => {
+        mockCtx.messages = { b: list };
+      });
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(/Couldn't load this chat.*Can't reach the server/);
+
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+    expect(mockCtx.loadMessages).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("All green")).toBeOnTheScreen();
+  });
+
+  it("offers a first Bot when there are none", async () => {
+    const onNewBot = jest.fn();
+    mockCtx.bots = [];
+    mockCtx.activeId = null;
+    await render(<ChatView onOpenDetails={jest.fn()} onNewBot={onNewBot} onToggleScreen={jest.fn()} />);
+    expect(screen.getByRole("heading", { name: "No Bots yet" })).toBeOnTheScreen();
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "New Bot" })));
+    expect(onNewBot).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives back a message that didn't send, with a toast to retry it", async () => {
+    const sendText = jest.fn().mockRejectedValueOnce(new TypeError("Network request failed")).mockResolvedValueOnce(undefined);
+    mockCtx.sendText = sendText;
+    await render(
+      <ToastProvider>
+        <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />
+      </ToastProvider>,
+    );
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Ship it"));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+    expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+    expect(screen.getByRole("alert")).toHaveTextContent(/Couldn't send your message\. Can't reach the server/);
+
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Retry" })));
+    expect(sendText).toHaveBeenNthCalledWith(2, "Ship it");
+    expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("names the header, the stop button and the chosen option for screen readers", async () => {
+    const stopBot = jest.fn(async () => {});
+    mockCtx.stopBot = stopBot;
+    mockCtx.bots = [bot("a", "Ada"), { ...bot("b", "Bob"), working: true }];
+    mockCtx.messages = {
+      b: [{ id: 9, botId: "b", role: "bot", text: "Which?", at: 9, question: { title: "Pick one", options: ["Red", "Blue"], picked: 1 } }],
+    };
+    const onOpenDetails = jest.fn();
+    await render(<ChatView onOpenDetails={onOpenDetails} onToggleScreen={jest.fn()} />);
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Bob, Claude Code" })));
+    expect(onOpenDetails).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Blue" })).toBeSelected();
+    expect(screen.getByRole("button", { name: "Red" })).not.toBeSelected();
+    expect(screen.getByRole("button", { name: "Red" })).toBeDisabled();
+    expect(screen.getByText("Working…")).toHaveProp("aria-live", "polite");
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Stop Bob" })));
+    expect(stopBot).toHaveBeenCalledWith("b");
+  });
+
+  it("says when stopping fails instead of failing silently", async () => {
+    mockCtx.stopBot = jest.fn().mockRejectedValue(new Error("Not allowed"));
+    mockCtx.bots = [bot("a", "Ada"), { ...bot("b", "Bob"), working: true }];
+    await render(
+      <ToastProvider>
+        <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />
+      </ToastProvider>,
+    );
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Stop Bob" })));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't stop it. Not allowed");
   });
 });

@@ -32,7 +32,7 @@ export function ConnectionBanner({ status }: { status: ConnectionStatus }) {
   if (status === "online") return null;
   const offline = status === "offline";
   return (
-    <View role="status" aria-live="polite" style={[styles.banner, offline ? styles.offline : styles.reconnecting]} testID="connection-banner">
+    <View accessible role="status" aria-live="polite" style={[styles.banner, offline ? styles.offline : styles.reconnecting]} testID="connection-banner">
       {offline ? null : <ThinkingDots />}
       <Text style={[styles.text, offline ? styles.offlineText : styles.reconnectingText]}>
         {offline ? "You're offline. Chats catch up when you're back." : "Reconnecting… New messages show up once you're back."}

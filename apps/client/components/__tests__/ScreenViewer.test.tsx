@@ -1,5 +1,5 @@
 import React from "react";
-import { act, render, screen, userEvent } from "@testing-library/react-native";
+import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
 import { ScreenViewer } from "../ScreenViewer";
 import type { Message } from "../../src/types";
 
@@ -63,6 +63,22 @@ describe("ScreenViewer", () => {
     expect(await screen.findByText("Screens are off on this server.")).toBeOnTheScreen();
     expect(screen.queryByTestId("screen-frame")).not.toBeOnTheScreen();
     expect(screen.getByRole("button", { name: "Take over" })).toBeDisabled();
+  });
+
+  it("shows the screen starting, and tries again at once on request", async () => {
+    let fail!: (err: Error) => void;
+    const fetchUrl = jest
+      .fn()
+      .mockImplementationOnce(() => new Promise<string>((_, reject) => (fail = reject)))
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a");
+    await render(<ScreenViewer botId="b1" botName="Ada" fetchUrl={fetchUrl} onClose={jest.fn()} retryMs={60_000} />);
+    expect(screen.getByRole("progressbar", { name: "Starting Ada's screen" })).toBeOnTheScreen();
+
+    await act(async () => fail(new Error("The screen is starting.")));
+    expect(screen.getByRole("alert")).toHaveTextContent(/Can't show Ada's screen.*The screen is starting\./);
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+    expect(await screen.findByTestId("screen-frame")).toBeOnTheScreen();
+    expect(fetchUrl).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the screen alive and drops control when the link changes", async () => {
