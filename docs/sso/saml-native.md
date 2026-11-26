@@ -177,6 +177,7 @@ With [several IdPs of a federation](#several-idps-of-a-federation), the setting 
 | `SSO_<ID>_IDP_ENTITY_ID` | (required, or `IDP_ENTITY_IDS`) | The IdP's entity ID. Responses from any other issuer are refused, and identities are stored under it. |
 | `SSO_<ID>_IDP_ENTITY_IDS` | | Instead of `IDP_ENTITY_ID`: several IdPs of a federation, comma separated (2 to 100), each fetched from `IDP_MDQ_URL` or `IDP_AGGREGATE_URL` and chosen at sign-in ([below](#several-idps-of-a-federation)). Or `all`: every SAML IdP in `IDP_AGGREGATE_URL`'s aggregate, found by search at sign-in ([below](#every-idp-of-a-federation)). |
 | `SSO_<ID>_IDP_ENTITY_CATEGORIES` | | With `IDP_ENTITY_IDS=all`: only IdPs with every one of these entity categories, comma separated URIs, up to 8 (REFEDS R&S: `http://refeds.org/category/research-and-scholarship`; Sirtfi: `https://refeds.org/sirtfi`). |
+| `SSO_<ID>_DISCOVERY_URL` | | With `IDP_ENTITY_IDS`: the federation's discovery service (https, like `https://service.seamlessaccess.org/ds/`), where people pick their IdP instead of on SuperBot's chooser ([below](#a-federations-discovery-service)). |
 | `SSO_<ID>_IDP_METADATA_URL` | | The IdP's metadata, https, refreshed daily. |
 | `SSO_<ID>_IDP_METADATA_FILE` | | Or a metadata file, read at startup. Without either, import it with `botctl sso saml <id> import`. |
 | `SSO_<ID>_IDP_MDQ_URL` | | Or a federation's MDQ server, its https base URL (InCommon: `https://mdq.incommon.org`): botd asks it for each IdP alone, daily. Needs `METADATA_SIGNING_CERT_FILE` ([below](#metadata-from-a-federation-mdq)). |
@@ -422,6 +423,20 @@ SSO_UNI_IDP_ENTITY_CATEGORIES=http://refeds.org/category/research-and-scholarshi
 - **What's shown.** `botctl sso saml uni` counts the IdPs (and the hidden ones) instead of listing them. The log has one line per read, plus one counting the IdPs that can't be used. Certificate warnings skip the IdPs' own certificates, which are theirs and the federation's to look after; the federation's signing certificate is still warned about.
 - **Limits.** At most 10,000 IdPs: a bigger aggregate is refused as a whole. Entity IDs with a `|` are left out, as in a list.
 
+#### A federation's discovery service
+
+With several IdPs, people can pick theirs at the discovery service their federation runs or recommends (SeamlessAccess, a national federation's WAYF) instead of on SuperBot's chooser ([ADR 0314](../adr/0314-saml-discovery-service.md)). It remembers their choice across services and knows every member's name and logo:
+
+```bash
+SSO_UNI_DISCOVERY_URL=https://service.seamlessaccess.org/ds/
+```
+
+- **What happens.** The sign-in button sends the browser to the service with SuperBot's entity ID and a `return` URL, `<SSO_PUBLIC_URL>/api/auth/sso/<id>/discovery`, carrying the sign-in's own parameters. The service sends it back there with the IdP picked (`entityID`), and botd goes on to `/start?idp=<that IdP>` as if it had been picked on the chooser. Nothing is asked passively, so people always pick.
+- **The service only picks.** It never sees a SAML message. Its pick is checked as any `idp` is: an IdP the provider doesn't list (or, with `all`, that the aggregate doesn't have) fails as `unknown_idp`, the AuthnRequest goes to the IdP's own endpoint from its signed metadata, and only that IdP's signed answer counts. A service that sends the browser back with no pick (the person gave up there) gets SuperBot's own chooser, whose search stays on SuperBot.
+- **Register the return URL.** Discovery services only send people to a return URL the SP's metadata lists. With several IdPs, SuperBot's metadata has one (`idpdisc:DiscoveryResponse`, the `/discovery` URL), with or without this setting, and `botctl sso saml uni` shows it. Give the federation the updated metadata, or enter that URL where it registers your SP. A federation's own discovery service may also send people to it unasked.
+- **What it sees.** The `return` URL holds the sign-in's own parameters (`session`, and for apps their `redirect`, PKCE `challenge`, `state` and `label`), none of which signs anyone in. No cookie is set before the pick.
+- **Limits.** An https URL with no fragment; it may have a query of its own (like `?lang=en`), but not the protocol's `entityID`, `return`, `returnIDParam`, `policy` or `isPassive`, which botd sets. Refused with one IdP: there is nothing to choose.
+
 #### Groups with several IdPs
 
 One institution's `staff` group isn't another's, so with several IdPs botd keeps groups apart by IdP ([ADR 0287](../adr/0287-saml-groups-per-idp-of-a-federation.md)). Federations send who someone is at an institution as *scoped* values, like eduPersonScopedAffiliation (`urn:oid:1.3.6.1.4.1.5923.1.1.1.9`, values like `member@uni-a.example`):
@@ -556,7 +571,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `transient_subject`, `missing_subject` | Use a persistent NameID. |
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
 | `email_out_of_scope` | With [several IdPs](#several-idps-of-a-federation) and `ALLOWED_DOMAINS`: the IdP sent an email at a domain the federation doesn't list for it (`botctl sso saml <id>` shows each IdP's email domains). Its operators must add the scope in the federation's registry. |
-| `unknown_idp` | With several IdPs: the start URL's `idp`, or an app tile's `Issuer` (`idpInitiated: true`; an artifact's `SourceID`), isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was, when it could be read). With `IDP_ENTITY_IDS=all`: it isn't a SAML IdP in the aggregate as last read, or lacks one of `IDP_ENTITY_CATEGORIES`. |
+| `unknown_idp` | With several IdPs: the start URL's `idp` (also what a [discovery service](#a-federations-discovery-service) picked), or an app tile's `Issuer` (`idpInitiated: true`; an artifact's `SourceID`), isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was, when it could be read). With `IDP_ENTITY_IDS=all`: it isn't a SAML IdP in the aggregate as last read, or lacks one of `IDP_ENTITY_CATEGORIES`. |
 | `idp_metadata_expired` | The IdP's signed metadata in use has passed its `validUntil`, and no fresh copy loaded. From a file or an import, give botd a fresh signed copy; from a URL or MDQ, look for `sso.saml_metadata_refused` or an unreachable server in the log ([above](#signed-idp-metadata)). |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
 | `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |
