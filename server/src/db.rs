@@ -12278,6 +12278,31 @@ mod tests {
     }
 
     #[test]
+    fn a_first_approval_is_saved_and_its_erased_approver_no_longer_counts() {
+        let db = Db::open(&temp_path("two-approvers").join("app.sqlite")).unwrap();
+        let r = db.create_custom_role("Root", "", Role::Member, &["machines.manage"], Some(1), None).unwrap();
+        assert_eq!(r.approvals, 1, "one approval unless set");
+        assert!(db.set_role_requestable(&r.id, true) && db.set_role_approvals(&r.id, 2));
+        assert_eq!(db.custom_role(&r.id).unwrap().approvals, 2);
+        let cy = db.create_user(None, Some("cy@example.com"), "Cy", Role::Member).unwrap();
+        let boss = db.create_user(None, Some("boss@example.com"), "Boss", Role::Admin).unwrap();
+        let ana = db.create_user(None, Some("ana@example.com"), "Ana", Role::Admin).unwrap();
+        let q = db.create_role_request(&cy.id, &r.id, None, 8, "x", now() + 86_400_000, 5, 10).unwrap();
+        let approve = |by: &str, hours: Option<i64>| db.approve_role_request(&q.id, hours, Some(by), Some("ok"), |_| Ok(()), crate::role_requests::first_counts);
+        let Ok(RequestApproval::First { request, replaced: None }) = approve(&boss.id, Some(4)) else { panic!("the first of two") };
+        assert_eq!(request.first.as_ref().map(|f| (f.by.as_str(), f.hours, f.note.as_deref())), Some((boss.id.as_str(), 4, Some("ok"))));
+        assert_eq!(db.role_request(&q.id).unwrap().first, request.first, "saved");
+        assert_eq!(db.role_request(&q.id).unwrap().status, "pending");
+        assert_eq!(approve(&boss.id, None).unwrap_err(), RoleRequestError::ApprovedAlready);
+
+        db.erase_user(&boss.id, "erased-1", None, &[]).unwrap();
+        assert_eq!(db.role_request(&q.id).unwrap().first.map(|f| f.by), Some("erased-1".into()), "named by their pseudonym");
+        let Ok(RequestApproval::First { replaced: Some(old), .. }) = approve(&ana.id, None) else { panic!("an erased approver no longer counts") };
+        assert_eq!((old.by.as_str(), old.hours), ("erased-1", 4));
+        assert!(db.user(&cy.id).unwrap().role_id.is_none());
+    }
+
+    #[test]
     fn saml_role_grants_only_ever_take_back_what_they_gave() {
         let db = Db::open(&temp_path("saml-roles").join("app.sqlite")).unwrap();
         let a = db.create_user(None, Some("a@example.com"), "A", Role::Readonly).unwrap();

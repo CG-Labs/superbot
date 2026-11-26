@@ -685,6 +685,7 @@ async fn custom_role_definitions_are_in_the_access_review_file() {
     let v = parse(file(&f, "access-review.json"));
     let r = &v["customRoles"][0];
     assert_eq!((r["id"].as_str(), r["base"].as_str(), r["permissions"].clone(), r["holders"]["server"].as_u64()), (Some(auditor.as_str()), Some("readonly"), json!(["audit.view"]), Some(0)), "{v}");
+    assert_eq!(r["approvals"], 1, "how many approve a request for it (ADR 0320): {v}");
     assert!(!v.to_string().contains("Night auditor"), "{v}");
     assert!(listed(&parse(file(&f, "manifest.json")), "access-review.json").1.as_array().unwrap().contains(&json!("CC6.3-3")));
 }
