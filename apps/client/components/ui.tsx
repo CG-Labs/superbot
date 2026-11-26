@@ -230,6 +230,48 @@ export function Card({
   );
 }
 
+interface PillButtonProps {
+  label: string;
+  onPress: () => void;
+  /** Primary fills with the accent; use it for the one next step on a screen. */
+  tone?: "primary" | "secondary";
+  /** Disables the button and shows `busyLabel` while the action runs. */
+  busy?: boolean;
+  busyLabel?: string;
+  disabled?: boolean;
+  hint?: string;
+  small?: boolean;
+}
+
+/** The kit's pill button as a component, for empty and error states, toasts and banners (ADR 0339). */
+export function PillButton({ label, onPress, tone = "secondary", busy, busyLabel, disabled, hint, small }: PillButtonProps) {
+  const ui = useUi();
+  const off = !!(disabled || busy);
+  const text = busy && busyLabel ? busyLabel : label;
+  return (
+    <Pressable
+      role="button"
+      aria-label={text}
+      aria-disabled={off}
+      aria-busy={!!busy}
+      accessibilityHint={hint}
+      disabled={off}
+      hitSlop={small ? 8 : 4}
+      onPress={onPress}
+      style={({ pressed }) => [
+        ui.btn,
+        { minHeight: small ? 32 : 40 },
+        small && ui.btnSmall,
+        tone === "primary" && ui.primary,
+        pressed && (tone === "primary" ? { opacity: 0.7 } : ui.btnPressed),
+        off && ui.disabled,
+      ]}
+    >
+      <Text style={[ui.btnText, tone === "primary" && ui.primaryText]}>{text}</Text>
+    </Pressable>
+  );
+}
+
 /** A spinner in the muted text colour. */
 export function Spinner({ style }: { style?: StyleProp<ViewStyle> }) {
   const t = useTheme();

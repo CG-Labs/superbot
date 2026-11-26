@@ -51,6 +51,34 @@ describe("design tokens", () => {
       expect(contrast(c.text, c.selected)).toBeGreaterThanOrEqual(4.5);
       expect(contrast(c.textMuted, c.selected)).toBeGreaterThanOrEqual(4.5);
     });
+
+    it.each(grounds)("keeps the keyboard focus ring visible on %s", (ground) => {
+      // WCAG 1.4.11: focus indicators need 3:1 against what's around them.
+      expect(contrast(c.accent, c[ground])).toBeGreaterThanOrEqual(3);
+    });
+
+    it.each(["bg", "surface"] as const)("keeps skeleton blocks visible on %s, where they load", (ground) => {
+      // Decorative, but they must still read as shapes.
+      expect(contrast(c.selected, c[ground])).toBeGreaterThan(1.1);
+    });
+
+    it("keeps empty, error and offline states, banners and toasts readable", () => {
+      // Empty-state glyphs, the reconnecting banner and error states.
+      expect(contrast(c.accentText, c.accentSoft)).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(c.danger, c.dangerSoft)).toBeGreaterThanOrEqual(4.5);
+      // The offline banner, and the success toast.
+      expect(contrast(c.warning, c.warningSoft)).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(c.success, c.successSoft)).toBeGreaterThanOrEqual(4.5);
+      // Pill buttons.
+      expect(contrast(c.text, c.raised)).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(c.onAccent, c.accent)).toBeGreaterThanOrEqual(4.5);
+    });
+  });
+
+  it("keeps the light focus ring visible on screens still dark-only", () => {
+    for (const ground of ["bg", "surface", "raised"] as const) {
+      expect(contrast(tokens.color.light.accent, tokens.color.dark[ground])).toBeGreaterThanOrEqual(3);
+    }
   });
 
   it("gives screens not yet on the design system the dark palette's neutrals", () => {

@@ -1,16 +1,14 @@
 import { useEffect } from "react";
 import { Redirect, router, useLocalSearchParams } from "expo-router";
-import { ActivityIndicator, View } from "react-native";
 import { LoginScreen } from "../components/LoginScreen";
+import { AppSkeleton } from "../components/Skeleton";
 import { codeFromHash } from "../src/invite";
 import { approvalParam } from "../src/notifications";
 import { botParam } from "../src/push";
 import { useSuperBot } from "../src/SuperBotContext";
-import { useTheme } from "../src/theme";
 
 export default function Index() {
   const { ready, api, inviteCode, offerInviteCode } = useSuperBot();
-  const t = useTheme();
   // An invite link's `#code=` (ADR 0021): the router keeps the fragment as a param and
   // writes it back to the address bar, so it is taken here and the URL replaced without it.
   const params = useLocalSearchParams<{ "#"?: string; approval?: string; bot?: string }>();
@@ -25,13 +23,7 @@ export default function Index() {
     router.replace("/");
   }, [hash, offerInviteCode]);
 
-  if (!ready) {
-    return (
-      <View style={{ flex: 1, justifyContent: "center", backgroundColor: t.c.bg }}>
-        <ActivityIndicator color={t.c.textMuted} />
-      </View>
-    );
-  }
+  if (!ready) return <AppSkeleton />;
 
   if (!api) {
     return <LoginScreen key={inviteCode ?? ""} inviteCode={inviteCode} />;
