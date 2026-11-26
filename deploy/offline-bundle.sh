@@ -12,7 +12,12 @@
 #                                  # --bin-dir's botd, installed here for /opt/superbot-harnesses (connected),
 #                                  # for install.sh --offline --harness-bundle
 #   deploy/offline-bundle.sh verify BUNDLE [--sha256 HEX]   # an offline, Hermes or harness bundle
-#   deploy/offline-bundle.sh load BUNDLE [--sha256 HEX]      # docker load its images, no network
+#   deploy/offline-bundle.sh load BUNDLE [--sha256 HEX] [-- COMPOSE_OPTION...]
+#                                  # docker load its images, no network; in a Compose stack's folder,
+#                                  # then check-compose with the loaded image
+#   deploy/offline-bundle.sh check-compose [--image REF] [--key-file FILE] [-- COMPOSE_OPTION...]
+#                                  # whether botd from REF (else the image Compose would run) would start
+#                                  # with the stack's settings and run Bots with its license, before you switch
 #   deploy/offline-bundle.sh load-hermes HERMES_BUNDLE [--sha256 HEX] [--image REF] [--env-file FILE] [--volume NAME]
 #                                  # Hermes Agent for Compose: the checked tree in a Docker volume,
 #                                  # for the pin of the image Compose runs, mounted by docker-compose.hermes.yml
@@ -35,7 +40,7 @@ HERMES_VOLUME_MARK=.superbot-hermes
 HERMES_VOLUME_NEW=""
 
 usage() {
-  sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The first of SUPERBOT_OCI and CANDIDATES (then superbot-oci on PATH) that runs here: one
@@ -606,8 +611,12 @@ cmd_harnesses() {
 }
 
 cmd_load() {
-  verify_args "$@"
+  local args=()
+  while [[ $# -gt 0 && "$1" != -- ]]; do args+=("$1"); shift; done
+  [[ $# -eq 0 ]] || { shift; COMPOSE_OPTS=("$@"); }
+  verify_args "${args[@]}"
   command -v docker >/dev/null 2>&1 || die "load needs docker"
+  local recorded_sha=$OFFLINE_BUNDLE_SHA256
   offline_unpack_bundle "$BUNDLE" "$OFFLINE_TMP"
   local tar name ref found=false
   for tar in "$OFFLINE_DIR"/images/*.tar; do
@@ -625,11 +634,28 @@ cmd_load() {
   done
   [[ "$found" == true ]] || die "This bundle has no images: it is for install.sh --offline only"
   log "Run Compose from the bundle's docker/ folder with SUPERBOT_VERSION=$OFFLINE_VERSION in .env (docs/ops/air-gapped.md#docker-compose)"
-  local pins commit tag volume ref
+  local ref
   ref=$(cat "$OFFLINE_DIR/images/superbot.ref" 2>/dev/null) || return 0
-  # Asked of the image just loaded, in a container with no network, not of the bundle's bin/botd on
-  # this host: the .sha256 beside a bundle could have been replaced with it.
-  pins=$(docker run --rm --network none --entrypoint botd "$ref" harness pins 2>/dev/null) || return 0
+  load_hermes_notice "$ref"
+  # The check runs the image with the stack's secrets and data, so only when the bundle was
+  # checked against something the operator chose, as push: its verified signature, or a
+  # --sha256 from where it was published. A .sha256 file beside it could have been replaced.
+  if [[ "$OFFLINE_SIGNED" != true && -z "$recorded_sha" ]] && compose_stack_here; then
+    warn "Not checking the Compose stack against $ref: this bundle was checked only against the .sha256 beside it, which could have been replaced with it. Give --sha256 <recorded sha-256> (or its signature with cosign), or check the image yourself once you trust it: $0 check-compose --image $ref (docs/ops/air-gapped.md#upgrading-with-compose)"
+  elif compose_stack_here; then
+    compose_upgrade_check "$ref"
+    log "To switch the stack to it: SUPERBOT_VERSION=$OFFLINE_VERSION in .env (or SUPERBOT_IMAGE=$ref), then docker compose up -d"
+  else
+    log "Before you switch a Compose stack to $ref, check it from the stack's folder: $0 check-compose --image $ref (docs/ops/air-gapped.md#upgrading-with-compose)"
+  fi
+}
+
+# Which Hermes bundle Compose needs for the image REF just loaded. Asked of the image, in a
+# container with no network, not of the bundle's bin/botd on this host: the .sha256 beside a
+# bundle could have been replaced with it.
+load_hermes_notice() {
+  local pins commit tag volume
+  pins=$(docker run --rm --network none --entrypoint botd "$1" harness pins 2>/dev/null) || return 0
   read -r commit tag < <(awk '$1 == "hermes" { print $3, $4; exit }' <<<"$pins") || true
   [[ "${commit:-}" =~ ^[0-9a-f]{40}$ ]] || return 0
   volume=$(hermes_volume_name "$commit")
@@ -637,6 +663,161 @@ cmd_load() {
     log "This release's Hermes Agent ($tag) is already in the Docker volume $volume, for Compose with Hermes (SUPERBOT_HERMES_VOLUME=$volume)"
   else
     log "With Hermes Agent in Compose, load this release's Hermes bundle ($tag): $0 load-hermes superbot-hermes-$tag-$(uname -m).tar.gz (docs/ops/air-gapped.md#hermes-agent-with-docker-compose)"
+  fi
+}
+
+# --- Compose upgrades checked first (docs/adr/0317-compose-upgrades-checked-first.md) ----------
+
+# docker compose's own options for the stack (-f, -p, --env-file, --project-directory), given
+# after --. Without them, Compose finds the stack from this folder, as `docker compose up` does.
+COMPOSE_OPTS=()
+COMPOSE_ERR=/dev/null
+# The image compose_upgrade_check judged.
+COMPOSE_IMAGE=""
+
+stack() { docker compose "${COMPOSE_OPTS[@]}" "$@"; }
+
+# Whether there is a stack here that has run botd: an upgrade, not a first start.
+compose_stack_here() {
+  docker compose version >/dev/null 2>&1 || return 1
+  [[ -n "$(stack ps -a -q botd 2>/dev/null)" ]]
+}
+
+# Whether IMAGE's botd has the subcommand whose usage is USAGE. An older botd would take the
+# subcommand for a start and run as the server, so nothing is asked of one without it.
+image_botd_has() {
+  # shellcheck disable=SC2016 # expanded in the container
+  docker run --rm --network none --entrypoint sh "$1" -c 'b=$(command -v botd) && grep -qaF "$1" "$b"' _ "$2" >/dev/null 2>&1
+}
+
+# The same, of the botd the stack runs now.
+stack_botd_has() {
+  # shellcheck disable=SC2016 # expanded in the container
+  stack exec -T botd sh -c 'b=$(command -v botd) && grep -qaF "$1" "$b"' _ "$1" </dev/null >/dev/null 2>&1
+}
+
+# botd ARGS... from IMAGE as Compose would start the stack's botd: the service's env_file,
+# environment, volumes, user and network, with SUPERBOT_IMAGE over .env's, and nothing else
+# started. botd's stdout is printed; Compose's and botd's stderr go to COMPOSE_ERR.
+stack_botd_run() {
+  local image=$1
+  shift
+  SUPERBOT_IMAGE=$image stack run --rm --no-deps -T --entrypoint botd botd "$@" 2>"$COMPOSE_ERR"
+}
+
+# The last line in COMPOSE_ERR that isn't Compose's progress.
+compose_err() { grep -vE '^ *(Network|Volume|Container) ' "$COMPOSE_ERR" | tail -n 1 || true; }
+
+# Whether botd from IMAGE (empty: the image Compose would run botd from now) would start with
+# the Compose stack's settings and run Bots with its license, before the stack is switched to it
+# (docs/adr/0317-compose-upgrades-checked-first.md). The image's own `botd settings check` and
+# `botd license check` (ADR 0310, ADR 0305) run as Compose would start botd; the running botd
+# says whether Bots run now. KEY, a file, is judged as the license in its place. Nothing in the
+# stack changes: it dies listing what to change, or returns.
+compose_upgrade_check() {
+  local image=${1:-} key=${2:-} configured what out rc refused now_rc=2 why lic doc="docs/ops/air-gapped.md#upgrading-with-compose"
+  COMPOSE_ERR="$OFFLINE_TMP/compose.err"
+  if [[ -n "$image" ]]; then
+    [[ "$image" != -* && "$image" != *'$'* && "$image" != *[[:space:]]* ]] || die "--image \"$image\" isn't an image reference"
+    configured=$(SUPERBOT_IMAGE=$image stack config --images botd 2>"$COMPOSE_ERR") \
+      || die "docker compose can't read this stack: $(compose_err) (run this from the folder you run Compose from, or give Compose's options after --)"
+    [[ "$(head -n 1 <<<"$configured")" == "$image" ]] \
+      || die "Compose runs botd from $(head -n 1 <<<"$configured") here whatever SUPERBOT_IMAGE says (another Compose file names botd's image), so $image can't be checked as it would run: check that image, or change the file"
+  else
+    configured=$(stack config --images botd 2>"$COMPOSE_ERR") \
+      || die "docker compose can't read this stack: $(compose_err) (run this from the folder you run Compose from, or give Compose's options after --)"
+    image=$(head -n 1 <<<"$configured")
+  fi
+  COMPOSE_IMAGE=$image
+  [[ -n "$(stack ps -a -q botd 2>/dev/null)" ]] \
+    || die "This Compose stack has never run botd, so there is nothing to upgrade: run this from your stack's folder, or give Compose's options after -- ($doc)"
+  docker image inspect "$image" >/dev/null 2>&1 \
+    || die "No image $image here: load the release's images first ($0 load <bundle>), or docker pull it from your registry"
+
+  what=""
+  if image_botd_has "$image" "Usage: botd settings check"; then
+    what=settings
+  elif image_botd_has "$image" "Usage: botd machines check"; then
+    what=machines
+  else
+    warn "botd in $image can't check its settings (botd settings check), so they weren't checked"
+  fi
+  if [[ -n "$what" ]]; then
+    rc=0
+    out=$(stack_botd_run "$image" "$what" check </dev/null) || rc=$?
+    case $rc in
+      0) log "Settings: botd from $image would start with this stack's settings (botd $what check)" ;;
+      1)
+        refused=$(sed -n "s/^botd wouldn't start with these settings: //p" <<<"$out")
+        [[ -n "$refused" ]] || refused=$(tail -n 1 <<<"$out")
+        warn "botd from $image wouldn't start with this stack's settings: $(head -n 1 <<<"$refused")"
+        tail -n +2 <<<"$refused" | sed 's/^/    and: /' >&2
+        die "Nothing in the stack has changed: keep it on the image it runs. Change what botd names in .env (the running botd reads it again only when Compose recreates it), then check again: $0 check-compose --image $image ($doc)"
+        ;;
+      *) die "botd $what check didn't finish in $image (status $rc), so the stack's settings weren't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)" ;;
+    esac
+  fi
+
+  if ! image_botd_has "$image" "Usage: botd license check"; then
+    warn "botd in $image can't check licenses (botd license check), so the license wasn't checked"
+    return 0
+  fi
+  lic="this stack's license"
+  local -a key_args=()
+  if [[ -n "$key" ]]; then
+    key_args=(--key-file -)
+    lic="the key in $key"
+    [[ "$key" != - ]] || key=/dev/stdin
+  fi
+  rc=0
+  out=$(tr -d '[:space:]' <"${key:-/dev/null}" | stack_botd_run "$image" license check "${key_args[@]}") || rc=$?
+  if [[ $rc -eq 1 && -n "$(stack ps -q botd 2>/dev/null)" ]] && stack_botd_has "Usage: botd license check"; then
+    now_rc=0
+    stack exec -T botd botd license check </dev/null >/dev/null 2>&1 || now_rc=$?
+    ((now_rc <= 1)) || now_rc=2
+  fi
+  case $rc in
+    0)
+      log "License: botd from $image would run Bots with $lic: $(license_detail "$out")"
+      sed -n 's/^Warning: //p' <<<"$out" | while IFS= read -r w; do warn "License with $image: $w"; done
+      ;;
+    1)
+      why="botd from $image wouldn't run Bots with $lic: $(license_detail "$out")"
+      case $now_rc in
+        0) ;;
+        1) warn "$why Bots don't run on this stack now either ($doc)"; return 0 ;;
+        *) warn "$why The running botd can't say whether Bots run now (botd license check) ($doc)"; return 0 ;;
+      esac
+      warn "Bots run now, but $why"
+      grep -E '^  ' <<<"$out" | sed -n '2,$p' >&2 || true
+      die "Nothing in the stack has changed: keep it on the image it runs. Ask CG-Labs for a license key that release takes, check it with $0 check-compose --image $image --key-file <file>, then install it with botctl license install, now if the running botd takes it too, else right after you switch ($doc)"
+      ;;
+    *)
+      die "botd license check didn't finish in $image (status $rc), so the license wasn't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)"
+      ;;
+  esac
+}
+
+cmd_check_compose() {
+  local image="" key=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) image=$2; shift 2 ;;
+      --key-file) key=$2; shift 2 ;;
+      --) shift; COMPOSE_OPTS=("$@"); break ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1 (Compose's own options go after --)" ;;
+    esac
+  done
+  [[ -z "$key" || "$key" == - || (-f "$key" && -r "$key") ]] || die "Can't read the key in --key-file $key"
+  { command -v docker && docker compose version; } >/dev/null 2>&1 || die "check-compose needs docker and its Compose plugin"
+  OFFLINE_TMP=$(mktemp -d)
+  trap cleanup_offline EXIT
+  compose_upgrade_check "$image" "$key"
+  if [[ -n "$image" ]]; then
+    log "To switch the stack to $COMPOSE_IMAGE: SUPERBOT_VERSION (or SUPERBOT_IMAGE) in .env, then docker compose up -d"
+  else
+    log "Compose would run botd from $COMPOSE_IMAGE, as .env says: docker compose up -d switches the stack to it"
   fi
 }
 
@@ -982,8 +1163,9 @@ case "${1:-}" in
   harnesses) shift; cmd_harnesses "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   load) shift; cmd_load "$@" ;;
+  check-compose) shift; cmd_check_compose "$@" ;;
   load-hermes) shift; cmd_load_hermes "$@" ;;
   push) shift; cmd_push "$@" ;;
   -h|--help|"") usage ;;
-  *) die "Unknown command: $1 (build, hermes, harnesses, verify, load, load-hermes or push)" ;;
+  *) die "Unknown command: $1 (build, hermes, harnesses, verify, load, check-compose, load-hermes or push)" ;;
 esac
