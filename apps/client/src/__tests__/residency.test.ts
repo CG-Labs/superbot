@@ -112,7 +112,16 @@ describe("where your Bots run (ADR 0267)", () => {
   });
 });
 
-describe("chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets and second factors in the region's own database (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299)", () => {
+describe("chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors and usage records in the region's own database (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304)", () => {
+  it("says the usage records of your Bots' runs are kept in the region too when the server says so", () => {
+    const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true, signIns: true, secrets: true, secondFactors: true, usageRecords: true } }));
+    expect(held.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets, your second factor and the usage records of your Bots' runs are kept in gb-lon, in a database of their own there.");
+    expect(held.lines).toContain("SuperBot's own copy of your account isn't in gb-lon; it is in de-fra-2. Your agreement says where it is.");
+    expect(held.warnings).toEqual([]);
+    const moving = residencyLines(view({ chats: { store: true, inRegion: false, moving: true, usageRecords: true } }));
+    expect(moving.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets, your second factor and the usage records of your Bots' runs are being moved to gb-lon's own database.");
+  });
+
   it("says your second factor is kept in the region too when the server says so", () => {
     const held = residencyLines(view({ serverData: { region: "de-fra-2", inRegion: false }, chats: { store: true, inRegion: true, signIns: true, secrets: true, secondFactors: true } }));
     expect(held.lines).toContain("Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets and your second factor are kept in gb-lon, in a database of their own there.");
