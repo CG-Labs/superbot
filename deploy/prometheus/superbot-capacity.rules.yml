@@ -24,7 +24,7 @@ groups:
           severity: page
         annotations:
           summary: Machines are waiting for room on an Incus host
-          description: "{{ $value }} machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load."
+          description: "{{ $value }} machines can't be made because no Incus host has room (machine.placement_failed in the audit log says why). Add capacity (INCUS_CAPACITY, or another host in INCUS_HOSTS), undrain a host, or free room; botctl machine hosts shows each host's load. See docs/support/runbook-capacity.md#no-room-for-new-machines."
 
       # Requests for machines refused for want of room.
       - alert: SuperBotMachineRequestsRefusedForRoom
@@ -33,7 +33,7 @@ groups:
           severity: ticket
         annotations:
           summary: A machine was refused because no Incus host had room
-          description: "Placement refused or held back a machine in the last 15 minutes (machine.placement_failed in the audit log names the plan and each host's reason). Add capacity or a host before more are refused."
+          description: "Placement refused or held back a machine in the last 15 minutes (machine.placement_failed in the audit log names the plan and each host's reason). Add capacity or a host before more are refused. See docs/support/runbook-capacity.md#no-room-for-new-machines."
 
       # Little room left across the hosts new machines may go on: the next few requests
       # may be refused. By CPUs, memory, disk and machine count, each against its limit
@@ -65,7 +65,7 @@ groups:
           severity: ticket
         annotations:
           summary: "Incus hosts are nearly out of room ({{ $labels.resource }})"
-          description: "Less than 15% of the open Incus hosts' {{ $labels.resource }} is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines."
+          description: "Less than 15% of the open Incus hosts' {{ $labels.resource }} is left for new machines (INCUS_CAPACITY, INCUS_MAX_MACHINES). Add capacity or a host, or undrain one, before placement starts refusing machines. See docs/support/runbook-capacity.md#no-room-for-new-machines."
 
       # A machine is on a host dedicated to another team, or on a shared host while its
       # team has hosts of its own (ADR 0166): someone joined or left a team.
@@ -76,7 +76,7 @@ groups:
           severity: ticket
         annotations:
           summary: Machines are on Incus hosts their team's dedication doesn't allow
-          description: "{{ $value }} machines are on a host dedicated to another team, or on a shared host while their team has hosts of its own, since their owner joined or left a team. botctl machine hosts lists them under misplaced; move each with botctl machine restore <user> <backup-id> --host <name> --yes."
+          description: "{{ $value }} machines are on a host dedicated to another team, or on a shared host while their team has hosts of its own, since their owner joined or left a team. botctl machine hosts lists them under misplaced; move each with botctl machine restore <user> <backup-id> --host <name> --yes. See docs/support/runbook-capacity.md#machines-on-another-teams-host."
 
       # Nowhere for a new machine at all.
       - alert: SuperBotNoOpenIncusHost
@@ -86,7 +86,7 @@ groups:
           severity: page
         annotations:
           summary: No Incus host is open for new machines
-          description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each."
+          description: "Every Incus host is down, lost, failing its checks or drained, so no machine can be made or restored elsewhere. botctl machine hosts says why for each. See docs/support/runbook-capacity.md#no-room-for-new-machines."
 
       # What hosts say they use, botd's own included.
       - alert: SuperBotHostMemoryHigh
@@ -96,7 +96,7 @@ groups:
           severity: ticket
         annotations:
           summary: "Host {{ $labels.host }} is using over 90% of its memory"
-          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 90% of its memory for 15 minutes. On an Incus host, containers may be OOM-killed under load: lower INCUS_CAPACITY's memory or move machines off (ADR 0081). On botd's own host, check what else runs there."
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 90% of its memory for 15 minutes. On an Incus host, containers may be OOM-killed under load: lower INCUS_CAPACITY's memory or move machines off (ADR 0081). On botd's own host, check what else runs there. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
 
       - alert: SuperBotHostDiskFilling
         expr: superbot_host_disk_used_bytes{job="superbot"} / superbot_host_disk_bytes{job="superbot"} > 0.85
@@ -105,7 +105,7 @@ groups:
           severity: ticket
         annotations:
           summary: "Disk {{ $labels.disk }} on host {{ $labels.host }} is over 85% full"
-          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 85% of its {{ $labels.disk }} disk. On an Incus host, snapshots and a restore in place's second copy count here but not in INCUS_CAPACITY; on botd's own host, DATA_DIR holds the database and backups. Free space or grow the disk."
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 85% of its {{ $labels.disk }} disk. On an Incus host, snapshots and a restore in place's second copy count here but not in INCUS_CAPACITY; on botd's own host, DATA_DIR holds the database and backups. Free space or grow the disk. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
 
       - alert: SuperBotHostDiskFull
         expr: superbot_host_disk_used_bytes{job="superbot"} / superbot_host_disk_bytes{job="superbot"} > 0.95
@@ -114,7 +114,7 @@ groups:
           severity: page
         annotations:
           summary: "Disk {{ $labels.disk }} on host {{ $labels.host }} is nearly full"
-          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 95% of its {{ $labels.disk }} disk. Writes will soon fail: machines' disks on an Incus pool, or botd's database and backups in DATA_DIR. Free space now."
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has used over 95% of its {{ $labels.disk }} disk. Writes will soon fail: machines' disks on an Incus pool, or botd's database and backups in DATA_DIR. Free space now. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
 
       - alert: SuperBotHostCPUSaturated
         expr: superbot_host_load5{job="superbot"} / superbot_host_cpus{job="superbot"} > 1.5
@@ -123,7 +123,7 @@ groups:
           severity: ticket
         annotations:
           summary: "Host {{ $labels.host }} is overloaded"
-          description: "{{ $labels.host }} ({{ $labels.kind }}) has had a 5-minute load average over 1.5 per CPU for 30 minutes, so Bots' runs there are slow. On an Incus host, lower INCUS_CAPACITY's CPUs (they may be overcommitted, ADR 0081) or move machines off."
+          description: "{{ $labels.host }} ({{ $labels.kind }}) has had a 5-minute load average over 1.5 per CPU for 30 minutes, so Bots' runs there are slow. On an Incus host, lower INCUS_CAPACITY's CPUs (they may be overcommitted, ADR 0081) or move machines off. See docs/support/runbook-capacity.md#a-host-is-short-of-memory-disk-or-cpu."
 
       # An Incus host that answers but hasn't said what it uses: its use panels are stale.
       - alert: SuperBotIncusHostReadingStale
@@ -133,4 +133,4 @@ groups:
           severity: ticket
         annotations:
           summary: "botd can't read what Incus host {{ $labels.host }} uses"
-          description: "{{ $labels.host }} answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\")."
+          description: "{{ $labels.host }} answers botd's checks but hasn't said what it uses for over 15 minutes, so its memory, disk and load metrics are stale. botd's log says why (\"didn't say what it uses\"). See docs/support/runbook-capacity.md#a-hosts-readings-are-stale."

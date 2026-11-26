@@ -29,7 +29,7 @@ groups:
           severity: ticket
         annotations:
           summary: "A {{ $labels.provider }} machine on {{ $labels.tier }} has no backup within its RPO"
-          description: "The oldest newest {{ $labels.provider }} backup among running {{ $labels.tier }} machines is {{ $value | humanizeDuration }} old, past the RPO (MACHINE_BACKUPS_RPO_HOURS). machine.rpo_breached in the audit log names the machines. Check their backups in the provider's console: a failed or paused backup, backups turned off, or a machine too busy to snapshot."
+          description: "The oldest newest {{ $labels.provider }} backup among running {{ $labels.tier }} machines is {{ $value | humanizeDuration }} old, past the RPO (MACHINE_BACKUPS_RPO_HOURS). machine.rpo_breached in the audit log names the machines. Check their backups in the provider's console: a failed or paused backup, backups turned off, or a machine too busy to snapshot. See docs/support/runbook-backups.md#machine-backups."
 
       # Running machines whose provider backups are off: nothing to restore them from.
       # botd turns them on each reconcile when MACHINE_BACKUPS=on; this stays on when that
@@ -41,4 +41,4 @@ groups:
           severity: ticket
         annotations:
           summary: "{{ $labels.provider }} machines on {{ $labels.tier }} have backups off"
-          description: "{{ $value }} running {{ $labels.tier }} machines have had {{ $labels.provider }} backups off for an hour, so they can't be restored. With MACHINE_BACKUPS=on, machine.backups_failed in the audit log says why botd couldn't turn them on; with MACHINE_BACKUPS=off, turn it on or record why these machines go without."
+          description: "{{ $value }} running {{ $labels.tier }} machines have had {{ $labels.provider }} backups off for an hour, so they can't be restored. With MACHINE_BACKUPS=on, machine.backups_failed in the audit log says why botd couldn't turn them on; with MACHINE_BACKUPS=off, turn it on or record why these machines go without. See docs/support/runbook-backups.md#machine-backups."

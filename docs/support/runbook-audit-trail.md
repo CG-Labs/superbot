@@ -30,7 +30,7 @@ The settings and checks are in the [audit export guide](../ops/audit-export.md);
 
 ## The export is failing
 
-After 3 failures in a row botd records `audit.export_failing` with a `reason`, and keeps retrying from 1 second up to 5 minutes for as long as it takes. Events wait in the database meanwhile, and retention never deletes one a sink hasn't taken, so nothing is lost; the database grows instead. `audit.export_recovered` follows when the sink takes events again.
+Alert: `SuperBotAuditExportFailing`, a sink failing for 15 minutes. After 3 failures in a row botd records `audit.export_failing` with a `reason`, and keeps retrying from 1 second up to 5 minutes for as long as it takes. Events wait in the database meanwhile, and retention never deletes one a sink hasn't taken, so nothing is lost; the database grows instead. `audit.export_recovered` follows when the sink takes events again.
 
 | Reason | Usually | Fix |
 |---|---|---|
@@ -44,7 +44,7 @@ A long failure is worth Severity 2 when the database is filling the disk (`botd 
 
 ## A sink was stopped
 
-`audit.export_stopped` is recorded once when botd starts without a sink it was sending to: `reason` `removed` (other sinks still run) or `export_off` (none does), with the last event it took (`delivered`) and how many it hadn't (`pending`). It's a success in the audit log, since someone changed a setting, but from then on that SIEM gets nothing, which is exactly what someone covering their tracks would do first. So:
+Alert: `SuperBotAuditSinkStopped`, for the hour after the stop. `audit.export_stopped` is recorded once when botd starts without a sink it was sending to: `reason` `removed` (other sinks still run) or `export_off` (none does), with the last event it took (`delivered`) and how many it hadn't (`pending`). It's a success in the audit log, since someone changed a setting, but from then on that SIEM gets nothing, which is exactly what someone covering their tracks would do first. So:
 
 1. Find who changed `AUDIT_EXPORT` and why: the change record, the customer's admins. botd can't name them; the setting lives in `.env`.
 2. If nobody can, it's a suspected security incident: Severity 1, and the customer's [incident response](../security/policies/incident-response.md).
@@ -54,7 +54,7 @@ A long failure is worth Severity 2 when the database is filling the disk (`botd 
 
 ## The chain check failed
 
-botd checks the whole chain a minute after starting and once a day, and records `audit.verified`; a failed one has the first break's `reason`. `botctl audit verify` runs the same check now and names `firstBroken`.
+Alert: `SuperBotAuditChainCheckFailed`, a page. botd checks the whole chain a minute after starting and once a day, and records `audit.verified`; a failed one has the first break's `reason`. `botctl audit verify` runs the same check now and names `firstBroken`.
 
 | Reason | Means | Then |
 |---|---|---|
@@ -78,7 +78,7 @@ Then, in this order:
 
 ## Timestamps are failing
 
-With `AUDIT_TIMESTAMP_URL`, each checkpoint goes to a TSA. Timestamping never holds up the log: checkpoints wait as pending and are stamped oldest first. After 3 failures in a row botd records `audit.timestamp_failing` with a `reason`; `audit.timestamp_recovered` follows.
+Alert: `SuperBotAuditTimestampsFailing`, timestamps failing for an hour. With `AUDIT_TIMESTAMP_URL`, each checkpoint goes to a TSA. Timestamping never holds up the log: checkpoints wait as pending and are stamped oldest first. After 3 failures in a row botd records `audit.timestamp_failing` with a `reason`; `audit.timestamp_recovered` follows.
 
 | Reason | Usually | Fix |
 |---|---|---|

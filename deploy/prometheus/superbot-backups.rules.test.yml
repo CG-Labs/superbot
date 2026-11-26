@@ -35,7 +35,7 @@ tests:
               tier: starter
             exp_annotations:
               summary: "A linode machine on starter has no backup within its RPO"
-              description: "The oldest newest linode backup among running starter machines is 1d 3h 46m 40s old, past the RPO (MACHINE_BACKUPS_RPO_HOURS). machine.rpo_breached in the audit log names the machines. Check their backups in the provider's console: a failed or paused backup, backups turned off, or a machine too busy to snapshot."
+              description: "The oldest newest linode backup among running starter machines is 1d 3h 46m 40s old, past the RPO (MACHINE_BACKUPS_RPO_HOURS). machine.rpo_breached in the audit log names the machines. Check their backups in the provider's console: a failed or paused backup, backups turned off, or a machine too busy to snapshot. See docs/support/runbook-backups.md#machine-backups."
       - eval_time: 45m
         alertname: SuperBotMachineBackupsStale
         exp_alerts: []
@@ -67,7 +67,7 @@ tests:
               tier: starter
             exp_annotations:
               summary: "linode machines on starter have backups off"
-              description: "2 running starter machines have had linode backups off for an hour, so they can't be restored. With MACHINE_BACKUPS=on, machine.backups_failed in the audit log says why botd couldn't turn them on; with MACHINE_BACKUPS=off, turn it on or record why these machines go without."
+              description: "2 running starter machines have had linode backups off for an hour, so they can't be restored. With MACHINE_BACKUPS=on, machine.backups_failed in the audit log says why botd couldn't turn them on; with MACHINE_BACKUPS=off, turn it on or record why these machines go without. See docs/support/runbook-backups.md#machine-backups."
       - eval_time: 85m
         alertname: SuperBotMachineBackupsOff
         exp_alerts: []
