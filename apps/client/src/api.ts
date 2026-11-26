@@ -17,6 +17,7 @@ import type {
   BotView,
   CustomRole,
   CustomRoleRef,
+  KeptBotsResult,
   LoginCode,
   Message,
   MfaPolicy,
@@ -291,6 +292,11 @@ export class SuperBotApi {
   /** One of the Bot owner's service accounts keeps and manages it from now on (ADR 0229). Owner or admin. */
   async keepBot(id: string, serviceAccount: string): Promise<BotAccessView> {
     return this.request<BotAccessView>("PUT", `/api/bots/${encodeURIComponent(id)}/keeper`, { serviceAccount });
+  }
+
+  /** The service account keeps every one of these Bots of its owner's, or none (ADR 0324). Owner or admin. */
+  async keepBots(serviceAccount: string, bots: string[]): Promise<KeptBotsResult> {
+    return this.request<KeptBotsResult>("POST", `/api/service-accounts/${encodeURIComponent(serviceAccount)}/kept-bots`, { bots });
   }
 
   /** The service account keeping it stops; it stays its owner's (ADR 0229). */
