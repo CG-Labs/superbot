@@ -49,6 +49,10 @@ describe("the settings kit", () => {
     expect(kit(themes.light)).not.toBe(kit(themes.dark));
     expect(kit(themes.dark).primary).toMatchObject({ backgroundColor: themes.dark.c.accent });
   });
+
+  it.each(["light", "dark"] as const)("draws %s group headings in muted text, which meets AA on every ground", (scheme) => {
+    expect(kit(themes[scheme]).section).toMatchObject({ color: themes[scheme].c.textMuted });
+  });
 });
 
 describe("Chips", () => {

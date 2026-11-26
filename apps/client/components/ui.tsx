@@ -43,7 +43,7 @@ const build = (t: Theme) =>
     cardTitle: { color: t.c.text, ...type(t, "lg"), fontWeight: t.font.weight.semibold },
     /** A group heading above a card, as in the sidebar. */
     section: {
-      color: t.c.textFaint,
+      color: t.c.textMuted,
       ...type(t, "xs"),
       fontWeight: t.font.weight.semibold,
       textTransform: "uppercase",

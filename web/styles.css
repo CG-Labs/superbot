@@ -186,7 +186,7 @@ input[type="checkbox"] { padding: 0; }
   box-shadow: var(--shadow-card); overflow: hidden;
 }
 .grid th {
-  text-align: left; font-weight: 600; color: var(--c-text-faint); font-size: var(--fs-xs); line-height: var(--lh-xs);
+  text-align: left; font-weight: 600; color: var(--text-dim); font-size: var(--fs-xs); line-height: var(--lh-xs);
   text-transform: uppercase; letter-spacing: 0.04em;
   padding: var(--space-md) var(--space-lg); background: var(--c-surface); border-bottom: 1px solid var(--border);
 }
@@ -195,7 +195,7 @@ input[type="checkbox"] { padding: 0; }
 .grid tbody tr { transition: background var(--motion-fast) ease; }
 .grid tbody tr:hover td { background: var(--c-hover); }
 .grid tr.revoked td { color: var(--text-dim); }
-.grid tr.section td { color: var(--c-text-faint); font-size: var(--fs-xs); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding-top: var(--space-lg); background: var(--c-surface); }
+.grid tr.section td { color: var(--text-dim); font-size: var(--fs-xs); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding-top: var(--space-lg); background: var(--c-surface); }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
 .grid td.actions { display: table-cell; text-align: right; }
 .grid td.actions .btn { margin: 0 0 4px 4px; }
