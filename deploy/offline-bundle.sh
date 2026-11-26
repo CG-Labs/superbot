@@ -756,12 +756,12 @@ compose_downgrade_check() {
   out=$(stack_botd_run "$image" support check </dev/null) || rc=$?
   ((rc <= 1)) \
     || die "botd support check didn't finish in $image (status $rc), so the stack's database wasn't checked: $(compose_err). Nothing in the stack has changed: keep it on the image it runs, and check again ($doc)"
-  line=$(grep -E '^(ok|info|warn|fail) +database ' <<<"$out" | head -n 1) || true
+  line=$(grep -E '^(ok|info|warn|fail) +database ' <<<"$out" | sed -n 1p) || true
   if [[ -z "$line" ]]; then
     warn "botd support check in $image said nothing of the stack's database, so whether a newer release ran on it wasn't checked: $(compose_err)"
     return 0
   fi
-  why=$(grep -oE 'made by a newer botd \([^)]*\)|botd [^ ;]+ ran on it last; this is [^ ;]+' <<<"$line" | head -n 1) || true
+  why=$(grep -oE 'made by a newer botd \([^)]*\)|botd [^ ;]+ ran on it last; this is [^ ;]+' <<<"$line" | sed -n 1p) || true
   if [[ -z "$why" ]]; then
     log "Database: no release newer than botd in $image has run on this stack's database (botd support check)"
     return 0
@@ -867,7 +867,7 @@ cmd_check_compose() {
 # now, else how to take one.
 compose_rollback_notice() {
   local dir=$COMPOSE_ROLLBACK_DIR doc="docs/ops/air-gapped.md#going-back-with-compose" cid id
-  cid=$(stack ps -q botd 2>/dev/null | head -n 1) || true
+  cid=$(stack ps -q botd 2>/dev/null | sed -n 1p) || true
   id=$([[ -z "$cid" ]] || docker inspect -f '{{.Image}}' "$cid" 2>/dev/null) || true
   if [[ -n "$id" && -f "$dir/record" && "$(record_value "$dir/record" image_id)" == "$id" ]]; then
     log "Way back: the rollback point in $dir, taken $(record_value "$dir/record" taken) on the image botd runs now ($0 rollback-compose, $doc)"
@@ -1012,7 +1012,7 @@ cmd_rollback_compose() {
   rc=0
   out=$(SUPERBOT_IMAGE=$image stack run --rm --no-deps -T "${mount[@]}" botd superbot-restore "${rargs[@]}" --check - <"$dir/$archive" 2>"$COMPOSE_ERR") || rc=$?
   [[ $rc -eq 0 ]] || die "superbot-restore in $image refused the rollback point: $(compose_err). Nothing has changed"
-  newest=$(sed -n 's/^newest audit: *//p' <<<"$out" | head -n 1)
+  newest=$(sed -n 's/^newest audit: *//p' <<<"$out" | sed -n 1p)
   log "Rollback point: $archive, taken $taken on $image (its newest audit event: ${newest:-unknown}); superbot-restore --check passed"
   before=$(pre_restores "$image") || die "Couldn't look in botd's data volume: $(compose_err). Nothing has changed"
 
