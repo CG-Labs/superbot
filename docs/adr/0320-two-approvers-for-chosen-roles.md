@@ -49,7 +49,7 @@ We chose option 1.
 
 **Who hears.** A first approval notifies those who could give the second, through ADR 0302's channels: the server's request list and webhook, and, for a team request, the team's other deciders by email and push. The first approver isn't told. The push reads "A request on {team} needs a second approver." The asker sees "Approved once, waiting for a second approver" in their requests.
 
-**Erasure** pseudonymises `first_by` with the rest of a person's audit trail ([ADR 0102](0102-erasing-a-users-data.md)); an erased first approver no longer counts.
+**Erasure** names a first approver, and anyone who decided a request, by their pseudonym without their note, as ADR 0102 does for approvals they decided ([ADR 0102](0102-erasing-a-users-data.md)); an erased first approver no longer counts.
 
 **Clients.** The roles editors have "Needs two approvers", only for a requestable role (and cleared when a role stops being requestable). Request rows show the first approval and offer the first approval's hours or fewer, or, when it no longer counts, say so and treat the next approval as the first; the first approver sees "You gave the first approval. Someone else gives the second." instead of Approve, and can still deny. "Approve (1 of 2)" and its confirmation say nothing is given yet. The asker's card says a role needs two approvers before they ask. `botctl role approve` says when it gave the first approval.
 
@@ -78,7 +78,7 @@ We chose option 1.
   - `team_owners_and_admins_give_either_approval_within_their_team`: a team owner first and an admin second, or the other way round; not both by one person; a team admin who has since become the team's plain member no longer counts and is replaced.
   - unit `a_first_approval_counts_for_admins_and_the_teams_deciders_only`: `first_counts` across roles, team roles, IdP-managed team roles, disabled, service and asker.
 - `team_role_requests_http_tests.rs`: `a_first_approval_tells_the_others_who_may_give_the_second` (the team's other deciders are told by email and push, the first approver isn't).
-- `db` unit tests: `a_first_approval_is_saved_and_its_erased_approver_no_longer_counts`, and `a_roles_approvals_are_saved_with_its_other_fields_or_not_at_all`.
+- `db` unit tests: `a_first_approval_is_saved_and_its_erased_approver_no_longer_counts` (with the notes of an erased first approver and decider gone), and `a_roles_approvals_are_saved_with_its_other_fields_or_not_at_all`.
 - `evidence_http_tests.rs`: custom roles carry `approvals`.
 - `botctl` unit tests: `--approvals` on `role add|edit`, and the first-approval message.
 - Client: `roles.test.ts` (draft, cap, labels), `RolesAdmin.test.tsx` (the checkbox, first and second approval, the first approver can't give the second, the picked hours capped again when a reload brings a shorter first approval), `RoleRequestsCard.test.tsx` (the asker sees two approvers are needed and where a request is).

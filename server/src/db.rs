@@ -7719,8 +7719,9 @@ impl Db {
         run("DELETE FROM billing_checkouts WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM team_members WHERE user_id = ?", &[&user_id])?;
         run("DELETE FROM role_requests WHERE user_id = ?", &[&user_id])?;
-        run("UPDATE role_requests SET decided_by = ?2 WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
-        run("UPDATE role_requests SET first_by = ?2 WHERE first_by = ?1", &[&user_id, &pseudonym])?;
+        // Named by the pseudonym, without their note (ADR 0102).
+        run("UPDATE role_requests SET decided_by = ?2, note = NULL WHERE decided_by = ?1", &[&user_id, &pseudonym])?;
+        run("UPDATE role_requests SET first_by = ?2, first_note = NULL WHERE first_by = ?1", &[&user_id, &pseudonym])?;
         run("DELETE FROM settings WHERE key = ?", &[&format!("machine_egress_policy:user:{user_id}")])?;
         run("DELETE FROM residency_pins WHERE subject_type = 'user' AND subject_id = ?", &[&user_id])?;
         run("DELETE FROM settings WHERE key = ?", &[&format!("{}{user_id}", crate::machines::egress_policy::USER_KEY)])?;
@@ -12338,10 +12339,19 @@ mod tests {
         assert_eq!(approve(&boss.id, None).unwrap_err(), RoleRequestError::ApprovedAlready);
 
         db.erase_user(&boss.id, "erased-1", None, &[]).unwrap();
-        assert_eq!(db.role_request(&q.id).unwrap().first.map(|f| f.by), Some("erased-1".into()), "named by their pseudonym");
+        let kept = db.role_request(&q.id).unwrap().first.unwrap();
+        assert_eq!((kept.by.as_str(), kept.hours, kept.note), ("erased-1", 4, None), "named by their pseudonym, without their note");
         let Ok(RequestApproval::First { replaced: Some(old), .. }) = approve(&ana.id, None) else { panic!("an erased approver no longer counts") };
         assert_eq!((old.by.as_str(), old.hours), ("erased-1", 4));
         assert!(db.user(&cy.id).unwrap().role_id.is_none());
+
+        // A decider's note goes with them too.
+        let dee = db.create_user(None, Some("dee@example.com"), "Dee", Role::Admin).unwrap();
+        assert!(matches!(approve(&dee.id, None), Ok(RequestApproval::Given(_))));
+        assert_eq!(db.role_request(&q.id).unwrap().note.as_deref(), Some("ok"));
+        db.erase_user(&dee.id, "erased-2", None, &[]).unwrap();
+        let decided = db.role_request(&q.id).unwrap();
+        assert_eq!((decided.decided_by.as_deref(), decided.note), (Some("erased-2"), None));
     }
 
     #[test]
