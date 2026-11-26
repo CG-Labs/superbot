@@ -1,6 +1,6 @@
 import React from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { colors } from "../src/theme";
+import { themedStyles, type } from "../src/theme";
 
 interface Props<T extends string | number> {
   options: readonly { value: T; label: string }[];
@@ -11,6 +11,7 @@ interface Props<T extends string | number> {
 
 /** A row of choices, one picked. */
 export function Chips<T extends string | number>({ options, value, onChange, disabled }: Props<T>) {
+  const styles = useStyles();
   return (
     <View style={styles.row} accessibilityRole="radiogroup">
       {options.map((o) => {
@@ -20,7 +21,7 @@ export function Chips<T extends string | number>({ options, value, onChange, dis
             key={String(o.value)}
             accessibilityRole="radio"
             accessibilityState={{ checked: on, disabled }}
-            style={[styles.chip, on && styles.on, disabled && styles.disabled]}
+            style={({ pressed }) => [styles.chip, pressed && !on && styles.pressed, on && styles.on, disabled && styles.disabled]}
             disabled={disabled}
             onPress={() => onChange(o.value)}
           >
@@ -32,11 +33,21 @@ export function Chips<T extends string | number>({ options, value, onChange, dis
   );
 }
 
-const styles = StyleSheet.create({
-  row: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  chip: { paddingVertical: 7, paddingHorizontal: 14, borderRadius: 999, borderWidth: 1, borderColor: "#3a3a3a" },
-  on: { backgroundColor: "#f2f2f2", borderColor: "#f2f2f2" },
-  disabled: { opacity: 0.5 },
-  text: { color: colors.text, fontSize: 14 },
-  onText: { color: "#111" },
-});
+const useStyles = themedStyles((t) =>
+  StyleSheet.create({
+    row: { flexDirection: "row", flexWrap: "wrap", gap: t.space.sm },
+    chip: {
+      paddingVertical: 6,
+      paddingHorizontal: 14,
+      borderRadius: t.radius.pill,
+      borderWidth: 1,
+      borderColor: t.c.border,
+      backgroundColor: t.c.raised,
+    },
+    pressed: { backgroundColor: t.c.hover },
+    on: { backgroundColor: t.c.text, borderColor: t.c.text },
+    disabled: { opacity: 0.5 },
+    text: { color: t.c.text, ...type(t, "sm") },
+    onText: { color: t.c.bg, fontWeight: t.font.weight.medium },
+  }),
+);

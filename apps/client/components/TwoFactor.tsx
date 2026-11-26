@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { SvgXml } from "react-native-svg";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
-import { colors } from "../src/theme";
+import { themedStyles, type, useTheme } from "../src/theme";
 import type { MfaPolicy, MfaProof, MfaSetup, MfaStatus } from "../src/types";
 import { Chips } from "./Chips";
+import { kit, Spinner } from "./ui";
 
 /** A typed code: six digits for the app, anything else is a recovery code. */
 export function proofFrom(input: string): MfaProof | null {
@@ -18,6 +19,7 @@ export function proofFrom(input: string): MfaProof | null {
 
 /** The key to add to an authenticator app: its QR code, the key to type, and a link. */
 export function MfaSetupView({ setup }: { setup: MfaSetup }) {
+  const styles = useStyles();
   return (
     <View style={styles.setup} testID="mfa-setup">
       {setup.qrSvg ? (
@@ -38,6 +40,7 @@ export function MfaSetupView({ setup }: { setup: MfaSetup }) {
 
 /** Recovery codes, shown this once: the server keeps only their hashes. */
 export function RecoveryCodes({ codes, onDone, doneLabel = "I saved them" }: { codes: string[]; onDone: () => void; doneLabel?: string }) {
+  const styles = useStyles();
   const [copied, setCopied] = useState<boolean | null>(null);
   return (
     <View style={styles.codesWrap} testID="recovery-codes">
@@ -74,6 +77,8 @@ const POLICY_LABELS: { value: MfaPolicy; label: string }[] = [
  * protects sign-in codes and the password; single sign-on relies on your IdP's MFA.
  */
 export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boolean }) {
+  const styles = useStyles();
+  const t = useTheme();
   const [status, setStatus] = useState<MfaStatus | null>(null);
   const [setup, setSetup] = useState<MfaSetup | null>(null);
   const [codes, setCodes] = useState<string[] | null>(null);
@@ -152,7 +157,7 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
         </Text>
       ) : null}
       {!status ? (
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       ) : codes ? (
         <RecoveryCodes codes={codes} onDone={() => setCodes(null)} />
       ) : setup ? (
@@ -164,7 +169,7 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
             autoComplete="one-time-code"
             maxLength={6}
             placeholder="6-digit code"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             value={input}
             onChangeText={setInput}
             accessibilityLabel="Code from your authenticator app"
@@ -186,7 +191,7 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Code or recovery code"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             value={input}
             onChangeText={setInput}
             accessibilityLabel="Code or recovery code"
@@ -242,29 +247,33 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
   );
 }
 
-const styles = StyleSheet.create({
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  field: { gap: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: colors.border },
-  label: { color: colors.text, fontWeight: "500" },
-  text: { color: colors.text },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 13 },
-  warn: { color: colors.warning },
-  error: { color: colors.danger },
-  link: { color: colors.blueDot },
-  setup: { gap: 8, alignItems: "flex-start" },
-  qr: { backgroundColor: "#fff", padding: 8, borderRadius: 12 },
-  key: { color: colors.text, fontFamily: "monospace", fontSize: 15 },
-  codesWrap: { gap: 10 },
-  codes: { flexDirection: "row", flexWrap: "wrap", gap: 8, padding: 12, borderRadius: 12, borderWidth: 1, borderColor: colors.border },
-  code: { color: colors.text, fontFamily: "monospace", fontSize: 15, width: "45%" },
-  row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
-  input: { backgroundColor: colors.bgBubble, borderColor: colors.border, borderWidth: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, color: colors.text, fontSize: 16 },
-  btn: { borderRadius: 10, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 14, paddingVertical: 8 },
-  btnText: { color: colors.text },
-  primary: { backgroundColor: colors.blue, borderColor: colors.blue },
-  primaryText: { color: "#fff", fontWeight: "600" },
-  dangerText: { color: colors.danger },
-  disabled: { opacity: 0.5 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    card: k.card,
+    cardTitle: k.cardTitle,
+    field: k.field,
+    label: k.label,
+    text: k.text,
+    dim: k.dim,
+    faint: k.faint,
+    warn: k.warn,
+    error: k.error,
+    link: k.link,
+    setup: { gap: t.space.sm, alignItems: "flex-start" },
+    // Scanners need dark modules on white, in either scheme.
+    qr: { backgroundColor: "#ffffff", padding: t.space.sm, borderRadius: t.radius.md },
+    key: { ...k.mono, ...type(t, "md") },
+    codesWrap: { gap: t.space.md },
+    codes: { ...k.inset, flexDirection: "row", flexWrap: "wrap" },
+    code: { ...k.mono, ...type(t, "md"), width: "45%" },
+    row: k.actions,
+    input: k.input,
+    btn: k.btn,
+    btnText: k.btnText,
+    primary: k.primary,
+    primaryText: k.primaryText,
+    dangerText: k.dangerText,
+    disabled: k.disabled,
+  });
 });

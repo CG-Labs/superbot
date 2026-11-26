@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { BLOCKED, projectProblem, pushUnavailable } from "../src/push";
 import { pushDevice, type PushDevice } from "../src/pushDevice";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 import type { PushView } from "../src/types";
 import { Chips } from "./Chips";
+import { kit, Spinner } from "./ui";
 
 export type PushApi = Pick<SuperBotApi, "pushDevice" | "registerPush" | "unregisterPush">;
 
@@ -24,6 +25,7 @@ const ON_OFF = [
  * where the server sends them. Each push says only which Bot needs you.
  */
 export function PushCard({ api, device = pushDevice }: Props) {
+  const styles = useStyles();
   const [view, setView] = useState<PushView | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -86,7 +88,7 @@ export function PushCard({ api, device = pushDevice }: Props) {
   const unavailable = pushUnavailable(view, supported);
   const body = () => {
     if (!supported) return <Text style={styles.dim}>{unavailable}</Text>;
-    if (!view) return error ? null : <ActivityIndicator color={colors.textDim} />;
+    if (!view) return error ? null : <Spinner />;
     const d = view.device;
     // With push paused on the server, a saved phone can still be removed, not added.
     if (!view.available && !d) return <Text style={styles.dim}>{unavailable}</Text>;
@@ -156,12 +158,15 @@ export function PushCard({ api, device = pushDevice }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  field: { gap: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: colors.border },
-  label: { color: colors.text, fontWeight: "500" },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  dim: { color: colors.textDim },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    card: k.card,
+    cardTitle: k.cardTitle,
+    field: k.field,
+    label: k.label,
+    good: k.good,
+    error: k.error,
+    dim: k.dim,
+  });
 });

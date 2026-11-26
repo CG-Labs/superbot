@@ -13,7 +13,7 @@ import { MfaRequired } from "../src/api";
 import { defaultServerUrl } from "../src/auth";
 import { fetchSsoProviders, ssoButtonText, ssoButtonTone, ssoSupported, type SsoProvider } from "../src/sso";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { colors, ThemeScope } from "../src/theme";
 import { MfaSetupView, proofFrom, RecoveryCodes } from "./TwoFactor";
 
 /** `inviteCode` fills in the code from an invite link; it is only spent on Connect. */
@@ -82,7 +82,9 @@ export function LoginScreen({ inviteCode = null }: { inviteCode?: string | null 
           <Text style={styles.title}>SuperBot</Text>
           <Text style={styles.sub}>Two-factor authentication is on.</Text>
           {error ? <Text style={styles.error}>{error}</Text> : null}
-          <RecoveryCodes codes={saved.codes} doneLabel="I saved them. Continue" onDone={() => void run(saved.finish)} />
+          <ThemeScope scheme="dark">
+            <RecoveryCodes codes={saved.codes} doneLabel="I saved them. Continue" onDone={() => void run(saved.finish)} />
+          </ThemeScope>
         </View>
       </View>
     );
@@ -96,7 +98,11 @@ export function LoginScreen({ inviteCode = null }: { inviteCode?: string | null 
           <Text style={styles.title}>SuperBot</Text>
           <Text style={styles.sub}>{enrolling ? "Set up two-factor authentication" : "Two-factor authentication"}</Text>
           <Text style={styles.hint}>{mfa.message}</Text>
-          {enrolling && mfa.setup ? <MfaSetupView setup={mfa.setup} /> : null}
+          {enrolling && mfa.setup ? (
+            <ThemeScope scheme="dark">
+              <MfaSetupView setup={mfa.setup} />
+            </ThemeScope>
+          ) : null}
           <Text style={styles.label}>{enrolling ? "Code from your authenticator app" : "Code from your authenticator app, or a recovery code"}</Text>
           <TextInput
             style={styles.input}
