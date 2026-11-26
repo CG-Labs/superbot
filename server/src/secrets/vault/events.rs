@@ -1050,7 +1050,7 @@ pub(crate) mod tests {
         assert!(!off.describe().contains("change events"));
         let bad = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_TOKEN", "hvs.off"), ("VAULT_EVENTS", "yes")];
         let e = external::from_env(&settings(&bad), &EnvStore::fixed(&bad)).err().unwrap();
-        assert!(e.contains("VAULT_EVENTS must be 1"), "{e}");
+        assert!(e.contains("VAULT_EVENTS must be 1"));
         assert_eq!(external::unused_settings(&settings(&[("VAULT_EVENTS", "1")]), "aws"), ["VAULT_EVENTS"]);
     }
 }
