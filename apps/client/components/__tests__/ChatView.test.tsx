@@ -225,6 +225,14 @@ describe("ChatView", () => {
     await act(async () => fail(new TypeError("Network request failed")));
     expect(screen.getByLabelText("Message Ada")).toHaveDisplayValue("");
 
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Ada"), "Hi Ada"));
+    mockCtx.activeId = "b";
+    await view.rerender(ui());
+    expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Hi Ada");
+
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), ""));
+    mockCtx.activeId = "a";
+    await view.rerender(ui());
     mockCtx.activeId = "b";
     await view.rerender(ui());
     expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");

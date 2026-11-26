@@ -105,13 +105,16 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
 
   /** Words from failed sends, kept per Bot so they only come back in that Bot's chat. */
   const unsentRef = useRef<Record<string, string>>({});
+  const textRef = useRef(text);
+  textRef.current = text;
 
   useEffect(() => {
     if (!activeId) return;
+    // Only into an empty box; otherwise it waits for the next visit or a Retry.
     const unsent = unsentRef.current[activeId];
-    if (unsent) {
+    if (unsent && !textRef.current) {
       delete unsentRef.current[activeId];
-      setText((cur) => cur || unsent);
+      setText(unsent);
     }
     void load(activeId);
   }, [activeId, load]);
@@ -156,13 +159,18 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
   const send = (body: string, id: string) =>
     void sendText(body, undefined, id).catch((err) => {
       // Gives the words back unless something new was typed meanwhile.
-      if (shownRef.current === id) setText((cur) => cur || body);
-      else unsentRef.current[id] = body;
+      if (shownRef.current !== id) unsentRef.current[id] = body;
+      else
+        setText((cur) => {
+          if (!cur) return body;
+          unsentRef.current[id] = body;
+          return cur;
+        });
       toast.error(err, "Couldn't send your message", {
         label: "Retry",
         onPress: () => {
           if (shownRef.current === id) setText((cur) => (cur === body ? "" : cur));
-          else if (unsentRef.current[id] === body) delete unsentRef.current[id];
+          if (unsentRef.current[id] === body) delete unsentRef.current[id];
           send(body, id);
         },
       });
