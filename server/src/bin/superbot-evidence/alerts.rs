@@ -49,7 +49,7 @@ pub const MAX_RULES_BYTES: u64 = 1 << 20;
 const SHOWN_LABELS: [&str; 7] = ["alertname", "severity", "job", "harness", "route_class", "provider", "tier"];
 
 /// The rule files `deploy/prometheus/` ships, expected loaded unless `--rules` names others.
-pub const SHIPPED: [(&str, &str); 10] = [
+pub const SHIPPED: [(&str, &str); 11] = [
     ("superbot-audit-trail.rules.yml", include_str!("../../../../deploy/prometheus/superbot-audit-trail.rules.yml")),
     ("superbot-backup-encryption.rules.yml", include_str!("../../../../deploy/prometheus/superbot-backup-encryption.rules.yml")),
     ("superbot-backups.rules.yml", include_str!("../../../../deploy/prometheus/superbot-backups.rules.yml")),
@@ -58,6 +58,7 @@ pub const SHIPPED: [(&str, &str); 10] = [
     ("superbot-errors.rules.yml", include_str!("../../../../deploy/prometheus/superbot-errors.rules.yml")),
     ("superbot-health-score.rules.yml", include_str!("../../../../deploy/prometheus/superbot-health-score.rules.yml")),
     ("superbot-server-backups.rules.yml", include_str!("../../../../deploy/prometheus/superbot-server-backups.rules.yml")),
+    ("superbot-secrets-events.rules.yml", include_str!("../../../../deploy/prometheus/superbot-secrets-events.rules.yml")),
     ("superbot-signin.rules.yml", include_str!("../../../../deploy/prometheus/superbot-signin.rules.yml")),
     ("superbot-slo.rules.yml", include_str!("../../../../deploy/prometheus/superbot-slo.rules.yml")),
 ];

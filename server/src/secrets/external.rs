@@ -22,7 +22,9 @@
 //! - `refresh` reads every cached answer again at once, for an admin who rotated a value
 //!   and can't wait out the cache, and says which names botd read at startup have
 //!   changed since, which only a restart picks up (ADR 0291). A backend that announces
-//!   changes (Vault's events, ADR 0306) has each one read again as it comes (`changed`).
+//!   changes (Vault's events, ADR 0306) has each one read again as it comes (`changed`),
+//!   and says what its stream is doing (`watch_status`) for `botctl secrets backend` and
+//!   `/metrics` (ADR 0318).
 
 use super::leases::{self, RunCredentials};
 use super::{check_name, check_user_name, env_shaped, redact, server_secret, Error, Secret, SecretStore};
@@ -137,6 +139,46 @@ pub trait Provider: Send + Sync {
     /// if it is set to; whether it does. An error when it is set to but can't (ADR 0306).
     fn watch(&self, _store: std::sync::Weak<ExternalStore>) -> Result<bool, Error> {
         Ok(false)
+    }
+    /// What the stream `watch` started is doing; None when there is none (ADR 0318).
+    fn watch_status(&self) -> Option<WatchStatus> {
+        None
+    }
+}
+
+/// What a backend's change stream is doing (ADR 0318): counts since botd started, and botd's
+/// own reason for the last loss, never a path, a value or the backend's text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WatchStatus {
+    /// A stream is open now.
+    pub following: bool,
+    /// Since when it has been open, or not, in ms since the epoch.
+    pub since_ms: i64,
+    /// Changes read again as they were announced.
+    pub changes: u64,
+    pub last_change_ms: Option<i64>,
+    /// Times the stream was lost and subscribed to again.
+    pub lost: u64,
+    /// Reads of every cached answer, because events may have been missed: after a loss, a
+    /// handoff that may have dropped some, or too many changes waiting.
+    pub catch_ups: u64,
+    pub last_loss: Option<String>,
+}
+
+impl WatchStatus {
+    /// For `botctl secrets backend` and the setup report: ages in seconds at `now_ms`, so
+    /// they don't depend on the caller's clock.
+    pub fn view(&self, now_ms: i64) -> serde_json::Value {
+        let ago = |t: i64| ((now_ms - t).max(0) / 1000) as u64;
+        json!({
+            "following": self.following,
+            "forSeconds": ago(self.since_ms),
+            "changes": self.changes,
+            "lastChangeSecondsAgo": self.last_change_ms.map(ago),
+            "lost": self.lost,
+            "catchUps": self.catch_ups,
+            "lastLoss": self.last_loss,
+        })
     }
 }
 
@@ -512,6 +554,11 @@ impl ExternalStore {
     /// (`VAULT_EVENTS`, ADR 0306): whether it does. An error stops botd at startup.
     pub fn watch(self: &Arc<Self>) -> Result<bool, Error> {
         self.provider.watch(Arc::downgrade(self))
+    }
+
+    /// What the backend's change stream is doing, if it follows one (ADR 0318).
+    pub fn watch_status(&self) -> Option<WatchStatus> {
+        self.provider.watch_status()
     }
 
     /// The backend announced a change to `name` in `scope` at `index` (ADR 0306): reads it
@@ -1022,7 +1069,32 @@ fn diagnose(x: Option<&ExternalStore>) -> serde_json::Value {
         Err(e) => (false, None, format!("{} can't be read: {e}. Bot runs are refused until it answers (fail closed).", x.kind())),
     };
     let run_credentials = x.run_credentials.as_ref().map(|rc| rc.paths()).unwrap_or_default();
-    json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "userFolders": x.user_folders, "runCredentials": run_credentials, "ok": ok, "names": names, "detail": detail })
+    let events = x.watch_status().map(|w| w.view(crate::db::now()));
+    json!({ "backend": x.kind(), "description": x.describe(), "cacheSeconds": x.ttl.as_secs(), "userFolders": x.user_folders, "runCredentials": run_credentials, "ok": ok, "names": names, "detail": detail, "events": events })
+}
+
+/// The gauges and counters `/metrics` shows for the external store's change stream, when it
+/// follows one (ADR 0318); nothing otherwise. The only label is the backend's kind.
+pub fn render_metrics(out: &mut String) {
+    render_watch(active().as_deref(), out);
+}
+
+fn render_watch(x: Option<&ExternalStore>, out: &mut String) {
+    use crate::obs::metrics::{family, sample};
+    let Some((x, w)) = x.and_then(|x| Some((x, x.watch_status()?))) else { return };
+    let b = [("backend", x.kind())];
+    family(out, "superbot_secrets_change_events_following", "gauge", "1 while botd follows the external secrets store's change events (VAULT_EVENTS, ADR 0306), 0 while it is subscribing again (ADR 0318).");
+    sample(out, "superbot_secrets_change_events_following", &b, w.following as u8 as f64);
+    family(out, "superbot_secrets_change_events_changes_total", "counter", "Changes the external secrets store announced that botd read again.");
+    sample(out, "superbot_secrets_change_events_changes_total", &b, w.changes as f64);
+    if let Some(at) = w.last_change_ms {
+        family(out, "superbot_secrets_change_events_last_change_timestamp_seconds", "gauge", "When botd last read a change the external secrets store announced.");
+        sample(out, "superbot_secrets_change_events_last_change_timestamp_seconds", &b, at as f64 / 1000.0);
+    }
+    family(out, "superbot_secrets_change_events_lost_total", "counter", "Times botd lost the external secrets store's change stream and subscribed again.");
+    sample(out, "superbot_secrets_change_events_lost_total", &b, w.lost as f64);
+    family(out, "superbot_secrets_change_events_catch_ups_total", "counter", "Times botd read every cached secret again because change events may have been missed.");
+    sample(out, "superbot_secrets_change_events_catch_ups_total", &b, w.catch_ups as f64);
 }
 
 #[cfg(test)]
@@ -1039,6 +1111,8 @@ pub(crate) mod tests {
         pub lists: AtomicUsize,
         /// The next read or list takes its answer, says so on the first, and waits for the second.
         pub pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+        /// What its change stream does, when it follows one.
+        pub watching: Mutex<Option<WatchStatus>>,
     }
 
     impl Fake {
@@ -1084,6 +1158,9 @@ pub(crate) mod tests {
             let names = self.values.lock().unwrap().keys().filter(|(s, _)| *s == scope).map(|(_, n)| n.clone()).collect();
             self.hold();
             Ok(names)
+        }
+        fn watch_status(&self) -> Option<WatchStatus> {
+            self.watching.lock().unwrap().clone()
         }
     }
 
@@ -1435,6 +1512,49 @@ pub(crate) mod tests {
         assert_eq!(d["ok"], false);
         assert!(d["detail"].as_str().unwrap().contains("fake is down"), "{d}");
         assert!(!d.to_string().contains("diag-value-1"));
+    }
+
+    #[test]
+    fn the_change_streams_state_shows_in_diagnostics_and_metrics() {
+        let (f, s) = fake(&[(Scope::Bots, "WATCHED_TOKEN", "watched-value-1")], Duration::from_secs(60));
+        let mut out = String::new();
+        render_watch(Some(&s), &mut out);
+        render_watch(None, &mut out);
+        assert!(out.is_empty(), "nothing without a stream");
+        assert_eq!(diagnose(Some(&s))["events"], serde_json::Value::Null);
+
+        let now = crate::db::now();
+        let w = WatchStatus { following: true, since_ms: now - 7_200_000, changes: 3, last_change_ms: Some(now - 30_000), lost: 1, catch_ups: 2, last_loss: Some("Vault closed the stream".into()) };
+        *f.watching.lock().unwrap() = Some(w.clone());
+        let d = diagnose(Some(&s))["events"].clone();
+        assert_eq!((d["following"].as_bool(), d["changes"].as_u64(), d["lost"].as_u64(), d["catchUps"].as_u64()), (Some(true), Some(3), Some(1), Some(2)));
+        assert!((7199..=7201).contains(&d["forSeconds"].as_u64().unwrap()) && (29..=31).contains(&d["lastChangeSecondsAgo"].as_u64().unwrap()), "{d}");
+        assert_eq!(d["lastLoss"], "Vault closed the stream");
+        assert_eq!(WatchStatus { since_ms: now + 5000, last_change_ms: None, ..w.clone() }.view(now)["forSeconds"], 0, "never negative");
+
+        render_watch(Some(&s), &mut out);
+        for line in [
+            "# TYPE superbot_secrets_change_events_following gauge",
+            "superbot_secrets_change_events_following{backend=\"fake\"} 1",
+            "# TYPE superbot_secrets_change_events_changes_total counter",
+            "superbot_secrets_change_events_changes_total{backend=\"fake\"} 3",
+            "superbot_secrets_change_events_lost_total{backend=\"fake\"} 1",
+            "superbot_secrets_change_events_catch_ups_total{backend=\"fake\"} 2",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in\n{out}");
+        }
+        let at = out.lines().find_map(|l| l.strip_prefix("superbot_secrets_change_events_last_change_timestamp_seconds{backend=\"fake\"} ")).expect("a timestamp");
+        assert!((at.parse::<f64>().unwrap() - (now - 30_000) as f64 / 1000.0).abs() < 0.01, "{at}");
+        assert!(!out.contains("Vault closed") && !out.contains("watched-value-1"), "no reasons or values in labels");
+        let types: BTreeSet<String> = out.lines().filter_map(|l| Some(l.strip_prefix("# TYPE ")?.split(' ').next()?.to_string())).collect();
+        let used = crate::machines_placement_tests::metric_names(include_str!("../../../deploy/prometheus/superbot-secrets-events.rules.yml"));
+        assert!(!used.is_empty() && used.is_subset(&types), "the rules use metrics botd doesn't write: {:?}", used.difference(&types).collect::<Vec<_>>());
+
+        *f.watching.lock().unwrap() = Some(WatchStatus { following: false, last_change_ms: None, ..w });
+        let mut out = String::new();
+        render_watch(Some(&s), &mut out);
+        assert!(out.lines().any(|l| l == "superbot_secrets_change_events_following{backend=\"fake\"} 0"), "{out}");
+        assert!(!out.contains("last_change_timestamp"), "no change yet, no timestamp");
     }
 
     fn entry<'a>(r: &'a Refresh, scope: &str, name: &str) -> &'a Refreshed {
