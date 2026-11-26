@@ -1496,6 +1496,12 @@ grep -Fq "!! The key in --license-file isn't a license 0.2.0 takes: The license 
   || fail "a new install's --license-file the bundle refuses wasn't said: $out"
 out=$(lcheck "" renewed LICENSE_FILE="$T/lkey") || fail "a new install's good --license-file stopped it: $out"
 grep -Fq "License: 0.2.0 takes the key in --license-file: Licensed to Acme Ltd" <<<"$out" || fail "a new install's good --license-file wasn't said: $out"
+out=$( (
+  OFFLINE_BUNDLE=$B OFFLINE_DIR=$T/lbundle OFFLINE_VERSION=0.2.0 SUPERBOT_USER=nobody-here LICENSE_FILE="$T/lkey" DRY_RUN=false
+  echo renewed >"$T/lbundle/bin/accepts"
+  offline_license_check
+) 2>&1) || fail "a new install with no botd user yet stopped on the license check: $out"
+grep -Fq "License: 0.2.0 takes the key in --license-file" <<<"$out" || fail "a new install with no botd user yet didn't judge --license-file: $out"
 mv "$LH/superbot/env.away" "$LH/superbot/.env"
 ok "a new offline install says whether the bundle's botd takes the key in --license-file, and goes on either way"
 

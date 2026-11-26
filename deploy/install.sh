@@ -1949,8 +1949,7 @@ offline_license_check() {
   [[ -n "$OFFLINE_BUNDLE" ]] || return 0
   local botd="$OFFLINE_DIR/bin/botd" home env_file="" out rc=0 now_rc=2 why doc="docs/ops/air-gapped.md#the-license-through-upgrades"
   LICENSE_JUDGED="$LICENSE_FILE" LICENSE_WHAT="the key in --license-file"
-  home=$(user_home)
-  if ! id "$SUPERBOT_USER" &>/dev/null || [[ ! -f "$home/superbot/.env" ]]; then
+  if ! id "$SUPERBOT_USER" &>/dev/null || [[ ! -f "$(user_home)/superbot/.env" ]]; then
     # A new server: Bots don't run yet, so a key the bundle's botd doesn't take is only said.
     [[ -n "$LICENSE_FILE" ]] && botd_checks_license "$botd" || return 0
     out=$(tr -d '[:space:]' <"$LICENSE_FILE" | (cd / && env -i PATH=/usr/bin:/bin "$botd" license check --key-file -) 2>&1) || true
@@ -1960,6 +1959,7 @@ offline_license_check() {
     esac
     return 0
   fi
+  home=$(user_home)
   if ! botd_checks_license "$botd"; then
     warn "The bundle's botd ($OFFLINE_VERSION) can't check licenses (botd license check), so the license wasn't checked before the $([[ "$ROLLBACK_RESTORE" == true ]] && echo rollback || echo upgrade)"
     return 0
