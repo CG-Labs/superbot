@@ -54,7 +54,7 @@ describe("SecretsView (ADR 0044)", () => {
     const api = fakeApi();
     const user = userEvent.setup();
     await render(<SecretsView api={api} onBack={jest.fn()} canWrite />);
-    expect(await screen.findByText("No secrets yet.")).toBeOnTheScreen();
+    expect(await screen.findByRole("heading", { name: "No secrets yet" })).toBeOnTheScreen();
     await user.type(screen.getByLabelText("Secret name"), "openai api key");
     await user.type(screen.getByLabelText("Secret value"), "sk-live-123");
     await user.press(screen.getByRole("button", { name: "Save secret" }));
@@ -111,7 +111,7 @@ describe("SecretsView (ADR 0044)", () => {
     await user.press(screen.getByRole("button", { name: "Delete GITHUB_TOKEN" }));
     expect(api.deleteMySecret).toHaveBeenCalledWith("GITHUB_TOKEN");
     expect(await screen.findByText("Deleted GITHUB_TOKEN.")).toBeOnTheScreen();
-    expect(screen.getByText("No secrets yet.")).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "No secrets yet" })).toBeOnTheScreen();
   });
 
   it("shows read-only people their names without ways to change them", async () => {
@@ -184,7 +184,21 @@ describe("SecretsView (ADR 0044)", () => {
     const api = fakeApi();
     api.mySecrets.mockRejectedValueOnce(new ApiError("Sign in as a user to keep your own secrets.", 403));
     await render(<SecretsView api={api} onBack={jest.fn()} canWrite />);
-    expect(await screen.findByText("Sign in as a user to keep your own secrets.")).toBeOnTheScreen();
+    expect(await screen.findByText("Couldn't load your secrets. Sign in as a user to keep your own secrets.")).toBeOnTheScreen();
+  });
+
+  it("shows a skeleton while the list loads, then a retry that loads it", async () => {
+    const api = fakeApi([{ name: "OPENAI_API_KEY", updatedAt: NOV3 }]);
+    let fail: (e: Error) => void = () => {};
+    api.mySecrets.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<SecretsView api={api} onBack={jest.fn()} canWrite />);
+    expect(screen.getByRole("progressbar", { name: "Loading your secrets" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load your secrets. Can't reach the server. Check your connection and try again.");
+    expect(screen.getByLabelText("Secret value")).toBeOnTheScreen();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("OPENAI_API_KEY")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("titles the screen and goes back to the Bots", async () => {
