@@ -822,6 +822,181 @@ grep -Fqx "run --rm --network none --entrypoint botd reg.test/cg/superbot:1.0.0 
 rm -f "$REG/local/$(regkey reg.test/cg/superbot:1.0.0)" "$REG/run.log"
 ok "load names the Hermes bundle for Compose from the loaded image's pins, asked in a container with no network, not the bundle's botd on the host"
 
+# Compose upgrades checked first (docs/adr/0317-compose-upgrades-checked-first.md), with a
+# stand-in docker: each image in $CS/images lists the checks its botd has, $CS/out and $CS/rc
+# hold what each image's `botd <check> check` prints and exits with, and $CS/running names the
+# image of the botd container that runs now.
+CS="$T/compose"
+mkdir -p "$T/cstub" "$CS/images" "$CS/out" "$CS/rc"
+cat >"$T/cstub/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+key() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+cs=$STUB_COMPOSE
+caps() { [[ -f "$cs/images/$(key "$1")" ]] && grep -qw "$2" "$cs/images/$(key "$1")"; }
+# The check a usage line names: "Usage: botd license check" is license.
+check_of() { awk '{ print $3 }' <<<"$1"; }
+botd_out() { cat "$cs/out/$(key "$1").$2" 2>/dev/null || true; exit "$(cat "$cs/rc/$(key "$1").$2" 2>/dev/null || echo 0)"; }
+if [[ $1 != compose ]]; then
+  case "$1 $2" in
+    "image inspect") [[ -f "$cs/images/$(key "${*: -1}")" ]] ;;
+    "load -q") : ;;
+    "run --rm")
+      echo "docker $*" >>"$cs/log"
+      [[ "$*" == *"--network none --entrypoint sh "* ]] || exit 1
+      image=${*: -5:1}
+      caps "$image" "$(check_of "${*: -1}")" ;;
+    *) echo "stub docker: $*" >&2; exit 2 ;;
+  esac
+  exit
+fi
+shift
+opts=()
+while [[ $# -gt 0 && ! $1 =~ ^(version|ps|config|run|exec)$ ]]; do opts+=("$1"); shift; done
+[[ $# -gt 0 ]] || exit 2
+if [[ -f "$cs/noconfig" && $1 != version ]]; then echo "no configuration file provided: not found" >&2; exit 1; fi
+case $1 in
+  version) echo "Docker Compose version stub" ;;
+  ps)
+    if [[ $2 == -a ]]; then [[ ! -f "$cs/exists" ]] || echo c0ffee; else [[ ! -f "$cs/running" ]] || echo c0ffee; fi ;;
+  config)
+    if [[ -f "$cs/override" ]]; then cat "$cs/override"; elif [[ -n "${SUPERBOT_IMAGE:-}" ]]; then echo "$SUPERBOT_IMAGE"; else cat "$cs/configured"; fi ;;
+  run)
+    [[ "${*:2:6}" == "--rm --no-deps -T --entrypoint botd botd" ]] || { echo "stub compose run: $*" >&2; exit 2; }
+    echo "run image=${SUPERBOT_IMAGE:-} opts=${opts[*]} args=${*:8} stdin=$(cat)" >>"$cs/log"
+    echo " Container superbot-botd-run-1 Creating" >&2
+    botd_out "$SUPERBOT_IMAGE" "$8" ;;
+  exec)
+    running=$(cat "$cs/running")
+    echo "exec image=$running args=${*:4}" >>"$cs/log"
+    if [[ $4 == sh ]]; then caps "$running" "$(check_of "${*: -1}")"; else botd_out "$running" "$5"; fi ;;
+esac
+EOF
+chmod 0755 "$T/cstub/docker"
+ckey() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+# IMAGE CHECKS...: an image here whose botd has those checks.
+cimage() { local i=$1; shift; echo "$*" >"$CS/images/$(ckey "$i")"; }
+# IMAGE CHECK RC OUTPUT: what that image's botd says to `botd CHECK check`.
+csays() { printf '%s\n' "$4" >"$CS/out/$(ckey "$1").$2"; echo "$3" >"$CS/rc/$(ckey "$1").$2"; }
+cstack() { rm -f "$CS/log"; (cd "$T" && env -u SUPERBOT_IMAGE STUB_COMPOSE="$CS" PATH="$T/cstub:$PATH" "$DIR/offline-bundle.sh" "$@"); }
+OK_SETTINGS=$'Observability: ok\nbotd would start with these settings.'
+OK_LICENSE=$'License: active, from /data/license.key\n  Licensed to Acme Ltd (business, 25 seats) until 2027-03-31.\nSeats: 3 of 25 in use\nWarning: 3 people more than last month\nBots would run with this license (botd 0.2.0).'
+NO_LICENSE=$'License: invalid, from /data/license.key\n  The license key isn\'t valid (unknown_key).\n  Signed with a key this release no longer trusts.\nSeats: 3 in use, and none allowed\nBots wouldn\'t run with this license (botd 0.2.0): The license key isn\'t valid (unknown_key).'
+touch "$CS/exists" "$CS/running"
+echo old:1 >"$CS/running"
+echo old:1 >"$CS/configured"
+cimage old:1 settings license
+cimage new:2 settings license
+csays old:1 license 0 "$OK_LICENSE"
+csays new:2 settings 0 "$OK_SETTINGS"
+csays new:2 license 0 "$OK_LICENSE"
+
+cstack check-compose --image new:2 -- -p stack -f x.yml >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose refused a stack the new botd would start"; }
+for want in "Settings: botd from new:2 would start with this stack's settings (botd settings check)" \
+  "License: botd from new:2 would run Bots with this stack's license: Licensed to Acme Ltd (business, 25 seats) until 2027-03-31." \
+  "License with new:2: 3 people more than last month" \
+  "To switch the stack to new:2: SUPERBOT_VERSION (or SUPERBOT_IMAGE) in .env, then docker compose up -d"; do
+  grep -Fq -- "$want" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "check-compose didn't say: $want"; }
+done
+grep -Fqx "run image=new:2 opts=-p stack -f x.yml args=settings check stdin=" "$CS/log" || { cat "$CS/log" >&2; fail "botd settings check didn't run from the new image as Compose starts the stack's botd"; }
+grep -Fqx "run image=new:2 opts=-p stack -f x.yml args=license check stdin=" "$CS/log" || fail "botd license check didn't run from the new image as Compose starts botd"
+grep -Fq "docker run --rm --network none --entrypoint sh new:2 -c " "$CS/log" || fail "the new image's botd wasn't asked for its checks in a container with no network"
+if grep -q "^exec " "$CS/log"; then fail "the running botd was asked about the license when the new one would run Bots"; fi
+if grep -q "Container superbot-botd-run" "$T/cc.log"; then fail "Compose's progress reached the output"; fi
+ok "check-compose runs the new image's botd settings check and license check as Compose would start the stack's botd, with Compose's own options, and says how to switch"
+
+csays new:2 settings 1 $'SSO: refused\nbotd wouldn\'t start with these settings: SSO: SSO_PUBLIC_URL is required with SSO_PROVIDERS\nbotd wouldn\'t start with these settings: Server backups: SERVER_BACKUP_OFF_HOST must be auto, on or off, not "sometimes"'
+if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose passed a stack the new botd wouldn't start"; fi
+for want in "botd from new:2 wouldn't start with this stack's settings: SSO: SSO_PUBLIC_URL is required with SSO_PROVIDERS" \
+  '    and: Server backups: SERVER_BACKUP_OFF_HOST must be auto, on or off, not "sometimes"' \
+  "Nothing in the stack has changed: keep it on the image it runs." "check-compose --image new:2"; do
+  grep -Fq -- "$want" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "a refused setting didn't say: $want"; }
+done
+if grep -q "args=license" "$CS/log"; then fail "the license was checked after a refused setting"; fi
+csays new:2 settings 0 "$OK_SETTINGS"
+ok "check-compose stops on settings the new botd would refuse, naming each, before anything else"
+
+cimage mid:2 machines license
+csays mid:2 machines 0 "botd would start with these machine settings."
+csays mid:2 license 0 "$OK_LICENSE"
+cstack check-compose --image mid:2 >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose refused an image with only botd machines check"; }
+grep -Fq "Settings: botd from mid:2 would start with this stack's settings (botd machines check)" "$T/cc.log" || fail "an image with only botd machines check wasn't checked with it"
+cimage bare:2
+cstack check-compose --image bare:2 >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose refused an image whose botd has no checks"; }
+grep -Fq "botd in bare:2 can't check its settings (botd settings check), so they weren't checked" "$T/cc.log" || fail "an image without the checks wasn't said"
+grep -Fq "botd in bare:2 can't check licenses (botd license check), so the license wasn't checked" "$T/cc.log" || fail "an image without botd license check wasn't said"
+if grep -q "^run " "$CS/log" 2>/dev/null; then fail "a botd without the checks was run, which would start it as the server"; fi
+ok "an image with only botd machines check is checked with it; one with neither, or no license check, is said and never run"
+
+csays new:2 license 1 "$NO_LICENSE"
+if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose passed a license the new botd wouldn't run Bots with, while Bots run now"; fi
+for want in "Bots run now, but botd from new:2 wouldn't run Bots with this stack's license: The license key isn't valid (unknown_key)." \
+  "Signed with a key this release no longer trusts." "Nothing in the stack has changed" "check-compose --image new:2 --key-file <file>" "botctl license install"; do
+  grep -Fq -- "$want" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "a license the new botd won't take didn't say: $want"; }
+done
+grep -Fqx "exec image=old:1 args=botd license check" "$CS/log" || fail "the running botd wasn't asked whether Bots run now"
+csays old:1 license 1 "$NO_LICENSE"
+cstack check-compose --image new:2 >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose stopped on a license Bots don't run with now either"; }
+grep -Fq "Bots don't run on this stack now either" "$T/cc.log" || fail "a license Bots don't run with now wasn't said"
+cimage old:1 settings
+cstack check-compose --image new:2 >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose stopped when the running botd can't check licenses"; }
+grep -Fq "The running botd can't say whether Bots run now" "$T/cc.log" || fail "a running botd without botd license check wasn't said"
+if grep -q "^exec image=old:1 args=botd license" "$CS/log"; then fail "a running botd without botd license check was asked"; fi
+rm -f "$CS/running"
+cstack check-compose --image new:2 >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose stopped on a stack whose botd is stopped"; }
+grep -Fq "The running botd can't say whether Bots run now" "$T/cc.log" || fail "a stopped botd wasn't said"
+echo old:1 >"$CS/running"
+cimage old:1 settings license
+csays old:1 license 0 "$OK_LICENSE"
+printf '  key.\n  more\n' >"$T/renewal.key"
+csays new:2 license 0 "$OK_LICENSE"
+cstack check-compose --image new:2 --key-file "$T/renewal.key" >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose refused a key the new botd takes"; }
+grep -Fqx "run image=new:2 opts= args=license check --key-file - stdin=key.more" "$CS/log" || { cat "$CS/log" >&2; fail "--key-file wasn't judged by the new botd from stdin, whitespace dropped"; }
+grep -Fq "would run Bots with the key in $T/renewal.key: " "$T/cc.log" || fail "--key-file's key wasn't named"
+csays new:2 license 0 "$OK_LICENSE"
+ok "check-compose stops when Bots run now but the new botd wouldn't run them, asked of the running botd; it warns when they don't run now or the running botd can't say; --key-file judges a renewal"
+
+cstack check-compose >"$T/cc.log" 2>&1 || { cat "$T/cc.log" >&2; fail "check-compose without --image failed"; }
+grep -Fqx "run image=old:1 opts= args=settings check stdin=" "$CS/log" || fail "without --image, the image Compose would run wasn't checked"
+echo other:9 >"$CS/override"
+if cstack check-compose --image new:2 >"$T/cc.log" 2>&1; then fail "check-compose checked an image Compose wouldn't run botd from"; fi
+grep -Fq "Compose runs botd from other:9 here whatever SUPERBOT_IMAGE says" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "an override naming botd's image wasn't said"; }
+rm -f "$CS/override"
+crefused() { # why, then what it says, then check-compose's arguments
+  local why=$1 want=$2
+  shift 2
+  if cstack check-compose "$@" >"$T/cc.log" 2>&1; then fail "$why: checked"; fi
+  grep -Fq -- "$want" "$T/cc.log" || { cat "$T/cc.log" >&2; fail "$why: didn't say $want"; }
+  if grep -q "^run " "$CS/log" 2>/dev/null; then fail "$why: botd ran"; fi
+}
+crefused "an image not here" "No image gone:3 here: load the release's images first" --image gone:3
+crefused "an option for Compose before --" "Unknown option: -p (Compose's own options go after --)" -p stack
+crefused "an image that isn't a reference" "isn't an image reference" --image '-x'
+crefused "a key that can't be read" "Can't read the key in --key-file $T/none.key" --key-file "$T/none.key"
+rm -f "$CS/exists"
+crefused "a stack that has never run botd" "This Compose stack has never run botd, so there is nothing to upgrade" --image new:2
+touch "$CS/noconfig"
+crefused "no stack here" "docker compose can't read this stack: no configuration file provided: not found" --image new:2
+rm -f "$CS/noconfig"
+touch "$CS/exists"
+ok "check-compose checks the image Compose would run without --image, and refuses images Compose wouldn't run botd from, images not here, a stack it can't read or that never ran botd, and bad options"
+
+REF=reg.test/cg/superbot:1.0.0
+cimage "$REF" settings license
+csays "$REF" settings 0 "$OK_SETTINGS"
+csays "$REF" license 0 "$OK_LICENSE"
+cstack load "$IB" -- -p stack >"$T/cl.log" 2>&1 || { cat "$T/cl.log" >&2; fail "load into a stack the new botd would start failed"; }
+grep -Fqx "run image=$REF opts=-p stack args=settings check stdin=" "$CS/log" || { cat "$CS/log" >&2; fail "load didn't check the loaded image against the stack"; }
+grep -Fq "To switch the stack to it: SUPERBOT_VERSION=$VERSION in .env (or SUPERBOT_IMAGE=$REF), then docker compose up -d" "$T/cl.log" || { cat "$T/cl.log" >&2; fail "load didn't say how to switch the stack"; }
+csays "$REF" settings 1 "botd wouldn't start with these settings: Status page: STATUS_PAGE must be on or off"
+if cstack load "$IB" >"$T/cl.log" 2>&1; then fail "load passed a stack the loaded botd wouldn't start"; fi
+grep -Fq "botd from $REF wouldn't start with this stack's settings: Status page: STATUS_PAGE must be on or off" "$T/cl.log" || { cat "$T/cl.log" >&2; fail "load didn't say what the loaded botd refuses"; }
+rm -f "$CS/exists"
+cstack load "$IB" >"$T/cl.log" 2>&1 || { cat "$T/cl.log" >&2; fail "load with no stack here failed"; }
+grep -Fq "Before you switch a Compose stack to $REF, check it from the stack's folder: " "$T/cl.log" || { cat "$T/cl.log" >&2; fail "load with no stack didn't say how to check one"; }
+if grep -q "^run " "$CS/log" 2>/dev/null; then fail "load ran botd with no stack to check"; fi
+ok "load checks the loaded image against the Compose stack it runs in, and stops when botd wouldn't start; with no stack, it says how to check one"
+
 ibuild "$T/iown" --image own=own-image:2 --allow-unsigned >"$T/iown.log" 2>&1 || { cat "$T/iown.log" >&2; fail "a local image didn't bundle"; }
 [[ "$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest")" == "$OWN" ]] || fail "the local image wasn't bundled from docker save"
 grep -qx "unsigned_images=true" <<<"$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/MANIFEST")" || fail "MANIFEST doesn't say an image is unsigned"

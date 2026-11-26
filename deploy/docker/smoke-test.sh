@@ -386,4 +386,21 @@ if dc exec -T -u 0 botd touch /opt/hermes/.hermes/superbot/x 2>/dev/null; then f
   || { cat "$WORK/load-hermes-again.log" >&2; fail "load-hermes again failed"; }
 grep -Fq "is already in the Docker volume $HERMES_VOLUME" "$WORK/load-hermes-again.log" || fail "load-hermes again didn't see the volume was loaded"
 
+log "Compose upgrades checked first (ADR 0317): check-compose runs the image's own checks as Compose starts botd, and changes nothing"
+check_compose() { "$DIR/../offline-bundle.sh" check-compose --image "$image" -- "${COMPOSE_FILES[@]}" -p "$PROJECT" --env-file "$SUPERBOT_ENV_FILE"; }
+check_compose >"$WORK/check-compose.log" 2>&1 || { cat "$WORK/check-compose.log" >&2; fail "check-compose refused the stack botd runs with"; }
+grep -Fq "Settings: botd from $image would start with this stack's settings (botd settings check)" "$WORK/check-compose.log" \
+  || { cat "$WORK/check-compose.log" >&2; fail "check-compose didn't judge the stack's settings"; }
+grep -Eq "License: botd from .* would run Bots|Bots don't run on this stack now either" "$WORK/check-compose.log" \
+  || { cat "$WORK/check-compose.log" >&2; fail "check-compose didn't judge the stack's license"; }
+cid=$(dc ps -q botd)
+echo "SERVER_BACKUP_OFF_HOST=sometimes" >>"$SUPERBOT_ENV_FILE"
+if check_compose >"$WORK/check-compose.log" 2>&1; then fail "check-compose passed a setting botd refuses at start"; fi
+grep -Fq "wouldn't start with this stack's settings: Server backups: SERVER_BACKUP_OFF_HOST" "$WORK/check-compose.log" \
+  || { cat "$WORK/check-compose.log" >&2; fail "check-compose didn't name the setting botd refuses"; }
+grep -v '^SERVER_BACKUP_OFF_HOST=' "$SUPERBOT_ENV_FILE" >"$WORK/env.tmp"
+install -m 0600 "$WORK/env.tmp" "$SUPERBOT_ENV_FILE"
+[[ $(dc ps -q botd) == "$cid" ]] || fail "check-compose recreated botd's container"
+[[ $(curl -fsS "$BASE/healthz") == '{"ok":true}' ]] || fail "botd isn't healthy after check-compose"
+
 log "Smoke test passed"
