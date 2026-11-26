@@ -28,8 +28,8 @@ async fn signups(port: u16, admin: &str, status: &str) -> Vec<Value> {
 async fn the_site_is_public_and_the_console_moved_to_its_own_path() {
     let (port, _, admin, _) = serve_app().await;
     for (path, kind, has) in [
-        ("/", "text/html", "Your always-on AI team"),
-        ("/index.html", "text/html", "Your always-on AI team"),
+        ("/", "text/html", "<title>SuperBot · Your always-on AI team</title>"),
+        ("/index.html", "text/html", "<title>SuperBot · Your always-on AI team</title>"),
         ("/get-started", "text/html", "Request access"),
         ("/site/site.css", "text/css", "--c-accent: #2563eb"),
         ("/site/get-started.js", "text/javascript", "/api/signups"),
