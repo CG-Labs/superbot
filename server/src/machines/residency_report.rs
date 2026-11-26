@@ -40,11 +40,10 @@ const PIN_CHANGES: [&str; 8] = [
 const KEPT: &str = "user.residency_pin_kept";
 const REFUSALS: [&str; 6] = ["machine.residency_refused", "bot.run_refused", "user.region_change_refused", "team.region_change_refused", "team.join_refused", "team.delete_refused"];
 
-const NOT_COVERED: [&str; 4] = [
+const NOT_COVERED: [&str; 3] = [
     "What a Bot's own tools send over the network; outbound allow-lists are the control for that (ADR 0135).",
     "Push, email, webhooks, payments and sign-in providers, as the DPA's subprocessor annex lists them.",
     "People who have left a pinned team: their data is held by a pin of their own, kept from the team's when they left, with its own report, until botd holds none of their machine data unless the operator keeps such pins (ADR 0171, ADR 0205).",
-    "Audit events sent whole to a SIEM or the write-once audit archive the operator sets up, wherever those are (ADR 0316).",
 ];
 
 fn rfc3339(ms: i64) -> String {
@@ -220,8 +219,9 @@ pub(super) fn person(app: &App, cp: &ControlPlane, id: &str, region: &str) -> Op
 /// states it is in the pin's region (ADR 0184); without chats, routines, approvals, Bots'
 /// memory, owners' facts, sign-ins, own secrets, second factors, usage records and audit
 /// events' details when they are all in the region's own chat store (ADR 0215, ADR 0228,
-/// ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304, ADR 0316).
-fn not_covered(server_data: &Value, chats: &Value) -> Vec<String> {
+/// ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304, ADR 0316); and the audit
+/// export's sinks outside the region that get their audit events whole (ADR 0330).
+fn not_covered(server_data: &Value, chats: &Value, audit_export: &Value) -> Vec<String> {
     let mut out = Vec::new();
     if server_data["inRegion"] != true {
         let why: Vec<&str> = server_data["outside"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
@@ -233,7 +233,33 @@ fn not_covered(server_data: &Value, chats: &Value) -> Vec<String> {
         out.push(format!("{what}, its files and server backups, which are where the operator runs botd: {} (ADR 0129, ADR 0184).", why.join("; ")));
     }
     out.extend(NOT_COVERED.iter().map(|s| s.to_string()));
+    let whole: Vec<String> = audit_export.as_array().into_iter().flatten().filter(|s| s["details"] == "whole" && s["inRegion"] != true).map(sink_named).collect();
+    if !whole.is_empty() {
+        out.push(format!(
+            "Their audit events, sent whole by the audit export to {}, which the operator doesn't state is in the region (AUDIT_EXPORT_DATA_REGION, ADR 0316, ADR 0330).",
+            whole.join(", ")
+        ));
+    }
+    let partly: Vec<&Value> = audit_export.as_array().into_iter().flatten().filter(|s| s["details"] == "partly").collect();
+    if let Some(n) = partly.first().and_then(|s| s["wholeEvents"].as_i64()) {
+        let to: Vec<String> = partly.iter().map(|s| sink_named(s)).collect();
+        out.push(format!(
+            "{n} of their audit events whose details are still in botd's own database, not yet moved to the region's chat store, which the audit export sends whole to {} too (ADR 0316, ADR 0330).",
+            to.join(", ")
+        ));
+    }
     out
+}
+
+/// An audit sink as a report names it: its name and kind, never its address.
+fn sink_named(s: &Value) -> String {
+    let kind = s["kind"].as_str().unwrap_or("sink");
+    match (s["name"].as_str(), s["dataRegion"].as_str()) {
+        (Some(n), Some(r)) => format!("{n} ({kind}, in {r})"),
+        (Some(n), None) => format!("{n} ({kind}, in no stated region)"),
+        (None, Some(r)) => format!("the {kind} sink (in {r})"),
+        (None, None) => format!("the {kind} sink (in no stated region)"),
+    }
 }
 
 /// The report on `p` for `from`..`to`, generated at `now`, with its digest. For
@@ -262,6 +288,7 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
     }
     let server_in = server_data["inRegion"] == true;
     let chats = super::chat_stores::against(app, cp, region, &ids, server_in);
+    let audit_export = json!(crate::audit_export::for_pin(app, region, chats["store"] == true, chats["auditEvents"]["inServerDatabase"].as_i64().unwrap_or(0)));
     warnings.extend(super::chat_stores::report_warnings(&chats, region, crate::db::now()));
     let hosts = cp.hosts().map(|h| h.configured().into_iter().filter(|c| c.region.as_deref() == Some(region)).map(|c| c.name).collect::<Vec<_>>());
     let pinned_by = p.pinned_by.as_deref().map(|id| json!({ "id": id, "name": app.db.user(id).map(|u| u.name) }));
@@ -284,7 +311,8 @@ pub fn build(app: &App, cp: &ControlPlane, p: &ResidencyPin, from: i64, to: i64,
         "serverData": server_data,
         "chats": chats,
         "activity": activity(app, p, &set, from, to, self_service)?,
-        "notCovered": not_covered(&server_data, &chats),
+        "notCovered": not_covered(&server_data, &chats, &audit_export),
+        "auditExport": audit_export,
     });
     report["digest"] = json!(digest(&report));
     Ok(report)
@@ -348,6 +376,7 @@ pub fn markdown(r: &Value) -> String {
     }
     out += &server_data_markdown(&r["serverData"]);
     out += &chats_markdown(&r["chats"], &r["region"]["id"]);
+    out += &audit_export_markdown(&r["auditExport"]);
     let a = &r["activity"];
     out += "\n## In the period\n\n### Pin changes\n\n";
     match a["pinChanges"].as_array().filter(|x| !x.is_empty()) {
@@ -474,6 +503,22 @@ fn chats_markdown(c: &Value, region: &Value) -> String {
     out
 }
 
+/// The report's "Audit export" section (ADR 0330). Empty without sinks, and for reports
+/// from before it.
+fn audit_export_markdown(sinks: &Value) -> String {
+    let Some(sinks) = sinks.as_array().filter(|a| !a.is_empty()) else { return String::new() };
+    let mut out = String::from("\n## Audit export\n\nWhere botd sends the audit log, and what each sink gets of their events.\n\n");
+    for s in sinks {
+        let gets = match s["details"].as_str() {
+            Some("whole") => "their events whole".to_string(),
+            Some("partly") => format!("their events' sealed rows, but {} whose details are still in botd's own database whole", cell(&s["wholeEvents"])),
+            _ => "only their events' sealed rows, their details held back".to_string(),
+        };
+        out += &format!("- **{}:** {gets}\n", cell(&json!(sink_named(s))));
+    }
+    out
+}
+
 /// The longest run of backticks in `s`, so a fence around it is longer.
 fn longest_backtick_run(s: &str) -> usize {
     s.split(|c| c != '`').map(str::len).max().unwrap_or(0)
@@ -577,16 +622,16 @@ mod tests {
     fn botds_own_data_is_not_covered_unless_it_is_in_the_region() {
         let inside = json!({ "inRegion": true, "outside": [] });
         let none = Value::Null;
-        assert_eq!(not_covered(&inside, &none).len(), NOT_COVERED.len());
+        assert_eq!(not_covered(&inside, &none, &none).len(), NOT_COVERED.len());
         let out = json!({ "inRegion": false, "outside": ["botd's own data region isn't stated (SERVER_DATA_REGION)"] });
-        let lines = not_covered(&out, &none);
+        let lines = not_covered(&out, &none, &none);
         assert!(lines[0].starts_with("botd's own database (accounts, chats,") && lines[0].contains(": botd's own data region isn't stated (SERVER_DATA_REGION) (ADR 0129, ADR 0184)."), "{lines:?}");
-        assert_eq!(not_covered(&Value::Null, &none).len(), NOT_COVERED.len() + 1, "no server data section: not covered");
+        assert_eq!(not_covered(&Value::Null, &none, &none).len(), NOT_COVERED.len() + 1, "no server data section: not covered");
         // Chats all in the region's own store are left out of what isn't covered (ADR 0215).
-        let held = not_covered(&out, &json!({ "store": true, "inRegion": true }));
+        let held = not_covered(&out, &json!({ "store": true, "inRegion": true }), &none);
         assert!(held[0].starts_with("botd's own database apart from chats, routines, approvals, Bots' memory, owners' facts, sign-ins, own secrets, second factors, model usage records and the details of their audit events, which are in the region's chat store (accounts, the audit log's sealed rows"), "{held:?}");
         assert!(!held[0].contains("its files hold"), "owners' facts are in the store too (ADR 0277): {held:?}");
-        let moving = not_covered(&out, &json!({ "store": true, "inRegion": false }));
+        let moving = not_covered(&out, &json!({ "store": true, "inRegion": false }), &none);
         assert!(moving[0].starts_with("botd's own database (accounts, chats, routines, approvals,"), "{moving:?}");
         assert_eq!(chats_markdown(&Value::Null, &json!("gb-lon")), "", "reports from before ADR 0215 have no section");
         let md = chats_markdown(&json!({ "store": true, "inRegion": true, "lastBackupAt": null, "messages": { "inStore": 4, "inServerDatabase": 0, "elsewhere": 0 } }), &json!("gb-lon"));
@@ -609,6 +654,36 @@ mod tests {
         let md = server_data_markdown(&json!({ "region": null, "backups": { "offHost": true, "region": null }, "inRegion": false, "policy": "report", "outside": ["a|b"] }));
         assert!(md.contains("- **Region:** not stated by the operator\n- **Server backups:** copied off the host to a store in no stated region\n- **In the pinned region:** no"), "{md}");
         assert!(md.contains("- Outside: a\\|b\n"), "{md}");
+    }
+
+    #[test]
+    fn audit_sinks_outside_the_region_that_get_events_whole_are_not_covered() {
+        let inside = json!({ "inRegion": true, "outside": [] });
+        let sinks = json!([
+            { "kind": "webhook", "name": "lon", "dataRegion": "gb-lon", "inRegion": true, "details": "whole" },
+            { "kind": "webhook", "name": "us", "dataRegion": "us-east-1", "inRegion": false, "details": "heldBack" },
+            { "kind": "syslog", "name": "soc", "dataRegion": null, "inRegion": false, "details": "whole" },
+            { "kind": "s3", "name": null, "dataRegion": null, "inRegion": false, "details": "whole" },
+        ]);
+        let lines = not_covered(&inside, &Value::Null, &sinks);
+        assert_eq!(lines.len(), NOT_COVERED.len() + 1);
+        assert_eq!(
+            lines.last().unwrap(),
+            "Their audit events, sent whole by the audit export to soc (syslog, in no stated region), the s3 sink (in no stated region), which the operator doesn't state is in the region (AUDIT_EXPORT_DATA_REGION, ADR 0316, ADR 0330)."
+        );
+        let held = json!([{ "kind": "s3", "name": null, "dataRegion": "us-east-1", "inRegion": false, "details": "heldBack" }]);
+        assert_eq!(not_covered(&inside, &Value::Null, &held).len(), NOT_COVERED.len(), "held back: covered");
+        assert_eq!(not_covered(&inside, &Value::Null, &json!([])).len(), NOT_COVERED.len(), "no export: nothing to say");
+        let md = audit_export_markdown(&sinks);
+        assert!(md.starts_with("\n## Audit export\n") && md.contains("- **lon (webhook, in gb-lon):** their events whole\n"), "{md}");
+        assert!(md.contains("- **us (webhook, in us-east-1):** only their events' sealed rows, their details held back\n"), "{md}");
+        assert_eq!(audit_export_markdown(&Value::Null), "", "reports from before ADR 0330, or with no export, have no section");
+        let partly = json!([{ "kind": "webhook", "name": "us", "dataRegion": "us-east-1", "inRegion": false, "details": "partly", "wholeEvents": 2 }]);
+        assert_eq!(
+            not_covered(&inside, &Value::Null, &partly).last().unwrap(),
+            "2 of their audit events whose details are still in botd's own database, not yet moved to the region's chat store, which the audit export sends whole to us (webhook, in us-east-1) too (ADR 0316, ADR 0330)."
+        );
+        assert!(audit_export_markdown(&partly).contains("- **us (webhook, in us-east-1):** their events' sealed rows, but 2 whose details are still in botd's own database whole\n"));
     }
 
     #[test]

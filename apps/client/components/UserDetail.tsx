@@ -1,15 +1,16 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import { CODE_TTLS, formatExpiry, relativeTime, ROLES, signInMethod } from "../src/invite";
 import { overLimits, planUsageLines } from "../src/plan";
 import type { SsoProvider } from "../src/sso";
-import { colors } from "../src/theme";
+import { themedStyles, type } from "../src/theme";
 import type { AdminUser, CustomRole, LoginCode, Role, SessionView, TeammateAccounts, TeammateRemoval, UserBots, UserIdentity } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
+import { kit, Spinner, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -25,6 +26,7 @@ interface Props {
 const ACCESS_LABEL = { view: "Can view", operate: "Can use", manage: "Manages" } as const;
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  const styles = useStyles();
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>{title}</Text>
@@ -34,8 +36,9 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 function Button({ label, onPress, danger, disabled }: { label: string; onPress: () => void; danger?: boolean; disabled?: boolean }) {
+  const styles = useStyles();
   return (
-    <Pressable style={[styles.btn, danger && styles.dangerBtn, disabled && styles.disabled]} disabled={disabled} onPress={onPress}>
+    <Pressable style={({ pressed }) => [styles.btn, danger && styles.dangerBtn, pressed && styles.pressed, disabled && styles.disabled]} disabled={disabled} onPress={onPress}>
       <Text style={[styles.btnText, danger && styles.dangerText]}>{label}</Text>
     </Pressable>
   );
@@ -75,15 +78,18 @@ function workOutcome(t: TeammateAccounts | null): string {
 }
 
 function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
+  const styles = useStyles();
   return (
-    <View style={styles.row}>
-      <Text style={[styles.error, { flex: 1 }]}>{message}</Text>
+    <View style={styles.line}>
+      <Text style={[styles.error, styles.grow]}>{message}</Text>
       <Button label="Retry" onPress={onRetry} />
     </View>
   );
 }
 
 export function UserDetail({ api, user, meId, providers, roles = [], onChanged }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [ttl, setTtl] = useState<number>(CODE_TTLS[1].minutes);
@@ -199,7 +205,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
 
   return (
     <View style={styles.wrap}>
-      <View>
+      <View style={styles.head}>
         <Text style={styles.name}>{user.name}</Text>
         <Text style={styles.dim}>{user.email ?? "No email"}</Text>
         <Text style={styles.faint}>
@@ -244,8 +250,8 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
       ) : null}
 
       <Section title="Status">
-        <View style={styles.row}>
-          <Text style={[styles.text, { flex: 1 }]}>{active ? "Active" : "Disabled: can't sign in"}</Text>
+        <View style={styles.line}>
+          <Text style={styles.rowText}>{active ? "Active" : "Disabled: can't sign in"}</Text>
           <Button label={active ? "Disable" : "Enable"} danger={active} disabled={busy || locked} onPress={() => void toggleStatus()} />
         </View>
       </Section>
@@ -277,15 +283,19 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
             </View>
           </>
         ) : sessions == null ? (
-          <ActivityIndicator color={colors.textDim} />
+          <Spinner />
         ) : (
           <>
             {sessions.length ? (
-              sessions.map((s) => (
-                <Text key={s.id} style={styles.dim}>
-                  {s.label || (s.kind === "cookie" ? "Browser" : "App")} · {signInMethod(s.method, s.idpProvider && providerLabel(s.idpProvider))} · last used {relativeTime(s.lastSeenAt).toLowerCase()}
-                </Text>
-              ))
+              <View style={styles.list}>
+                {sessions.map((s) => (
+                  <View key={s.id} style={styles.item}>
+                    <Text style={styles.rowText}>
+                      {s.label || (s.kind === "cookie" ? "Browser" : "App")} · {signInMethod(s.method, s.idpProvider && providerLabel(s.idpProvider))} · last used {relativeTime(s.lastSeenAt).toLowerCase()}
+                    </Text>
+                  </View>
+                ))}
+              </View>
             ) : (
               <Text style={styles.dim}>Not signed in anywhere.</Text>
             )}
@@ -297,8 +307,8 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
       </Section>
 
       <Section title="Two-factor authentication">
-        <View style={styles.row}>
-          <Text style={[styles.text, { flex: 1 }]}>
+        <View style={styles.line}>
+          <Text style={styles.rowText}>
             {user.mfa?.enabled ? `On since ${new Date(user.mfa.enabledAt ?? 0).toLocaleDateString()}` : "Off"}
           </Text>
           {user.mfa?.enabled && !self ? <Button label="Reset" danger disabled={busy} onPress={() => void resetMfa()} /> : null}
@@ -308,15 +318,17 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
 
       <Section title="Single sign-on">
         {user.identities?.length ? (
-          user.identities.map((i) => (
-            <View key={i.id} style={styles.row}>
-              <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
-                {providerLabel(i.provider)} · {identityName(i, providers)}
-                <Text style={styles.faint}> · used {relativeTime(i.lastLoginAt).toLowerCase()}</Text>
-              </Text>
-              <Button label="Unlink" disabled={busy} onPress={() => void unlink(i.id, providerLabel(i.provider))} />
-            </View>
-          ))
+          <View style={styles.list}>
+            {user.identities.map((i) => (
+              <View key={i.id} style={styles.item}>
+                <Text style={styles.rowText} numberOfLines={1}>
+                  {providerLabel(i.provider)} · {identityName(i, providers)}
+                  <Text style={styles.faint}> · used {relativeTime(i.lastLoginAt).toLowerCase()}</Text>
+                </Text>
+                <Button label="Unlink" disabled={busy} onPress={() => void unlink(i.id, providerLabel(i.provider))} />
+              </View>
+            ))}
+          </View>
         ) : (
           <Text style={styles.dim}>No linked sign-ins.</Text>
         )}
@@ -329,7 +341,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
               autoCapitalize="none"
               autoCorrect={false}
               placeholder={SUBJECT_HINT[linkType ?? ""] ?? "Subject (sub)"}
-              placeholderTextColor={colors.textFaint}
+              placeholderTextColor={placeholder}
               value={subject}
               onChangeText={setSubject}
               accessibilityLabel="Subject"
@@ -340,7 +352,7 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
                 autoCapitalize="none"
                 autoCorrect={false}
                 placeholder="Tenant id (optional)"
-                placeholderTextColor={colors.textFaint}
+                placeholderTextColor={placeholder}
                 value={tenant}
                 onChangeText={setTenant}
                 accessibilityLabel="Tenant"
@@ -359,21 +371,23 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
         {botsError ? (
           <LoadFailed message={botsError} onRetry={() => void loadExtras()} />
         ) : bots == null ? (
-          <ActivityIndicator color={colors.textDim} />
+          <Spinner />
         ) : bots.bots.length ? (
-          bots.bots.map((b) => (
-            <View key={b.bot.id} style={styles.row}>
-              <BotAvatar color={b.bot.color} shape={b.bot.shape} size={22} />
-              <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
-                {b.bot.name}
-                <Text style={styles.faint}>
-                  {" "}
-                  · {b.owner.id === user.id ? "owner" : b.grant ? `${b.grant} grant` : b.visibility}
+          <View style={styles.list}>
+            {bots.bots.map((b) => (
+              <View key={b.bot.id} style={styles.item}>
+                <BotAvatar color={b.bot.color} shape={b.bot.shape} size={22} />
+                <Text style={styles.rowText} numberOfLines={1}>
+                  {b.bot.name}
+                  <Text style={styles.faint}>
+                    {" "}
+                    · {b.owner.id === user.id ? "owner" : b.grant ? `${b.grant} grant` : b.visibility}
+                  </Text>
                 </Text>
-              </Text>
-              <Text style={styles.dim}>{ACCESS_LABEL[b.access]}</Text>
-            </View>
-          ))
+                <Text style={styles.dim}>{ACCESS_LABEL[b.access]}</Text>
+              </View>
+            ))}
+          </View>
         ) : (
           <Text style={styles.dim}>No Bots. Share one or grant access from the Bot's details.</Text>
         )}
@@ -386,57 +400,62 @@ export function UserDetail({ api, user, meId, providers, roles = [], onChanged }
         </Section>
       ) : teammates && (teammates.accounts.length || teammates.removals.length) ? (
         <Section title="Teammate accounts here">
-          {teammates.accounts.map((a) => {
-            const mine = a.owner.id === user.id;
-            const who = personName(mine ? a.teammate : user);
-            return (
-              <View key={a.account} style={styles.row}>
-                <Text style={[styles.text, { flex: 1 }]} numberOfLines={2}>
-                  {mine ? `${personName(a.teammate)}, for these Bots` : `For ${personName(a.owner)}'s Bots`}
-                  <Text style={styles.faint}> · {a.removal ? removalStatus(a.removal) : a.wanted ? "in use" : "no longer has access"}</Text>
-                </Text>
-                <Button label="Remove" danger disabled={busy} onPress={() => void removeTeammate(a.owner.id, a.teammate.id, who)} />
-              </View>
-            );
-          })}
-          {teammates.removals
-            .filter((r) => r.state !== "pending")
-            .slice(0, 5)
-            .map((r) => (
-              <Text key={r.id} style={styles.dim}>
-                {r.ownerId === user.id ? personName(r.teammate) : `For ${personName(r.owner)}'s Bots`} · {removalStatus(r)}
-              </Text>
-            ))}
+          <View style={styles.list}>
+            {teammates.accounts.map((a) => {
+              const mine = a.owner.id === user.id;
+              const who = personName(mine ? a.teammate : user);
+              return (
+                <View key={a.account} style={styles.item}>
+                  <Text style={styles.rowText} numberOfLines={2}>
+                    {mine ? `${personName(a.teammate)}, for these Bots` : `For ${personName(a.owner)}'s Bots`}
+                    <Text style={styles.faint}> · {a.removal ? removalStatus(a.removal) : a.wanted ? "in use" : "no longer has access"}</Text>
+                  </Text>
+                  <Button label="Remove" danger disabled={busy} onPress={() => void removeTeammate(a.owner.id, a.teammate.id, who)} />
+                </View>
+              );
+            })}
+            {teammates.removals
+              .filter((r) => r.state !== "pending")
+              .slice(0, 5)
+              .map((r) => (
+                <View key={r.id} style={styles.item}>
+                  <Text style={[styles.dim, styles.grow]}>
+                    {r.ownerId === user.id ? personName(r.teammate) : `For ${personName(r.owner)}'s Bots`} · {removalStatus(r)}
+                  </Text>
+                </View>
+              ))}
+          </View>
         </Section>
       ) : null}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  wrap: { gap: 16 },
-  name: { color: colors.text, fontSize: 22, fontWeight: "600" },
-  text: { color: colors.text },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 13 },
-  error: { color: colors.danger },
-  section: { gap: 8, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 12 },
-  sectionTitle: { color: colors.textDim, fontSize: 13, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.5 },
-  row: { flexDirection: "row", alignItems: "center", gap: 10, flexWrap: "wrap" },
-  linkBox: { gap: 8, marginTop: 4 },
-  input: {
-    backgroundColor: colors.bgBubble,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    color: colors.text,
-    fontSize: 15,
-  },
-  btn: { paddingVertical: 7, paddingHorizontal: 16, borderRadius: 999, borderWidth: 1, borderColor: "#3a3a3a" },
-  btnText: { color: colors.text, fontSize: 14 },
-  dangerBtn: { borderColor: "#5a2a2c" },
-  dangerText: { color: colors.danger },
-  disabled: { opacity: 0.5 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    wrap: { gap: t.space.lg },
+    head: { gap: t.space.xxs, paddingHorizontal: t.space.xs },
+    name: { color: t.c.text, ...type(t, "xl"), fontWeight: t.font.weight.semibold },
+    text: k.text,
+    rowText: { ...k.text, flex: 1 },
+    dim: k.dim,
+    faint: k.faint,
+    error: k.error,
+    grow: { flex: 1 },
+    section: k.card,
+    sectionTitle: k.cardTitle,
+    row: k.actions,
+    line: { flexDirection: "row", alignItems: "center", gap: t.space.md },
+    list: {},
+    item: { ...k.row, paddingVertical: t.space.sm },
+    linkBox: k.field,
+    input: k.input,
+    btn: { ...k.btn, ...k.btnSmall },
+    btnText: k.btnText,
+    dangerBtn: k.danger,
+    dangerText: k.dangerText,
+    pressed: k.btnPressed,
+    disabled: k.disabled,
+  });
 });

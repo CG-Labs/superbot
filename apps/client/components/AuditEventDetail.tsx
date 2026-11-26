@@ -2,7 +2,8 @@ import React, { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { decisionSummary, detailsPretty, eventFields, eventText, pivotsFor, signInLabel, type AuditFilters } from "../src/audit";
 import { copyText, COPY_LABEL } from "../src/clipboard";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type } from "../src/theme";
+import { kit } from "./ui";
 import type { AuditEvent } from "../src/types";
 
 interface Props {
@@ -13,9 +14,10 @@ interface Props {
   onPivot: (filters: AuditFilters) => void;
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({ label, value, first }: { label: string; value: string; first?: boolean }) {
+  const styles = useStyles();
   return (
-    <View style={styles.field}>
+    <View style={[styles.field, first && styles.fieldFirst]}>
       <Text style={styles.label}>{label}</Text>
       <Text style={styles.value} selectable>
         {value}
@@ -26,6 +28,7 @@ function Row({ label, value }: { label: string; value: string }) {
 
 /** One audit event in full: every field, an approval's decision, its details, and "show everything like this". */
 export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
+  const styles = useStyles();
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
@@ -55,18 +58,22 @@ export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
       {decision ? (
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Decision</Text>
-          <Text style={[styles.verdict, e.action !== "approval.approved" && styles.verdictBad]}>{decision.verdict}</Text>
-          {decision.lines.map(([label, value]) => (
-            <Row key={label} label={label} value={value} />
-          ))}
+          <View style={styles.group}>
+            <Text style={[styles.verdict, e.action !== "approval.approved" && styles.verdictBad]}>{decision.verdict}</Text>
+            {decision.lines.map(([label, value]) => (
+              <Row key={label} label={label} value={value} />
+            ))}
+          </View>
         </View>
       ) : null}
 
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Event</Text>
-        {eventFields(e, { nameOf, botName }).map(([label, value]) => (
-          <Row key={label} label={label} value={value} />
-        ))}
+        <View style={styles.group}>
+          {eventFields(e, { nameOf, botName }).map(([label, value], i) => (
+            <Row key={label} label={label} value={value} first={i === 0} />
+          ))}
+        </View>
       </View>
 
       {details ? (
@@ -80,48 +87,52 @@ export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
 
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Show</Text>
-        {pivotsFor(e, { nameOf, botName }).map((p) => (
-          <Pressable key={p.label} onPress={() => onPivot(p.filters)} accessibilityRole="button" style={styles.pivot}>
-            <Text style={styles.link}>{p.label} ›</Text>
-          </Pressable>
-        ))}
+        <View style={styles.group}>
+          {pivotsFor(e, { nameOf, botName }).map((p, i) => (
+            <Pressable
+              key={p.label}
+              onPress={() => onPivot(p.filters)}
+              accessibilityRole="button"
+              style={({ pressed }) => [styles.pivot, i === 0 && styles.fieldFirst, pressed && styles.pivotPressed]}
+            >
+              <Text style={styles.link}>{p.label} ›</Text>
+            </Pressable>
+          ))}
+        </View>
       </View>
 
-      <Pressable style={styles.copyBtn} onPress={() => void copy()} accessibilityRole="button" accessibilityLabel={`${COPY_LABEL} event`}>
+      <Pressable style={({ pressed }) => [styles.copyBtn, pressed && styles.copyPressed]} onPress={() => void copy()} accessibilityRole="button" accessibilityLabel={`${COPY_LABEL} event`}>
         <Text style={styles.copyText}>{copied ? "Copied" : `${COPY_LABEL} event`}</Text>
       </Pressable>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  root: { gap: 14 },
-  top: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
-  action: { color: colors.text, fontFamily: "monospace", fontSize: 16, lineHeight: 22, flexShrink: 1 },
-  tag: { fontSize: 12, borderWidth: 1, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 1 },
-  okTag: { color: colors.accent, borderColor: "#2a4a33" },
-  badTag: { color: colors.danger, borderColor: "#5a2a2c" },
-  dim: { color: colors.textDim },
-  section: { gap: 6 },
-  sectionTitle: { color: colors.textFaint, fontSize: 12, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.5 },
-  verdict: { color: colors.accent, fontSize: 15, fontWeight: "600" },
-  verdictBad: { color: colors.danger },
-  field: { flexDirection: "row", gap: 12 },
-  label: { color: colors.textDim, width: 110, fontSize: 13 },
-  value: { color: colors.text, flex: 1, fontSize: 13 },
-  code: {
-    color: colors.textDim,
-    fontFamily: "monospace",
-    fontSize: 12,
-    lineHeight: 18,
-    backgroundColor: colors.bgSidebar,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 12,
-  },
-  pivot: { paddingVertical: 4 },
-  link: { color: colors.blueDot },
-  copyBtn: { alignSelf: "flex-start", borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  copyText: { color: colors.text },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: { gap: t.space.lg },
+    top: { flexDirection: "row", alignItems: "center", gap: t.space.sm, flexWrap: "wrap" },
+    action: { color: t.c.text, fontFamily: t.font.mono, ...type(t, "md"), fontWeight: t.font.weight.semibold, flexShrink: 1 },
+    tag: k.tag,
+    okTag: k.tagGood,
+    badTag: k.tagDanger,
+    dim: k.dim,
+    section: { gap: t.space.sm },
+    sectionTitle: { ...k.section, marginTop: 0, marginBottom: 0 },
+    group: { ...k.card, gap: 0, paddingVertical: t.space.xs, paddingHorizontal: t.space.lg },
+    verdict: { color: t.c.success, ...type(t, "md"), fontWeight: t.font.weight.semibold, paddingVertical: t.space.sm },
+    verdictBad: { color: t.c.danger },
+    field: { flexDirection: "row", gap: t.space.md, paddingVertical: t.space.sm, borderTopWidth: hairline, borderTopColor: t.c.border },
+    fieldFirst: { borderTopWidth: 0 },
+    label: { ...k.dim, width: 110 },
+    value: { color: t.c.text, ...type(t, "sm"), flex: 1 },
+    code: { ...k.inset, color: t.c.textMuted, fontFamily: t.font.mono, ...type(t, "xs") },
+    pivot: { paddingVertical: t.space.sm, borderTopWidth: hairline, borderTopColor: t.c.border },
+    pivotPressed: { opacity: 0.7 },
+    link: { ...k.link, ...type(t, "sm") },
+    copyBtn: { ...k.btn, alignSelf: "flex-start" },
+    copyPressed: k.btnPressed,
+    copyText: k.btnText,
+  });
 });

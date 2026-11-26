@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import { managedIn, normalizeSecretName, savedLine, secretNameProblem, secretValueProblem } from "../src/secrets";
-import { colors } from "../src/theme";
+import { themedStyles, type } from "../src/theme";
 import type { PersonalSecret } from "../src/types";
+import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "mySecrets" | "setMySecret" | "deleteMySecret">;
@@ -20,6 +21,8 @@ interface Props {
  * dates only; a value is sent once and never shown again, so it isn't kept here either.
  */
 export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const [list, setList] = useState<PersonalSecret[] | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -109,20 +112,13 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
     }
   };
 
-  const header = (
-    <View style={styles.header}>
-      <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
-        <Text style={styles.back}>‹ Bots</Text>
-      </Pressable>
-      <Text style={styles.title}>Your secrets</Text>
-    </View>
-  );
+  const header = <PageHeader title="Your secrets" onBack={onBack} />;
 
   if (list === undefined && !error) {
     return (
       <View style={styles.root}>
         {header}
-        <ActivityIndicator style={styles.loading} color={colors.textDim} />
+        <Spinner style={styles.loading} />
       </View>
     );
   }
@@ -146,46 +142,52 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
           </Text>
         ) : null}
         {list?.length ? (
-          list.map((s) => (
-            <View key={s.name} style={styles.card}>
-              <Text style={styles.name} selectable>
-                {s.name}
-              </Text>
-              <Text style={styles.dim}>{savedLine(s)}</Text>
-              {s.overrides ? <Text style={styles.dim}>The server has one with this name too; yours wins for your Bots.</Text> : null}
-              {canWrite && (!managedIn(s) || s.saved) ? (
-                <View style={styles.row}>
-                  {managedIn(s) ? null : (
-                    <Pressable
-                      style={[styles.btn, !!busy && styles.busy]}
-                      disabled={!!busy}
-                      onPress={() => {
-                        setReplacing(s.name);
-                        setName("");
-                        setValue("");
-                        setNotice(null);
-                      }}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Replace ${s.name}`}
-                    >
-                      <Text style={styles.btnText}>Replace</Text>
-                    </Pressable>
-                  )}
-                  <Pressable
-                    style={[styles.btn, !!busy && styles.busy]}
-                    disabled={!!busy}
-                    onPress={() => void remove(s)}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Delete ${s.name}`}
-                  >
-                    <Text style={styles.dangerText}>{busy === s.name ? "Deleting…" : "Delete"}</Text>
-                  </Pressable>
+          <View style={styles.list}>
+            {list.map((s, i) => (
+              <View key={s.name} style={[styles.item, i === 0 && styles.itemFirst]}>
+                <View style={styles.grow}>
+                  <Text style={styles.name} selectable>
+                    {s.name}
+                  </Text>
+                  <Text style={styles.dim}>{savedLine(s)}</Text>
+                  {s.overrides ? <Text style={styles.dim}>The server has one with this name too; yours wins for your Bots.</Text> : null}
                 </View>
-              ) : null}
-            </View>
-          ))
+                {canWrite && (!managedIn(s) || s.saved) ? (
+                  <View style={styles.row}>
+                    {managedIn(s) ? null : (
+                      <Pressable
+                        style={[styles.btn, styles.small, !!busy && styles.busy]}
+                        disabled={!!busy}
+                        onPress={() => {
+                          setReplacing(s.name);
+                          setName("");
+                          setValue("");
+                          setNotice(null);
+                        }}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Replace ${s.name}`}
+                      >
+                        <Text style={styles.btnText}>Replace</Text>
+                      </Pressable>
+                    )}
+                    <Pressable
+                      style={[styles.btn, styles.small, styles.dangerBtn, !!busy && styles.busy]}
+                      disabled={!!busy}
+                      onPress={() => void remove(s)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Delete ${s.name}`}
+                    >
+                      <Text style={styles.dangerText}>{busy === s.name ? "Deleting…" : "Delete"}</Text>
+                    </Pressable>
+                  </View>
+                ) : null}
+              </View>
+            ))}
+          </View>
         ) : list ? (
-          <Text style={styles.dim}>No secrets yet.</Text>
+          <View style={styles.list}>
+            <Text style={styles.empty}>No secrets yet.</Text>
+          </View>
         ) : null}
         {canWrite ? (
           <View style={styles.card}>
@@ -194,7 +196,7 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
               <TextInput
                 style={[styles.input, styles.mono]}
                 placeholder="Name, like OPENAI_API_KEY"
-                placeholderTextColor={colors.textFaint}
+                placeholderTextColor={placeholder}
                 value={name}
                 onChangeText={setName}
                 onBlur={() => setName((n) => normalizeSecretName(n))}
@@ -207,7 +209,7 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
             <TextInput
               style={[styles.input, styles.mono]}
               placeholder="Value"
-              placeholderTextColor={colors.textFaint}
+              placeholderTextColor={placeholder}
               value={value}
               onChangeText={setValue}
               secureTextEntry
@@ -251,35 +253,34 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  loading: { marginTop: 32 },
-  body: { padding: 16, gap: 12, maxWidth: 640, width: "100%", alignSelf: "center" },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  warn: { color: colors.warning },
-  dim: { color: colors.textDim },
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 6, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  name: { color: colors.text, fontSize: 15, fontFamily: "monospace" },
-  mono: { fontFamily: "monospace" },
-  input: {
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-  },
-  row: { flexDirection: "row", gap: 8, marginTop: 8 },
-  btn: { borderRadius: 999, borderWidth: 1, borderColor: colors.border, paddingVertical: 8, paddingHorizontal: 16 },
-  btnText: { color: colors.text, fontSize: 15 },
-  dangerText: { color: colors.danger, fontSize: 15 },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  primaryText: { color: "#111", fontSize: 15 },
-  busy: { opacity: 0.6 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: { marginTop: t.space.xxl },
+    body: k.body,
+    good: k.good,
+    error: k.error,
+    warn: k.warn,
+    dim: k.dim,
+    card: k.card,
+    cardTitle: k.cardTitle,
+    list: { ...k.card, gap: 0, paddingVertical: t.space.xs },
+    item: { ...k.row, flexWrap: "wrap" },
+    itemFirst: k.rowFirst,
+    grow: { flex: 1, minWidth: 160, gap: t.space.xxs },
+    empty: k.empty,
+    name: { ...k.mono, ...type(t, "md"), fontWeight: t.font.weight.medium },
+    mono: { fontFamily: t.font.mono },
+    input: k.input,
+    row: k.actions,
+    btn: k.btn,
+    small: k.btnSmall,
+    btnText: k.btnText,
+    dangerBtn: k.danger,
+    dangerText: { ...k.btnText, ...k.dangerText },
+    primaryBtn: { ...k.btn, ...k.primary },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    busy: k.disabled,
+  });
 });
