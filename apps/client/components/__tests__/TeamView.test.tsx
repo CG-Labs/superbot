@@ -73,7 +73,7 @@ async function open(team: Team | null, { meId = "ada", canWrite = true, invites 
   const user = userEvent.setup();
   const openPage = jest.fn(async (_url: string) => {});
   await render(<TeamView api={api as unknown as SuperBotApi} meId={meId} canWrite={canWrite} onBack={jest.fn()} checkout={checkout} open={openPage} />);
-  await screen.findByText(team ? "People" : "You aren't on a team.");
+  await screen.findByRole("heading", { name: team ? "People" : "You aren't on a team" });
   return { api, user, openPage };
 }
 
@@ -378,9 +378,9 @@ describe("TeamView", () => {
       api.teamRoleRequests.mockRejectedValueOnce(new Error("Server busy"));
       const user = userEvent.setup();
       await render(<TeamView api={api as unknown as SuperBotApi} meId="ada" canWrite onBack={jest.fn()} />);
-      expect(await screen.findByText("Couldn't load requests for team roles: Server busy")).toBeOnTheScreen();
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load requests for team roles. Server busy");
       expect(screen.getByText("People")).toBeOnTheScreen();
-      await user.press(screen.getByLabelText("Load requests again"));
+      await user.press(screen.getByRole("button", { name: "Load requests again" }));
       expect(await screen.findByTestId("team-role-requests")).toBeOnTheScreen();
       expect(screen.queryByText(/Couldn't load requests/)).toBeNull();
     });
@@ -436,12 +436,67 @@ describe("TeamView", () => {
   it("offers invites to someone on no team, and joins after saying what changes", async () => {
     const invite: MyTeamInvite = { id: "ti1", team: { id: "t1", name: "Alpha" }, role: "member", expiresAt: Date.UTC(2030, 0, 2) };
     const { api, user } = await open(null, { invites: [invite] });
+    expect(screen.getByText("Join a team from one of your invites below.")).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Invites for you" })).toBeOnTheScreen();
     const card = within(screen.getByLabelText("Invite to Alpha"));
-    await user.press(card.getByText("Join"));
+    expect(card.getByRole("heading", { name: "Alpha" })).toBeOnTheScreen();
+    expect(card.getByRole("button", { name: "Decline invite to Alpha" })).toBeOnTheScreen();
+    await user.press(card.getByRole("button", { name: "Join Alpha" }));
     expect(mockConfirm).toHaveBeenCalledWith("Join Alpha?", expect.stringContaining("outside it"), "Join");
     expect(api.acceptTeamInvite).toHaveBeenCalledWith("ti1");
     await user.press(card.getByText("Decline"));
     expect(api.declineTeamInvite).toHaveBeenCalledWith("ti1");
+  });
+
+  it("says what to do when you're on no team and have no invites", async () => {
+    await open(null);
+    expect(screen.getByText("Ask a team's owner or admin to invite you with the email you sign in with.")).toBeOnTheScreen();
+    expect(screen.queryByText("Invites for you")).toBeNull();
+  });
+
+  it("shows a skeleton while the team loads, and a retry that loads it when it can't", async () => {
+    const api = fakeApi(teamAs("member"));
+    let fail: (e: Error) => void = () => {};
+    api.team.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<TeamView api={api as unknown as SuperBotApi} meId="al" canWrite onBack={jest.fn()} />);
+    expect(screen.getByRole("progressbar", { name: "Loading your team" })).toBeOnTheScreen();
+    await act(async () => fail(new ApiError("HTTP 500", 500)));
+    expect(screen.getByRole("alert")).toHaveTextContent(/^Couldn't load your team/);
+    expect(screen.getByText("The server had a problem. Try again in a moment.")).toBeOnTheScreen();
+    expect(screen.queryByText("You aren't on a team")).toBeNull();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: "People" })).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps the team on screen when a refresh fails, with a retry", async () => {
+    const { api, user } = await open(teamAs("owner"));
+    api.team.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    await user.press(screen.getByRole("button", { name: "Cancel invite for cy@example.com" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't refresh your team. Can't reach the server. Check your connection and try again.");
+    expect(screen.getByText("People")).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Try again" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(api.team).toHaveBeenCalledTimes(3);
+  });
+
+  it("shows the header's busy dots while a change saves", async () => {
+    const { api, user } = await open(teamAs("member"), { meId: "al" });
+    let done: () => void = () => {};
+    api.leaveTeam.mockImplementationOnce(() => new Promise<void>((r) => (done = r)));
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    await user.press(screen.getByRole("button", { name: "Leave team" }));
+    expect(screen.getByRole("progressbar", { name: "Saving" })).toBeOnTheScreen();
+    await act(async () => done());
+    expect(screen.queryByRole("progressbar", { name: "Saving" })).toBeNull();
+  });
+
+  it("reads the screen's sections as headings, and says when nobody's on the team yet", async () => {
+    await open({ ...teamAs("owner"), billing: paying });
+    for (const name of ["Plan", "Pro plan", "Invite a teammate", "People"]) expect(screen.getByRole("heading", { name })).toBeOnTheScreen();
+    await render(<TeamView api={fakeApi({ ...teamAs("owner"), members: [] }) as unknown as SuperBotApi} meId="ada" canWrite onBack={jest.fn()} />);
+    expect(await screen.findByRole("heading", { name: "No one on the team yet" })).toBeOnTheScreen();
+    expect(screen.getByText("Invite a teammate above.")).toBeOnTheScreen();
   });
 
   it("titles the screen with the team's name and goes back to the Bots", async () => {

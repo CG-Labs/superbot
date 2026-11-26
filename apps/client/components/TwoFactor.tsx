@@ -4,10 +4,13 @@ import { SvgXml } from "react-native-svg";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
 import { confirmAsync } from "../src/dialogs";
-import { hairline, themedStyles, themes, type, useTheme } from "../src/theme";
+import { errorText, friendlyError } from "../src/errors";
+import { hairline, themedStyles, themes, type } from "../src/theme";
 import type { MfaPolicy, MfaProof, MfaSetup, MfaStatus } from "../src/types";
 import { Chips } from "./Chips";
-import { kit, Spinner } from "./ui";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit, usePlaceholder } from "./ui";
 
 /** A typed code: six digits for the app, anything else is a recovery code. */
 export function proofFrom(input: string): MfaProof | null {
@@ -108,7 +111,7 @@ const POLICY_LABELS: { value: MfaPolicy; label: string }[] = [
  */
 export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boolean }) {
   const styles = useStyles();
-  const t = useTheme();
+  const placeholder = usePlaceholder();
   const [status, setStatus] = useState<MfaStatus | null>(null);
   const [setup, setSetup] = useState<MfaSetup | null>(null);
   const [codes, setCodes] = useState<string[] | null>(null);
@@ -116,12 +119,14 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
   const [asking, setAsking] = useState<"codes" | "off" | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
       setStatus(await api.mfaStatus());
+      setLoadError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setLoadError(errorText(e, "Couldn't load two-factor authentication"));
     }
   }, [api]);
   useEffect(() => {
@@ -134,7 +139,7 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
     try {
       await fn();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(false);
     }
@@ -177,17 +182,19 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
 
   return (
     <View style={styles.card} accessibilityLabel="Two-factor authentication">
-      <Text style={styles.cardTitle}>Two-factor authentication</Text>
+      <Text style={styles.cardTitle} role="heading">
+        Two-factor authentication
+      </Text>
       <Text style={styles.dim}>
         Ask for a code from an authenticator app when you sign in with a sign-in code or the password. Single sign-on uses your identity provider&apos;s MFA instead.
       </Text>
-      {error ? (
-        <Text style={styles.error} accessibilityRole="alert">
-          {error}
-        </Text>
-      ) : null}
+      {error ? <InlineError message={error} /> : null}
       {!status ? (
-        <Spinner />
+        loadError ? (
+          <InlineError message={loadError} onRetry={load} />
+        ) : (
+          <ListSkeleton label="Loading two-factor authentication" rows={2} />
+        )
       ) : codes ? (
         <RecoveryCodes codes={codes} onDone={() => setCodes(null)} />
       ) : setup ? (
@@ -199,16 +206,23 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
             autoComplete="one-time-code"
             maxLength={6}
             placeholder="6-digit code"
-            placeholderTextColor={t.c.textFaint}
+            placeholderTextColor={placeholder}
             value={input}
             onChangeText={setInput}
             accessibilityLabel="Code from your authenticator app"
           />
           <View style={styles.row}>
-            <Pressable style={[styles.btn, styles.primary, busy && styles.disabled]} disabled={busy || !input.trim()} onPress={() => void confirm()}>
+            <Pressable
+              style={[styles.btn, styles.primary, busy && styles.disabled]}
+              disabled={busy || !input.trim()}
+              onPress={() => void confirm()}
+              accessibilityRole="button"
+              accessibilityLabel="Turn on two-factor authentication"
+              aria-busy={busy}
+            >
               <Text style={[styles.btnText, styles.primaryText]}>Turn on</Text>
             </Pressable>
-            <Pressable style={styles.btn} disabled={busy} onPress={() => void cancel()}>
+            <Pressable style={styles.btn} disabled={busy} onPress={() => void cancel()} accessibilityRole="button" accessibilityLabel="Cancel setting up two-factor authentication">
               <Text style={styles.btnText}>Cancel</Text>
             </Pressable>
           </View>
@@ -221,16 +235,29 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
             autoCapitalize="none"
             autoCorrect={false}
             placeholder="Code or recovery code"
-            placeholderTextColor={t.c.textFaint}
+            placeholderTextColor={placeholder}
             value={input}
             onChangeText={setInput}
             accessibilityLabel="Code or recovery code"
           />
           <View style={styles.row}>
-            <Pressable style={[styles.btn, styles.primary, busy && styles.disabled]} disabled={busy || !input.trim()} onPress={() => void prove()}>
+            <Pressable
+              style={[styles.btn, styles.primary, busy && styles.disabled]}
+              disabled={busy || !input.trim()}
+              onPress={() => void prove()}
+              accessibilityRole="button"
+              accessibilityLabel={asking === "codes" ? "Make new recovery codes" : "Turn off two-factor authentication"}
+              aria-busy={busy}
+            >
               <Text style={[styles.btnText, styles.primaryText]}>{asking === "codes" ? "Make new codes" : "Turn off"}</Text>
             </Pressable>
-            <Pressable style={styles.btn} disabled={busy} onPress={() => (setAsking(null), setInput(""))}>
+            <Pressable
+              style={styles.btn}
+              disabled={busy}
+              onPress={() => (setAsking(null), setInput(""))}
+              accessibilityRole="button"
+              accessibilityLabel={asking === "codes" ? "Cancel making new recovery codes" : "Cancel turning off two-factor authentication"}
+            >
               <Text style={styles.btnText}>Cancel</Text>
             </Pressable>
           </View>
@@ -247,17 +274,24 @@ export function TwoFactorCard({ api, admin = false }: { api: MfaApi; admin?: boo
           <View style={styles.row}>
             {status.enabled ? (
               <>
-                <Pressable style={styles.btn} disabled={busy} onPress={() => setAsking("codes")}>
+                <Pressable style={styles.btn} disabled={busy} onPress={() => setAsking("codes")} accessibilityRole="button" accessibilityLabel="New recovery codes">
                   <Text style={styles.btnText}>New recovery codes</Text>
                 </Pressable>
                 {status.required ? null : (
-                  <Pressable style={styles.btn} disabled={busy} onPress={() => setAsking("off")}>
+                  <Pressable style={styles.btn} disabled={busy} onPress={() => setAsking("off")} accessibilityRole="button" accessibilityLabel="Turn off two-factor authentication">
                     <Text style={[styles.btnText, styles.dangerText]}>Turn off</Text>
                   </Pressable>
                 )}
               </>
             ) : (
-              <Pressable style={[styles.btn, styles.primary, busy && styles.disabled]} disabled={busy} onPress={() => void start()}>
+              <Pressable
+                style={[styles.btn, styles.primary, busy && styles.disabled]}
+                disabled={busy}
+                onPress={() => void start()}
+                accessibilityRole="button"
+                accessibilityLabel="Turn on two-factor authentication"
+                aria-busy={busy}
+              >
                 <Text style={[styles.btnText, styles.primaryText]}>Turn on</Text>
               </Pressable>
             )}
@@ -287,7 +321,6 @@ const useStyles = themedStyles((t) => {
     text: k.text,
     dim: k.dim,
     faint: k.faint,
-    error: k.error,
     row: k.actions,
     input: k.input,
     btn: k.btn,

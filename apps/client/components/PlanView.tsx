@@ -2,10 +2,13 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AppState, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { BILLING_OFF, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
+import { errorText, friendlyError } from "../src/errors";
 import { overLimits, planUsageLines, storageWarning, usageLines } from "../src/plan";
 import { themedStyles, type } from "../src/theme";
 import type { BillingEmails, BillingView, MyUsage } from "../src/types";
-import { kit, PageHeader, Spinner } from "./ui";
+import { ErrorState, InlineError } from "./ErrorState";
+import { PageSkeleton } from "./Skeleton";
+import { kit, PageHeader } from "./ui";
 
 /** After a successful checkout, how often and how many times to look for Stripe's confirmation. */
 export const CONFIRM_EVERY_MS = 3000;
@@ -26,7 +29,9 @@ function UsageCard({ usage, warn }: { usage: MyUsage; warn?: boolean }) {
   const warning = warn ? storageWarning(usage.storage) : null;
   return (
     <View style={styles.card} accessibilityLabel="Usage this period">
-      <Text style={styles.cardTitle}>Usage this period</Text>
+      <Text style={styles.cardTitle} role="heading">
+        Usage this period
+      </Text>
       {usageLines(usage).map((l) => (
         <Text key={l} style={styles.line}>
           {l}
@@ -46,7 +51,9 @@ function EmailsCard({ emails, busy, onChange }: { emails: BillingEmails; busy: b
   const styles = useStyles();
   return (
     <View style={styles.card}>
-      <Text style={styles.cardTitle}>Emails</Text>
+      <Text style={styles.cardTitle} role="heading">
+        Emails
+      </Text>
       <Text style={styles.dim}>We email you when your plan, its payments or your computer change.</Text>
       <View style={styles.row}>
         <Text style={[styles.line, styles.grow]}>Also email me near my token and storage limits</Text>
@@ -63,6 +70,8 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
   const [usage, setUsage] = useState<MyUsage | null>(null);
   const [emails, setEmails] = useState<BillingEmails | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** The plan didn't load: alone it fills the screen, after a refresh it sits above what's already shown. */
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const notice = checkoutNotice(checkout);
   // Bumped by each email setting save: a refresh started before one doesn't undo it.
@@ -76,9 +85,9 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
       setView(b);
       setUsage(u);
       if (saves.current === at) setEmails(m);
-      setError(null);
+      setLoadError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setLoadError(e);
     }
   }, [api]);
 
@@ -110,7 +119,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
     try {
       setEmails(await api.setUsageEmails(usage));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -122,7 +131,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
     try {
       await open((await start()).url);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(null);
     }
@@ -130,11 +139,15 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
 
   const header = <PageHeader title="Plan" onBack={onBack} />;
 
-  if (view === undefined && !error) {
+  if (view === undefined) {
     return (
       <View style={styles.root}>
         {header}
-        <Spinner style={styles.loading} />
+        {loadError ? (
+          <ErrorState title="Couldn't load your plan" message={friendlyError(loadError)} onRetry={load} />
+        ) : (
+          <PageSkeleton label="Loading your plan" />
+        )}
       </View>
     );
   }
@@ -153,13 +166,10 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
               {BILLING_OFF}
             </Text>
           </View>
+          {loadError ? <InlineError message={errorText(loadError, "Couldn't refresh your plan")} onRetry={load} /> : null}
           {usage || emailsCard ? (
             <>
-              {error ? (
-                <Text style={styles.error} accessibilityRole="alert">
-                  {error}
-                </Text>
-              ) : null}
+              {error ? <InlineError message={error} /> : null}
               {usage ? <UsageCard usage={usage} warn /> : null}
               {emailsCard}
             </>
@@ -187,14 +197,13 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
             {notice.text}
           </Text>
         ) : null}
-        {error ? (
-          <Text style={styles.error} accessibilityRole="alert">
-            {error}
-          </Text>
-        ) : null}
+        {loadError ? <InlineError message={errorText(loadError, "Couldn't refresh your plan")} onRetry={load} /> : null}
+        {error ? <InlineError message={error} /> : null}
         {plan ? (
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>{plan.label} plan</Text>
+            <Text style={styles.cardTitle} role="heading">
+              {plan.label} plan
+            </Text>
             {team ? <Text style={styles.dim}>{`${team.name ?? "Your team"} pays for this plan for everyone on it.`}</Text> : status ? <Text style={styles.dim}>{status}</Text> : null}
             {planUsageLines(plan).map((l) => (
               <Text key={l} style={styles.line}>
@@ -213,6 +222,8 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
                 disabled={!!busy}
                 onPress={() => void go("portal", () => api.billingPortal())}
                 accessibilityRole="link"
+                accessibilityLabel="Manage billing"
+                aria-busy={busy === "portal"}
                 accessibilityHint="Opens Stripe's billing page"
               >
                 <Text style={styles.btnText}>{busy === "portal" ? "Opening…" : "Manage billing"}</Text>
@@ -222,10 +233,16 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
         ) : null}
         {usage ? <UsageCard usage={usage} warn={!plan} /> : null}
         {emailsCard}
-        {view?.plans.length ? <Text style={styles.section}>Plans</Text> : null}
+        {view?.plans.length ? (
+          <Text style={styles.section} role="heading">
+            Plans
+          </Text>
+        ) : null}
         {view?.plans.map((p) => (
           <View key={p.name} style={[styles.card, p.current && styles.currentCard]}>
-            <Text style={styles.cardTitle}>{p.label}</Text>
+            <Text style={styles.cardTitle} role="heading">
+              {p.label}
+            </Text>
             {limitSummary(p.limits).map((l) => (
               <Text key={l} style={styles.line}>
                 {l}
@@ -240,6 +257,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
                 onPress={() => void go(p.name, () => api.checkout(p.name))}
                 accessibilityRole="link"
                 accessibilityLabel={`Upgrade to ${p.label}`}
+                aria-busy={busy === p.name}
                 accessibilityHint="Opens Stripe Checkout to pay"
               >
                 <Text style={styles.primaryText}>{busy === p.name ? "Opening…" : `Upgrade to ${p.label}`}</Text>
@@ -265,11 +283,9 @@ const useStyles = themedStyles((t) => {
   const k = kit(t);
   return StyleSheet.create({
     root: k.root,
-    loading: { marginTop: t.space.xxl },
     body: k.body,
     notice: { ...k.text },
     good: k.good,
-    error: k.error,
     warn: k.warn,
     dim: k.dim,
     section: k.section,

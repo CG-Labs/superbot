@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, waitFor } from "@testing-library/react-native";
+import { act, render, screen, userEvent, waitFor } from "@testing-library/react-native";
 import { RoleRequestsCard } from "../RoleRequestsCard";
 import { ApiError } from "../../src/api";
 import type { MyRoleRequests, RequestableRole, RoleRequest } from "../../src/types";
@@ -63,6 +63,37 @@ describe("RoleRequestsCard (ADR 0209)", () => {
     const { toJSON } = await render(<RoleRequestsCard api={api} />);
     await waitFor(() => expect(toJSON()).toBeNull());
     expect(api.myRoleRequests).toHaveBeenCalled();
+  });
+
+  it("shows a skeleton while it loads, then a retry that loads it", async () => {
+    const api = fakeApi(mine());
+    let fail: (e: Error) => void = () => {};
+    api.myRoleRequests.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<RoleRequestsCard api={api} />);
+    expect(screen.getByRole("heading", { name: "Request access" })).toBeOnTheScreen();
+    expect(screen.getByRole("progressbar", { name: "Loading the roles you may request" })).toBeOnTheScreen();
+    await act(async () => fail(new ApiError("HTTP 500", 500)));
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load the roles you may request. The server had a problem. Try again in a moment.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("Production access during an incident")).toBeOnTheScreen();
+    expect(api.myRoleRequests).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says when no role may be requested beside your requests, and why an ask failed", async () => {
+    const api = fakeApi(mine({ requestable: [], requests: [PENDING] }));
+    await render(<RoleRequestsCard api={api} />);
+    expect(await screen.findByRole("heading", { name: "No role may be requested now" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Your requests" })).toBeOnTheScreen();
+
+    const asking = fakeApi(mine());
+    asking.requestRole.mockRejectedValueOnce(new ApiError("You have 5 requests waiting already.", 409));
+    const u = userEvent.setup();
+    await render(<RoleRequestsCard api={asking} />);
+    await u.type(await screen.findByLabelText("Why you need it"), "Incident 43");
+    await u.press(screen.getByRole("button", { name: "Ask for it" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("You have 5 requests waiting already.");
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
   it("asks for a role for a while, with a reason, within its limit", async () => {

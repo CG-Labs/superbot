@@ -125,12 +125,13 @@ export function ListSkeleton({ label, rows = 3, avatar }: { label: string; rows?
 
 /**
  * A settings or admin screen loading: a heading and a card or two of rows in the screen's column,
- * the way the shared kit lays them out (ADR 0337).
+ * the way the shared kit lays them out (ADR 0337). `inset={false}` drops its padding inside a
+ * column that already has some.
  */
-export function PageSkeleton({ label = "Loading", cards = 2 }: { label?: string; cards?: number }) {
+export function PageSkeleton({ label = "Loading", cards = 2, inset = true }: { label?: string; cards?: number; inset?: boolean }) {
   const styles = useStyles();
   return (
-    <SkeletonGroup label={label} style={styles.page}>
+    <SkeletonGroup label={label} style={[styles.page, !inset && styles.pageBare]}>
       {Array.from({ length: cards }, (_, i) => (
         <View key={i} style={styles.pageGroup}>
           <Skeleton width={i ? 120 : 88} height={11} />
@@ -231,6 +232,7 @@ const useStyles = themedStyles((t) =>
     row: { flexDirection: "row", alignItems: "center", gap: t.space.md, paddingVertical: t.space.xs },
     rowText: { flex: 1, gap: t.space.xs + 2 },
     page: { flex: 1, alignSelf: "center", width: "100%", maxWidth: 720, padding: t.space.lg, gap: t.space.xl },
+    pageBare: { padding: 0 },
     pageGroup: { gap: t.space.md },
     card: {
       backgroundColor: t.c.raised,

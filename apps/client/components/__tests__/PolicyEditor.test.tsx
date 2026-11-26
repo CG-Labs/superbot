@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, within } from "@testing-library/react-native";
+import { act, render, screen, userEvent, within } from "@testing-library/react-native";
 import { PolicyEditor } from "../PolicyEditor";
 import PolicyScreen from "../../app/policy";
 import type { NewPolicyRule, Policy, PolicyAction, PolicyOverride, PolicyPatch, PolicyRule, PolicyView } from "../../src/types";
@@ -244,6 +244,24 @@ describe("PolicyEditor (ADR 0049)", () => {
     expect(screen.queryByText("rm -rf /*")).toBeNull();
   });
 
+  it("says when there are no rules, and what to do", async () => {
+    const api = fakeApi();
+    await api.deletePolicyRule("g1");
+    const { rerender } = await render(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={yes} />);
+    expect(await screen.findByRole("heading", { name: "No rules yet" })).toBeOnTheScreen();
+    expect(screen.getByText("Add one below to always allow or deny calls that match it.")).toBeOnTheScreen();
+    await rerender(<PolicyEditor api={api} canEdit={false} onBack={jest.fn()} confirm={yes} />);
+    expect(await screen.findByText("Risky calls follow the actions above.")).toBeOnTheScreen();
+  });
+
+  it("reads each card's title as a heading", async () => {
+    await render(<PolicyEditor api={fakeApi()} bot={{ id: "b1", name: "Scout" }} canEdit onBack={jest.fn()} confirm={yes} />);
+    expect(await screen.findByRole("heading", { name: "Mode" })).toBeOnTheScreen();
+    for (const name of ["Sandbox", "Risky actions", "Time to answer", "Rules", "Add a rule for Scout"]) {
+      expect(screen.getByRole("heading", { name })).toBeOnTheScreen();
+    }
+  });
+
   it("shows a server refusal and keeps the draft", async () => {
     const api = fakeApi();
     api.addPolicyRule.mockRejectedValueOnce(new Error("pattern is required"));
@@ -251,8 +269,22 @@ describe("PolicyEditor (ADR 0049)", () => {
     await render(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={yes} />);
     await user.type(await screen.findByLabelText("Rule pattern"), "curl *");
     await user.press(screen.getByRole("button", { name: "Add rule" }));
-    expect(await screen.findByText("pattern is required")).toBeOnTheScreen();
+    expect(await screen.findByRole("alert")).toHaveTextContent("pattern is required");
     expect(screen.getByLabelText("Rule pattern").props.value).toBe("curl *");
+  });
+
+  it("keeps the policy on screen when a refresh fails, with a retry", async () => {
+    const api = fakeApi();
+    const user = userEvent.setup();
+    await render(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={yes} />);
+    await user.type(await screen.findByLabelText("Rule pattern"), "curl *");
+    api.policyView.mockRejectedValueOnce(new TypeError("Network request failed"));
+    await user.press(screen.getByRole("button", { name: "Add rule" }));
+    expect(await screen.findByText("Couldn't refresh the policy. Can't reach the server. Check your connection and try again.")).toHaveProp("role", "alert");
+    expect(screen.getByText("Deny rule added.")).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("curl *")).toBeOnTheScreen();
+    expect(screen.queryByText(/Couldn't refresh the policy/)).toBeNull();
   });
 
   it("is read-only for everyone but admins", async () => {
@@ -266,11 +298,18 @@ describe("PolicyEditor (ADR 0049)", () => {
     expect(screen.queryByRole("button", { name: /Delete rule/ })).toBeNull();
   });
 
-  it("says why when the policy can't be read", async () => {
+  it("says why when the policy can't be read, and loads it again", async () => {
     const api = fakeApi();
-    api.policyView.mockRejectedValue(new Error("Bot not found"));
-    await render(<PolicyEditor api={api} bot={{ id: "b9", name: "this Bot" }} canEdit onBack={jest.fn()} />);
-    expect(await screen.findByText("Bot not found")).toBeOnTheScreen();
+    let fail: (e: Error) => void = () => {};
+    api.policyView.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<PolicyEditor api={api} bot={{ id: "b1", name: "Scout" }} canEdit onBack={jest.fn()} />);
+    expect(screen.getByRole("progressbar", { name: "Loading the policy" })).toBeOnTheScreen();
+    await act(async () => fail(new Error("Bot not found")));
+    expect(screen.getByRole("alert")).toHaveTextContent(/^Couldn't load the policy/);
+    expect(screen.getByText("Bot not found")).toBeOnTheScreen();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Pushes to a git remote")).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("titles the screen with the Bot's name and goes back", async () => {
