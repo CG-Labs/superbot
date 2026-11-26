@@ -35,7 +35,9 @@ export function residencyLines(v: MyResidency): { lines: string[]; warnings: str
   const c = v.chats;
   const moving = !!c?.store && (c.moving ?? !c.inRegion);
   const chatsHeld = !!c?.store && !moving && !s?.inRegion;
-  const kept = c?.usageRecords
+  const kept = c?.auditEvents
+    ? "Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets, your second factor, the usage records of your Bots' runs and the details of the audit log's entries about what you did"
+    : c?.usageRecords
     ? "Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets, your second factor and the usage records of your Bots' runs"
     : c?.secondFactors
     ? "Your chats, routines, approvals, Bots' memory, the facts your Bots keep about you, your sign-ins, your own secrets and your second factor"
