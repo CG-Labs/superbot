@@ -1122,7 +1122,7 @@ mod tests {
     /// manifest like any other row.
     #[test]
     fn register_bundles_of_format_8_add_no_file() {
-        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 8);
+        assert_eq!(KINDS.iter().find(|k| k.id == "policy-register").unwrap().format, 9);
         let body = json_file(&json!({ "exceptions": { "notApproved": ["soc2-system-description"], "reviewOverdue": [], "changedSinceApproval": [], "approverNotInRole": [] } }));
         for n in [7, 8] {
             let f = register_bundle_with(n, "policies.json", Some((&body, &["CC2.3", "CC3.1", "CC5.3"], &["CC2.3-4", "CC3.1-1", "CC5.3-1"])));
@@ -1240,7 +1240,7 @@ mod tests {
         let d = drills::Collected { repo: json!({ "fullName": "example-org/example-repo" }), branch: "main".into(), workflows: vec![], executions: vec![] };
         let reg = register::parse(br#"{ "superbotRegister": 1 }"#, &register::builtin_policies()).unwrap();
         let policies = register::builtin_policies();
-        let rc = register::Check { r: &reg, p: period, policies: &policies, baselines: &[], sign_offs: &[] };
+        let rc = register::Check { r: &reg, p: period, policies: &policies, baselines: &[], sign_offs: &[], courses: &[] };
         let rsrc = register::Source { file: "register.json".into(), bytes: 24, sha256: sha256(b"register") };
         for tar in [
             changes::build(&c, &period, &src, now).tar,

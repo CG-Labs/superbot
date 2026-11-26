@@ -45,6 +45,10 @@ fn policies() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/policies")
 }
 
+fn training() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/training")
+}
+
 fn description() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/security/soc2-system-description.md")
 }
@@ -68,6 +72,13 @@ fn register() -> Value {
         }
         training.push(json!({ "person": p, "course": "security-awareness", "at": "2026-09-05" }));
     }
+    for p in ["p-b", "p-c"] {
+        training.push(json!({ "person": p, "course": "secure-development", "at": "2026-09-08" }));
+    }
+    let screenings: Vec<Value> = ["p-a", "p-b", "p-c", "p-d"]
+        .iter()
+        .map(|p| json!({ "person": p, "kind": "check", "at": "2025-12-01", "by": if *p == "p-a" { "p-b" } else { "p-a" }, "recordSha256": hex(p.as_bytes()), "notes": "Judy's agency" }))
+        .collect();
     json!({
         "superbotRegister": 1,
         "notes": "Kept by the security owner",
@@ -82,6 +93,7 @@ fn register() -> Value {
         "policyApprovals": approvals,
         "acknowledgements": acks,
         "training": training,
+        "screenings": screenings,
         "risks": [
             { "id": "R-1", "title": "Cross-user data leak", "owner": "Engineering lead", "likelihood": 2, "impact": 5, "treatment": "reduce", "controls": ["CC6.1-1"], "identified": "2026-01-01", "reviewed": ["2026-09-10"] },
             { "id": "R-2", "title": "Signup abuse", "owner": "Management", "likelihood": 3, "impact": 3, "treatment": "accept", "fraud": true, "identified": "2026-01-01", "reviewed": ["2026-09-10"], "acceptedBy": "p-a", "acceptedAt": "2026-09-10", "acceptedUntil": "2027-03-10", "notes": "a private reason" },
@@ -188,11 +200,13 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
     write(&dir, "access-review.json", &access_review("2026-10-12T15:00:00Z"));
     let pol = policies();
     let desc = description();
-    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--description", desc.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "--access-review", "botd-1=access-review.json", "-o", "register.tar"][..], &PERIOD].concat());
+    let courses = training();
+    let o = evidence(&dir, &[&["register", "register.json", "--policies", pol.to_str().unwrap(), "--description", desc.to_str().unwrap(), "--training", courses.to_str().unwrap(), "--baseline", "baseline-a.json", "--baseline", "baseline-b.json", "--access-review", "botd-1=access-review.json", "-o", "register.tar"][..], &PERIOD].concat());
     let out = text(&o);
     assert!(o.status.success(), "{out}");
     for want in [
         "against the policy files and system description given",
+        "with the training courses' texts in force",
         "roles.json: no exceptions; evidence for CC1.3-1",
         "policies.json: no exceptions; evidence for CC2.3-4, CC3.1-1, CC5.3-1",
         "people.json: no exceptions; evidence for CC1.4-1, CC2.2-1",
@@ -216,16 +230,20 @@ fn a_months_register_checks_against_the_real_policies_and_the_coverage_report() 
         assert_eq!(fs::metadata(&tar).unwrap().permissions().mode() & 0o777, 0o600, "private to its owner");
     }
     let raw = fs::read(&tar).unwrap();
-    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex", "Initech", "carol-gh", "initech.test", "Hooli", "Grace", "Ivan", "Umbrella"] {
+    for never in ["Alice", "Bob Example", "Cross-user data leak", "Signup abuse", "a private reason", "Kept by the security owner", "Dave", "took a gift", "Frank", "Globex", "Initech", "carol-gh", "initech.test", "Hooli", "Grace", "Ivan", "Umbrella", "Judy"] {
         assert!(!raw.windows(never.len()).any(|w| w == never.as_bytes()), "{never:?} is in the bundle");
     }
     let folder = unpack(&dir, &tar);
     let manifest = json_in(&folder, "manifest.json");
-    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(8), Some(true), Some(2)));
+    assert_eq!((manifest["kind"].as_str(), manifest["format"].as_u64(), manifest["source"]["policyTextsChecked"].as_bool(), manifest["source"]["baselineChecks"].as_u64()), (Some("policy-register"), Some(9), Some(true), Some(2)));
+    assert_eq!(manifest["source"]["trainingTextsRecorded"].as_bool(), Some(true));
     assert_eq!(manifest["source"]["accessReviewFiles"], 1);
     assert_eq!(manifest["source"]["registerSha256"].as_str(), Some(hex(&fs::read(dir.join("register.json")).unwrap()).as_str()), "identifies the register kept beside it");
     let files: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
     assert_eq!(files, ["README.txt", "roles.json", "policies.json", "people.json", "risks.json", "management-reviews.json", "vendors.json", "policy-exceptions.json", "conduct.json", "incidents.json", "access.json", "vulnerabilities.json", "production-changes.json"]);
+    let people = json_in(&folder, "people.json");
+    assert_eq!(people["courses"].as_array().unwrap().iter().map(|c| c["course"].as_str().unwrap()).collect::<Vec<_>>(), ["security-awareness", "secure-development"], "{people:#}");
+    assert_eq!((people["summary"]["engineersAtEnd"].as_u64(), people["summary"]["screenings"].as_u64()), (Some(2), Some(4)), "{people:#}");
     let vendors = json_in(&folder, "vendors.json");
     assert_eq!(vendors["exceptions"]["opinionNotUnqualified"], json!(["AR-1 of hosting (soc2-type2, reviewed 2026-10-05): qualified"]), "{vendors:#}");
     assert_eq!((vendors["assuranceReports"][1]["coveredTo"].as_str(), vendors["assuranceReports"][1]["risk"].as_str(), vendors["assuranceReports"][1]["heldRole"].as_str()), (Some("2026-09-30"), Some("R-1"), Some("Security owner")), "{vendors:#}");
