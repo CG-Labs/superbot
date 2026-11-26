@@ -1,18 +1,20 @@
 import React from "react";
 import { Redirect, router } from "expo-router";
-import { ActivityIndicator, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { SettingsView } from "../components/SettingsView";
+import { kit, Spinner } from "../components/ui";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 
 /** This device's settings: App lock (ADR 0078) and push notifications (ADR 0080); your two-factor authentication (ADR 0094) and your data's residency pin (ADR 0168). */
 export default function SettingsScreen() {
+  const styles = useStyles();
   const { ready, api, can } = useSuperBot();
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       </View>
     );
   }
@@ -25,7 +27,10 @@ export default function SettingsScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  loading: { flex: 1, justifyContent: "center", backgroundColor: colors.bgMain },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: k.center,
+  });
 });

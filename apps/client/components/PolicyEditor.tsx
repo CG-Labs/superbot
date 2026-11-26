@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import { ACTION_LABELS, ACTIONS, classChoice, minutesLabel, newRule, parseTimeout, ruleProblem, RULE_TOOLS, sortRules, toolLabel } from "../src/policy";
-import { colors } from "../src/theme";
+import { hairline, themedStyles } from "../src/theme";
 import type { Policy, PolicyAction, PolicyMode, PolicyPatch, PolicyRule, PolicyView } from "../src/types";
 import { Chips } from "./Chips";
 import { NotificationsCard, type NotificationsApi } from "./NotificationsCard";
+import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "policyView" | "patchGlobalPolicy" | "patchBotPolicy" | "resetBotPolicy" | "addPolicyRule" | "deletePolicyRule">;
@@ -35,6 +36,8 @@ function message(e: unknown): string {
  * approval waits, and the allow/deny rules. Global, or one Bot's on top of it.
  */
 export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm = confirmAsync }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const botId = bot?.id;
   const [view, setView] = useState<PolicyView | undefined>(undefined);
   /** The global policy under a Bot's, for the "Default (…)" choices. */
@@ -94,16 +97,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
       }
     });
 
-  const header = (
-    <View style={styles.header}>
-      <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back">
-        <Text style={styles.back}>‹ Back</Text>
-      </Pressable>
-      <Text style={styles.title} numberOfLines={1}>
-        {bot ? `Approvals for ${bot.name}` : "Approval policy"}
-      </Text>
-    </View>
-  );
+  const header = <PageHeader title={bot ? `Approvals for ${bot.name}` : "Approval policy"} onBack={onBack} backText="‹ Back" backLabel="Back" />;
 
   if (!view) {
     return (
@@ -114,7 +108,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
             {error}
           </Text>
         ) : (
-          <ActivityIndicator style={styles.loading} color={colors.textDim} />
+          <Spinner style={styles.loading} />
         )}
       </View>
     );
@@ -318,7 +312,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
             rules.map((r) => (
               <View key={r.id} style={styles.rule}>
                 <View style={styles.row}>
-                  <Text style={r.action === "deny" ? styles.denyTag : styles.allowTag}>{ACTION_LABELS[r.action]}</Text>
+                  <Text style={[styles.tag, r.action === "deny" ? styles.denyTag : styles.allowTag]}>{ACTION_LABELS[r.action]}</Text>
                   <Text style={styles.dim}>{toolLabel(r.tool)}</Text>
                   <Text style={[styles.faint, styles.grow]}>{r.botId ? (bot ? "This Bot" : "One Bot") : "All Bots"}</Text>
                   {canEdit ? (
@@ -363,7 +357,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
             <TextInput
               style={[styles.input, styles.mono]}
               placeholder="Or an exact tool name (optional)"
-              placeholderTextColor={colors.textFaint}
+              placeholderTextColor={placeholder}
               value={customTool}
               onChangeText={setCustomTool}
               autoCapitalize="none"
@@ -374,7 +368,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
             <TextInput
               style={[styles.input, styles.mono]}
               placeholder="Pattern, like git push origin *"
-              placeholderTextColor={colors.textFaint}
+              placeholderTextColor={placeholder}
               value={pattern}
               onChangeText={setPattern}
               autoCapitalize="none"
@@ -385,7 +379,7 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
             <TextInput
               style={styles.input}
               placeholder="Note (optional)"
-              placeholderTextColor={colors.textFaint}
+              placeholderTextColor={placeholder}
               value={note}
               onChangeText={setNote}
               editable={!busy}
@@ -412,45 +406,38 @@ export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  loading: { marginTop: 32 },
-  pad: { padding: 16 },
-  body: { padding: 16, gap: 12, maxWidth: 640, width: "100%", alignSelf: "center" },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  warn: { color: colors.warning },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 13 },
-  grow: { flex: 1 },
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  classRow: { gap: 6, paddingVertical: 4 },
-  label: { color: colors.text },
-  rule: { gap: 4, paddingVertical: 8, borderTopWidth: 1, borderTopColor: colors.border },
-  pattern: { color: colors.text, fontFamily: "monospace", fontSize: 13, backgroundColor: "#151515", borderRadius: 8, padding: 8 },
-  allowTag: { color: colors.accent, fontWeight: "600" },
-  denyTag: { color: colors.danger, fontWeight: "600" },
-  mono: { fontFamily: "monospace" },
-  input: {
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-  },
-  minutes: { width: 90 },
-  row: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 8 },
-  self: { alignSelf: "flex-start" },
-  btn: { borderRadius: 999, borderWidth: 1, borderColor: colors.border, paddingVertical: 8, paddingHorizontal: 16 },
-  btnText: { color: colors.text, fontSize: 15 },
-  dangerText: { color: colors.danger, fontSize: 15 },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  primaryText: { color: "#111", fontSize: 15 },
-  busy: { opacity: 0.6 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: { marginTop: t.space.xxl },
+    pad: { padding: t.space.lg },
+    body: k.body,
+    good: k.good,
+    error: k.error,
+    warn: k.warn,
+    dim: k.dim,
+    faint: k.faint,
+    grow: { flex: 1 },
+    card: k.card,
+    cardTitle: k.cardTitle,
+    classRow: { gap: t.space.sm, paddingTop: t.space.md, borderTopWidth: hairline, borderTopColor: t.c.border },
+    label: k.label,
+    rule: { gap: t.space.xs, paddingTop: t.space.md, borderTopWidth: hairline, borderTopColor: t.c.border },
+    pattern: { ...k.mono, backgroundColor: t.c.codeBg, borderRadius: t.radius.sm, padding: t.space.sm },
+    tag: { ...k.tag, fontWeight: t.font.weight.semibold },
+    allowTag: k.tagGood,
+    denyTag: k.tagDanger,
+    mono: { fontFamily: t.font.mono },
+    input: k.input,
+    minutes: { width: 90 },
+    row: k.actions,
+    self: { alignSelf: "flex-start" },
+    btn: k.btn,
+    btnText: k.btnText,
+    dangerText: { ...k.btnText, ...k.dangerText },
+    primaryBtn: { ...k.btn, ...k.primary },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    busy: k.disabled,
+  });
 });

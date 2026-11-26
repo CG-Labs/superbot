@@ -1,19 +1,21 @@
 import React from "react";
 import { Redirect, router } from "expo-router";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { RolesAdmin } from "../components/RolesAdmin";
+import { kit, Spinner } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 
 /** Admins only (ADR 0123, 0132). The server refuses roles to anyone else; this just says so. */
 export default function RolesScreen() {
+  const styles = useStyles();
   const { ready, api, me } = useSuperBot();
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       </View>
     );
   }
@@ -35,10 +37,13 @@ export default function RolesScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  loading: { flex: 1, justifyContent: "center", backgroundColor: colors.bgMain },
-  denied: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
-  text: { color: colors.text, fontSize: 16 },
-  link: { color: colors.blueDot },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: k.center,
+    denied: k.center,
+    text: k.text,
+    link: k.link,
+  });
 });

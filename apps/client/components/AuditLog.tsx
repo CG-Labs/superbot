@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import type { SuperBotApi } from "../src/api";
 import {
@@ -18,11 +18,12 @@ import {
   type AuditFilters,
 } from "../src/audit";
 import { saveCsv } from "../src/saveCsv";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type } from "../src/theme";
 import type { AuditEvent } from "../src/types";
 import { AuditChainPanel } from "./AuditChainPanel";
 import { AuditEventDetail } from "./AuditEventDetail";
 import { Chips } from "./Chips";
+import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -39,12 +40,14 @@ interface Props {
 const DEBOUNCE_MS = 300;
 
 function Field({ label, value, onChange, placeholder, width }: { label: string; value: string; onChange: (v: string) => void; placeholder: string; width?: number }) {
+  const styles = useStyles();
+  const placeholderColor = usePlaceholder();
   return (
     <TextInput
       style={[styles.input, width ? { width } : styles.grow]}
       accessibilityLabel={label}
       placeholder={placeholder}
-      placeholderTextColor={colors.textFaint}
+      placeholderTextColor={placeholderColor}
       value={value}
       onChangeText={onChange}
       autoCapitalize="none"
@@ -54,13 +57,37 @@ function Field({ label, value, onChange, placeholder, width }: { label: string; 
   );
 }
 
-function EventRow({ e, selected, onPress, botName, nameOf }: { e: AuditEvent; selected: boolean; onPress: () => void; botName?: Props["botName"]; nameOf: (id: string) => string }) {
+function EventRow({
+  e,
+  selected,
+  first,
+  last,
+  onPress,
+  botName,
+  nameOf,
+}: {
+  e: AuditEvent;
+  selected: boolean;
+  first: boolean;
+  last: boolean;
+  onPress: () => void;
+  botName?: Props["botName"];
+  nameOf: (id: string) => string;
+}) {
+  const styles = useStyles();
   const how = signInLabel(e, nameOf);
   const target = targetLabel(e);
   const details = detailsText(e);
   return (
     <Pressable
-      style={[styles.row, e.outcome !== "success" && styles.rowBad, selected && styles.rowOpen]}
+      style={({ pressed }) => [
+        styles.row,
+        first && styles.rowFirst,
+        last && styles.rowLast,
+        e.outcome !== "success" && styles.rowBad,
+        pressed && styles.rowPressed,
+        selected && styles.rowOpen,
+      ]}
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={`Audit event ${e.id}: ${e.action}`}
@@ -93,6 +120,7 @@ function EventRow({ e, selected, onPress, botName, nameOf }: { e: AuditEvent; se
 
 /** The audit log for admins: filters, paging, event detail, CSV export, and the hash chain's state (ADR 0009, 0019, 0028, 0060, 0149). The server refuses it to everyone else. */
 export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
+  const styles = useStyles();
   const { width } = useWindowDimensions();
   const wide = width >= 900;
   const [filters, setFilters] = useState<AuditFilters>(() => ({ ...NO_FILTERS, ...initial }));
@@ -248,12 +276,20 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
       refreshing={refreshing}
       onRefresh={() => void refresh()}
       testID="audit-list"
-      renderItem={({ item }) => (
-        <EventRow e={item} selected={selected?.id === item.id} onPress={() => setSelected(item)} botName={botName} nameOf={nameOf} />
+      renderItem={({ item, index }) => (
+        <EventRow
+          e={item}
+          selected={selected?.id === item.id}
+          first={index === 0}
+          last={index === (events?.length ?? 0) - 1}
+          onPress={() => setSelected(item)}
+          botName={botName}
+          nameOf={nameOf}
+        />
       )}
       ListEmptyComponent={
         loading ? (
-          <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} />
+          <Spinner style={styles.spinner} />
         ) : (
           <Text style={error ? styles.error : styles.empty}>{error ?? "No events match."}</Text>
         )
@@ -280,24 +316,32 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
 
   return (
     <View style={styles.root}>
-      <View style={styles.header}>
-        <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
-          <Text style={styles.back}>‹ Bots</Text>
-        </Pressable>
-        <Text style={styles.title}>Audit log</Text>
-        <Pressable onPress={() => setShowChain((s) => !s)} accessibilityRole="button" accessibilityState={{ expanded: showChain }} accessibilityLabel="The hash chain's state">
-          <Text style={styles.link}>{showChain ? "Hide chain" : "Chain"}</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.primaryBtn, exporting && styles.busy]}
-          onPress={() => void exportCsv()}
-          disabled={exporting}
-          accessibilityRole="button"
-          accessibilityState={{ disabled: exporting, busy: exporting }}
-        >
-          <Text style={styles.primaryText}>{exporting ? "Exporting…" : "Export CSV"}</Text>
-        </Pressable>
-      </View>
+      <PageHeader
+        title="Audit log"
+        onBack={onBack}
+        right={
+          <View style={styles.headerActions}>
+            <Pressable
+              onPress={() => setShowChain((s) => !s)}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: showChain }}
+              accessibilityLabel="The hash chain's state"
+              style={({ pressed }) => [styles.btn, showChain && styles.btnOn, pressed && styles.btnPressed]}
+            >
+              <Text style={styles.btnText}>{showChain ? "Hide chain" : "Chain"}</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.primaryBtn, exporting && styles.busy]}
+              onPress={() => void exportCsv()}
+              disabled={exporting}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: exporting, busy: exporting }}
+            >
+              <Text style={styles.primaryText}>{exporting ? "Exporting…" : "Export CSV"}</Text>
+            </Pressable>
+          </View>
+        }
+      />
       {showChain ? <AuditChainPanel api={api} /> : null}
       {wide ? (
         filterPanel
@@ -316,7 +360,7 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
       {wide ? (
         <View style={styles.body}>
           {list}
-          <ScrollView style={styles.detailPane} contentContainerStyle={{ padding: 20 }}>
+          <ScrollView style={styles.detailPane} contentContainerStyle={styles.detailBody}>
             {detail ?? <Text style={styles.empty}>Pick an event to see all of it.</Text>}
           </ScrollView>
         </View>
@@ -328,7 +372,7 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
               <Pressable style={styles.modalHeader} onPress={() => setSelected(null)} accessibilityRole="button" accessibilityLabel="Back to the audit log">
                 <Text style={styles.back}>‹ Audit log</Text>
               </Pressable>
-              <ScrollView contentContainerStyle={{ padding: 16, paddingRight: 20 }}>{detail}</ScrollView>
+              <ScrollView contentContainerStyle={styles.modalBody}>{detail}</ScrollView>
             </SafeAreaView>
           </Modal>
         </>
@@ -337,52 +381,66 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  primaryText: { color: "#111", fontSize: 15 },
-  busy: { opacity: 0.6 },
-  filterToggle: { paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.border },
-  filtersNarrow: { maxHeight: "55%", flexGrow: 0 },
-  filters: { gap: 10, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  inputs: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
-  input: {
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-  },
-  grow: { flexGrow: 1, flexBasis: 200 },
-  clear: { paddingHorizontal: 8, paddingVertical: 10 },
-  link: { color: colors.blueDot },
-  body: { flex: 1, flexDirection: "row" },
-  list: { flex: 1 },
-  listContent: { padding: 12, gap: 4 },
-  detailPane: { width: 440, flexGrow: 0, borderLeftWidth: 1, borderLeftColor: colors.border },
-  modalRoot: { flex: 1, backgroundColor: colors.bgMain },
-  modalHeader: { padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  row: { padding: 12, borderRadius: 14, gap: 3, backgroundColor: colors.bgSidebar },
-  rowBad: { borderLeftWidth: 3, borderLeftColor: colors.danger },
-  rowOpen: { backgroundColor: colors.bgActive },
-  rowTop: { flexDirection: "row", alignItems: "center", gap: 8 },
-  // One clipped line: without the extra line height, web cuts off the underscores.
-  action: { color: colors.text, fontFamily: "monospace", fontSize: 14, lineHeight: 20, flexShrink: 1 },
-  time: { color: colors.textDim, fontSize: 12, marginLeft: "auto" },
-  who: { color: colors.text },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 12 },
-  details: { color: colors.textDim, fontFamily: "monospace", fontSize: 12, lineHeight: 18 },
-  tag: { fontSize: 12, borderWidth: 1, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 1 },
-  badTag: { color: colors.danger, borderColor: "#5a2a2c" },
-  empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
-  error: { color: colors.danger, paddingHorizontal: 16, paddingVertical: 8 },
-  footer: { alignItems: "center", gap: 10, paddingVertical: 16 },
-  moreBtn: { borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  moreText: { color: colors.text },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    back: k.backText,
+    headerActions: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
+    btn: { ...k.btn, ...k.btnSmall },
+    btnOn: { backgroundColor: t.c.selected },
+    btnPressed: k.btnPressed,
+    btnText: k.btnText,
+    primaryBtn: { ...k.btn, ...k.btnSmall, ...k.primary },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    busy: k.disabled,
+    filterToggle: { paddingHorizontal: t.space.lg, paddingVertical: t.space.md, borderBottomWidth: hairline, borderBottomColor: t.c.border },
+    filtersNarrow: { maxHeight: "55%", flexGrow: 0 },
+    filters: { gap: t.space.sm, paddingHorizontal: t.space.lg, paddingVertical: t.space.md, borderBottomWidth: hairline, borderBottomColor: t.c.border },
+    inputs: { flexDirection: "row", flexWrap: "wrap", gap: t.space.sm, alignItems: "center" },
+    input: { ...k.search, ...type(t, "sm") },
+    grow: { flexGrow: 1, flexBasis: 200 },
+    clear: { paddingHorizontal: t.space.sm, paddingVertical: t.space.sm },
+    link: k.link,
+    body: { flex: 1, flexDirection: "row" },
+    list: { flex: 1 },
+    listContent: { padding: t.space.lg, paddingBottom: t.space.xl },
+    spinner: { marginTop: t.space.xl },
+    detailPane: { width: 440, flexGrow: 0, backgroundColor: t.c.surface, borderLeftWidth: hairline, borderLeftColor: t.c.border },
+    detailBody: { padding: t.space.xl },
+    modalRoot: { flex: 1, backgroundColor: t.c.bg },
+    modalHeader: { ...k.header, minHeight: 0 },
+    modalBody: { padding: t.space.lg },
+    // The rows together make one card: hairlines between them, the card's corners on the first and last.
+    row: {
+      paddingVertical: t.space.md,
+      paddingHorizontal: t.space.lg,
+      gap: t.space.xxs,
+      backgroundColor: t.c.raised,
+      borderColor: t.c.border,
+      borderTopWidth: hairline,
+      borderLeftWidth: hairline,
+      borderRightWidth: hairline,
+    },
+    rowFirst: { borderTopLeftRadius: t.radius.lg, borderTopRightRadius: t.radius.lg },
+    rowLast: { borderBottomWidth: hairline, borderBottomLeftRadius: t.radius.lg, borderBottomRightRadius: t.radius.lg },
+    rowBad: { borderLeftWidth: t.space.xxs, borderLeftColor: t.c.danger },
+    rowPressed: { backgroundColor: t.c.hover },
+    rowOpen: { backgroundColor: t.c.selected },
+    rowTop: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
+    // One clipped line: without the extra line height, web cuts off the underscores.
+    action: { color: t.c.text, fontFamily: t.font.mono, ...type(t, "sm"), fontWeight: t.font.weight.medium, flexShrink: 1 },
+    time: { ...k.faint, marginLeft: "auto" },
+    who: { color: t.c.text, ...type(t, "sm") },
+    dim: { color: t.c.textMuted },
+    faint: k.faint,
+    details: { color: t.c.textMuted, fontFamily: t.font.mono, ...type(t, "xs") },
+    tag: k.tag,
+    badTag: k.tagDanger,
+    empty: k.empty,
+    error: { ...k.error, paddingHorizontal: t.space.lg, paddingVertical: t.space.sm },
+    footer: { alignItems: "center", gap: t.space.md, paddingVertical: t.space.lg },
+    moreBtn: k.btn,
+    moreText: k.btnText,
+  });
 });

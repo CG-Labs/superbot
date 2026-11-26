@@ -272,6 +272,15 @@ describe("PolicyEditor (ADR 0049)", () => {
     await render(<PolicyEditor api={api} bot={{ id: "b9", name: "this Bot" }} canEdit onBack={jest.fn()} />);
     expect(await screen.findByText("Bot not found")).toBeOnTheScreen();
   });
+
+  it("titles the screen with the Bot's name and goes back", async () => {
+    const onBack = jest.fn();
+    const user = userEvent.setup();
+    await render(<PolicyEditor api={fakeApi()} bot={{ id: "b1", name: "Scout" }} canEdit onBack={onBack} confirm={yes} />);
+    expect(await screen.findByRole("header", { name: "Approvals for Scout" })).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Back" }));
+    expect(onBack).toHaveBeenCalled();
+  });
 });
 
 describe("the /policy screen", () => {

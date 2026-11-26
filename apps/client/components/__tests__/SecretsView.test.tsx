@@ -186,6 +186,14 @@ describe("SecretsView (ADR 0044)", () => {
     await render(<SecretsView api={api} onBack={jest.fn()} canWrite />);
     expect(await screen.findByText("Sign in as a user to keep your own secrets.")).toBeOnTheScreen();
   });
+
+  it("titles the screen and goes back to the Bots", async () => {
+    const onBack = jest.fn();
+    await render(<SecretsView api={fakeApi()} onBack={onBack} canWrite />);
+    expect(await screen.findByRole("header", { name: "Your secrets" })).toBeOnTheScreen();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Back to Bots" }));
+    expect(onBack).toHaveBeenCalled();
+  });
 });
 
 describe("secrets route", () => {
