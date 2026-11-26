@@ -33,14 +33,14 @@ Which events are held back is read from botd's rows, not worked out again from p
 
 ### The archive
 
-A retried archive batch must be the same object (ADR 0154): a later version that differs is reported as overwritten. So when the export cuts an archive batch it saves which of its events it holds back (`audit_export:<id>#held`), before saving the batch's last id, and a retry, after a restart too, holds back the same ones whoever has moved since.
+A retried archive batch must be the same object (ADR 0154): a later version that differs is reported as overwritten. So when the export cuts an archive batch it records which of its events it holds back, with the region named, in a table of botd's own (`audit_export_held`), in the same transaction as the batch's last id. A retry, after a restart too, holds back exactly those, whoever has moved since. A cut that couldn't be saved sent nothing, so the batch is cut again. A batch cut before this change has no record, and went whole on its first try, so its retries go whole too: on the upgrade, at most that one batch reaches an archive outside the region whole.
 
-The archive's check compares each archived event with this server's row. An event the archive holds only the sealed row of is held to the fields no erasure may change, as an erased one is, and counted as `heldBack`. Its hash, which covers the digest of the rest, must still match.
+The archive's check compares each archived event with this server's row. An event the archive holds only the sealed row of is held to the fields no erasure may change, as an erased one is, and counted as `heldBack`, only when botd's record says it sent that event sealed, naming that region. A line that only looks sealed is held to every field: someone who can replace an object can't strip an event's details and keep its hash, which the line still gives from its fixed fields, and pass. Retention deletes the record with its event.
 
 ### Saying so
 
 - `GET /api/audit/siem`, `botctl audit siem` and the startup line give each sink's `dataRegion` and how many events it has been sent as sealed rows since botd started (`heldBack`).
-- A pin's residency report gets an `auditExport` section: each sink by name and kind (never its address), its stated region and whether it gets their events whole or held back. What the pin doesn't cover lists only the sinks that get them whole and aren't stated to be in the region, in place of the general line ADR 0316 added.
+- A pin's residency report gets an `auditExport` section: each sink by name and kind (never its address), its stated region and whether it gets their events whole, held back, or `partly`: held back but for the events whose details are still in botd's own database (a move into the store that failed or hasn't run yet; the report's chat section counts them), which go whole. The report reads that from where the details are, not from the store being there. What the pin doesn't cover lists the sinks that get them whole and aren't stated to be in the region, in place of the general line ADR 0316 added, and how many go whole to those `partly`.
 - The DPA template's annex IV, the data flows page and the ops guides say the same.
 
 ## Consequences
@@ -59,7 +59,8 @@ The archive's check compares each archived event with this server's row. An even
 ## Tests
 
 - `audit_export`: a sink's region is its own, else the server-wide one, `off` taking it away, and a bad id stops botd; the startup line names it; an event's sealed row has every erasable field empty but `details`, keeps its fixed fields and digest, and drops its salt.
-- `audit_archive_verify`: an archived sealed row is held to its fixed fields only, and a line that isn't one (an actor left, more details, a region that isn't text) is held to all of them.
+- `audit_archive_verify`: an archived sealed row botd recorded sending is held to its fixed fields only; one botd sent whole, or recorded under another region, and a line that isn't one (an actor left, more details, a region that isn't text), are held to all of them.
+- `db`: an archive batch's cut records what it holds back with it, only the batch's own events, per sink; a batch cut before has no record; cutting again replaces what wasn't delivered; retention deletes the record.
 - `db::chats`: botd's rows say which events a store keeps, from one store to another, and none once unpinned.
-- `residency_report`: sinks that get events whole outside the region are not covered, held back or in the region they are, and the Markdown names what each gets.
-- HTTP (`machines_residency_tests.rs`): with London's store, a pinned person's event goes whole to London's SIEM and to one with no stated region, and as its sealed row to a US SIEM and the archive, whose lines still check; events in botd's log go whole everywhere; `GET /api/audit/siem` counts what it held back; the archive still checks against the log; the report names each sink and lists only the one with no stated region as not covered.
+- `residency_report`: sinks that get events whole outside the region are not covered, held back or in the region they are, those held back but for events still in botd's database say how many, and the Markdown names what each gets.
+- HTTP (`machines_residency_tests.rs`): with London's store, a pinned person's event goes whole to London's SIEM and to one with no stated region, and as its sealed row to a US SIEM and the archive, whose lines still check; events in botd's log go whole everywhere; `GET /api/audit/siem` counts what it held back; the archive still checks against the log, and a copy of a batch with an event botd sent whole stripped to look sealed fails as `contents`; the report names each sink and lists only the one with no stated region as not covered.
