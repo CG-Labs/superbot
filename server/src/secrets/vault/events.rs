@@ -13,6 +13,8 @@
 //!   has a new one, or the renewal came after the token's time), everything is read again.
 //! - Each change is read again where it is applied, one after another, after the store's
 //!   epoch moves, so neither a read in flight nor the change's own can cache over a newer one.
+//!   A name changed again before it is read waits once; too many waiting make way for one
+//!   read of everything.
 //! - botd pings every 30 s; a stream whose server answered a ping once and then stops
 //!   answering is lost. A lost stream is subscribed to again, waiting 1 s, then twice as long
 //!   each time up to a minute.
@@ -30,7 +32,8 @@ use crate::audit::{Event, Outcome};
 use crate::obs::log::{log_info, log_warn};
 use base64::Engine;
 use serde_json::{json, Value};
-use std::sync::{Arc, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -251,6 +254,7 @@ pub(crate) fn seen(text: &str, cfg: &Config, users: bool) -> Option<Seen> {
 }
 
 /// What the stream tells the thread that applies it to the store.
+#[derive(Debug, PartialEq)]
 enum Note {
     Changed { scope: Scope, name: String, event: String, index: Option<String> },
     /// Subscribed again after a gap, or after a token that may have stopped events early:
@@ -258,7 +262,104 @@ enum Note {
     Resumed,
 }
 
-type Tx = mpsc::UnboundedSender<Note>;
+/// Most names waiting to be read again; past it they make way for one read of everything.
+const MAX_PENDING: usize = 1024;
+
+/// Changes waiting for the thread that applies them. A name changed again before it is read
+/// waits once, at its latest index, so a busy name can't hold up the rest or pile up reads;
+/// past `MAX_PENDING` names, they are dropped for one read of everything cached.
+#[derive(Default)]
+struct Pending {
+    order: VecDeque<(Scope, String)>,
+    latest: HashMap<(Scope, String), (String, Option<String>)>,
+    all: bool,
+    sender_gone: bool,
+    receiver_gone: bool,
+}
+
+#[derive(Default)]
+struct Queue {
+    pending: Mutex<Pending>,
+    ready: Condvar,
+}
+
+impl Queue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The stream's end of the queue.
+struct Tx(Arc<Queue>);
+/// The applying thread's end.
+struct Rx(Arc<Queue>);
+
+fn queue() -> (Tx, Rx) {
+    let q = Arc::new(Queue::default());
+    (Tx(Arc::clone(&q)), Rx(q))
+}
+
+impl Tx {
+    fn send(&self, note: Note) {
+        let mut p = self.0.lock();
+        match note {
+            Note::Resumed => p.all = true,
+            Note::Changed { scope, name, event, index } => {
+                let key = (scope, name);
+                if let Some(waiting) = p.latest.get_mut(&key) {
+                    *waiting = (event, index);
+                } else if p.order.len() >= MAX_PENDING {
+                    p.order.clear();
+                    p.latest.clear();
+                    p.all = true;
+                } else {
+                    p.order.push_back(key.clone());
+                    p.latest.insert(key, (event, index));
+                }
+            }
+        }
+        drop(p);
+        self.0.ready.notify_one();
+    }
+
+    /// Nothing applies changes any more: the store is gone.
+    fn is_closed(&self) -> bool {
+        self.0.lock().receiver_gone
+    }
+}
+
+impl Drop for Tx {
+    fn drop(&mut self) {
+        self.0.lock().sender_gone = true;
+        self.0.ready.notify_one();
+    }
+}
+
+impl Rx {
+    /// The next thing to apply, a read of everything first; None once the stream is gone.
+    fn recv(&self) -> Option<Note> {
+        let mut p = self.0.lock();
+        loop {
+            if std::mem::take(&mut p.all) {
+                return Some(Note::Resumed);
+            }
+            if let Some(key) = p.order.pop_front() {
+                let (event, index) = p.latest.remove(&key).unwrap_or_default();
+                return Some(Note::Changed { scope: key.0, name: key.1, event, index });
+            }
+            if p.sender_gone {
+                return None;
+            }
+            p = self.0.ready.wait(p).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl Drop for Rx {
+    fn drop(&mut self) {
+        self.0.lock().receiver_gone = true;
+    }
+}
 
 /// A subscription Vault accepted, and the token it was made with.
 struct Subscribed {
@@ -547,8 +648,8 @@ fn audit_refresh(report: &Refresh, target: (&str, &str), trigger: &str, event: O
 
 /// Applies what the stream announces to the store, on a thread of its own: reads and
 /// refreshes block, and must not hold up the stream.
-fn apply(store: Weak<ExternalStore>, mut rx: mpsc::UnboundedReceiver<Note>) {
-    while let Some(note) = rx.blocking_recv() {
+fn apply(store: Weak<ExternalStore>, rx: Rx) {
+    while let Some(note) = rx.recv() {
         let Some(store) = store.upgrade() else { return };
         match note {
             Note::Changed { scope, name, event, index } => {
@@ -595,7 +696,7 @@ pub(super) fn start(vault: &Vault, store: Weak<ExternalStore>) -> Result<(), Err
     let users = store.upgrade().is_some_and(|s| s.user_folders());
     let first = vault.run(|i| async move { i.subscribe().await })?;
     audit_state(&vault.inner.cfg.addr, "subscribed", None);
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = queue();
     std::thread::Builder::new().name("vault-events".into()).spawn(move || apply(store, rx)).map_err(|e| unavailable("change events", e))?;
     vault.worker.spawn(follow(Arc::clone(&vault.inner), first, users, tx))
 }
@@ -801,6 +902,33 @@ pub(crate) mod tests {
         }
         let e = Reader::new(&frame(TEXT, b"x", None)[..], true).next().await.unwrap_err();
         assert!(e.to_string().contains("unmasked frame from a client"), "{e}");
+    }
+
+    #[test]
+    fn a_name_changed_again_waits_once_and_too_many_make_way_for_one_full_read() {
+        let changed = |name: &str, index: &str| Note::Changed { scope: Scope::Bots, name: name.into(), event: "kv-v2/data-write".into(), index: Some(index.into()) };
+        let (tx, rx) = queue();
+        tx.send(changed("A_TOKEN", "1"));
+        tx.send(changed("B_TOKEN", "2"));
+        tx.send(changed("A_TOKEN", "3"));
+        assert_eq!(rx.recv(), Some(changed("A_TOKEN", "3")), "once, at its latest index, in its first place");
+        assert_eq!(rx.recv(), Some(changed("B_TOKEN", "2")));
+
+        for i in 0..MAX_PENDING {
+            tx.send(changed(&format!("N{i}_TOKEN"), "4"));
+        }
+        tx.send(changed("C_TOKEN", "5"));
+        assert_eq!(rx.recv(), Some(Note::Resumed), "everything read again instead");
+        tx.send(changed("D_TOKEN", "6"));
+        tx.send(Note::Resumed);
+        assert_eq!(rx.recv(), Some(Note::Resumed), "a full read first");
+        assert_eq!(rx.recv(), Some(changed("D_TOKEN", "6")));
+        assert!(!tx.is_closed());
+        drop(tx);
+        assert_eq!(rx.recv(), None, "the stream is gone");
+        let (tx, rx) = queue();
+        drop(rx);
+        assert!(tx.is_closed(), "the store is gone");
     }
 
     #[test]
