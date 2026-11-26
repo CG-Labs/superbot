@@ -40,6 +40,7 @@ Acme (corp): ready
     SOAP SLO URL:            https://superbot.example.com/api/auth/sso/corp/slo/soap
   IdP-initiated sign-in:    refused (start from SuperBot)
   Authentication context:   not checked (the IdP's MFA isn't required)
+  Federation listing:       none (set SP_DISPLAY_NAME and contacts to register with a federation)
   IdP metadata from url (https://acme.okta.example/app/exk1abc/sso/saml/metadata):
     Sign-in URL: https://acme.okta.example/app/acme_superbot_1/exk1abc/sso/saml
     Logout URL:  https://acme.okta.example/app/exk1abc/slo/saml
@@ -209,6 +210,12 @@ With [several IdPs of a federation](#several-idps-of-a-federation), the setting 
 | `SSO_<ID>_FORCE_AUTHN` | `false` | `true`: every AuthnRequest asks the IdP to sign the person in again (`ForceAuthn`), and an answer from before the request is refused ([below](#sign-in-age-and-the-idps-session-limit)). |
 | `SSO_<ID>_MAX_AUTHN_AGE` | | A duration (`30m`, `12h`, `7d`; 5m to 365d): a sign-in at the IdP older than this is sent back once with `ForceAuthn`. Not with `FORCE_AUTHN`. |
 | `SSO_<ID>_IDP_SESSION_LIMIT` | `on` | Sessions end at the IdP's `SessionNotOnOrAfter`, if sooner than `SESSION_MAX_AGE`. `off` ignores it. |
+| `SSO_<ID>_SP_DISPLAY_NAME` | | SuperBot's name in federations' listings, discovery services and consent pages (`mdui:DisplayName`, at most 100 characters); also publishes the attributes botd reads ([below](#registering-superbot-with-a-federation)). |
+| `SSO_<ID>_SP_DESCRIPTION` | | A sentence about the service (`mdui:Description`, at most 500 characters; 140 recommended). Needs `SP_DISPLAY_NAME`. |
+| `SSO_<ID>_SP_INFORMATION_URL`, `SSO_<ID>_SP_PRIVACY_URL` | | https pages about the service and its privacy notice (`mdui:InformationURL`, `mdui:PrivacyStatementURL`). Need `SP_DISPLAY_NAME`. |
+| `SSO_<ID>_SP_ORGANIZATION`, `SSO_<ID>_SP_ORGANIZATION_URL` | | Who runs SuperBot and its https web site (`md:Organization`), both or neither. |
+| `SSO_<ID>_SP_CONTACT_TECHNICAL`, `_SUPPORT`, `_ADMINISTRATIVE`, `_SECURITY` | | Contacts in the metadata, `Name <email>` or an email; the security one is the REFEDS security contact and needs a name. |
+| `SSO_<ID>_SP_SIRTFI` | `off` | `v1` or `v2`: the metadata asserts Sirtfi compliance (v2 asserts v1 too). Needs `SP_CONTACT_SECURITY`. |
 
 The bridge's settings (`CLIENT_ID`, `IDP_ALIAS`, `SCOPES`, `*_CLAIM`) are refused on a native provider, and the native ones on a bridge provider, so a provider is never half of each. There is no client secret.
 
@@ -474,6 +481,29 @@ botctl sso role map uni faculty@uni-b.example Auditor --idp https://login.uni-b.
 
 - A sign-in at an IdP applies only that IdP's mappings, and takes back only what they gave: someone with identities at two IdPs keeps a role from A's group when they sign in at B. Unlinking takes it back once they have no identity left at A.
 - A mapping for an IdP the provider no longer has (taken off `IDP_ENTITY_IDS`, or made before the provider had several IdPs) shows `active: false`, gives nothing, and what it gave goes at the person's next sign-in (`idp_not_listed`). Map the group again with the right `--idp`, and remove the old one.
+
+## Registering SuperBot with a federation
+
+A research and education federation registers SuperBot from its SP metadata, and its IdPs release attributes by what that says. Describe SuperBot there ([ADR 0323](../adr/0323-saml-sp-metadata-for-federation-registration.md)):
+
+```bash
+SSO_UNI_SP_DISPLAY_NAME=SuperBot at Example University
+SSO_UNI_SP_DESCRIPTION=AI teammates for research groups, each with its own computer
+SSO_UNI_SP_INFORMATION_URL=https://superbot.example.edu/
+SSO_UNI_SP_PRIVACY_URL=https://superbot.example.edu/privacy
+SSO_UNI_SP_ORGANIZATION=Example University
+SSO_UNI_SP_ORGANIZATION_URL=https://www.example.edu/
+SSO_UNI_SP_CONTACT_TECHNICAL=Research Computing <rc-ops@example.edu>
+SSO_UNI_SP_CONTACT_SUPPORT=help@example.edu
+SSO_UNI_SP_CONTACT_ADMINISTRATIVE=Research Computing <rc-admin@example.edu>
+SSO_UNI_SP_CONTACT_SECURITY=Security Team <security@example.edu>
+SSO_UNI_SP_SIRTFI=v2   # only once you meet the Sirtfi framework
+```
+
+- **What's published.** The name, description and links as `mdui:UIInfo` in English; the organization; each contact as a `ContactPerson`, the security one as the REFEDS security contact; Sirtfi as the `assurance-certification` entity attribute. With a display name, an `AttributeConsumingService` lists the attributes botd reads: the email and display name (your `EMAIL_ATTRIBUTE` and `NAME_ATTRIBUTE`, or eduPerson's `mail` and `displayName`), and the groups and authentication methods attributes if set. The email is marked required when `ALLOWED_DOMAINS` is set, and the groups with `REQUIRED_GROUPS`. A subject identifier is asked for as [above](#subject-identifiers-subject-id-and-pairwise-id). With none of these settings, the metadata is unchanged.
+- **Contacts are public.** Federations publish them in their metadata. Use role addresses, and a security address that isn't publicly archived, as Sirtfi requires.
+- **Entity categories are the federation's to add.** Research and Scholarship and the Code of Conduct v2 are added by your federation after review; botd doesn't claim them. `botctl sso saml uni` shows the listing and, for each, "metadata ready, ask the federation to add it" or the settings still missing. R&S needs `SP_DISPLAY_NAME`, `SP_INFORMATION_URL`, `SP_CONTACT_TECHNICAL` and `RESPONSE_BINDING=post` (the default); CoCo v2 needs `SP_DISPLAY_NAME`, `SP_DESCRIPTION` and `SP_PRIVACY_URL`, and most federations also want an administrative contact and Sirtfi for it.
+- **Then register.** Give the federation `<SSO_PUBLIC_URL>/api/auth/sso/uni/metadata`, or the file it serves, through its registration process. Send it again after changing these settings or rolling over a key.
 
 ## Single logout
 

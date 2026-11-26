@@ -29,6 +29,7 @@ pub(crate) mod saml_aggregate;
 pub(crate) mod saml_artifact;
 pub(crate) mod saml_expiry;
 pub(crate) mod saml_keys;
+pub(crate) mod saml_registration;
 pub(crate) mod saml_roles;
 pub(crate) mod saml_slo;
 pub(crate) mod saml_sp;
@@ -48,6 +49,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
 pub use provider::{ClaimMap, ENTRA_AUTHORITY, EveryIdp, GOOGLE_ISSUER, IdpSource, Kind, Provider, domain, guid, secure_url};
+use saml_registration::About;
 use saml_sp::{AesCbc, Binding, Encryption, IdpInitiated, KeyUse, Refused, RequestBinding, ResponseBinding, Sp, SpKey, SpSigning};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -471,7 +473,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 44] = [
+const ONLY_FOR: [(&str, &[&str]); 55] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -516,11 +518,22 @@ const ONLY_FOR: [(&str, &[&str]); 44] = [
     ("IDP_SESSION_LIMIT", &["saml"]),
     ("DISCOVERY_URL", &["saml"]),
     ("SUBJECT", &["saml"]),
+    ("SP_DISPLAY_NAME", &["saml"]),
+    ("SP_DESCRIPTION", &["saml"]),
+    ("SP_INFORMATION_URL", &["saml"]),
+    ("SP_PRIVACY_URL", &["saml"]),
+    ("SP_ORGANIZATION", &["saml"]),
+    ("SP_ORGANIZATION_URL", &["saml"]),
+    ("SP_CONTACT_TECHNICAL", &["saml"]),
+    ("SP_CONTACT_SUPPORT", &["saml"]),
+    ("SP_CONTACT_ADMINISTRATIVE", &["saml"]),
+    ("SP_CONTACT_SECURITY", &["saml"]),
+    ("SP_SIRTFI", &["saml"]),
 ];
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 29] = [
+const SAML_NATIVE_ONLY: [&str; 40] = [
     "IDP_ENTITY_IDS",
     "IDP_ENTITY_CATEGORIES",
     "IDP_METADATA_URL",
@@ -550,6 +563,17 @@ const SAML_NATIVE_ONLY: [&str; 29] = [
     "IDP_SESSION_LIMIT",
     "DISCOVERY_URL",
     "SUBJECT",
+    "SP_DISPLAY_NAME",
+    "SP_DESCRIPTION",
+    "SP_INFORMATION_URL",
+    "SP_PRIVACY_URL",
+    "SP_ORGANIZATION",
+    "SP_ORGANIZATION_URL",
+    "SP_CONTACT_TECHNICAL",
+    "SP_CONTACT_SUPPORT",
+    "SP_CONTACT_ADMINISTRATIVE",
+    "SP_CONTACT_SECURITY",
+    "SP_SIRTFI",
 ];
 
 /// Native SAML's IdP: `IDP_ENTITY_ID`, or several of a federation's in `IDP_ENTITY_IDS` (ADR
@@ -891,8 +915,9 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             let authn_context = authn_context(&key, var, list, &attributes)?;
             let freshness = freshness(&key, var)?;
             let discovery = discovery_url(&key, var, several)?;
+            let about = about(&key, var, &attributes, !allowed_domains.is_empty(), !required_groups.is_empty())?;
             (
-                Kind::SamlSp { entity_ids, every_idp, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, discovery },
+                Kind::SamlSp { entity_ids, every_idp, sp_entity_id, source, attributes, required_groups, allowed_domains, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, discovery, about },
                 saml::LABEL,
             )
         }
@@ -1050,6 +1075,43 @@ fn freshness(key: &dyn Fn(&str) -> String, var: &Var) -> Result<saml_sp::Freshne
         return Err(format!("{} already asks for a new sign-in every time, newer than any {}: remove one of them", key("FORCE_AUTHN"), key("MAX_AUTHN_AGE")));
     }
     Ok(saml_sp::Freshness { force_authn, max_authn_age_ms, idp_session_limit })
+}
+
+/// Native SAML: how our SP metadata describes SuperBot to a federation (ADR 0323), from the
+/// `SP_*` settings. The description and links need a display name, the organization's name and
+/// URL go together, and Sirtfi needs a security contact.
+fn about(key: &dyn Fn(&str) -> String, var: &Var, attributes: &saml_sp::Attributes, email_required: bool, groups_required: bool) -> Result<About, String> {
+    use saml_registration as reg;
+    let text = |k: &str, max: usize| var(&key(k)).map(|v| reg::text(&v, max).map_err(|e| format!("{} {e}", key(k)))).transpose();
+    let link = |k: &str| var(&key(k)).map(|v| reg::link(&v).map_err(|e| format!("{} {e}", key(k)))).transpose();
+    let display_name = text("SP_DISPLAY_NAME", reg::MAX_NAME)?;
+    let description = text("SP_DESCRIPTION", reg::MAX_DESCRIPTION)?;
+    let (information_url, privacy_url) = (link("SP_INFORMATION_URL")?, link("SP_PRIVACY_URL")?);
+    if display_name.is_none()
+        && let Some(k) = [("SP_DESCRIPTION", description.is_some()), ("SP_INFORMATION_URL", information_url.is_some()), ("SP_PRIVACY_URL", privacy_url.is_some())].iter().find(|(_, set)| *set).map(|(k, _)| k)
+    {
+        return Err(format!("{} needs {}: the name federations and IdPs show for SuperBot", key(k), key("SP_DISPLAY_NAME")));
+    }
+    let organization = match (text("SP_ORGANIZATION", reg::MAX_NAME)?, link("SP_ORGANIZATION_URL")?) {
+        (Some(name), Some(url)) => Some(reg::Organization { name, url }),
+        (None, None) => None,
+        _ => return Err(format!("Set both {} and {}: metadata names an organization with its web site", key("SP_ORGANIZATION"), key("SP_ORGANIZATION_URL"))),
+    };
+    let mut contacts = Vec::new();
+    for kind in reg::ContactType::ALL {
+        if let Some(v) = var(&key(kind.setting())) {
+            contacts.push(reg::contact(kind, &v).map_err(|e| format!("{} {e}", key(kind.setting())))?);
+        }
+    }
+    let sirtfi = match var(&key("SP_SIRTFI")) {
+        None => reg::Sirtfi::Off,
+        Some(v) => reg::Sirtfi::parse(&v).ok_or_else(|| format!("{} must be off, v1, or v2", key("SP_SIRTFI")))?,
+    };
+    if sirtfi != reg::Sirtfi::Off && !contacts.iter().any(|c| c.kind == reg::ContactType::Security) {
+        return Err(format!("{} needs {}: Sirtfi is asserted with a security contact, like Security Team <security@example.com>", key("SP_SIRTFI"), key("SP_CONTACT_SECURITY")));
+    }
+    let requested = reg::requested(attributes, email_required, groups_required);
+    Ok(About { display_name, description, information_url, privacy_url, organization, contacts, sirtfi, requested })
 }
 
 // Audit
@@ -1954,7 +2016,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let Some(p) = a.sso.provider(&id).filter(|p| p.saml_sp()) else {
         return not_found("SAML provider").into_response();
     };
-    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, aes_cbc, response_binding, attributes, .. } = &p.kind else {
+    let Kind::SamlSp { sp_entity_id, sign_requests, encryption, aes_cbc, response_binding, attributes, about, .. } = &p.kind else {
         return not_found("SAML provider").into_response();
     };
     let keys = a.app.as_ref().and_then(|app| published_keys(app, p, KeyUse::Signing).map_err(|e| crate::obs::log::log_warn!("SSO {id}: no SP key for the metadata: {e}")).ok());
@@ -1968,7 +2030,7 @@ pub async fn saml_metadata(Extension(a): Extension<Arc<Auth>>, Path(id): Path<St
     let enc_certs: Vec<&str> = enc.iter().map(|k| k.cert.as_str()).collect();
     // Even without DISCOVERY_URL: a federation's own discovery service may send people back.
     let discovery = p.several_idps().then(|| a.sso.discovery_response_url(&id));
-    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc, *response_binding, discovery.as_deref(), attributes.subject);
+    let md = saml_sp::sp_metadata(&Sp { entity_id: sp_entity_id, acs: &acs }, signing.as_ref(), &enc_certs, *aes_cbc, *response_binding, discovery.as_deref(), attributes.subject, about);
     ([(header::CONTENT_TYPE, "application/samlmetadata+xml")], md).into_response()
 }
 
@@ -2530,7 +2592,7 @@ fn saml_provider<'a>(a: &'a Auth, id: &str) -> Result<&'a Arc<Provider>, ApiErro
 }
 
 fn saml_view(a: &Auth, p: &Provider) -> Value {
-    let Kind::SamlSp { entity_ids, sp_entity_id, source, attributes, required_groups, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, .. } = &p.kind else {
+    let Kind::SamlSp { entity_ids, sp_entity_id, source, attributes, required_groups, sign_requests, request_binding, response_binding, sp_cert, encryption, aes_cbc, enc_cert, metadata_trust, idp_initiated, authn_context, freshness, about, .. } = &p.kind else {
         return json!({});
     };
     let several = p.several_idps();
@@ -2592,7 +2654,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         IdpSource::File(f) => Some(f.clone()),
         IdpSource::Saved => None,
     };
-    json!({
+    let mut out = json!({
         "provider": p.id, "label": p.label, "ready": p.ready(), "problem": p.not_ready(),
         "spEntityId": sp_entity_id, "acsUrl": a.sso.acs_url(&p.id), "metadataUrl": a.sso.sp_metadata_url(&p.id),
         "sloUrl": a.sso.slo_url(&p.id), "signRequests": sign_requests, "requestBinding": request_binding.as_str(), "responseBinding": response_binding.as_str(), "spKey": sp_key, "singleLogout": slo,
@@ -2609,6 +2671,25 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
         "authnContext": authn_context.as_ref().map(|c| json!({ "required": c.accepted, "methodsAttribute": attributes.authn_methods, "requested": c.request })),
         "forceAuthn": freshness.force_authn, "maxAuthnAgeSeconds": freshness.max_authn_age_ms.map(|ms| ms / 1000), "idpSessionLimit": freshness.idp_session_limit,
         "certificateWarnings": a.app.as_ref().map_or_else(Vec::new, |app| saml_expiry::warnings(app, p, now)),
+    });
+    out["about"] = about_view(about, *response_binding);
+    out
+}
+
+/// How our metadata describes SuperBot to a federation (ADR 0323), and what each entity
+/// category a registrar can add still needs.
+fn about_view(about: &About, response: ResponseBinding) -> Value {
+    let posts = response == ResponseBinding::Post;
+    let categories: Vec<Value> = saml_registration::CATEGORIES.iter().map(|(uri, name)| json!({ "category": uri, "name": name, "missing": about.missing(uri, posts) })).collect();
+    let contacts: Vec<Value> = about.contacts.iter().map(|c| json!({ "type": c.kind.as_str(), "name": c.name, "email": c.email })).collect();
+    let requested: Vec<Value> = match about.display_name {
+        Some(_) => about.requested.iter().map(|r| json!({ "name": r.name, "friendlyName": r.friendly, "required": r.required })).collect(),
+        None => vec![],
+    };
+    json!({
+        "displayName": about.display_name, "description": about.description, "informationUrl": about.information_url, "privacyUrl": about.privacy_url,
+        "organization": about.organization.as_ref().map(|o| json!({ "name": o.name, "url": o.url })),
+        "contacts": contacts, "sirtfi": about.sirtfi.as_str(), "requestedAttributes": requested, "categories": categories,
     })
 }
 
@@ -3203,8 +3284,8 @@ mod tests {
         let p = s.provider("corp").unwrap();
         assert!(p.saml_sp() && !p.oidc() && !p.needs_secret());
         assert_eq!((p.type_name(), p.jit_role), ("saml", None), "audited as idp=saml, like the bridge");
-        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, every_idp: None, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness, discovery: None }
-            if *freshness == saml_sp::Freshness::default() && entity_ids == &[ADFS] && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
+        assert!(matches!(&p.kind, Kind::SamlSp { entity_ids, every_idp: None, sp_entity_id, source: IdpSource::Saved, attributes, required_groups, allowed_domains, sign_requests: false, request_binding: RequestBinding::Auto, response_binding: ResponseBinding::Post, sp_cert: None, encryption: Encryption::Off, aes_cbc: AesCbc::Off, enc_cert: None, metadata_trust: None, idp_initiated: IdpInitiated::Off, authn_context: None, freshness, discovery: None, about }
+            if *freshness == saml_sp::Freshness::default() && about.display_name.is_none() && about.contacts.is_empty() && entity_ids == &[ADFS] && sp_entity_id == "https://bot.example.com/api/auth/sso/corp/metadata" && attributes.email.is_none() && attributes.groups.is_none() && required_groups.is_empty() && allowed_domains.is_empty()));
         assert_eq!((p.env_var(), s.slo_url("corp")), ("SSO_CORP_PRIVATE_KEY".to_string(), "https://bot.example.com/api/auth/sso/corp/slo".to_string()));
         assert_eq!(s.callback_url("corp"), "https://bot.example.com/api/auth/sso/corp/acs");
         assert!(p.not_ready().unwrap().contains("botctl sso saml corp import"), "not offered until its metadata is imported");
@@ -3291,6 +3372,60 @@ mod tests {
         let e = by_attribute.subject("00u1ADA-Persistent").unwrap_err();
         assert!(e.contains("pairwise-id") && e.contains("SSO_CORP_SUBJECT=pairwise-id"), "{e}");
         assert_eq!(native(&[]).unwrap().providers[0].subject("00u1ADA-Persistent").as_deref(), Ok("00u1ada-persistent"), "a NameID, as before");
+    }
+
+    #[test]
+    fn reads_how_the_sp_metadata_describes_superbot() {
+        use saml_registration::{ContactType, Organization, Sirtfi};
+        let about = |s: &Sso| match &s.providers[0].kind {
+            Kind::SamlSp { about, .. } => about.clone(),
+            _ => unreachable!(),
+        };
+        let plain = about(&native(&[]).unwrap());
+        assert_eq!((plain.display_name, plain.contacts.len(), plain.sirtfi, plain.organization), (None, 0, Sirtfi::Off, None), "nothing unless set");
+        assert_eq!(plain.requested.iter().map(|r| r.required).collect::<Vec<_>>(), [false, false], "email and name, neither needed without a domain list");
+
+        let s = native(&[
+            ("SSO_CORP_SP_DISPLAY_NAME", " SuperBot at Example University "),
+            ("SSO_CORP_SP_DESCRIPTION", "AI teammates with their own computer"),
+            ("SSO_CORP_SP_INFORMATION_URL", "https://superbot.example.edu/"),
+            ("SSO_CORP_SP_PRIVACY_URL", "https://superbot.example.edu/privacy"),
+            ("SSO_CORP_SP_ORGANIZATION", "Example University"),
+            ("SSO_CORP_SP_ORGANIZATION_URL", "https://www.example.edu/"),
+            ("SSO_CORP_SP_CONTACT_SECURITY", "CSIRT <csirt@example.edu>"),
+            ("SSO_CORP_SP_CONTACT_TECHNICAL", "platform@example.edu"),
+            ("SSO_CORP_SP_SIRTFI", "v2"),
+            ("SSO_CORP_ALLOWED_DOMAINS", "example.edu"),
+            ("SSO_CORP_GROUPS_ATTRIBUTE", "groups"),
+            ("SSO_CORP_REQUIRED_GROUPS", "SuperBot Users"),
+        ])
+        .unwrap();
+        let a = about(&s);
+        assert_eq!(a.display_name.as_deref(), Some("SuperBot at Example University"));
+        assert_eq!(a.organization, Some(Organization { name: "Example University".into(), url: "https://www.example.edu/".into() }));
+        assert_eq!(a.contacts.iter().map(|c| c.kind).collect::<Vec<_>>(), [ContactType::Technical, ContactType::Security], "in the schema's usual order, not the settings'");
+        assert_eq!(a.sirtfi, Sirtfi::V2);
+        assert_eq!(a.requested.iter().map(|r| (r.name.as_str(), r.required)).collect::<Vec<_>>(), [(saml_registration::MAIL, true), (saml_registration::DISPLAY_NAME, false), ("groups", true)], "required when sign-in needs it");
+
+        for (extra, says) in [
+            (vec![("SSO_CORP_SP_DESCRIPTION", "AI teammates")], "SSO_CORP_SP_DESCRIPTION needs SSO_CORP_SP_DISPLAY_NAME"),
+            (vec![("SSO_CORP_SP_PRIVACY_URL", "https://superbot.example.edu/privacy")], "SSO_CORP_SP_PRIVACY_URL needs SSO_CORP_SP_DISPLAY_NAME"),
+            (vec![("SSO_CORP_SP_DISPLAY_NAME", "SuperBot"), ("SSO_CORP_SP_INFORMATION_URL", "http://superbot.example.edu/")], "SSO_CORP_SP_INFORMATION_URL must be an https URL"),
+            (vec![("SSO_CORP_SP_DISPLAY_NAME", "two\nlines")], "SSO_CORP_SP_DISPLAY_NAME must be text"),
+            (vec![("SSO_CORP_SP_ORGANIZATION", "Example University")], "Set both SSO_CORP_SP_ORGANIZATION and SSO_CORP_SP_ORGANIZATION_URL"),
+            (vec![("SSO_CORP_SP_ORGANIZATION_URL", "https://www.example.edu/")], "Set both"),
+            (vec![("SSO_CORP_SP_CONTACT_SUPPORT", "help desk")], "SSO_CORP_SP_CONTACT_SUPPORT must be an email"),
+            (vec![("SSO_CORP_SP_CONTACT_SECURITY", "csirt@example.edu")], "SSO_CORP_SP_CONTACT_SECURITY needs a name"),
+            (vec![("SSO_CORP_SP_SIRTFI", "v1")], "SSO_CORP_SP_SIRTFI needs SSO_CORP_SP_CONTACT_SECURITY"),
+            (vec![("SSO_CORP_SP_SIRTFI", "yes")], "SSO_CORP_SP_SIRTFI must be off, v1, or v2"),
+        ] {
+            let e = native(&extra).err().unwrap_or_default();
+            assert!(e.contains(says), "{extra:?}: {e}");
+        }
+        assert!(native(&[("SSO_CORP_SP_SIRTFI", "off")]).is_ok());
+        assert!(saml(&[("SSO_ADFS_SP_DISPLAY_NAME", "SuperBot")]).err().unwrap().contains("only for native SAML"), "the broker publishes its own metadata");
+        let e = with_base(&[("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "oidc"), ("SSO_CORP_ISSUER", "https://idp.example"), ("SSO_CORP_CLIENT_ID", "x")], &[("SSO_CORP_SP_CONTACT_TECHNICAL", "a@example.com")]).err().unwrap();
+        assert!(e.contains("only for SSO_CORP_TYPE=saml"), "{e}");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
 use super::saml_sp::{self, AesCbc, Attributes, AuthnContext, Encryption, Freshness, IdpInitiated, IdpMetadata, KeyUse, MetadataRefused, MetadataTrust, RequestBinding, ResponseBinding, SpKey, Subject};
+use super::saml_registration::About;
 use super::{apple, saml, saml_aggregate, xmldsig};
 use crate::rbac::Role;
 use serde_json::Value;
@@ -62,7 +63,8 @@ pub enum Kind {
     /// each person's identity is stored under the IdP that signed them in. With `every_idp`
     /// it is empty: every IdP in the federation's aggregate is, as of its last read (ADR 0308).
     /// With several, `discovery` is the federation's discovery service, where people pick
-    /// their IdP instead of botd's chooser (ADR 0314).
+    /// their IdP instead of botd's chooser (ADR 0314). `about` is how our metadata describes
+    /// SuperBot to a federation (ADR 0323).
     SamlSp {
         entity_ids: Vec<String>,
         every_idp: Option<EveryIdp>,
@@ -83,6 +85,7 @@ pub enum Kind {
         authn_context: Option<AuthnContext>,
         freshness: Freshness,
         discovery: Option<String>,
+        about: About,
     },
 }
 
