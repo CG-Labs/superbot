@@ -175,7 +175,8 @@ With [several IdPs of a federation](#several-idps-of-a-federation), the setting 
 |----------|---------|---------|
 | `SSO_<ID>_TYPE` | (required) | `saml`, without `SSO_<ID>_ISSUER`. |
 | `SSO_<ID>_IDP_ENTITY_ID` | (required, or `IDP_ENTITY_IDS`) | The IdP's entity ID. Responses from any other issuer are refused, and identities are stored under it. |
-| `SSO_<ID>_IDP_ENTITY_IDS` | | Instead of `IDP_ENTITY_ID`: several IdPs of a federation, comma separated (2 to 100), each fetched from `IDP_MDQ_URL` or `IDP_AGGREGATE_URL` and chosen at sign-in ([below](#several-idps-of-a-federation)). |
+| `SSO_<ID>_IDP_ENTITY_IDS` | | Instead of `IDP_ENTITY_ID`: several IdPs of a federation, comma separated (2 to 100), each fetched from `IDP_MDQ_URL` or `IDP_AGGREGATE_URL` and chosen at sign-in ([below](#several-idps-of-a-federation)). Or `all`: every SAML IdP in `IDP_AGGREGATE_URL`'s aggregate, found by search at sign-in ([below](#every-idp-of-a-federation)). |
+| `SSO_<ID>_IDP_ENTITY_CATEGORIES` | | With `IDP_ENTITY_IDS=all`: only IdPs with every one of these entity categories, comma separated URIs, up to 8 (REFEDS R&S: `http://refeds.org/category/research-and-scholarship`; Sirtfi: `https://refeds.org/sirtfi`). |
 | `SSO_<ID>_IDP_METADATA_URL` | | The IdP's metadata, https, refreshed daily. |
 | `SSO_<ID>_IDP_METADATA_FILE` | | Or a metadata file, read at startup. Without either, import it with `botctl sso saml <id> import`. |
 | `SSO_<ID>_IDP_MDQ_URL` | | Or a federation's MDQ server, its https base URL (InCommon: `https://mdq.incommon.org`): botd asks it for each IdP alone, daily. Needs `METADATA_SIGNING_CERT_FILE` ([below](#metadata-from-a-federation-mdq)). |
@@ -402,6 +403,25 @@ SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
 - **SCIM per IdP.** A SCIM tenant links one of the IdPs: `botctl scim token create uni-b --sso uni --idp https://login.uni-b.example/idp/shibboleth` ([ADR 0297](../adr/0297-scim-linking-at-one-idp-of-a-federation.md)). Its `externalId`s are that IdP's NameIDs, so each person it provisions signs in there as the user it made, and its deactivations end their sessions there too. Give each institution that provisions its own tenant. An email the tenant sets must be at one of its IdP's `shibmd:Scope`s, or the request is refused (`invalidValue`); only new emails are checked, so deprovisioning never waits on the MDQ server. See [SCIM](scim.md#federations).
 - **Limits.** botd lists at most 100 IdPs. Entity IDs with a comma or a `|` can't be listed: sessions keep `<entity ID>|<NameID>`, and a `|` in the entity ID could make one IdP's person look like another's at logout.
 
+#### Every IdP of a federation
+
+A service open to a whole federation can take every IdP in its [aggregate](#a-federations-aggregate), with no list to keep up ([ADR 0308](../adr/0308-saml-every-idp-of-a-federation.md)). Members who join or leave are picked up at the next daily read:
+
+```bash
+SSO_UNI_TYPE=saml
+SSO_UNI_IDP_ENTITY_IDS=all
+SSO_UNI_IDP_AGGREGATE_URL=https://md.incommon.org/InCommon/InCommon-metadata.xml
+SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert.pem
+SSO_UNI_IDP_ENTITY_CATEGORIES=http://refeds.org/category/research-and-scholarship   # optional
+```
+
+- **Which IdPs.** Every entity with a SAML 2.0 `IDPSSODescriptor`; SPs and SAML 1 only IdPs are skipped. With `IDP_ENTITY_CATEGORIES`, only those whose `mdattr:EntityAttributes` list each category (as `entity-category`, `entity-category-support` or `assurance-certification`). It needs `IDP_AGGREGATE_URL`: an MDQ server can't say who the members are.
+- **People search for theirs.** The sign-in page is a search box. It shows the IdPs whose name, entity ID or email domain has every word typed, at most 50, and runs no script. IdPs the federation tags `http://refeds.org/category/hide-from-discovery` aren't shown, but `&idp=<entity ID>` still reaches them, so a federation's own discovery service can send people straight there.
+- **Everything else is as for [several IdPs](#several-idps-of-a-federation):** emails and scoped groups only from each IdP's own domains, links, role mappings and SCIM tenants with `--idp`, and logout and app tiles at the right IdP. An IdP the aggregate no longer has fails as `unknown_idp`. A SCIM tenant keeps its IdP meanwhile, so it can still deprovision.
+- **Who gets an account** is still yours to decide: link people, or set `JIT_ROLE` with `ALLOWED_DOMAINS`. Anyone at any member IdP can otherwise reach the sign-in.
+- **What's shown.** `botctl sso saml uni` counts the IdPs (and the hidden ones) instead of listing them. The log has one line per read, plus one counting the IdPs that can't be used. Certificate warnings skip the IdPs' own certificates, which are theirs and the federation's to look after; the federation's signing certificate is still warned about.
+- **Limits.** At most 10,000 IdPs: a bigger aggregate is refused as a whole. Entity IDs with a `|` are left out, as in a list.
+
 #### Groups with several IdPs
 
 One institution's `staff` group isn't another's, so with several IdPs botd keeps groups apart by IdP ([ADR 0287](../adr/0287-saml-groups-per-idp-of-a-federation.md)). Federations send who someone is at an institution as *scoped* values, like eduPersonScopedAffiliation (`urn:oid:1.3.6.1.4.1.5923.1.1.1.9`, values like `member@uni-a.example`):
@@ -536,7 +556,7 @@ Every refused sign-in is in the audit log with a reason (`botctl audit --action 
 | `transient_subject`, `missing_subject` | Use a persistent NameID. |
 | `email_unverified`, `wrong_domain` | No email attribute was sent, or it isn't in `ALLOWED_DOMAINS`. Set `SSO_<ID>_EMAIL_ATTRIBUTE` if the IdP uses another name. |
 | `email_out_of_scope` | With [several IdPs](#several-idps-of-a-federation) and `ALLOWED_DOMAINS`: the IdP sent an email at a domain the federation doesn't list for it (`botctl sso saml <id>` shows each IdP's email domains). Its operators must add the scope in the federation's registry. |
-| `unknown_idp` | With several IdPs: the start URL's `idp`, or an app tile's `Issuer` (`idpInitiated: true`; an artifact's `SourceID`), isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was, when it could be read). |
+| `unknown_idp` | With several IdPs: the start URL's `idp`, or an app tile's `Issuer` (`idpInitiated: true`; an artifact's `SourceID`), isn't one of `IDP_ENTITY_IDS` (`entityId` says what it was, when it could be read). With `IDP_ENTITY_IDS=all`: it isn't a SAML IdP in the aggregate as last read, or lacks one of `IDP_ENTITY_CATEGORIES`. |
 | `idp_metadata_expired` | The IdP's signed metadata in use has passed its `validUntil`, and no fresh copy loaded. From a file or an import, give botd a fresh signed copy; from a URL or MDQ, look for `sso.saml_metadata_refused` or an unreachable server in the log ([above](#signed-idp-metadata)). |
 | `idp_error` | The IdP said no (`idpStatus` has its status code), for example someone not assigned to the app. `Responder/NoAuthnContext`: it couldn't sign them in the way `REQUEST_AUTHN_CONTEXT` asked for ([above](#require-mfa-at-the-idp)). |
 | `authn_context` | `SSO_<ID>_AUTHN_CONTEXT` is set and the IdP didn't vouch for any of its values. `authnContexts` and `authnMethods` say what it sent: password only (fix the IdP's MFA policy for the app), or another value for MFA (add it). Check `AUTHN_METHODS_ATTRIBUTE` names the attribute the IdP sends. |
@@ -552,7 +572,7 @@ Refused logout messages are audited as `auth.slo_failed` (`botctl audit --action
 |--------|-----|
 | `unsigned`, `bad_signature` | The IdP must sign logout messages with a certificate in its metadata: refresh or import it. |
 | `wrong_issuer` | The message came from another entity than `SSO_<ID>_IDP_ENTITY_ID`. |
-| `unknown_idp` | With several IdPs: the message's `Issuer` isn't one of `IDP_ENTITY_IDS`. |
+| `unknown_idp` | With several IdPs: the message's `Issuer` isn't one of `IDP_ENTITY_IDS` (with `all`, an IdP of the aggregate). |
 | `wrong_destination` | The IdP's logout URL for SuperBot isn't the SLO URL botctl shows (the SOAP SLO URL for the back channel), or it sends no `Destination`. |
 | `must_understand` | The IdP's SOAP envelope has a header botd must understand to answer: send none. |
 | `expired`, `not_yet_valid` | The message is older than five minutes, or clocks differ by more than two: fix NTP. |

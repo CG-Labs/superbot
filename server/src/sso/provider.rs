@@ -58,9 +58,11 @@ pub enum Kind {
     /// session limit ends ours (ADR 0225). Responses come over `response_binding` only: posted,
     /// or as an artifact botd resolves over SOAP (ADR 0268). `entity_ids` is one IdP, or
     /// several of a federation's from its MDQ server (ADR 0282), one chosen at each sign-in;
-    /// each person's identity is stored under the IdP that signed them in.
+    /// each person's identity is stored under the IdP that signed them in. With `every_idp`
+    /// it is empty: every IdP in the federation's aggregate is, as of its last read (ADR 0308).
     SamlSp {
         entity_ids: Vec<String>,
+        every_idp: Option<EveryIdp>,
         sp_entity_id: String,
         source: IdpSource,
         attributes: Attributes,
@@ -78,6 +80,21 @@ pub enum Kind {
         authn_context: Option<AuthnContext>,
         freshness: Freshness,
     },
+}
+
+/// Native SAML with every IdP of a federation (`SSO_<ID>_IDP_ENTITY_IDS=all`, ADR 0308): each
+/// entity with a SAML 2.0 IdP role in its signed aggregate, if its entity attributes hold
+/// every one of `categories` (`SSO_<ID>_IDP_ENTITY_CATEGORIES`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EveryIdp {
+    pub categories: Vec<String>,
+}
+
+impl EveryIdp {
+    /// Whether IdP `m`, read from the aggregate, is one of the provider's.
+    fn admits(&self, m: &IdpMetadata) -> bool {
+        self.categories.iter().all(|c| m.categories.contains(c))
+    }
 }
 
 /// Where a native SAML provider's IdP metadata comes from.
@@ -175,30 +192,66 @@ struct AggregateFetch {
 struct AggregateRefresh {
     provider: String,
     url: String,
-    entity_ids: Vec<String>,
-    sign_requests: bool,
-    request_binding: RequestBinding,
-    response_binding: ResponseBinding,
+    select: Select,
     certs: Vec<xmldsig::Cert>,
     idp: Arc<Mutex<IdpCopies>>,
     refused: Arc<Mutex<Refusals>>,
 }
 
+/// Which IdPs of an aggregate a provider takes, and how it reads each one's metadata.
+#[derive(Clone)]
+struct Select {
+    /// `IDP_ENTITY_ID` or `IDP_ENTITY_IDS`; empty with `every`.
+    listed: Vec<String>,
+    every: Option<EveryIdp>,
+    sign_requests: bool,
+    request_binding: RequestBinding,
+    response_binding: ResponseBinding,
+}
+
+/// One IdP from an aggregate: its metadata, None when `EveryIdp` leaves it out, or why it
+/// can't be used.
+type Loaded = (String, Result<Option<IdpMetadata>, MetadataRefused>);
+
+impl Select {
+    fn wanted(&self) -> saml_aggregate::Wanted<'_> {
+        match self.every {
+            Some(_) => saml_aggregate::Wanted::Every,
+            None => saml_aggregate::Wanted::Listed(&self.listed),
+        }
+    }
+
+    /// Reads IdP `f`'s copy as all metadata is read (ADR 0301), then, with every IdP of the
+    /// federation, holds it to `EveryIdp`. Sessions keep `<entity ID>|<NameID>`, so an entity
+    /// ID with a `|` could make one IdP's person look like another's: such an IdP isn't used.
+    fn load(&self, f: saml_aggregate::Found) -> Loaded {
+        let got = saml_sp::load_aggregate_entity(&f, self.sign_requests, self.request_binding, self.response_binding, crate::db::now());
+        let got = match (&self.every, got) {
+            (Some(_), Ok(_)) if f.entity_id.contains('|') => Err(MetadataRefused { reason: "bad_metadata", message: "its entity ID has a |, which can't tell one IdP's people from another's".into() }),
+            (Some(every), Ok(m)) => Ok(every.admits(&m).then_some(m)),
+            (_, got) => got.map(Some),
+        };
+        (f.entity_id, got)
+    }
+}
+
 impl AggregateRefresh {
     /// Downloads the aggregate and replaces each IdP's copy with what it lists. An IdP
-    /// missing from it, or refused in it, loses its copy: the federation dropped it.
+    /// missing from it, or refused in it, loses its copy: the federation dropped it. With
+    /// every IdP of the federation, the copies are then exactly those it admits.
     async fn run(&self, fetch: &mut AggregateFetch) -> Result<(), Invalid> {
         let (id, url) = (&self.provider, &self.url);
         let idp = || self.idp.lock().unwrap_or_else(|e| e.into_inner());
+        let every = self.select.every.is_some();
         // Unchanged is only worth hearing when every copy from it is still good.
         let now = crate::db::now();
         let unchanged_ok = {
             let idp = idp();
-            let held: Vec<&Arc<IdpMetadata>> = self.entity_ids.iter().filter_map(|e| idp.get(e).map(|(m, _)| m)).collect();
+            let held: Vec<&Arc<IdpMetadata>> = if every { idp.values().map(|(m, _)| m).collect() } else { self.select.listed.iter().filter_map(|e| idp.get(e).map(|(m, _)| m)).collect() };
             !held.is_empty() && held.iter().all(|m| m.valid_at(now))
         };
         let validators = unchanged_ok.then(|| (fetch.etag.clone(), fetch.last_modified.clone()));
-        match get_aggregate(url, &self.entity_ids, self.certs.clone(), validators).await {
+        match get_aggregate(url, self.select.clone(), self.certs.clone(), validators).await {
             Ok(None) => {
                 fetch.read = Some(Instant::now());
                 fetch.failed = None;
@@ -208,30 +261,59 @@ impl AggregateRefresh {
             }
             Ok(Some((read, etag, last_modified))) => {
                 *fetch = AggregateFetch { read: Some(Instant::now()), failed: None, etag, last_modified };
-                for f in &read.found {
-                    match saml_sp::load_aggregate_entity(f, self.sign_requests, self.request_binding, self.response_binding, crate::db::now()) {
-                        Ok(m) => {
-                            idp().insert(m.entity_id.clone(), (Arc::new(m), Instant::now()));
+                // With every IdP, thousands: what can't be used is summed up, not logged each.
+                let mut unusable: Vec<String> = Vec::new();
+                let mut kept = std::collections::HashSet::new();
+                let mut left_out = 0;
+                let mut seen = std::collections::HashSet::new();
+                for (entity, got) in read.found {
+                    seen.insert(entity.clone());
+                    match got {
+                        Ok(Some(m)) => {
+                            kept.insert(entity.clone());
+                            idp().insert(entity, (Arc::new(m), Instant::now()));
+                        }
+                        Ok(None) => {
+                            left_out += 1;
+                            idp().remove(&entity);
                         }
                         Err(e) => {
-                            crate::obs::log::log_warn!("SSO {id}: IdP {} in the aggregate at {url}: {e}", f.entity_id);
-                            idp().remove(&f.entity_id);
+                            if every {
+                                unusable.push(format!("{entity} ({e})"));
+                            } else {
+                                crate::obs::log::log_warn!("SSO {id}: IdP {entity} in the aggregate at {url}: {e}");
+                            }
+                            idp().remove(&entity);
                             if e.untrusted() {
-                                refuse(&self.refused, &f.entity_id, e);
+                                refuse(&self.refused, &entity, e);
                             }
                         }
                     }
                 }
                 for (entity, why) in &read.problems {
-                    crate::obs::log::log_warn!("SSO {id}: IdP {entity} in the aggregate at {url}: {why}");
+                    if every {
+                        unusable.push(format!("{entity} ({why})"));
+                    } else {
+                        crate::obs::log::log_warn!("SSO {id}: IdP {entity} in the aggregate at {url}: {why}");
+                    }
                     idp().remove(entity);
                 }
-                let missing: Vec<&str> = self.entity_ids.iter().filter(|e| !read.found.iter().any(|f| f.entity_id == **e) && !read.problems.iter().any(|(p, _)| p == *e)).map(String::as_str).collect();
-                for entity in &missing {
-                    idp().remove(*entity);
-                }
-                if !missing.is_empty() {
-                    crate::obs::log::log_warn!("SSO {id}: the aggregate at {url} doesn't list {}: check SSO_{}_IDP_ENTITY_IDS", missing.join(", "), id.to_ascii_uppercase());
+                if every {
+                    idp().retain(|e, _| kept.contains(e));
+                    let filtered = if left_out > 0 { format!(", {left_out} left out by SSO_{}_IDP_ENTITY_CATEGORIES", id.to_ascii_uppercase()) } else { String::new() };
+                    crate::obs::log::log_info!("SSO {id}: {} IdPs from the aggregate at {url}{filtered}", kept.len());
+                    if !unusable.is_empty() {
+                        let first: Vec<&str> = unusable.iter().take(3).map(String::as_str).collect();
+                        crate::obs::log::log_warn!("SSO {id}: {} IdPs in the aggregate at {url} can't be used, such as {}", unusable.len(), first.join("; "));
+                    }
+                } else {
+                    let missing: Vec<&str> = self.select.listed.iter().filter(|e| !seen.contains(*e) && !read.problems.iter().any(|(p, _)| p == *e)).map(String::as_str).collect();
+                    for entity in &missing {
+                        idp().remove(*entity);
+                    }
+                    if !missing.is_empty() {
+                        crate::obs::log::log_warn!("SSO {id}: the aggregate at {url} doesn't list {}: check SSO_{}_IDP_ENTITY_IDS", missing.join(", "), id.to_ascii_uppercase());
+                    }
                 }
             }
             Err((e, refused)) => {
@@ -472,17 +554,17 @@ impl std::io::Read for Chunks {
     }
 }
 
-/// A federation aggregate's listing of IdPs `wanted`, read and verified against `certs` as it
-/// downloads (`saml_aggregate::read`), with its `ETag` and `Last-Modified`. With
-/// `validators`, asked only if it changed since: None when it hasn't. Refused, with why when
-/// it's for its signature or validity.
+/// A federation aggregate's IdPs that `select` takes, read and verified against `certs` as it
+/// downloads (`saml_aggregate::read_each`), each IdP's metadata read there too, with its
+/// `ETag` and `Last-Modified`. With `validators`, asked only if it changed since: None when it
+/// hasn't. Refused, with why when it's for its signature or validity.
 #[allow(clippy::type_complexity)]
 async fn get_aggregate(
     url: &str,
-    wanted: &[String],
+    select: Select,
     certs: Vec<xmldsig::Cert>,
     validators: Option<(Option<String>, Option<String>)>,
-) -> Result<Option<(saml_aggregate::Aggregate, Option<String>, Option<String>)>, (Invalid, Option<MetadataRefused>)> {
+) -> Result<Option<(saml_aggregate::Aggregate<Loaded>, Option<String>, Option<String>)>, (Invalid, Option<MetadataRefused>)> {
     use reqwest::header;
     let mut req = aggregate_http().get(url).header(header::ACCEPT, "application/samlmetadata+xml, application/xml, text/xml").header(header::ACCEPT_ENCODING, "gzip");
     let conditional = validators.is_some();
@@ -514,11 +596,11 @@ async fn get_aggregate(
         }
     };
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let wanted = wanted.to_vec();
     let reader = tokio::task::spawn_blocking(move || {
         let body = Chunks { rx, chunk: Vec::new(), at: 0 };
         let now = crate::db::now();
-        if gzip { saml_aggregate::read(flate2::read::MultiGzDecoder::new(body), &wanted, &certs, now) } else { saml_aggregate::read(body, &wanted, &certs, now) }
+        let load = |f| select.load(f);
+        if gzip { saml_aggregate::read_each(flate2::read::MultiGzDecoder::new(body), select.wanted(), &certs, now, load) } else { saml_aggregate::read_each(body, select.wanted(), &certs, now, load) }
     });
     loop {
         let next = match res.chunk().await {
@@ -656,10 +738,15 @@ impl Provider {
             Kind::GitHub { web, allowed_orgs, .. } => format!("members of {} on {web}", allowed_orgs.join(", ")),
             Kind::Saml { entity_id, alias, allowed_domains, .. } if allowed_domains.is_empty() => format!("anyone SAML IdP {entity_id} signs in (broker alias {alias})"),
             Kind::Saml { entity_id, alias, allowed_domains, .. } => format!("verified emails at {} from SAML IdP {entity_id} (broker alias {alias})", allowed_domains.join(", ")),
-            Kind::SamlSp { entity_ids, allowed_domains, .. } => {
-                let idps = match entity_ids.as_slice() {
-                    [one] => format!("SAML IdP {one}"),
-                    several => format!("{} SAML IdPs ({})", several.len(), several.join(", ")),
+            Kind::SamlSp { entity_ids, every_idp, source, allowed_domains, .. } => {
+                let idps = match (every_idp, entity_ids.as_slice()) {
+                    (Some(every), _) => {
+                        let from = source.url_for("").unwrap_or_default();
+                        let categories = if every.categories.is_empty() { String::new() } else { format!(" with {}", every.categories.join(" and ")) };
+                        format!("every SAML IdP{categories} in the federation aggregate at {from}")
+                    }
+                    (None, [one]) => format!("SAML IdP {one}"),
+                    (None, several) => format!("{} SAML IdPs ({})", several.len(), several.join(", ")),
                 };
                 if allowed_domains.is_empty() { format!("anyone {idps} signs in (native)") } else { format!("emails at {} from {idps} (native)", allowed_domains.join(", ")) }
             }
@@ -828,10 +915,11 @@ impl Provider {
                 }
                 Ok((format!("{authority}/{tid}/v2.0"), Some(tid)))
             }
-            Kind::SamlSp { entity_ids, .. } if tenant.is_none() => match entity_ids.as_slice() {
+            Kind::SamlSp { entity_ids, every_idp: None, .. } if tenant.is_none() => match entity_ids.as_slice() {
                 [one] => Ok((one.clone(), None)),
                 _ => Err("This provider has several SAML IdPs: say which with --idp <entity ID>".into()),
             },
+            Kind::SamlSp { .. } if tenant.is_none() => Err("This provider takes every SAML IdP of a federation: say which with --idp <entity ID>".into()),
             Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::GitHub { web: issuer, .. } | Kind::Saml { entity_id: issuer, .. } if tenant.is_none() => {
                 Ok((issuer.clone(), None))
             }
@@ -844,13 +932,26 @@ impl Provider {
     pub fn issuer_at(&self, idp: &str) -> Result<String, String> {
         let idp = idp.trim();
         match &self.kind {
-            Kind::SamlSp { entity_ids, .. } if entity_ids.iter().any(|e| e == idp) => Ok(idp.to_string()),
+            Kind::SamlSp { .. } if self.lists(idp) => Ok(idp.to_string()),
+            Kind::SamlSp { every_idp: Some(_), .. } => Err(format!("{idp} is not an IdP of the federation's aggregate that this provider takes (SSO_{}_IDP_AGGREGATE_URL), as botd last read it", self.id.to_ascii_uppercase())),
             Kind::SamlSp { .. } => Err(format!("{idp} is not one of this provider's IdPs (SSO_{}_IDP_ENTITY_IDS)", self.id.to_ascii_uppercase())),
             _ => Err("idp is only for native SAML providers".into()),
         }
     }
 
-    /// Native SAML: the entity IDs of the provider's IdPs. Empty for the others.
+    /// Native SAML: the issuer that people linked to IdP `idp` earlier (a SCIM tenant's) stay
+    /// under. With every IdP of a federation, any IdP: one the aggregate leaves out for a while
+    /// signs nobody in meanwhile, yet its people can still be deprovisioned.
+    pub fn issuer_linked(&self, idp: &str) -> Result<String, String> {
+        let idp = idp.trim();
+        match self.every_idp() {
+            Some(_) if !idp.contains('|') && saml::entity_id(idp).is_some() => Ok(idp.to_string()),
+            _ => self.issuer_at(idp),
+        }
+    }
+
+    /// Native SAML: the entity IDs of the provider's IdPs as configured. Empty for the others,
+    /// and with every IdP of a federation, whose IdPs are `listed_idps`.
     pub fn idps(&self) -> &[String] {
         match &self.kind {
             Kind::SamlSp { entity_ids, .. } => entity_ids,
@@ -858,16 +959,45 @@ impl Provider {
         }
     }
 
-    /// Native SAML with several IdPs of a federation (ADR 0282): each sign-in says which.
+    /// Native SAML with every IdP of a federation (ADR 0308): who they are.
+    pub fn every_idp(&self) -> Option<&EveryIdp> {
+        match &self.kind {
+            Kind::SamlSp { every_idp, .. } => every_idp.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Native SAML with several IdPs of a federation (ADR 0282), or every one (ADR 0308): each
+    /// sign-in says which.
     pub fn several_idps(&self) -> bool {
-        self.idps().len() > 1
+        self.every_idp().is_some() || self.idps().len() > 1
+    }
+
+    /// Native SAML: whether `entity_id` is one of the provider's IdPs. With every IdP of a
+    /// federation, one in its aggregate as last read, that the provider admits.
+    pub fn lists(&self, entity_id: &str) -> bool {
+        match self.every_idp() {
+            Some(_) => self.idp.lock().unwrap_or_else(|e| e.into_inner()).contains_key(entity_id),
+            None => self.idps().iter().any(|e| e == entity_id),
+        }
+    }
+
+    /// Native SAML: the entity IDs of the provider's IdPs now: as configured, or with every IdP
+    /// of a federation, those its aggregate held at the last read, sorted.
+    pub fn listed_idps(&self) -> Vec<String> {
+        if self.every_idp().is_none() {
+            return self.idps().to_vec();
+        }
+        let mut out: Vec<String> = self.idp.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+        out.sort();
+        out
     }
 
     /// Native SAML: which of the provider's IdPs an identity key (`issuer|subject`, as
     /// sessions record it) is from. With several IdPs, none has a `|` in its entity ID.
-    pub fn idp_of(&self, key: &str) -> Option<&str> {
+    pub fn idp_of(&self, key: &str) -> Option<String> {
         let (issuer, _) = key.split_once('|')?;
-        self.idps().iter().find(|e| *e == issuer).map(String::as_str)
+        self.lists(issuer).then(|| issuer.to_string())
     }
 
     /// The subject as tokens carry it: Entra object ids are lowercase GUIDs, GitHub's are numbers.
@@ -935,11 +1065,13 @@ impl Provider {
     /// at most once per `gap`, keeping what we had meanwhile, as for OIDC discovery. Signed
     /// metadata past its `validUntil` is never used, not even as the last good copy (ADR
     /// 0281): it's fetched again, or the sign-in fails `idp_metadata_expired`.
+    /// With every IdP of a federation (ADR 0308), any entity ID is looked up in the aggregate,
+    /// read again only when due: `unknown_idp` if it isn't one the provider admits.
     pub async fn idp_metadata_for(&self, http: &reqwest::Client, gap: Duration, entity_id: &str) -> Result<Arc<IdpMetadata>, Invalid> {
-        let Kind::SamlSp { entity_ids, source, sign_requests, request_binding, response_binding, metadata_trust, .. } = &self.kind else {
+        let Kind::SamlSp { entity_ids, every_idp, source, sign_requests, request_binding, response_binding, metadata_trust, .. } = &self.kind else {
             return Err(Invalid("not_configured"));
         };
-        if !entity_ids.iter().any(|e| e == entity_id) {
+        if every_idp.is_none() && !entity_ids.iter().any(|e| e == entity_id) {
             return Err(Invalid("unknown_idp"));
         }
         let now = crate::db::now();
@@ -1013,9 +1145,9 @@ impl Provider {
     /// downloads, also the one that started the download. A download costs the federation
     /// tens of MB, so after a failure it's retried at most once per ten `gap`s.
     async fn idp_from_aggregate(&self, gap: Duration, entity_id: &str, url: &str, stale: Option<Arc<IdpMetadata>>, expired: bool) -> Result<Arc<IdpMetadata>, Invalid> {
-        let Kind::SamlSp { entity_ids, sign_requests, request_binding, response_binding, metadata_trust, .. } = &self.kind else {
-            return Err(Invalid("not_configured"));
-        };
+        // Not in an aggregate read fine: a listed IdP the federation dropped, or with every
+        // IdP, one it doesn't have.
+        let absent = Invalid(if self.every_idp().is_some() { "unknown_idp" } else { "idp_bad_response" });
         let good = |m: Option<Arc<IdpMetadata>>, e: Invalid| match m {
             Some(m) if m.valid_at(crate::db::now()) => Ok(m),
             Some(_) => Err(Invalid("idp_metadata_expired")),
@@ -1034,30 +1166,61 @@ impl Provider {
         // Read today, by whoever held the lock just now or before: this IdP wasn't in it, or
         // its copy expired since, and reading it again so soon won't change that.
         if since(fetch.read, META_TTL) && (copy.is_none() || valid(&copy) || since(fetch.read, retry)) {
-            return good(copy, Invalid("idp_bad_response"));
+            return good(copy, absent);
         }
         if let Some((at, e)) = fetch.failed
             && at.elapsed() < retry
         {
             return good(copy, e);
         }
-        let refresh = AggregateRefresh {
+        let Some(refresh) = self.aggregate_refresh(url) else { return Err(Invalid("not_configured")) };
+        if valid(&copy) {
+            tokio::spawn(async move { refresh.run(&mut fetch).await });
+            return good(copy, absent);
+        }
+        let e = refresh.run(&mut fetch).await.err().unwrap_or(absent);
+        good(self.idp_loaded_for(entity_id), e)
+    }
+
+    /// One download of the aggregate at `url`, for whichever IdPs the provider takes.
+    fn aggregate_refresh(&self, url: &str) -> Option<AggregateRefresh> {
+        let Kind::SamlSp { entity_ids, every_idp, sign_requests, request_binding, response_binding, metadata_trust, .. } = &self.kind else {
+            return None;
+        };
+        let select = Select { listed: entity_ids.clone(), every: every_idp.clone(), sign_requests: *sign_requests, request_binding: *request_binding, response_binding: *response_binding };
+        Some(AggregateRefresh {
             provider: self.id.clone(),
             url: url.to_string(),
-            entity_ids: entity_ids.clone(),
-            sign_requests: *sign_requests,
-            request_binding: *request_binding,
-            response_binding: *response_binding,
+            select,
             certs: metadata_trust.as_ref().map(|t| t.certs.clone()).unwrap_or_default(),
             idp: self.idp.clone(),
             refused: self.metadata_refused.clone(),
+        })
+    }
+
+    /// Native SAML with every IdP of a federation (ADR 0308): reads the aggregate when it's
+    /// due, so the chooser, the status and the certificate check know who is in it. Waits
+    /// only while no IdP has a copy; otherwise it downloads in the background, as for a
+    /// sign-in with a good copy. Retried after a failure as for sign-ins.
+    pub async fn every_idp_read(&self, gap: Duration) {
+        let Kind::SamlSp { every_idp: Some(_), source, .. } = &self.kind else { return };
+        let Some(url) = source.url_for("") else { return };
+        let held = !self.idp.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        let mut fetch = match self.aggregate.clone().try_lock_owned() {
+            Ok(f) => f,
+            Err(_) if held => return,
+            Err(_) => self.aggregate.clone().lock_owned().await,
         };
-        if valid(&copy) {
-            tokio::spawn(async move { refresh.run(&mut fetch).await });
-            return good(copy, Invalid("idp_bad_response"));
+        let since = |at: Option<Instant>, d: Duration| at.is_some_and(|at| at.elapsed() < d);
+        if since(fetch.read, META_TTL) || fetch.failed.is_some_and(|(at, _)| at.elapsed() < gap * 10) {
+            return;
         }
-        let e = refresh.run(&mut fetch).await.err().unwrap_or(Invalid("idp_bad_response"));
-        good(self.idp_loaded_for(entity_id), e)
+        let Some(refresh) = self.aggregate_refresh(&url) else { return };
+        if held {
+            tokio::spawn(async move { refresh.run(&mut fetch).await });
+        } else if let Err(e) = refresh.run(&mut fetch).await {
+            crate::obs::log::log_warn!("SSO {}: the federation aggregate at {url}: {e}", self.id);
+        }
     }
 
     /// Waits for a federation aggregate download in progress, so what it loads is in use.

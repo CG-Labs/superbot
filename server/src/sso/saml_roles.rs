@@ -91,7 +91,7 @@ fn idp_key<'a>(p: &Provider, issuer: &'a str) -> Option<&'a str> {
 fn serves(p: &Provider, m: &SamlRoleMapping) -> bool {
     m.provider == p.id
         && match &m.idp {
-            Some(e) => p.several_idps() && p.idps().contains(e),
+            Some(e) => p.several_idps() && p.lists(e),
             None => !p.several_idps(),
         }
 }
@@ -295,7 +295,7 @@ pub async fn list(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
                 _ => vec![],
             };
             let idps = if p.several_idps() { p.idps() } else { &[] };
-            json!({ "id": p.id, "label": p.label, "groupsAttribute": groups_attribute(p), "requiredGroups": required, "idps": idps })
+            json!({ "id": p.id, "label": p.label, "groupsAttribute": groups_attribute(p), "requiredGroups": required, "idps": idps, "everyIdp": p.every_idp().is_some() })
         })
         .collect();
     let all: Vec<Value> = app.db.saml_role_mappings().iter().map(|m| view(&app, &a, m)).collect();
@@ -312,6 +312,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
         return Err(bad(format!("Unknown field \"{k}\": send provider, group, role, and idp with several IdPs.")));
     }
     let p = super::saml_provider(&a, v["provider"].as_str().unwrap_or(""))?;
+    p.every_idp_read(a.sso.refresh_gap).await;
     if groups_attribute(p).is_none() {
         let up = p.id.to_ascii_uppercase();
         return Err(conflict(format!("{} reads no groups. Set SSO_{up}_GROUPS_ATTRIBUTE to the assertion attribute the IdP sends groups in, and restart.", p.id)));

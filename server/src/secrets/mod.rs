@@ -297,6 +297,12 @@ impl Secrets {
         users.in_stores().map_err(|e| e.to_string())
     }
 
+    /// The users' secrets' own connection, which attaches the chat stores too (ADR 0293), for
+    /// a store moving while botd runs (ADR 0309).
+    pub fn users_for_stores(&self) -> Option<&sealed::UserSecrets> {
+        self.users.as_ref()
+    }
+
     fn server_names_for_bots(&self) -> Vec<String> {
         self.list().unwrap_or_default().into_iter().filter(|l| l.for_bots).map(|l| l.name).collect()
     }
