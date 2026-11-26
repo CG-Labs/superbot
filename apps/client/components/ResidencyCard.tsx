@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { MARKDOWN } from "../src/fileTypes";
 import { reportFileName, reportLabel, residencyLines } from "../src/residency";
 import { saveCsv } from "../src/saveCsv";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 import type { MyResidency } from "../src/types";
+import { kit, Spinner } from "./ui";
 
 export type ResidencyApi = Pick<SuperBotApi, "myResidency" | "myResidencyReport">;
 
@@ -20,6 +21,7 @@ interface Props {
  * residency report to download. Nothing shows when nothing pins your data.
  */
 export function ResidencyCard({ api, save = saveCsv }: Props) {
+  const styles = useStyles();
   const [view, setView] = useState<MyResidency | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -54,7 +56,7 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
             </Pressable>
           </>
         ) : (
-          <ActivityIndicator color={colors.textDim} />
+          <Spinner />
         )}
       </View>
     );
@@ -116,16 +118,19 @@ export function ResidencyCard({ api, save = saveCsv }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  line: { color: colors.text, fontSize: 14 },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  warn: { color: colors.warning },
-  dim: { color: colors.textDim },
-  row: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  btn: { alignSelf: "flex-start", borderRadius: 999, borderWidth: 1, borderColor: colors.border, paddingVertical: 8, paddingHorizontal: 16 },
-  btnText: { color: colors.text, fontSize: 15 },
-  busy: { opacity: 0.6 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    card: k.card,
+    cardTitle: k.cardTitle,
+    line: k.text,
+    good: k.good,
+    error: k.error,
+    warn: k.warn,
+    dim: k.dim,
+    row: k.actions,
+    btn: { ...k.btn, alignSelf: "flex-start" },
+    btnText: k.btnText,
+    busy: k.disabled,
+  });
 });

@@ -248,6 +248,14 @@ describe("PlanView (ADR 0042)", () => {
     expect(screen.queryByText("Plans")).toBeNull();
     expect(screen.queryByText(/Upgrade to/)).toBeNull();
   });
+
+  it("titles the screen and goes back to the Bots", async () => {
+    const onBack = jest.fn();
+    await render(<PlanView api={fakeApi(null)} onBack={onBack} />);
+    expect(await screen.findByRole("header", { name: "Plan" })).toBeOnTheScreen();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Back to Bots" }));
+    expect(onBack).toHaveBeenCalled();
+  });
 });
 
 describe("plan route", () => {

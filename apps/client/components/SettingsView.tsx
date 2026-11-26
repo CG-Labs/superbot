@@ -1,13 +1,14 @@
 import React, { useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { availabilityProblem, LOCK_AFTER_OPTIONS, lockAfterLabel } from "../src/appLock";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 import { useAppLock } from "./AppLock";
 import { Chips } from "./Chips";
 import { PushCard, type PushApi } from "./PushCard";
 import { ResidencyCard, type ResidencyApi } from "./ResidencyCard";
 import { RoleRequestsCard, type RoleRequestsApi } from "./RoleRequestsCard";
 import { TwoFactorCard, type MfaApi } from "./TwoFactor";
+import { kit, PageHeader, Spinner } from "./ui";
 
 interface Props {
   onBack: () => void;
@@ -19,20 +20,26 @@ interface Props {
 
 /** This device's own settings: App lock is kept on the device, push on the server for this session. */
 export function SettingsView({ onBack, api, admin = false }: Props) {
+  const styles = useStyles();
   return (
     <View style={styles.root}>
-      <View style={styles.header}>
-        <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
-          <Text style={styles.back}>‹ Bots</Text>
-        </Pressable>
-        <Text style={styles.title}>Settings</Text>
-      </View>
+      <PageHeader title="Settings" onBack={onBack} />
       <ScrollView contentContainerStyle={styles.body}>
+        <Text style={styles.section} accessibilityRole="header">
+          This device
+        </Text>
         <AppLockCard />
         {api ? <PushCard api={api} /> : null}
-        {api ? <TwoFactorCard api={api} admin={admin} /> : null}
-        {api ? <ResidencyCard api={api} /> : null}
-        {api && !admin ? <RoleRequestsCard api={api} /> : null}
+        {api ? (
+          <>
+            <Text style={styles.section} accessibilityRole="header">
+              Your account
+            </Text>
+            <TwoFactorCard api={api} admin={admin} />
+            <ResidencyCard api={api} />
+            {!admin ? <RoleRequestsCard api={api} /> : null}
+          </>
+        ) : null}
       </ScrollView>
     </View>
   );
@@ -40,6 +47,7 @@ export function SettingsView({ onBack, api, admin = false }: Props) {
 
 /** App lock (ADR 0078): off by default, and unavailable where there are no biometrics. */
 export function AppLockCard() {
+  const styles = useStyles();
   const { settings, availability, enable, disable, setLockAfter } = useAppLock();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -64,7 +72,7 @@ export function AppLockCard() {
     return (
       <View style={styles.card} accessibilityLabel="App lock">
         <Text style={styles.cardTitle}>App lock</Text>
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       </View>
     );
   }
@@ -122,18 +130,19 @@ export function AppLockCard() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  body: { padding: 16, gap: 12, maxWidth: 640, width: "100%", alignSelf: "center" },
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  field: { gap: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: colors.border },
-  label: { color: colors.text, fontWeight: "500" },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  warn: { color: colors.warning },
-  dim: { color: colors.textDim },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    body: k.body,
+    section: k.section,
+    card: k.card,
+    cardTitle: k.cardTitle,
+    field: k.field,
+    label: k.label,
+    good: k.good,
+    error: k.error,
+    warn: k.warn,
+    dim: k.dim,
+  });
 });

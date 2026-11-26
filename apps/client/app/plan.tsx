@@ -1,20 +1,22 @@
 import React from "react";
 import { Redirect, router, useLocalSearchParams } from "expo-router";
-import { ActivityIndicator, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { PlanView } from "../components/PlanView";
+import { kit, Spinner } from "../components/ui";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 
 /** Your plan, and Stripe's pages to buy or manage it (ADR 0042). Stripe sends people back here. */
 export default function PlanScreen() {
+  const styles = useStyles();
   const { ready, api } = useSuperBot();
   const { checkout } = useLocalSearchParams<{ checkout?: string }>();
   // Coming back from Stripe is a fresh page load: wait for the saved session.
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       </View>
     );
   }
@@ -27,7 +29,10 @@ export default function PlanScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  loading: { flex: 1, justifyContent: "center", backgroundColor: colors.bgMain },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: k.center,
+  });
 });

@@ -82,6 +82,11 @@ pub struct Sink {
     /// Request bodies go gzipped (`AUDIT_EXPORT_COMPRESS`, or `_<NAME>`, ADR 0227): webhook
     /// Azure Monitor and Datadog only. The archive's own setting is [`crate::audit_archive::Archive::gzip`].
     gzip: bool,
+    /// The data region the operator says the sink keeps what it gets in
+    /// (`AUDIT_EXPORT_DATA_REGION`, or `_<NAME>`, ADR 0330). Stated, it gets the details of
+    /// events a chat store keeps only from that region's store. None: not stated, and it gets
+    /// every event whole.
+    pub region: Option<String>,
 }
 
 /// Splits `<name>=<url>` into its name and URL. An entry is named when what comes
@@ -266,19 +271,19 @@ impl Sink {
     }
 
     fn from_archive(a: crate::audit_archive::Archive) -> Sink {
-        Sink { shown: a.shown(), id: a.id(), kind: Kind::Archive(Box::new(a)), name: None, start: None, gzip: false }
+        Sink { shown: a.shown(), id: a.id(), kind: Kind::Archive(Box::new(a)), name: None, start: None, gzip: false, region: None }
     }
 
     fn from_monitor(m: crate::audit_azure::Monitor) -> Sink {
-        Sink { shown: m.shown(), id: m.id(), kind: Kind::Monitor(Box::new(m)), name: None, start: None, gzip: false }
+        Sink { shown: m.shown(), id: m.id(), kind: Kind::Monitor(Box::new(m)), name: None, start: None, gzip: false, region: None }
     }
 
     fn from_secops(g: crate::audit_secops::SecOps) -> Sink {
-        Sink { shown: g.shown(), id: g.id(), kind: Kind::SecOps(Box::new(g)), name: None, start: None, gzip: false }
+        Sink { shown: g.shown(), id: g.id(), kind: Kind::SecOps(Box::new(g)), name: None, start: None, gzip: false, region: None }
     }
 
     fn from_datadog(d: crate::audit_datadog::Datadog) -> Sink {
-        Sink { shown: d.shown(), id: d.id(), kind: Kind::Datadog(Box::new(d)), name: None, start: None, gzip: false }
+        Sink { shown: d.shown(), id: d.id(), kind: Kind::Datadog(Box::new(d)), name: None, start: None, gzip: false, region: None }
     }
 
     pub fn parse(raw: &str, insecure: bool) -> Result<Sink, String> {
@@ -318,7 +323,7 @@ impl Sink {
             Kind::Syslog { .. } => (format!("{}://{host}{port}", u.scheme()), format!("{}://{host}{port}", u.scheme())),
             Kind::Archive(_) | Kind::Monitor(_) | Kind::SecOps(_) | Kind::Datadog(_) => unreachable!("s3://, azure-monitor://, google-secops:// and datadog:// sinks are read with their settings"),
         };
-        Ok(Sink { kind, shown, id, name: None, start: None, gzip: false })
+        Ok(Sink { kind, shown, id, name: None, start: None, gzip: false, region: None })
     }
 }
 
@@ -400,6 +405,38 @@ fn labelling(sinks: &mut [Sink], get: &dyn Fn(&str) -> String) -> Result<(), Str
     }
     if all_ns.as_ref().is_some_and(Option::is_some) && !sinks.iter().any(|s| matches!(s.kind, Kind::SecOps(_))) {
         return Err(format!("AUDIT_EXPORT_NAMESPACE {NAMESPACE_FOR}, and AUDIT_EXPORT has none"));
+    }
+    Ok(())
+}
+
+/// A data region id, as MACHINE_REGIONS names them, or `off` for none (ADR 0330). None when unset.
+fn region_from(var: &str, raw: &str) -> Result<Option<Option<String>>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.eq_ignore_ascii_case("off") {
+        return Ok(Some(None));
+    }
+    if !crate::machines::slug(raw, 32) {
+        return Err(format!("{var}: \"{}\" isn't a region id (lowercase letters, digits and inner dashes, such as gb-lon)", crate::audit::clip(raw, 32)));
+    }
+    Ok(Some(Some(raw.to_string())))
+}
+
+/// `AUDIT_EXPORT_DATA_REGION` for every sink, and `AUDIT_EXPORT_DATA_REGION_<NAME>` for a
+/// named one, which wins, `off` taking the server-wide one away (ADR 0330). botd can't see
+/// where a SIEM or bucket keeps what it gets, so this is the operator's word, as
+/// SERVER_DATA_REGION is (ADR 0184). It needn't be one of MACHINE_REGIONS: a SIEM in a region
+/// botd has no machines in is what it is for.
+fn data_regions(sinks: &mut [Sink], get: &dyn Fn(&str) -> String) -> Result<(), String> {
+    let all = region_from("AUDIT_EXPORT_DATA_REGION", &get("AUDIT_EXPORT_DATA_REGION"))?;
+    for s in sinks.iter_mut() {
+        let mine = match s.name.as_deref().map(|n| own("AUDIT_EXPORT_DATA_REGION", n)) {
+            Some(var) => region_from(&var, &get(&var))?,
+            None => None,
+        };
+        s.region = mine.or(all.clone()).flatten();
     }
     Ok(())
 }
@@ -531,6 +568,7 @@ impl Settings {
         }
         compression(&mut sinks, get)?;
         labelling(&mut sinks, get)?;
+        data_regions(&mut sinks, get)?;
         Ok(Settings { sinks, start })
     }
 
@@ -562,7 +600,11 @@ impl Settings {
                     (Some(Start::New), Some(n)) => format!(", starting with new events ({})", own("AUDIT_EXPORT_START", n)),
                     _ => String::new(),
                 };
-                format!("every audit event to {} {how}{from}", s.label())
+                let region = match &s.region {
+                    Some(r) => format!(", in {r}, holding back the details other regions' chat stores keep (ADR 0330)"),
+                    None => String::new(),
+                };
+                format!("every audit event to {} {how}{from}{region}", s.label())
             })
             .collect();
         let also = if each.len() > 1 { ", each on its own and" } else { "" };
@@ -579,6 +621,8 @@ struct State {
     last_error: Option<String>,
     /// The archive's last object (ADR 0154).
     archived: Option<Value>,
+    /// Events sent as their sealed row only since botd started (ADR 0330).
+    held_back: u64,
 }
 
 /// The running export: its sink and how far it got.
@@ -602,9 +646,10 @@ impl Exporter {
     }
 
     /// Returns how many tries failed and since when, if it had been failing.
-    fn delivered_to(&self, id: i64) -> Option<(u32, i64)> {
+    fn delivered_to(&self, id: i64, held_back: u64) -> Option<(u32, i64)> {
         let mut s = self.state();
         s.delivered = id;
+        s.held_back += held_back;
         s.delivered_at = Some(now());
         let was = s.failing_since.take().map(|t| (s.failures, t));
         s.failures = 0;
@@ -644,6 +689,8 @@ impl Exporter {
             "failedTries": s.failures,
             "lastError": s.last_error,
             "compress": if self.sink.gzipped() { "gzip" } else { "off" },
+            "dataRegion": self.sink.region,
+            "heldBack": s.held_back,
         });
         match &self.sink.kind {
             Kind::Archive(a) => v["archive"] = a.view(s.archived.as_ref()),
@@ -1011,6 +1058,15 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
                     tokio::time::sleep(IDLE).await;
                     continue 'export;
                 };
+                let held = match held_back(&app, &x.sink, &rows, x.delivered(), retry_to) {
+                    Ok(h) => h,
+                    Err(e) => break 'batch Err(("unreadable", format!("couldn't read where audit events' details are kept: {e}"))),
+                };
+                let rows: Vec<AuditEvent> = rows.into_iter().map(|e| match held.get(&e.id) {
+                    Some(region) => sealed_row(&e, region),
+                    None => e,
+                }).collect();
+                let held_n = rows.iter().filter(|e| held.contains_key(&e.id)).count() as u64;
                 // Delivered only once the cursor is saved; if it can't be, the batch goes again.
                 let extras = match crate::audit_checkpoint::export_extras(&app.db, &rows) {
                     Ok(x) => x,
@@ -1023,16 +1079,17 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
                             None => app.db.set_audit_export_cursor(&start_key, rows[0].id).map_err(|e| ("cursor_unsaved", format!("couldn't save where the archive starts: {e}"))),
                             Some(_) => Ok(()),
                         };
-                        first.and_then(|()| app.db.set_audit_export_cursor(&batch_key, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the archive's next batch: {e}"))))
+                        first.and_then(|()| app.db.cut_audit_export_batch(&x.sink.id, x.delivered(), last, &held).map_err(|e| ("cursor_unsaved", format!("couldn't save the archive's next batch: {e}"))))
                     }
                     false => Ok(()),
                 };
+                // A batch whose cut wasn't saved is cut again: nothing of it was sent.
                 let r = match cut {
                     Ok(()) => out
                         .send(&x.sink, &rows, &extras, &host, sealed_after)
                         .await
                         .and_then(|object| app.db.set_audit_export_cursor(&x.sink.id, last).map(|()| object).map_err(|e| ("cursor_unsaved", format!("couldn't save the export cursor: {e}")))),
-                    Err(e) => Err(e),
+                    Err(e) => break 'batch Err(e),
                 };
                 if x.sink.archive().is_some() {
                     retry_to = r.is_err().then_some(last);
@@ -1041,14 +1098,14 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
                     if let Some(o) = object {
                         x.archived(o);
                     }
-                    last
+                    (last, held_n)
                 })
             }
             Err(e) => Err(e),
         };
         match sent {
-            Ok(last) => {
-                if let Some((tries, since)) = x.delivered_to(last) {
+            Ok((last, held_n)) => {
+                if let Some((tries, since)) = x.delivered_to(last, held_n) {
                     log_info!("Audit export: {} is taking events again after {tries} failed tries.", x.sink.label());
                     let e = Event::new(Actor::system("audit_export"), "audit.export_recovered").target("audit", "export");
                     let mut d = x.sink.about();
@@ -1075,6 +1132,67 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
             }
         }
     }
+}
+
+/// Events whose details a sink doesn't get, by id, with the region whose chat store keeps them.
+type Held = std::collections::BTreeMap<i64, String>;
+
+/// The events of `rows` whose details `sink` doesn't get (ADR 0330): with its region stated,
+/// those a chat store of another region keeps. An archive's retry (`retry_to`) holds back
+/// what its batch's cut recorded, so it writes the same object whoever has moved since; a
+/// batch cut before botd recorded that went whole, so it goes whole again.
+fn held_back(app: &App, sink: &Sink, rows: &[AuditEvent], delivered: i64, retry_to: Option<i64>) -> rusqlite::Result<Held> {
+    if let Some(to) = retry_to.filter(|_| sink.archive().is_some()) {
+        return Ok(app.db.audit_export_held_for_batch(&sink.id, delivered, to)?.unwrap_or_default());
+    }
+    let (Some(region), Some(first), Some(last)) = (sink.region.as_deref(), rows.first(), rows.last()) else { return Ok(Held::new()) };
+    let mut kept = app.db.audit_kept_in(first.id, last.id)?;
+    kept.retain(|_, r| r != region);
+    Ok(kept)
+}
+
+/// Event `e` as botd's own log holds it while `region`'s chat store keeps its details (ADR
+/// 0316): the fields an erasure may rewrite empty but `details`, which names the store, and
+/// no salt. What a sink outside that region gets (ADR 0330). Its `chainDigest` still goes, so
+/// the line gives its hash from the fields no erasure may change, as an erased event's does.
+pub(crate) fn sealed_row(e: &AuditEvent, region: &str) -> AuditEvent {
+    AuditEvent {
+        actor_id: None,
+        actor_name: None,
+        actor_subject: None,
+        target_id: None,
+        ip: None,
+        user_agent: None,
+        details: serde_json::from_str(&crate::db::audit_placeholder(region)).unwrap_or(Value::Null),
+        actor_email: None,
+        session_id: None,
+        on_behalf_of: None,
+        chain_salt: None,
+        ..e.clone()
+    }
+}
+
+/// For a residency report on a pin to `region` (ADR 0330): each sink, the region it is said
+/// to be in, and whether it gets the details of the pin's people's events `whole`, only
+/// their sealed rows (`heldBack`), or sealed rows but for the `wholeEvents` whose details are
+/// still in botd's own log (`partly`: a move into the store that hasn't happened yet). `store`:
+/// whether `region` has a chat store; without one their details are all in botd's log, which
+/// goes whole to every sink. `in_botd`: how many of their events' details are in botd's log.
+pub fn for_pin(app: &App, region: &str, store: bool, in_botd: i64) -> Vec<Value> {
+    let Some(xs) = app.audit_export.get() else { return Vec::new() };
+    xs.sinks
+        .iter()
+        .map(|x| {
+            let s = &x.sink;
+            let details = match () {
+                _ if !store || s.region.as_deref().is_none_or(|r| r == region) => "whole",
+                _ if in_botd > 0 => "partly",
+                _ => "heldBack",
+            };
+            let whole_events = (details == "partly").then_some(in_botd);
+            json!({ "kind": s.kind(), "name": s.name, "dataRegion": s.region, "inRegion": s.region.as_deref() == Some(region), "details": details, "wholeEvents": whole_events })
+        })
+        .collect()
 }
 
 /// Whether the archive's next batch should go now: it is full, or its oldest event has
@@ -1950,12 +2068,51 @@ pub(crate) mod tests {
         assert!(!x.failed("d"), "and only that one");
         let v = x.view(9);
         assert_eq!((v["pending"].as_i64(), v["failing"].as_bool(), v["lastError"].as_str()), (Some(4), Some(true), Some("d")));
-        assert_eq!(x.delivered_to(9).map(|(n, _)| n), Some(4));
-        assert_eq!((x.delivered(), x.delivered_to(10)), (9, None));
+        assert_eq!(x.delivered_to(9, 0).map(|(n, _)| n), Some(4));
+        assert_eq!((x.delivered(), x.delivered_to(10, 0)), (9, None));
         assert!(!x.view(10)["failing"].as_bool().unwrap());
         for _ in 0..100 {
             let j = jitter(Duration::from_secs(8));
             assert!(j >= Duration::from_secs(6) && j <= Duration::from_secs(8), "{j:?}");
         }
+    }
+
+    #[test]
+    fn a_sinks_data_region_is_its_own_else_the_server_wide_one() {
+        let regions = |vars: &[(&str, &str)]| with_archive(vars).map(|s| s.sinks.iter().map(|s| s.region.clone()).collect::<Vec<_>>());
+        let export = ("AUDIT_EXPORT", "lon=https://lon.example.net/in,us=https://us.example.net/in,s3://audit-archive/prod");
+        assert_eq!(regions(&[export]).unwrap(), [None, None, None], "not stated: every event goes whole, as before");
+        assert_eq!(regions(&[export, ("AUDIT_EXPORT_DATA_REGION", "us-east-1")]).unwrap(), [Some("us-east-1".into()), Some("us-east-1".into()), Some("us-east-1".into())]);
+        let own = [export, ("AUDIT_EXPORT_DATA_REGION", "us-east-1"), ("AUDIT_EXPORT_DATA_REGION_LON", " gb-lon "), ("AUDIT_EXPORT_DATA_REGION_US", "OFF")];
+        assert_eq!(regions(&own).unwrap(), [Some("gb-lon".into()), None, Some("us-east-1".into())], "a named sink's own wins, off taking it away");
+        for bad in ["GB LON", "-lon", "gb_lon", &"a".repeat(33)] {
+            let e = regions(&[export, ("AUDIT_EXPORT_DATA_REGION_LON", bad)]).unwrap_err();
+            assert!(e.starts_with("AUDIT_EXPORT_DATA_REGION_LON: ") && e.contains("isn't a region id"), "{bad}: {e}");
+        }
+        let d = with_archive(&own).unwrap().describe();
+        assert!(d.contains("lon (https://lon.example.net:443) as JSON lines over HTTPS, in gb-lon, holding back the details other regions' chat stores keep (ADR 0330)"), "{d}");
+        assert!(d.contains("every audit event to us (https://us.example.net:443) as JSON lines over HTTPS; and"), "{d}");
+    }
+
+    #[test]
+    fn a_sealed_row_is_the_event_as_botds_log_holds_it_and_still_gives_its_hash() {
+        let mut e = event("success");
+        (e.actor_name, e.actor_subject, e.target_id, e.user_agent) = (Some("Ada".into()), Some("idp|ada".into()), Some("u2".into()), Some("curl".into()));
+        (e.actor_email, e.session_id, e.on_behalf_of, e.target_type) = (Some("ada@example.com".into()), Some("s1".into()), Some("u3".into()), Some("user".into()));
+        let salt = "5a".repeat(16);
+        let whole = line_value(&e, "h", None, false);
+        let digest = crate::audit_line::digest(&salt, &whole);
+        (e.chain_salt, e.chain_digest) = (Some(salt), Some(digest.clone()));
+        let sealed = sealed_row(&e, "gb-lon");
+        let v = line_value(&sealed, "h", None, true);
+        for f in crate::audit_line::ERASABLE_FIELDS {
+            let want = if f == "details" { json!({ "inChatStore": "gb-lon" }) } else { Value::Null };
+            assert_eq!(v[f], want, "{f}");
+        }
+        for f in crate::audit_line::FIXED_FIELDS {
+            assert_eq!(v[f], whole[f], "{f} stays");
+        }
+        assert_eq!((v["chainDigest"].as_str(), v.get("chainSalt")), (Some(digest.as_str()), None), "the digest goes, its salt doesn't");
+        assert_eq!(line_value(&e, "h", None, true)["chainSalt"].as_str().map(str::len), Some(32), "the whole event's line carries it");
     }
 }
