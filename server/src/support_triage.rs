@@ -785,6 +785,9 @@ fn audit_group(action: &str) -> (&'static str, &'static str, Option<&'static str
     if action.starts_with("server.backup") || action.starts_with("machine.backup") || action == "machine.rpo_breached" {
         return ("backups", "backup failures", Some("support/runbook-backups.md"));
     }
+    if action == "machine.placement_failed" {
+        return ("capacity", "machines refused or waiting for room", Some("support/runbook-capacity.md#no-room-for-new-machines"));
+    }
     match family {
         "auth" | "sso" => ("sign_in", "sign-in failures", None),
         "scim" => ("scim", "SCIM provisioning failures", Some("support/runbook-scim.md#reasons-and-fixes")),
@@ -958,6 +961,7 @@ fn log_rules(file: &str, text: &str, out: &mut Vec<Finding>) {
                 format!("botd panicked {} in its newest {}", if panics == 1 { "once".to_string() } else { format!("{panics} times") }, many(lines, "log line", "log lines")),
                 file,
             )
+            .runbook("support/runbook-server-errors.md#panics")
             .runbook("support/escalation.md")
             .next("A panic is a bug: send the bundle to level 3 through the issue tracker, and link the issue."),
         );
@@ -1643,6 +1647,8 @@ mod tests {
                 { "action": "machine.residency_refused", "total": 1, "outcomes": { "denied": 1 } },
                 { "action": "bot.run_refused", "total": 2, "outcomes": { "denied": 2 } },
                 { "action": "machine.run_limited", "total": 1, "outcomes": { "denied": 1 } },
+                { "action": "machine.placement_failed", "total": 2, "outcomes": { "failure": 2 } },
+                { "action": "machine.restore_failed", "total": 1, "outcomes": { "failure": 1 } },
                 { "action": "billing.email_failed", "total": 1, "outcomes": { "failure": 1 } },
             ],
             "recentProblems": [
@@ -1658,6 +1664,10 @@ mod tests {
         assert_eq!(find(&t, "audit.access").level, Level::Info);
         assert_eq!(find(&t, "audit.residency").runbooks, ["support/runbook-residency.md#refusals-and-fixes"]);
         assert_eq!(find(&t, "audit.run_limits").summary, "3 runs refused or held to limits in the 7 days to 2026-11-24T05:00:00Z: bot.run_refused ×2, machine.run_limited ×1");
+        let capacity = find(&t, "audit.capacity");
+        assert_eq!(capacity.summary, "2 machines refused or waiting for room in the 7 days to 2026-11-24T05:00:00Z: machine.placement_failed ×2");
+        assert_eq!(capacity.runbooks, ["support/runbook-capacity.md#no-room-for-new-machines"], "no room isn't a machine down");
+        assert_eq!(find(&t, "audit.machines").runbooks, ["support/runbook-machine-down.md"]);
         assert!(find(&t, "audit.other").runbooks.is_empty());
         assert!(ids(&t).contains(&"audit.truncated"));
         assert!(t.findings.iter().all(|f| f.severity.is_none()), "the audit log counts; the status says how bad");
@@ -1676,6 +1686,7 @@ mod tests {
         let t = triage(&b, &opts()).unwrap();
         assert_eq!(find(&t, "logs.problems").summary, "3 warnings in the newest 4 log lines; most frequent: ×2 model call failed: # after # ms | ×1 thread 'tokio' panicked at src/x.rs:#");
         assert!(find(&t, "logs.panic").next.as_ref().unwrap().contains("level 3"));
+        assert_eq!(find(&t, "logs.panic").runbooks, ["support/runbook-server-errors.md#panics", "support/escalation.md"]);
 
         let hook = r#"{"ts":"2026-11-24T05:00:00Z","level":"warn","msg":"server.panic","panic":"index out of bounds","location":"src/x.rs:1:2"}"#;
         b.files.insert("logs.jsonl".into(), hook.as_bytes().to_vec());
