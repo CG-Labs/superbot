@@ -236,9 +236,19 @@ pub fn check(var: &dyn Fn(&str) -> String, names: &[String], process: &dyn Secre
             None
         }
     };
-    match (&isolation, &shared_bots) {
-        (Some(iso), Some(sb)) => {
-            r.judge("Teammates' accounts", false, accounts::teammates_flag(&var("ISOLATION_TEAMMATES"), iso.is_some(), *sb == acl::SharedBots::Isolated).map_err(|e| format!("Isolation: {e}")));
+    // Start stops at a missing users' folder or helper before it reads the rest of
+    // isolation's settings, so those are judged here too, to be said with it.
+    let awaiting_setup = matches!(r.areas.last(), Some(("Isolation", Verdict::Refused(e))) if made_by_setup(e));
+    if awaiting_setup && let Some(d) = &data_dir {
+        r.judge("Isolation's other settings", false, isolation_beyond_setup(var, d).map_err(|e| format!("Isolation: {e}")));
+    }
+    let accounts_on = match &isolation {
+        Some(iso) => Some(iso.is_some()),
+        None => awaiting_setup.then_some(true),
+    };
+    match (accounts_on, &shared_bots) {
+        (Some(on), Some(sb)) => {
+            r.judge("Teammates' accounts", false, accounts::teammates_flag(&var("ISOLATION_TEAMMATES"), on, *sb == acl::SharedBots::Isolated).map_err(|e| format!("Isolation: {e}")));
         }
         _ => r.skip("Teammates' accounts", "isolation and shared Bots"),
     }
@@ -256,6 +266,24 @@ pub fn check(var: &dyn Fn(&str) -> String, names: &[String], process: &dyn Secre
         _ => r.skip("Backup encryption", "server backups, the control plane and regional chat stores"),
     }
     r
+}
+
+/// What `install.sh --isolation` makes: the users' folder, root's, and the helpers.
+/// Start's refusals for those say so; `install.sh --offline` lets them pass when it turns
+/// isolation on, as it makes them after the check.
+fn made_by_setup(e: &str) -> bool {
+    e.ends_with("Run deploy/install.sh --isolation.") || e.ends_with("must be a folder owned by root that only root can write")
+}
+
+/// The isolation settings start reads after the folder (`accounts::Isolation::from_env`).
+fn isolation_beyond_setup(var: &dyn Fn(&str) -> String, data_dir: &Path) -> Result<(), String> {
+    let dir = Some(var("ISOLATION_DIR")).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let root = std::path::PathBuf::from(dir.unwrap_or_else(|| accounts::DEFAULT_DIR.into()));
+    let data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    if data.starts_with(&root) || root.starts_with(&data) {
+        return Err("ISOLATION_DIR and DATA_DIR must not hold each other".into());
+    }
+    machines::offboard::Settings::from_vars(var, "ISOLATION_TEAMMATE_FILES", "ISOLATION_TEAMMATE_FILES_DAYS").map(|_| ())
 }
 
 /// botd's start with break-glass sign-in (`auth_startup`): AUTH_PASSWORD, or ALLOW_NO_AUTH=1
@@ -410,6 +438,33 @@ mod tests {
         let out = lines(&r);
         assert_eq!(out.iter().filter(|l| l.starts_with("botd wouldn't start with these settings: ")).count(), 3, "{out:?}");
         assert!(out.iter().any(|l| l.starts_with("  skipped  Notifications")), "{out:?}");
+    }
+
+    #[test]
+    fn isolation_awaiting_setup_still_judges_its_other_settings() {
+        let missing = temp("iso-missing").join("users").display().to_string();
+        let iso = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs: Vec<(&str, &str)> = vec![("ISOLATION", "users"), ("ISOLATION_DIR", &missing)];
+            pairs.extend_from_slice(extra);
+            run("iso-setup", &pairs)
+        };
+        let r = iso(&[]);
+        assert!(matches!(verdict(&r, "Isolation"), Verdict::Refused(e) if made_by_setup(e) && e.starts_with("Isolation: ISOLATION_DIR")), "{r:?}");
+        assert_eq!(r.refusals().len(), 1, "{r:?}");
+        assert!(matches!(verdict(&r, "Isolation's other settings"), Verdict::Ok), "{r:?}");
+        assert!(matches!(verdict(&r, "Teammates' accounts"), Verdict::Ok), "{r:?}");
+
+        let r = iso(&[("ISOLATION_TEAMMATE_FILES", "sometimes"), ("ISOLATION_TEAMMATES", "maybe")]);
+        let refused: Vec<&str> = r.refusals();
+        assert_eq!(refused.len(), 3, "{r:?}");
+        assert!(refused[1].starts_with("Isolation: ISOLATION_TEAMMATE_FILES must be archive or delete"), "{refused:?}");
+        assert!(refused[2].starts_with("Isolation: ISOLATION_TEAMMATES must be on or off"), "{refused:?}");
+        assert!(refused[1..].iter().all(|e| !made_by_setup(e)), "{refused:?}");
+
+        let r = run("iso-bad", &[("ISOLATION", "maybe"), ("ISOLATION_TEAMMATE_FILES", "sometimes")]);
+        assert!(matches!(verdict(&r, "Isolation"), Verdict::Refused(e) if !made_by_setup(e)), "{r:?}");
+        assert!(!r.areas.iter().any(|(a, _)| *a == "Isolation's other settings"), "{r:?}");
+        assert!(matches!(verdict(&r, "Teammates' accounts"), Verdict::Skipped(_)), "{r:?}");
     }
 
     #[test]

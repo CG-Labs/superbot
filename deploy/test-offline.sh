@@ -1156,7 +1156,8 @@ case \$(cat "$T/mbundle/mode") in
   ok) printf '  ok       SSO\nMachines: incus, enrolling at https://10.0.0.5:8443\nbotd would start with these settings.\n'; exit 0 ;;
   sso) printf '  refused  SSO   SSO: SSO_PUBLIC_URL is required with SSO_PROVIDERS\nbotd wouldn'"'"'t start with these settings: SSO: SSO_PUBLIC_URL is required with SSO_PROVIDERS\nbotd wouldn'"'"'t start with these settings: STATUS_PAGE must be on or off, not "maybe"\n'; exit 1 ;;
   isolation) printf 'botd wouldn'"'"'t start with these settings: Isolation: ISOLATION_DIR /var/lib/superbot-users: No such file or directory. Run deploy/install.sh --isolation.\n'; exit 1 ;;
-  isolation-and) printf 'botd wouldn'"'"'t start with these settings: Isolation: ISOLATION_DIR /var/lib/superbot-users: No such file\nbotd wouldn'"'"'t start with these settings: Sessions: SESSION_MAX_AGE must be a number of minutes\n'; exit 1 ;;
+  isolation-and) printf 'botd wouldn'"'"'t start with these settings: Isolation: ISOLATION_DIR /var/lib/superbot-users: No such file. Run deploy/install.sh --isolation.\nbotd wouldn'"'"'t start with these settings: Sessions: SESSION_MAX_AGE must be a number of minutes\n'; exit 1 ;;
+  isolation-files) printf 'botd wouldn'"'"'t start with these settings: Isolation: superbot-userctl isn'"'"'t at /usr/local/sbin/superbot-userctl. Run deploy/install.sh --isolation.\nbotd wouldn'"'"'t start with these settings: Isolation: ISOLATION_TEAMMATE_FILES must be archive or delete, not "sometimes"\n'; exit 1 ;;
   *) echo "no such subcommand"; exit 2 ;;
 esac
 EOF
@@ -1203,6 +1204,14 @@ grep -Fq "once this run has set up per-user accounts" <<<"$out" || fail "a check
 if out=$(mcheck isolation-and ISOLATION_MODE=users); then fail "a refusal beside isolation's went on: $out"; fi
 grep -Fq "wouldn't start with $MH/superbot/.env: Sessions: SESSION_MAX_AGE" <<<"$out" || fail "the refusal beside isolation's wasn't said: $out"
 if grep -Fq "and: Isolation" <<<"$out"; then fail "isolation this run sets up was listed as refused: $out"; fi
+if out=$(mcheck isolation-files ISOLATION_MODE=users); then fail "a bad isolation setting went on because this run sets up per-user accounts: $out"; fi
+grep -Fq "wouldn't start with $MH/superbot/.env: Isolation: ISOLATION_TEAMMATE_FILES must be archive or delete" <<<"$out" || fail "a bad isolation setting wasn't said: $out"
+if grep -Fq "superbot-userctl" <<<"$out"; then fail "a helper this run installs was listed as refused: $out"; fi
+mcheck ok ISOLATION_MODE=users ISOLATION_DIR=/srv/u >/dev/null || fail "a good settings check turning on isolation stopped the install"
+grep -qxF ISOLATION=users "$T/mbundle/args" && grep -qxF ISOLATION_DIR=/srv/u "$T/mbundle/args" \
+  || fail "the settings check wasn't given the isolation this run writes: $(cat "$T/mbundle/args")"
+mcheck ok ISOLATION_MODE=users >/dev/null && grep -qxF ISOLATION_DIR=/srv/superbot/users "$T/mbundle/args" \
+  || fail "the settings check wasn't given the default users' folder: $(cat "$T/mbundle/args")"
 ok "an offline upgrade stops before changing anything when the bundle's botd would refuse any setting at start, judged over what the install writes (botd settings check)"
 
 flags() { (parse_args "$@"; check_offline_flags) 2>&1; }

@@ -1810,7 +1810,11 @@ next_env_settings() {
     NEXT_ENV_SETTINGS+=(--set SUPERBOT_BACKUP_AGE_RECIPIENTS=made-by-the-installer)
   fi
   [[ -z "$DATABASE_ENCRYPTION" ]] || NEXT_ENV_SETTINGS+=(--set "SUPERBOT_DATABASE_ENCRYPTION=$DATABASE_ENCRYPTION")
-  [[ "$ISOLATION_MODE" != off ]] || NEXT_ENV_SETTINGS+=(--set ISOLATION=off)
+  # configure_isolation writes these, and warns of a changed folder itself.
+  case $(isolation_mode) in
+    users) NEXT_ENV_SETTINGS+=(--set ISOLATION=users --set "ISOLATION_DIR=$(isolation_dir 2>/dev/null)") ;;
+    *) [[ "$ISOLATION_MODE" != off ]] || NEXT_ENV_SETTINGS+=(--set ISOLATION=off) ;;
+  esac
   [[ -z "$MACHINE_HERMES_BUNDLE_VALUE" ]] || NEXT_ENV_SETTINGS+=(--set "MACHINE_HERMES_BUNDLE=$MACHINE_HERMES_BUNDLE_VALUE")
   [[ -z "$MACHINE_HARNESS_BUNDLE_VALUE" ]] || NEXT_ENV_SETTINGS+=(--set "MACHINE_HARNESS_BUNDLE=$MACHINE_HARNESS_BUNDLE_VALUE")
 }
@@ -1867,9 +1871,10 @@ offline_settings_start_check() {
       ;;
     1)
       refused=$(sed -n "s/^botd wouldn't start with these settings: //p" <<<"$out")
-      # Per-user accounts this run turns on are made after the check: their folder and helpers.
+      # Per-user accounts this run turns on get their folder and helpers after the check;
+      # botd says which refusals those are. Their other settings still count.
       if [[ "$what" == settings && "$(isolation_mode)" == users ]] && ! root_only "$SUDOERS_FILE"; then
-        refused=$(grep -v '^Isolation: ' <<<"$refused" || true)
+        refused=$(grep -vE '^Isolation: .*(Run deploy/install\.sh --isolation\.|must be a folder owned by root that only root can write)$' <<<"$refused" || true)
         if [[ -z "$refused" ]]; then
           log "$said, once this run has set up per-user accounts"
           return 0
