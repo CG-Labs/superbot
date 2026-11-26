@@ -765,9 +765,13 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                         stream.due = Instant::now() + MIN_RESUBSCRIBE;
                         stream.late = true;
                         // Vault may keep a stream open, and answer its pings, after its token ran
-                        // out while sending nothing on it (ADR 0318).
+                        // out while sending nothing on it (ADR 0318). The saved end is from when it
+                        // opened; Vault Agent or botd may have renewed the same token since.
                         if stream.expires.is_some_and(|at| Instant::now() >= at) {
-                            inner.events.stalled("the token the stream was made with ran out, and subscribing again failed");
+                            match inner.token_life(&stream.token, "auth/token/lookup-self", reqwest::Method::GET, None, false).await {
+                                Ok(Some((ttl, _))) => stream.expires = (ttl > 0).then(|| Instant::now() + Duration::from_secs(ttl)),
+                                _ => inner.events.stalled("the token the stream was made with ran out, and subscribing again failed"),
+                            }
                         }
                     }
                 },
@@ -1354,9 +1358,13 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 1);
         assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-1"));
-        // Its token ran out at 1 s: open and answering pings, but not counted as followed.
+        // Past the lease it had at 1 s, but renewed in place (Vault still says it lives): followed.
+        assert!(x.watch_status().unwrap().following);
+        // Vault forgets the token: open and answering pings, but not counted as followed.
+        f.tokens.lock().unwrap().remove(0);
+        wait_for(|| !x.watch_status().unwrap().following);
         let w = x.watch_status().unwrap();
-        assert!(!w.following && w.lost == 0 && w.last_loss.as_deref().is_some_and(|l| l.contains("ran out")), "{w:?}");
+        assert!(w.lost == 0 && w.last_loss.as_deref().is_some_and(|l| l.contains("ran out")), "{w:?}");
         f.events.status.store(0, Ordering::SeqCst);
         wait_for(|| caught_up("EVENTS_LATE_TOKEN"));
         assert!(x.watch_status().unwrap().following, "followed again with the new subscription");
