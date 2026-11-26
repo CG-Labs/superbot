@@ -313,3 +313,97 @@ describe("RolesAdmin: requests for roles (ADR 0209)", () => {
     expect(screen.queryByLabelText("Approve Me's request")).toBeNull();
   });
 });
+
+describe("RolesAdmin: two approvers for chosen roles (ADR 0320)", () => {
+  const NOW = Date.UTC(2026, 10, 26, 12);
+  beforeEach(() => jest.spyOn(Date, "now").mockReturnValue(NOW));
+  afterEach(() => jest.restoreAllMocks());
+
+  const request = (r: Partial<RoleRequest> = {}): RoleRequest => ({
+    id: "q1",
+    role: { id: "r1", name: "Root", maxDays: 1, permissions: ["machines.manage"], applies: ["machines.manage"] },
+    scope: "org",
+    team: null,
+    user: { id: "u3", name: "Cy", email: "cy@example.com" },
+    hours: 8,
+    reason: "Rotate keys",
+    status: "pending",
+    createdAt: NOW,
+    expiresAt: NOW + 7 * 86_400_000,
+    decidedAt: null,
+    decidedBy: null,
+    note: null,
+    grantedUntil: null,
+    current: null,
+    approvals: 2,
+    firstApproval: null,
+    ...r,
+  });
+  const first = { by: { id: "u2", name: "Ada", email: "ada@example.com" }, at: NOW - 60_000, hours: 4, note: "Fine by me" };
+
+  it("makes a requestable role need two approvers, and only a requestable one", async () => {
+    const api = mockApi();
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("New role"));
+    await u.type(screen.getByLabelText("Role name"), "Root");
+    expect(screen.getByRole("checkbox", { name: "Needs two approvers" })).toBeDisabled();
+    await u.type(screen.getByLabelText("Most days it can be given for"), "1");
+    expect(screen.getByRole("checkbox", { name: "Needs two approvers" })).toBeDisabled();
+    await u.press(screen.getByRole("checkbox", { name: "People may request it" }));
+    await u.press(screen.getByRole("checkbox", { name: "Needs two approvers" }));
+    await u.press(screen.getByLabelText("Create role"));
+    expect(api.createRole).toHaveBeenCalledWith({ name: "Root", description: "", base: "member", permissions: [], maxDays: 1, requestable: true, approvals: 2 });
+  });
+
+  it("goes back to one approver when people may no longer request it", async () => {
+    const api = mockApi();
+    api.roles.mockResolvedValue({ ...VIEW, roles: [{ ...SUPPORT, maxDays: 7, requestable: true, approvals: 2 }] });
+    const u = userEvent.setup();
+    await show(api);
+    await u.press(await screen.findByLabelText("Role Support"));
+    expect(screen.getByRole("checkbox", { name: "Needs two approvers" })).toBeChecked();
+    await u.press(screen.getByRole("checkbox", { name: "People may request it" }));
+    await u.press(screen.getByLabelText("Save"));
+    await waitFor(() => expect(api.updateRole).toHaveBeenCalledWith("r1", { requestable: false, approvals: 1 }));
+  });
+
+  it("gives the first of two approvals, saying nothing is given yet", async () => {
+    const api = mockApi();
+    api.roleRequests.mockResolvedValue({ requests: [request()], pending: 1, pendingDays: 7 });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByText(/Waiting for two approvers · lapses in 7 days/)).toBeTruthy();
+    expect(screen.getByText("Approve (1 of 2)")).toBeTruthy();
+    await u.press(screen.getByRole("radio", { name: "4 hours" }));
+    await u.press(screen.getByLabelText("Approve Cy's request"));
+    await waitFor(() => expect(api.approveRoleRequest).toHaveBeenCalledWith("q1", { hours: 4, note: undefined }));
+    const { confirmAsync } = jest.requireMock("../../src/dialogs");
+    expect(confirmAsync).toHaveBeenLastCalledWith("Approve Cy's request for Root?", expect.stringContaining("Yours is the first"), "Approve");
+  });
+
+  it("gives the second for the first's hours or fewer", async () => {
+    const api = mockApi();
+    api.roleRequests.mockResolvedValue({ requests: [request({ firstApproval: first })], pending: 1, pendingDays: 7 });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByText(/Approved once, waiting for a second approver/)).toBeTruthy();
+    expect(screen.getByText("First approved by Ada for 4 hours: “Fine by me”.")).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "4 hours (as first approved)" })).toBeTruthy();
+    expect(screen.queryByRole("radio", { name: /8 hours/ })).toBeNull();
+    expect(screen.getByText("Approve")).toBeTruthy();
+    await u.press(screen.getByLabelText("Approve Cy's request"));
+    await waitFor(() => expect(api.approveRoleRequest).toHaveBeenCalledWith("q1", { hours: 4, note: undefined }));
+  });
+
+  it("leaves the second approval to someone else, but lets the first approver deny", async () => {
+    const api = mockApi();
+    api.roleRequests.mockResolvedValue({ requests: [request({ firstApproval: { ...first, by: { id: "me", name: "Me" } } })], pending: 1, pendingDays: 7 });
+    const u = userEvent.setup();
+    await show(api);
+    expect(await screen.findByText("You gave the first approval. Someone else gives the second.")).toBeTruthy();
+    expect(screen.queryByLabelText("Approve Cy's request")).toBeNull();
+    await u.press(screen.getByLabelText("Deny Cy's request"));
+    await waitFor(() => expect(api.denyRoleRequest).toHaveBeenCalledWith("q1", undefined));
+  });
+});

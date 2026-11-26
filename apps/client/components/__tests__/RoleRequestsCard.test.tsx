@@ -102,4 +102,16 @@ describe("RoleRequestsCard (ADR 0209)", () => {
     await u.press(screen.getByLabelText("Withdraw request for On-call"));
     await waitFor(() => expect(api.withdrawRoleRequest).toHaveBeenCalledWith("q1"));
   });
+
+  it("says when a role needs two approvers, and where a request is (ADR 0320)", async () => {
+    const first = { by: { id: "u2", name: "Ada" }, at: NOW, hours: 4, note: null };
+    const api = fakeApi(mine({ requestable: [{ ...ONCALL, approvals: 2 }], requests: [{ ...PENDING, approvals: 2, firstApproval: first }] }));
+    const u = userEvent.setup();
+    await render(<RoleRequestsCard api={api} />);
+    expect(await screen.findByText("Adds machines.manage, audit.view. At most 1 day. Two people approve it before it starts.")).toBeTruthy();
+    expect(screen.getByText("Approved once, waiting for a second approver · lapses in 7 days")).toBeTruthy();
+    await u.type(screen.getByLabelText("Why you need it"), "Rotate keys");
+    await u.press(screen.getByLabelText("Ask for it"));
+    expect(await screen.findByText(/Two people approve it before it starts; it lapses in 7 days/)).toBeTruthy();
+  });
 });

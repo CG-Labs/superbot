@@ -23,7 +23,7 @@ export function emptyDraft(): RoleDraft {
 }
 
 export function draftOf(r: CustomRole): RoleDraft {
-  return { name: r.name, description: r.description, base: r.base, permissions: [...r.permissions], maxDays: r.maxDays ?? null, requestable: !!r.requestable };
+  return { name: r.name, description: r.description, base: r.base, permissions: [...r.permissions], maxDays: r.maxDays ?? null, requestable: !!r.requestable, approvals: r.approvals === 2 ? 2 : 1 };
 }
 
 const HOUR = 60 * 60_000;
@@ -134,6 +134,7 @@ export function draftChanges(r: CustomRole, draft: RoleDraft): Partial<RoleDraft
   if (!same || r.unknown.length > 0) out.permissions = draft.permissions;
   if (draft.maxDays !== undefined && draft.maxDays !== (r.maxDays ?? null)) out.maxDays = draft.maxDays;
   if (draft.requestable !== undefined && draft.requestable !== !!r.requestable) out.requestable = draft.requestable;
+  if (draft.approvals !== undefined && draft.approvals !== (r.approvals === 2 ? 2 : 1)) out.approvals = draft.approvals;
   return Object.keys(out).length ? out : null;
 }
 
@@ -165,9 +166,9 @@ export function requestChoices(maxHours: number): { value: string; label: string
   return REQUEST_HOURS.filter((h) => h <= maxHours).map((h) => ({ value: String(h), label: hoursLabel(h) }));
 }
 
-/** What an admin can approve a request for: as asked, or shorter. */
-export function approveChoices(asked: number): { value: string; label: string }[] {
-  return [{ value: String(asked), label: `${hoursLabel(asked)} (as asked)` }, ...REQUEST_HOURS.filter((h) => h < asked).reverse().map((h) => ({ value: String(h), label: hoursLabel(h) }))];
+/** What an admin can approve a request for: as asked (or as the first approver gave, `as`), or shorter. */
+export function approveChoices(asked: number, as = "as asked"): { value: string; label: string }[] {
+  return [{ value: String(asked), label: `${hoursLabel(asked)} (${as})` }, ...REQUEST_HOURS.filter((h) => h < asked).reverse().map((h) => ({ value: String(h), label: hoursLabel(h) }))];
 }
 
 /** Why the request can't be sent yet, or null. */
@@ -179,12 +180,31 @@ export function requestDraftError(draft: { role: string; reason: string }): stri
   return null;
 }
 
+/** Whether a pending request waits for the second of two approvals (ADR 0320). */
+export function awaitsSecond(q: Pick<RoleRequest, "approvals" | "firstApproval">): boolean {
+  return (q.approvals ?? 1) >= 2 && !!q.firstApproval;
+}
+
+/** The most hours a request can be approved for now: as asked, or the first approval's (ADR 0320). */
+export function approveCap(q: Pick<RoleRequest, "hours" | "approvals" | "firstApproval">): number {
+  return awaitsSecond(q) && q.firstApproval ? Math.min(q.hours, q.firstApproval.hours) : q.hours;
+}
+
+/** "First approved by Ana for 4 hours: “note”", or null without a first approval that still matters. */
+export function firstApprovalLabel(q: Pick<RoleRequest, "approvals" | "firstApproval">): string | null {
+  const f = q.firstApproval;
+  if (!f || !awaitsSecond(q)) return null;
+  const who = f.by.name || f.by.email || f.by.id;
+  return `First approved by ${who} for ${hoursLabel(f.hours)}${f.note ? `: “${f.note}”` : ""}`;
+}
+
 /** Where a request is: "Waiting for an admin", "Approved · ends in 3 hours", "Denied: <note>", "Withdrawn", "Lapsed". */
-export function requestStatusLabel(q: Pick<RoleRequest, "status" | "grantedUntil" | "note" | "expiresAt">, now: number): string {
+export function requestStatusLabel(q: Pick<RoleRequest, "status" | "grantedUntil" | "note" | "expiresAt" | "approvals" | "firstApproval">, now: number): string {
   switch (q.status) {
     case "pending": {
       const days = Math.max(1, Math.ceil((q.expiresAt - now) / DAY));
-      return `Waiting for an admin · lapses in ${days} day${days === 1 ? "" : "s"}`;
+      const waiting = awaitsSecond(q) ? "Approved once, waiting for a second approver" : (q.approvals ?? 1) >= 2 ? "Waiting for two approvers" : "Waiting for an admin";
+      return `${waiting} · lapses in ${days} day${days === 1 ? "" : "s"}`;
     }
     case "approved": {
       const ends = endsLabel(q.grantedUntil, now);
