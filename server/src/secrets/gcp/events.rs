@@ -167,7 +167,8 @@ impl Inner {
     /// POSTs `body` to `<subscription>:<verb>` with botd's token; when Pub/Sub refuses the
     /// token, gets a new one and asks once more.
     async fn pubsub(&self, client: &reqwest::Client, verb: &str, body: &Value) -> Result<Call, Failed> {
-        let url = format!("{}/v1/{}:{verb}", self.cfg.pubsub_endpoint, self.subscription());
+        // `%` is allowed in a subscription id, and must reach Google as itself.
+        let url = format!("{}/v1/{}:{verb}", self.cfg.pubsub_endpoint, self.subscription().replace('%', "%25"));
         for fresh in [false, true] {
             let token = self.token(fresh).await.map_err(|e| Failed { why: "botd couldn't sign in to Google".into(), sign_in: Some(e) })?;
             let res = match client.post(&url).bearer_auth(token.as_str()).json(body).send().await {
@@ -179,10 +180,11 @@ impl Inner {
             if status == reqwest::StatusCode::UNAUTHORIZED && !fresh {
                 continue;
             }
+            // Only a wait for the answer's start is an empty pull; one that starts and stalls is a failure.
             return match res.bytes().await {
                 Ok(b) => Ok(Call::Answered(status, Zeroizing::new(b.to_vec()))),
-                Err(e) if e.is_timeout() => Ok(Call::TimedOut),
-                Err(_) => Err(Failed { why: "Pub/Sub's answer broke off".into(), sign_in: None }),
+                Err(e) if e.is_timeout() => Err(Failed { why: format!("Pub/Sub answered {status}, but the answer didn't finish in time"), sign_in: None }),
+                Err(_) => Err(Failed { why: format!("Pub/Sub answered {status}, but the answer broke off"), sign_in: None }),
             };
         }
         unreachable!("the second pass returns")
@@ -319,6 +321,7 @@ pub(crate) mod tests {
     use super::super::tests::{authorized, put, stand_in, F};
     use super::*;
     use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
     use axum::Json;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -326,6 +329,8 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     const SUBSCRIPTION: &str = "projects/proj-1/subscriptions/superbot-secrets";
+    /// Allowed, and reaches Google as written only if botd escapes the `%`.
+    const ODD_SUBSCRIPTION: &str = "projects/proj-1/subscriptions/superbot%41";
 
     /// The stand-in's subscription: messages waiting, those delivered, and what botd did.
     #[derive(Default)]
@@ -342,6 +347,8 @@ pub(crate) mod tests {
         pub check: AtomicUsize,
         /// How long a pull with nothing to deliver waits, in milliseconds.
         pub hold_ms: AtomicUsize,
+        /// Pulls get a 503's headers, then a body that never ends.
+        pub stall: std::sync::atomic::AtomicBool,
         delivered: AtomicUsize,
     }
 
@@ -369,17 +376,25 @@ pub(crate) mod tests {
 
     /// Pub/Sub's `<subscription>:pull`, `:acknowledge` and `:testIamPermissions`; None for any
     /// other path.
-    pub(crate) async fn pubsub(f: &F, rest: &str, h: &HeaderMap, body: &Value) -> Option<(StatusCode, Json<Value>)> {
+    pub(crate) async fn pubsub(f: &F, rest: &str, h: &HeaderMap, body: &Value) -> Option<Response> {
         let (sub, verb) = rest.rsplit_once(':')?;
         if !sub.contains("/subscriptions/") {
             return None;
         }
         if let Err(e) = authorized(f, h) {
-            return Some(e);
+            return Some(e.into_response());
         }
-        assert_eq!(sub, SUBSCRIPTION);
+        if verb == "pull" && f.pubsub.stall.load(Ordering::SeqCst) {
+            let never = tokio_stream::pending::<Result<Vec<u8>, std::io::Error>>();
+            return Some((StatusCode::SERVICE_UNAVAILABLE, axum::body::Body::from_stream(never)).into_response());
+        }
+        Some(subscription(f, sub, verb, body).await.into_response())
+    }
+
+    async fn subscription(f: &F, sub: &str, verb: &str, body: &Value) -> (StatusCode, Json<Value>) {
+        assert!([SUBSCRIPTION, ODD_SUBSCRIPTION].contains(&sub), "{sub}");
         let p = &f.pubsub;
-        Some(match verb {
+        match verb {
             "testIamPermissions" => match p.check.load(Ordering::SeqCst) {
                 1 => refuse(404, "NOT_FOUND"),
                 2 => (StatusCode::OK, Json(json!({}))),
@@ -392,7 +407,7 @@ pub(crate) mod tests {
             "pull" => {
                 p.pulls.fetch_add(1, Ordering::SeqCst);
                 if let s @ 1.. = p.status.load(Ordering::SeqCst) {
-                    return Some(refuse(s as u16, "UNAVAILABLE"));
+                    return refuse(s as u16, "UNAVAILABLE");
                 }
                 let max = body["maxMessages"].as_u64().unwrap() as usize;
                 let until = Instant::now() + Duration::from_millis(p.hold_ms.load(Ordering::SeqCst).max(1) as u64);
@@ -414,14 +429,14 @@ pub(crate) mod tests {
             }
             "acknowledge" => {
                 if let s @ 1.. = p.ack_status.load(Ordering::SeqCst) {
-                    return Some(refuse(s as u16, "INVALID_ARGUMENT"));
+                    return refuse(s as u16, "INVALID_ARGUMENT");
                 }
                 let ids = body["ackIds"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string());
                 p.acked.lock().unwrap().extend(ids);
                 (StatusCode::OK, Json(json!({})))
             }
             other => panic!("Pub/Sub has no {other}"),
-        })
+        }
     }
 
     fn pairs<'a>(url: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
@@ -613,9 +628,16 @@ pub(crate) mod tests {
         f.pubsub.ack_status.store(0, Ordering::SeqCst);
         wait_for(|| x.watch_status().unwrap().catch_ups == 2);
 
+        // An answer that starts and stalls is a failure, not an empty pull.
+        f.pubsub.stall.store(true, Ordering::SeqCst);
+        wait_for(|| x.watch_status().unwrap().lost == 3);
+        assert_eq!(x.watch_status().unwrap().last_loss.as_deref(), Some("Pub/Sub answered 503 Service Unavailable, but the answer didn't finish in time"));
+        f.pubsub.stall.store(false, Ordering::SeqCst);
+        wait_for(|| x.watch_status().unwrap().catch_ups == 3);
+
         // Pub/Sub out of reach: the same.
         f.down.store(true, Ordering::SeqCst);
-        wait_for(|| x.watch_status().unwrap().lost == 3);
+        wait_for(|| x.watch_status().unwrap().lost == 4);
         f.down.store(false, Ordering::SeqCst);
         wait_for(|| x.watch_status().unwrap().following);
         redact::forget("gcp-gap-1");
@@ -666,6 +688,14 @@ pub(crate) mod tests {
         let x = on(&off);
         assert!(!x.watch().unwrap() && x.watch_status().is_none());
         assert!(!x.describe().contains("change events"));
+
+        // A `%` in the id names that subscription, not an escape.
+        let odd: Vec<_> = off.into_iter().chain([("GCP_SECRET_MANAGER_EVENTS", "superbot%41")]).collect();
+        let x = on(&odd);
+        assert!(x.watch().unwrap(), "pulls {ODD_SUBSCRIPTION}");
+        let pulls = f.pubsub.pulls.load(Ordering::SeqCst);
+        wait_for(|| f.pubsub.pulls.load(Ordering::SeqCst) > pulls);
+        assert_eq!(x.watch_status().unwrap().lost, 0);
     }
 
     #[test]

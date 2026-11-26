@@ -904,15 +904,20 @@ pub(crate) mod tests {
         (StatusCode::OK, Json(json!({ "secrets": page, "nextPageToken": next, "totalSize": ids.len() })))
     }
 
+    /// POSTs under `/v1/`: Pub/Sub's calls on a subscription, else IAM Credentials'.
+    async fn post_v1(State(f): State<F>, Path(rest): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match super::events::tests::pubsub(&f, &rest, &h, &body).await {
+            Some(answer) => answer,
+            None => iam(State(f), Path(rest), h, Json(body)).await.into_response(),
+        }
+    }
+
     /// IAM Credentials' `projects/-/serviceAccounts/<email>:generateAccessToken`. Accounts
     /// named `denied`, `missing` and `odd` are refused or answered oddly, `short` gets a
     /// token of ten minutes, and lifetimes over an hour are refused, as without the
-    /// organization policy that allows them. Pub/Sub's calls on a subscription, which share
-    /// the path, go to the stand-in Pub/Sub.
+    /// organization policy that allows them.
     async fn iam(State(f): State<F>, Path(rest): Path<String>, h: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
-        if let Some(answer) = super::events::tests::pubsub(&f, &rest, &h, &body).await {
-            return answer;
-        }
         if let Err(e) = authorized(&f, &h) {
             return e;
         }
@@ -981,7 +986,7 @@ pub(crate) mod tests {
             .route("/computeMetadata/v1/instance/service-accounts/default/token", axum::routing::get(metadata_token))
             .route("/token", axum::routing::post(oauth_token))
             .route("/v1/token", axum::routing::post(sts))
-            .route("/v1/{*rest}", axum::routing::get(api).post(iam))
+            .route("/v1/{*rest}", axum::routing::get(api).post(post_v1))
             .with_state(Arc::clone(&f));
         (serve(app), f)
     }
