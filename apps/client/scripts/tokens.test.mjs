@@ -4,10 +4,18 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { css, targets, withTokens } from "./tokens.mjs";
+import { css, hasTokens, targets, withTokens } from "./tokens.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tokens = JSON.parse(fs.readFileSync(path.join(root, "src/tokens.json"), "utf8"));
+
+test("the sign-in page's own styles carry the block", () => {
+  const login = fs.readFileSync(path.resolve(root, "../../web/login.html"), "utf8");
+  assert.ok(hasTokens(login));
+  const style = login.slice(login.indexOf("<style>"), login.indexOf("</style>"));
+  assert.ok(style.includes(css(tokens)), "the block sits inside <style> and is current");
+  assert.ok(!hasTokens("<style>body {}</style>"));
+});
 
 test("every colour is a property in light and in dark", () => {
   const block = css(tokens);
@@ -27,9 +35,9 @@ test("replaces only its own block, and puts it first when there is none", () => 
   assert.equal(withTokens(edited, block), once);
 });
 
-test("the console and the landing page carry the same block", () => {
+test("the console, the sign-in page and the landing page carry the same block", () => {
   const block = css(tokens);
-  assert.deepEqual(targets, ["web/styles.css", "site/assets/site.css"]);
+  assert.deepEqual(targets, ["web/styles.css", "web/login.html", "site/assets/site.css"]);
   for (const target of targets) {
     const text = fs.readFileSync(path.resolve(root, "../..", target), "utf8");
     assert.ok(text.includes(block), target);

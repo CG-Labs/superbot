@@ -2102,12 +2102,13 @@ async function loadSetup() {
     if (seq !== setup.seq) return;
     setup.data = data;
     setup.step = data.progress.step;
-    $("setup-empty").hidden = true;
+    $("setup-failed").hidden = true;
   } catch (err) {
     if (seq !== setup.seq) return;
     setup.data = null;
-    $("setup-empty").textContent = err.message;
-    $("setup-empty").hidden = false;
+    // Without a status the request never reached botd.
+    $("setup-empty").textContent = err.status ? `Setup didn't load: ${err.message}` : "Can't reach the server. Check your connection, then try again.";
+    $("setup-failed").hidden = false;
   }
   renderSetup();
 }
@@ -2292,6 +2293,7 @@ $("setup-hide").addEventListener("click", async () => {
   }
 });
 $("setup-unhide").addEventListener("click", () => saveSetup({ dismissed: false }));
+$("setup-retry").addEventListener("click", () => loadSetup());
 
 $("setup-body").addEventListener("click", async (e) => {
   const c = e.target.closest("button[data-copy]");

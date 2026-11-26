@@ -51,6 +51,11 @@ describe("design tokens", () => {
       expect(contrast(c.text, c.codeBg)).toBeGreaterThanOrEqual(4.5);
     });
 
+    it("keeps the console's selected pills readable: setup's progress, step numbers and tags", () => {
+      expect(contrast(c.text, c.selected)).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(c.textMuted, c.selected)).toBeGreaterThanOrEqual(4.5);
+    });
+
     it.each(grounds)("keeps the keyboard focus ring visible on %s", (ground) => {
       // WCAG 1.4.11: focus indicators need 3:1 against what's around them.
       expect(contrast(c.accent, c[ground])).toBeGreaterThanOrEqual(3);

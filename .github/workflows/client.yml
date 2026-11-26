@@ -5,6 +5,8 @@ on:
     paths:
       - "apps/client/**"
       - "web/index.html"
+      - "web/login.html"
+      - "web/app.js"
       - "web/styles.css"
       - "site/assets/site.css"
       - ".github/workflows/client.yml"
@@ -12,6 +14,8 @@ on:
     paths:
       - "apps/client/**"
       - "web/index.html"
+      - "web/login.html"
+      - "web/app.js"
       - "web/styles.css"
       - "site/assets/site.css"
       - ".github/workflows/client.yml"

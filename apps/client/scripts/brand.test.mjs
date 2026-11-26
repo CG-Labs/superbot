@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { assets, checkPng, chunk, decodePng } from "./brand.mjs";
+import { assets, checkPng, chunk, decodePng, withFavicon, withMark } from "./brand.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const asset = (file) => assets.find((a) => a.file === file);
@@ -33,6 +33,14 @@ test("tRNS on an RGB icon is applied to alpha", () => {
 test("tRNS on an RGB icon fails the check", () => {
   const errors = checkPng(icon, withChunk(read(icon), "tRNS", rgbKey(0x17, 0x17, 0x17)));
   assert.ok(errors.some((e) => e.includes("tRNS")), errors.join("\n"));
+});
+
+test("the sign-in page shows the app icon's tile in its card, kept by brand:check", () => {
+  const login = fs.readFileSync(path.resolve(root, "../../web/login.html"), "utf8");
+  assert.equal(withMark(withFavicon(login)), login);
+  const mark = login.split("\n").find((l) => l.includes("<!-- brand:mark -->"));
+  assert.match(mark, /^\s+<img class="mark" alt="" src="data:image\/svg\+xml,%3Csvg/);
+  assert.equal(withMark('  <img src="" /><!-- brand:mark -->'), mark.replace(/^\s+/, "  "));
 });
 
 test("tRNS on an RGBA icon fails the check", () => {

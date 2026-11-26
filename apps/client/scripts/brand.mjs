@@ -144,12 +144,26 @@ const render = (a) => {
   return img.pixels;
 };
 
-const withFavicon = (html) => {
+// The sign-in page's card shows the app icon's tile, as the app's sign-in frame does (ADR 0336, ADR 0341).
+const markTag = `<img class="mark" alt="" src="data:image/svg+xml,${encodeURIComponent(faviconSvg)}" /><!-- brand:mark -->`;
+const webLogin = path.resolve(root, "../../web/login.html");
+
+export const withFavicon = (html) => {
   const lines = html.split("\n").filter((l) => !l.includes("<!-- brand:favicon -->"));
   const at = lines.findIndex((l) => l.includes("<title>"));
   lines.splice(at + 1, 0, `  ${faviconTag}`);
   return lines.join("\n");
 };
+
+/** `html` with each `<!-- brand:mark -->` line made the mark, keeping its indent. */
+export const withMark = (html) =>
+  html.split("\n").map((l) => (l.includes("<!-- brand:mark -->") ? `${l.match(/^\s*/)[0]}${markTag}` : l)).join("\n");
+
+// The web pages that carry the brand, and what each carries.
+const webPages = [
+  { file: webIndex, name: "web/index.html", brand: withFavicon },
+  { file: webLogin, name: "web/login.html", brand: (html) => withMark(withFavicon(html)) },
+];
 
 function generate() {
   for (const a of assets) {
@@ -158,8 +172,10 @@ function generate() {
     fs.writeFileSync(out, encodePng(a.w, a.h, render(a), a.alpha));
     console.log(`wrote ${a.file} (${a.w}x${a.h}${a.alpha ? ", alpha" : ""})`);
   }
-  fs.writeFileSync(webIndex, withFavicon(fs.readFileSync(webIndex, "utf8")));
-  console.log("updated web/index.html favicon");
+  for (const p of webPages) {
+    fs.writeFileSync(p.file, p.brand(fs.readFileSync(p.file, "utf8")));
+    console.log(`updated ${p.name} brand`);
+  }
 }
 
 // Rasterizers can differ by a rounding step across CPUs, so compare pixels with a small tolerance.
@@ -206,8 +222,11 @@ function check() {
     if (color?.toLowerCase() !== palette.ink) errors.push(`app.json ${where} is ${color}, want ${palette.ink}`);
   }
 
-  const html = fs.readFileSync(webIndex, "utf8");
-  if (withFavicon(html) !== html) errors.push("web/index.html favicon is out of date; run npm run brand");
+  for (const p of webPages) {
+    const html = fs.readFileSync(p.file, "utf8");
+    if (p.brand(html) !== html) errors.push(`${p.name} favicon or mark is out of date; run npm run brand`);
+  }
+  if (!fs.readFileSync(webLogin, "utf8").includes("<!-- brand:mark -->")) errors.push("web/login.html has no <!-- brand:mark --> line");
 
   if (errors.length) {
     console.error(errors.map((e) => `brand: ${e}`).join("\n"));

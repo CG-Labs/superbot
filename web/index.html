@@ -462,18 +462,26 @@
     </section>
 
     <section id="tab-setup" hidden>
-      <div class="bar">
-        <h2 class="setup-title">Set up this server</h2>
-        <span class="hint setup-state" id="setup-state"></span>
-        <button type="button" class="btn push" id="setup-hide">Hide setup</button>
-        <button type="button" class="btn push" id="setup-unhide" hidden>Show setup to admins again</button>
-      </div>
-      <nav class="steps" id="setup-steps" aria-label="Setup steps"></nav>
-      <div id="setup-body"></div>
-      <div class="empty" id="setup-empty" hidden></div>
-      <div class="bar setup-nav">
-        <button type="button" class="btn" id="setup-back">Back</button>
-        <button type="button" class="btn primary" id="setup-next">Next</button>
+      <div class="setup-card">
+        <div class="setup-head">
+          <div class="setup-intro">
+            <h2 class="setup-title">Set up this server</h2>
+            <p class="hint setup-lede">A few steps get SuperBot ready for your team: its address, how people sign in, and its plans. Your place is saved, so you can leave and come back.</p>
+          </div>
+          <span class="setup-state" id="setup-state"></span>
+          <button type="button" class="btn" id="setup-hide">Hide setup</button>
+          <button type="button" class="btn" id="setup-unhide" hidden>Show setup to admins again</button>
+        </div>
+        <nav class="steps" id="setup-steps" aria-label="Setup steps"></nav>
+        <div id="setup-body"></div>
+        <div class="setup-failed" id="setup-failed" role="alert" hidden>
+          <span id="setup-empty"></span>
+          <button type="button" class="btn" id="setup-retry">Try again</button>
+        </div>
+        <div class="bar setup-nav">
+          <button type="button" class="btn" id="setup-back">Back</button>
+          <button type="button" class="btn primary" id="setup-next">Next</button>
+        </div>
       </div>
     </section>
   </main>
