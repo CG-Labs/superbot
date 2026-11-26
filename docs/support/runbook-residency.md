@@ -80,6 +80,25 @@ The backup must be this region's store, open with the master key (or the previou
 
 Routines that come back run on their schedule once botd starts; the command says so. What was written since the backup is lost; tell the customer, with the dry run's counts.
 
+## Moving a regional chat store
+
+To put a region's chat store on other storage in the same region (a bigger volume, say) without stopping botd ([ADR 0309](../adr/0309-moving-a-regional-chat-store-while-botd-runs.md)), mount the new storage, then, as an admin:
+
+```sh
+botctl regions move-store gb-lon /mnt/lon-2   # an empty folder, outside DATA_DIR and every store's folder
+```
+
+botd holds its database and the users' secrets' connection while it copies the store (requests wait for that, at disk speed, so move at a quiet time), checks the copy and switches to it, then moves the store's backups and deletes the old file, leaving `MOVED.txt` in the old folder. It is audited as `residency.chat_store_moved`. The store keeps its region and id, so its bucket copies stay as they are. The answer gives the new `REGION_DATA_DIRS`: set it before botd next starts, as botd won't start while `REGION_DATA_DIRS` names the old folder (and `botctl regions` warns about it until then).
+
+| Refused | Why | Fix |
+|---|---|---|
+| `isn't empty` | The folder holds files | Pick or make an empty folder |
+| `outside DATA_DIR` or `overlaps` | It is in `DATA_DIR` (server backups would take the store out of the region), or in or around a store's folder | Pick a folder of its own |
+| `belongs to uid ...` | botd's user doesn't own it | `chown` it to the user botd runs as |
+| `copying` or `attaching` | The copy or the switch failed; the old file stays in use and nothing changed | Check space and permissions on the new storage, then try again |
+
+If the answer lists files under `left`, they couldn't be moved or deleted: move those backups into the new folder's `backups/` by hand.
+
 ## Escalate when
 
 - Data of a pinned person or team is found outside the region (a machine, a backup, a restore) with no refusal in the audit log: a breach of the agreement, [Severity 1](escalation.md#security-incidents), and the customer's DPA notice terms apply.
