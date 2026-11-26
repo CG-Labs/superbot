@@ -25,6 +25,7 @@ mod github;
 pub mod jwt;
 mod provider;
 mod saml;
+pub(crate) mod saml_aggregate;
 pub(crate) mod saml_artifact;
 pub(crate) mod saml_expiry;
 pub(crate) mod saml_keys;
@@ -464,7 +465,7 @@ const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 40] = [
+const ONLY_FOR: [(&str, &[&str]); 41] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
@@ -484,6 +485,7 @@ const ONLY_FOR: [(&str, &[&str]); 40] = [
     ("IDP_METADATA_URL", &["saml"]),
     ("IDP_METADATA_FILE", &["saml"]),
     ("IDP_MDQ_URL", &["saml"]),
+    ("IDP_AGGREGATE_URL", &["saml"]),
     ("SP_ENTITY_ID", &["saml"]),
     ("EMAIL_ATTRIBUTE", &["saml"]),
     ("NAME_ATTRIBUTE", &["saml"]),
@@ -509,11 +511,12 @@ const ONLY_FOR: [(&str, &[&str]); 40] = [
 
 /// The SAML bridge's settings (with `ISSUER`), and native SAML's (without), so each refuses the other's.
 const SAML_BRIDGE_ONLY: [&str; 6] = ["CLIENT_ID", "IDP_ALIAS", "SCOPES", "SUBJECT_CLAIM", "EMAIL_CLAIM", "NAME_CLAIM"];
-const SAML_NATIVE_ONLY: [&str; 25] = [
+const SAML_NATIVE_ONLY: [&str; 26] = [
     "IDP_ENTITY_IDS",
     "IDP_METADATA_URL",
     "IDP_METADATA_FILE",
     "IDP_MDQ_URL",
+    "IDP_AGGREGATE_URL",
     "SP_ENTITY_ID",
     "EMAIL_ATTRIBUTE",
     "NAME_ATTRIBUTE",
@@ -669,7 +672,18 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             let entity_ids = entity_ids(&key, var, list)?;
             let several = entity_ids.len() > 1;
             let idps = entity_ids.join(", ");
+            let aggregate = var(&key("IDP_AGGREGATE_URL"));
+            if aggregate.is_some() && ["IDP_METADATA_URL", "IDP_METADATA_FILE", "IDP_MDQ_URL"].iter().any(|k| var(&key(k)).is_some()) {
+                return Err(format!("{} fetches the IdPs' metadata: remove {}, {} and {}", key("IDP_AGGREGATE_URL"), key("IDP_METADATA_URL"), key("IDP_METADATA_FILE"), key("IDP_MDQ_URL")));
+            }
             let source = match (var(&key("IDP_METADATA_URL")), var(&key("IDP_METADATA_FILE")), var(&key("IDP_MDQ_URL"))) {
+                _ if let Some(u) = aggregate => {
+                    let clean = Url::parse(&u).is_ok_and(|u| u.fragment().is_none());
+                    if !secure_url(&u) || !clean {
+                        return Err(format!("{} must be the https URL of the federation's signed metadata aggregate, like https://md.incommon.org/InCommon/InCommon-metadata.xml", key("IDP_AGGREGATE_URL")));
+                    }
+                    IdpSource::Aggregate(u)
+                }
                 (Some(_), Some(_), _) => return Err(format!("Set {} or {}, not both", key("IDP_METADATA_URL"), key("IDP_METADATA_FILE"))),
                 (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
                     return Err(format!("{} fetches the IdP's metadata: remove {} and {}", key("IDP_MDQ_URL"), key("IDP_METADATA_URL"), key("IDP_METADATA_FILE")));
@@ -686,8 +700,8 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                 }
                 (None, None, None) => IdpSource::Saved,
             };
-            if several && !matches!(source, IdpSource::Mdq(_)) {
-                return Err(format!("{} needs {}: botd fetches each IdP's metadata from the federation's MDQ server", key("IDP_ENTITY_IDS"), key("IDP_MDQ_URL")));
+            if several && !matches!(source, IdpSource::Mdq(_) | IdpSource::Aggregate(_)) {
+                return Err(format!("{} needs {} or {}: botd fetches each IdP's metadata from the federation's MDQ server or its aggregate", key("IDP_ENTITY_IDS"), key("IDP_MDQ_URL"), key("IDP_AGGREGATE_URL")));
             }
             let sp_entity_id = match var(&key("SP_ENTITY_ID")) {
                 Some(e) => saml::entity_id(&e).ok_or_else(|| format!("{}: {e} is not an entity ID (a URI)", key("SP_ENTITY_ID")))?,
@@ -780,6 +794,15 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
                     None => return Err(format!("{} needs {}: the certificate the federation signs its MDQ answers with", key("IDP_MDQ_URL"), key("METADATA_SIGNING_CERT_FILE"))),
                     Some(t) if !t.require => return Err(format!("{}=allow would take unsigned MDQ answers: remove it, every answer must be signed", key("SIGNED_METADATA"))),
                     Some(t) => t.query = true,
+                }
+            }
+            if matches!(source, IdpSource::Aggregate(_)) {
+                // Mirrors and caches hand aggregates on: only the federation's signature says
+                // what is in one (ADR 0301).
+                match &metadata_trust {
+                    None => return Err(format!("{} needs {}: the certificate the federation signs its aggregate with", key("IDP_AGGREGATE_URL"), key("METADATA_SIGNING_CERT_FILE"))),
+                    Some(t) if !t.require => return Err(format!("{}=allow would take an unsigned aggregate: remove it, the aggregate must be signed", key("SIGNED_METADATA"))),
+                    Some(_) => {}
                 }
             }
             let idp_initiated = match var(&key("IDP_INITIATED")) {
@@ -2298,13 +2321,19 @@ fn audit_metadata_refusal(a: &Auth, p: &Provider) {
 }
 
 /// `sso.saml_metadata_refused`: IdP `entity`'s metadata, whose signature or validity didn't
-/// hold (ADR 0151). The metadata loaded before, if any, stays in use.
+/// hold (ADR 0151). The metadata loaded before, if any, stays in use. A federation aggregate
+/// refused as a whole (ADR 0301) is for no one IdP: `entity` is empty, and `kept` says
+/// whether any of the provider's IdPs still has a copy.
 fn metadata_refused(p: &Provider, entity: &str, e: &saml_sp::MetadataRefused) -> Event {
     let source = match &p.kind {
         Kind::SamlSp { source, .. } => source.name(),
         _ => "",
     };
-    let details = json!({ "provider": p.id, "entityId": entity, "source": source, "reason": e.reason, "error": crate::audit::clip(&e.message, 256), "kept": p.idp_loaded_for(entity).is_some() });
+    let (entity_id, kept) = match entity {
+        "" => (Value::Null, p.idps().iter().any(|e| p.idp_loaded_for(e).is_some())),
+        _ => (json!(entity), p.idp_loaded_for(entity).is_some()),
+    };
+    let details = json!({ "provider": p.id, "entityId": entity_id, "source": source, "reason": e.reason, "error": crate::audit::clip(&e.message, 256), "kept": kept });
     Event::new(Actor::system("sso"), "sso.saml_metadata_refused").target("sso_provider", &p.id).outcome(Outcome::Failure).details(details)
 }
 
@@ -2372,7 +2401,7 @@ fn saml_view(a: &Auth, p: &Provider) -> Value {
     let back_channel = loaded.iter().any(|m| m.slo_soap.is_some()) && matches!(key, Some(Ok(_)));
     let from = match source {
         IdpSource::Mdq(base) if several => Some(base.clone()),
-        IdpSource::Url(_) | IdpSource::Mdq(_) => source.url_for(&entity_ids[0]),
+        IdpSource::Url(_) | IdpSource::Mdq(_) | IdpSource::Aggregate(_) => source.url_for(&entity_ids[0]),
         IdpSource::File(f) => Some(f.clone()),
         IdpSource::Saved => None,
     };
@@ -3472,6 +3501,45 @@ mod tests {
         assert!(matches!(&s.providers[0].kind, Kind::SamlSp { idp_initiated: IdpInitiated::Restart, .. }), "each IdP's tile restarts at that IdP (ADR 0290)");
         assert!(native(&[("SSO_CORP_IDP_ENTITY_ID", ""), two]).err().unwrap().contains("needs SSO_CORP_IDP_MDQ_URL"));
         assert!(saml(&[("SSO_ADFS_IDP_ENTITY_IDS", "https://a.example/idp,https://b.example/idp")]).is_err(), "a native setting on the bridge");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_one_or_several_idps_from_a_signed_federation_aggregate() {
+        use xmldsig::test_signer::signers;
+        let dir = std::env::temp_dir().join(format!("superbot-aggregate-{}", random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let anchor = dir.join("federation.pem");
+        std::fs::write(&anchor, format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", signers()[1].cert)).unwrap();
+        let anchor: &'static str = Box::leak(anchor.to_string_lossy().into_owned().into_boxed_str());
+        let url = "https://md.example.org/federation-metadata.xml";
+        let agg = ("SSO_CORP_IDP_AGGREGATE_URL", url);
+        let signer = ("SSO_CORP_METADATA_SIGNING_CERT_FILE", anchor);
+
+        let s = native(&[agg, signer]).unwrap();
+        let p = &s.providers[0];
+        let Kind::SamlSp { source, metadata_trust: Some(t), .. } = &p.kind else { panic!("trusted") };
+        assert_eq!(*source, IdpSource::Aggregate(url.into()));
+        assert_eq!((source.name(), source.setting(), source.fetched(), t.require, t.query), ("aggregate", Some("IDP_AGGREGATE_URL"), true, true, false), "not held to MDQ's rules");
+        assert_eq!(source.url_for(ADFS).as_deref(), Some(url));
+        assert_eq!(p.reaches(), [("SSO_CORP_IDP_AGGREGATE_URL".into(), url.into(), "metadata aggregate")]);
+        assert!(p.not_ready().is_none(), "offered: fetched when needed");
+        let two = ("SSO_CORP_IDP_ENTITY_IDS", "https://a.example/idp,https://b.example/idp");
+        let s = native(&[("SSO_CORP_IDP_ENTITY_ID", ""), two, agg, signer]).unwrap();
+        assert_eq!((s.providers[0].idps().len(), s.providers[0].reaches().len()), (2, 1), "one download for every IdP");
+
+        let err = |extra: &[(&'static str, &'static str)]| native(extra).err().unwrap();
+        assert!(err(&[agg]).contains("needs SSO_CORP_METADATA_SIGNING_CERT_FILE"), "never unsigned");
+        assert!(err(&[agg, signer, ("SSO_CORP_SIGNED_METADATA", "allow")]).contains("unsigned aggregate"));
+        assert!(native(&[agg, signer, ("SSO_CORP_SIGNED_METADATA", "require")]).is_ok());
+        for other in [("SSO_CORP_IDP_METADATA_URL", "https://idp.example/m"), ("SSO_CORP_IDP_METADATA_FILE", "/x.xml"), ("SSO_CORP_IDP_MDQ_URL", "https://mdq.example.org")] {
+            assert!(err(&[agg, signer, other]).contains("remove SSO_CORP_IDP_METADATA_URL, SSO_CORP_IDP_METADATA_FILE and SSO_CORP_IDP_MDQ_URL"), "{other:?}");
+        }
+        for bad in ["http://md.example.org/m.xml", "https://md.example.org/m.xml#x", "md.example.org"] {
+            assert!(err(&[("SSO_CORP_IDP_AGGREGATE_URL", bad), signer]).contains("https URL of the federation's signed metadata aggregate"), "{bad}");
+        }
+        assert!(err(&[("SSO_CORP_IDP_ENTITY_ID", ""), two]).contains("needs SSO_CORP_IDP_MDQ_URL or SSO_CORP_IDP_AGGREGATE_URL"));
+        assert!(saml(&[("SSO_ADFS_IDP_AGGREGATE_URL", url)]).is_err(), "a native setting on the bridge");
         let _ = std::fs::remove_dir_all(dir);
     }
 

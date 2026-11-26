@@ -175,10 +175,11 @@ With [several IdPs of a federation](#several-idps-of-a-federation), the setting 
 |----------|---------|---------|
 | `SSO_<ID>_TYPE` | (required) | `saml`, without `SSO_<ID>_ISSUER`. |
 | `SSO_<ID>_IDP_ENTITY_ID` | (required, or `IDP_ENTITY_IDS`) | The IdP's entity ID. Responses from any other issuer are refused, and identities are stored under it. |
-| `SSO_<ID>_IDP_ENTITY_IDS` | | Instead of `IDP_ENTITY_ID`: several IdPs of a federation, comma separated (2 to 100), each fetched from `IDP_MDQ_URL` and chosen at sign-in ([below](#several-idps-of-a-federation)). |
+| `SSO_<ID>_IDP_ENTITY_IDS` | | Instead of `IDP_ENTITY_ID`: several IdPs of a federation, comma separated (2 to 100), each fetched from `IDP_MDQ_URL` or `IDP_AGGREGATE_URL` and chosen at sign-in ([below](#several-idps-of-a-federation)). |
 | `SSO_<ID>_IDP_METADATA_URL` | | The IdP's metadata, https, refreshed daily. |
 | `SSO_<ID>_IDP_METADATA_FILE` | | Or a metadata file, read at startup. Without either, import it with `botctl sso saml <id> import`. |
 | `SSO_<ID>_IDP_MDQ_URL` | | Or a federation's MDQ server, its https base URL (InCommon: `https://mdq.incommon.org`): botd asks it for each IdP alone, daily. Needs `METADATA_SIGNING_CERT_FILE` ([below](#metadata-from-a-federation-mdq)). |
+| `SSO_<ID>_IDP_AGGREGATE_URL` | | Or a federation's signed aggregate of every member's metadata, https (InCommon: `https://md.incommon.org/InCommon/InCommon-metadata.xml`): botd reads it daily as it downloads, for every listed IdP at once. Needs `METADATA_SIGNING_CERT_FILE` ([below](#a-federations-aggregate)). |
 | `SSO_<ID>_SP_ENTITY_ID` | `<SSO_PUBLIC_URL>/api/auth/sso/<id>/metadata` | Our entity ID (the audience), if the IdP needs another. |
 | `SSO_<ID>_EMAIL_ATTRIBUTE` | `email`, `mail`, or the emailaddress claim URI | The attribute with the email. |
 | `SSO_<ID>_NAME_ATTRIBUTE` | `displayName`, `name`, or the displayname claim URI | The attribute with the display name. |
@@ -195,7 +196,7 @@ With [several IdPs of a federation](#several-idps-of-a-federation), the setting 
 | `SSO_<ID>_AES_CBC` | `off` | `signed-response`: also take AES-CBC encrypted assertions (Entra ID, ADFS), only inside a response the IdP signed ([below](#aes-cbc-entra-id-and-adfs)). Needs `ENCRYPTED_ASSERTIONS`. |
 | `SSO_<ID>_ENCRYPTION_PRIVATE_KEY` | | With `SP_ENCRYPTION_CERT_FILE`: its private key (PKCS #8 PEM), as env, `_FILE`, or `botctl secret set`. |
 | `SSO_<ID>_METADATA_SIGNING_CERT_FILE` | | The certificates (PEM, one or more) the IdP signs its metadata with. Metadata is then checked on every load ([below](#signed-idp-metadata)). |
-| `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked (not with `IDP_MDQ_URL`). Badly signed metadata is refused either way. |
+| `SSO_<ID>_SIGNED_METADATA` | `require` with the file, else `off` | `require`: refuse unsigned metadata; `allow`: take it unchecked (not with `IDP_MDQ_URL` or `IDP_AGGREGATE_URL`). Badly signed metadata is refused either way. |
 | `SSO_<ID>_GROUPS_ATTRIBUTE` | | The assertion attribute with the person's groups ([above](#groups)). No default: without it, groups aren't read. |
 | `SSO_<ID>_REQUIRED_GROUPS` | | Only people in one of these groups sign in, comma separated (exact). Needs `GROUPS_ATTRIBUTE`. With `IDP_ENTITY_IDS`, each must be scoped, like `member@uni.example` ([below](#groups-with-several-idps)). |
 | `SSO_<ID>_IDP_INITIATED` | `off` | `restart`: an unsolicited response from an IdP's app tile starts an SP-initiated sign-in ([above](#idp-initiated-sign-in-app-tiles)). `off` refuses it. |
@@ -343,11 +344,11 @@ SSO_CORP_METADATA_SIGNING_CERT_FILE=/etc/superbot/corp-idp-metadata.pem
 - Signed metadata past its `validUntil` is refused, so an old copy can't be served again.
 - A refused copy never replaces the one in use. From a URL, botd keeps the last good copy and tries again later. An import is refused, and the stored copy stays. A bad file stops botd from starting.
 - The copy in use is never used past its `validUntil` either, not even as the last good one ([ADR 0281](../adr/0281-saml-metadata-from-mdq.md)). From a URL or MDQ, botd fetches it again; from a file or an import, sign-ins fail as `idp_metadata_expired` until you give botd a fresh signed copy. `botctl sso saml corp` shows `Valid until` under the metadata. Unsigned metadata's `validUntil` vouches for nothing, so it ends nothing.
-- Refusals are audited as `sso.saml_metadata_refused` (`botctl audit --action sso.saml_metadata_refused`), with the source, the reason (`unsigned`, `bad_signature`, `wrapped`, `weak_algorithm`, `bad_algorithm`, `expired`, and for MDQ `not_one_entity`, `no_valid_until` and `valid_too_long`), and whether a good copy is still in use (`kept`). `botctl sso saml corp` shows the setting and the trusted certificates.
+- Refusals are audited as `sso.saml_metadata_refused` (`botctl audit --action sso.saml_metadata_refused`), with the source, the reason (`unsigned`, `bad_signature`, `wrapped`, `weak_algorithm`, `bad_algorithm`, `expired`, for MDQ `not_one_entity`, `no_valid_until` and `valid_too_long`, and for an aggregate those last two and `ambiguous`), and whether a good copy is still in use (`kept`). `botctl sso saml corp` shows the setting and the trusted certificates.
 
 ### Metadata from a federation (MDQ)
 
-Universities and research institutions often sign in through a federation, such as InCommon or a national federation in eduGAIN. Their aggregates of every member's metadata are far over botd's 1 MB limit, but many run an MDQ server (the Metadata Query Protocol) that answers for one entity at a time, signed by the federation ([ADR 0281](../adr/0281-saml-metadata-from-mdq.md)). Point botd at it instead of a metadata URL:
+Universities and research institutions often sign in through a federation, such as InCommon or a national federation in eduGAIN. Their aggregates of every member's metadata are far over botd's 1 MB limit for one metadata document, but many run an MDQ server (the Metadata Query Protocol) that answers for one entity at a time, signed by the federation ([ADR 0281](../adr/0281-saml-metadata-from-mdq.md)). Point botd at it instead of a metadata URL:
 
 ```bash
 SSO_UNI_TYPE=saml
@@ -363,9 +364,26 @@ SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
 
 Register SuperBot with the IdP's operators as they ask: some take SuperBot's metadata URL directly, others only through the federation's registry.
 
+#### A federation's aggregate
+
+A federation without an MDQ server publishes only its aggregate: one signed document with every member's metadata, 60 MB for InCommon and about 100 MB for eduGAIN. botd can read it instead ([ADR 0301](../adr/0301-saml-federation-aggregates.md)), for one IdP (`IDP_ENTITY_ID`) or several (`IDP_ENTITY_IDS`, [below](#several-idps-of-a-federation)):
+
+```bash
+SSO_UNI_TYPE=saml
+SSO_UNI_IDP_ENTITY_ID=https://idp.university.example/idp/shibboleth
+SSO_UNI_IDP_AGGREGATE_URL=https://md.incommon.org/InCommon/InCommon-metadata.xml
+SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert.pem
+```
+
+- **The signer is required**, as for MDQ: the certificate the federation signs its aggregate with (InCommon: `inc-md-cert.pem`, not its MDQ certificate), checked against the fingerprint the federation publishes. Without it, or with `SIGNED_METADATA=allow`, botd won't start: aggregates are mirrored and cached widely, so only the signature says what is in one.
+- **Read as it downloads.** botd never holds the whole aggregate: it checks the signature over the stream and keeps only the listed IdPs' `EntityDescriptor`s, each up to 1 MB. It asks for it gzipped, and with its `ETag` and `Last-Modified`, so a day the federation published nothing new costs one short request. Up to 256 MB (uncompressed) and ten minutes per download.
+- **What it takes.** An `EntitiesDescriptor` whose signature is its first child and covers all of it, by a certificate in the file, with a `validUntil` no more than 30 days ahead. Each IdP's copy is good until the earliest `validUntil` around it or on it. Each copy is then read a second time, as all metadata is, and must read the same both times (else `ambiguous`). No DTDs or processing instructions.
+- **When it changes.** An IdP the federation drops, or lists twice, loses its copy and its sign-ins fail; the log says which. An aggregate refused as a whole (unsigned, badly signed, expired) is audited with no `entityId`, and every IdP keeps its last good copy until its own `validUntil`. botd tries again ten minutes later at the earliest, as each download is large.
+- **Everything else is as with MDQ**: rollovers reach botd within a day, certificate warnings cover the federation's signer, `botctl offline check` lists the aggregate URL, and `botctl sso saml uni` shows `IdP metadata from aggregate (<the URL>)`. botd reads it at startup and when due, in the background with its hourly certificate check, and sign-ins use the copies in hand while it downloads; one waits only when its IdP has no good copy.
+
 #### Several IdPs of a federation
 
-A research platform often serves people from many institutions in one federation. One provider can take several of its IdPs, each fetched from the MDQ server on its own ([ADR 0282](../adr/0282-saml-several-idps-of-a-federation.md)). List their entity IDs in `IDP_ENTITY_IDS` instead of `IDP_ENTITY_ID`:
+A research platform often serves people from many institutions in one federation. One provider can take several of its IdPs, each fetched from the MDQ server on its own ([ADR 0282](../adr/0282-saml-several-idps-of-a-federation.md)), or all from the federation's [aggregate](#a-federations-aggregate) (`IDP_AGGREGATE_URL` instead of `IDP_MDQ_URL`). List their entity IDs in `IDP_ENTITY_IDS` instead of `IDP_ENTITY_ID`:
 
 ```bash
 SSO_UNI_TYPE=saml
@@ -378,7 +396,7 @@ SSO_UNI_METADATA_SIGNING_CERT_FILE=/etc/superbot/inc-md-cert-mdq.pem
 - **Each identity is the IdP's.** People are stored under the IdP that signed them in (its entity ID is the `issuer`), so the same NameID at two institutions is two people. To link someone by hand, say which IdP: `botctl user link <user> uni <NameID> --idp https://idp.uni-a.example/idp/shibboleth`.
 - **Emails only from the IdP's own domains.** Any IdP in the federation could send any email, so botd takes an email only at a domain the federation's metadata lists for that IdP (its `shibmd:Scope`s, exact domains; patterns are ignored). Another email is dropped. With `ALLOWED_DOMAINS` set, where the email decides who gets in, the sign-in is refused as `email_out_of_scope` instead.
 - **Logout reaches the right IdP.** Signing out goes to the IdP that signed the session in; a logout message from an IdP is checked against that IdP's metadata, and one naming an IdP that isn't listed is refused as `unknown_idp`.
-- **Each IdP's metadata is its own.** It's fetched when first needed and daily after, a refusal is audited with its `entityId`, and [certificate warnings](#certificates-that-are-ending) name the IdP. `botctl sso saml uni` lists every IdP with its name, email domains and certificates, and `botctl offline check` lists each MDQ URL.
+- **Each IdP's metadata is its own.** It's fetched when first needed and daily after (from an aggregate, one download for all of them), a refusal is audited with its `entityId`, and [certificate warnings](#certificates-that-are-ending) name the IdP. `botctl sso saml uni` lists every IdP with its name, email domains and certificates, and `botctl offline check` lists each MDQ URL.
 - **Groups are each IdP's.** Groups work, but with rules of their own ([below](#groups-with-several-idps)).
 - **Each IdP's tiles restart at that IdP.** With `IDP_INITIATED=restart`, an IdP's portal link (Shibboleth's `/idp/profile/SAML2/Unsolicited/SSO?providerId=…`, a library or LMS link) restarts the sign-in at the IdP that signed it, skipping the chooser ([ADR 0290](../adr/0290-saml-idp-initiated-sign-in-at-several-idps.md)). The response's `Issuer` (an artifact's `SourceID`) only says which listed IdP's keys to check it with; one naming an IdP that isn't listed is refused as `unknown_idp`, and one naming another IdP than signed it fails that IdP's signature check. [Below](#idp-initiated-sign-in-app-tiles) for the rest.
 - **SCIM per IdP.** A SCIM tenant links one of the IdPs: `botctl scim token create uni-b --sso uni --idp https://login.uni-b.example/idp/shibboleth` ([ADR 0297](../adr/0297-scim-linking-at-one-idp-of-a-federation.md)). Its `externalId`s are that IdP's NameIDs, so each person it provisions signs in there as the user it made, and its deactivations end their sessions there too. Give each institution that provisions its own tenant. An email the tenant sets must be at one of its IdP's `shibmd:Scope`s, or the request is refused (`invalidValue`); only new emails are checked, so deprovisioning never waits on the MDQ server. See [SCIM](scim.md#federations).

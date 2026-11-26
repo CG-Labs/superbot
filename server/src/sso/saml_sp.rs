@@ -61,7 +61,7 @@ use zeroize::Zeroizing;
 
 pub const PROTOCOL: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 pub const ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
-const METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
+pub(super) const METADATA: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
 const POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
 const REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect";
 /// The SOAP binding: back-channel logout, server to server (ADR 0208), and artifact resolution (ADR 0268).
@@ -536,6 +536,37 @@ pub fn load_idp_metadata(xml: &str, entity_id: &str, signs_requests: bool, bindi
     };
     let mut m = read_idp(entity, entity_id, signs_requests, binding, response).map_err(MetadataRefused::bad)?;
     m.valid_until = valid_until;
+    Ok(m)
+}
+
+/// An IdP's metadata from a verified federation aggregate (ADR 0301), read as
+/// `load_idp_metadata` reads it. The `EntityDescriptor` is parsed again here and must
+/// canonicalize to exactly what the stream digested: if the two readers disagree on any byte,
+/// the signature can't be said to cover what this one reads, and it is refused. It is good
+/// until the earliest `validUntil` around it or on it.
+pub fn load_aggregate_entity(f: &super::saml_aggregate::Found, signs_requests: bool, binding: RequestBinding, response: ResponseBinding, now_ms: i64) -> Result<IdpMetadata, MetadataRefused> {
+    let id = &f.entity_id;
+    let ambiguous = || MetadataRefused { reason: "ambiguous", message: format!("{id}'s EntityDescriptor in the aggregate doesn't read the same twice, so its signature can't vouch for it") };
+    let opt = roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: 100_000, ..Default::default() };
+    let doc = roxmltree::Document::parse_with_options(&f.xml, opt).map_err(|e| MetadataRefused::bad(format!("{id}'s EntityDescriptor in the aggregate isn't XML SuperBot reads: {e}")))?;
+    let mut children = doc.root_element().children().filter(|n| !n.is_comment());
+    let entity = match (children.next(), children.next()) {
+        (Some(e), None) if is(e, METADATA, "EntityDescriptor") && e.attribute("entityID") == Some(id.as_str()) => e,
+        _ => return Err(ambiguous()),
+    };
+    let canonical = xmldsig::exc_c14n(entity, None, &[]).map_err(|_| ambiguous())?;
+    if xmldsig::DigestAlg::Sha256.digest(canonical.as_bytes()) != f.sha256 {
+        return Err(ambiguous());
+    }
+    let mut valid_until = f.valid_until;
+    if let Some(v) = entity.attribute("validUntil") {
+        valid_until = valid_until.min(time(v).map_err(|_| MetadataRefused::bad(format!("{id}'s validUntil ({v}) isn't a date")))?);
+    }
+    if valid_until <= now_ms {
+        return Err(MetadataRefused { reason: "expired", message: format!("{id}'s EntityDescriptor in the aggregate expired at {} (validUntil)", instant(valid_until)) });
+    }
+    let mut m = read_idp(entity, id, signs_requests, binding, response).map_err(MetadataRefused::bad)?;
+    m.valid_until = Some(valid_until);
     Ok(m)
 }
 
@@ -1604,6 +1635,19 @@ pub mod test_idp {
         let at = xml.find("Descriptor ").expect("a descriptor") + "Descriptor ".len();
         let with_id = format!(r#"{}ID="_md1" {}"#, &xml[..at], &xml[at..]);
         s.sign(&with_id, "_md1")
+    }
+
+    /// A federation's aggregate (ADR 0301) of `entities`, as `metadata_with` makes them, valid
+    /// until `valid_until`; unsigned, with `_agg` as its root's ID.
+    pub fn aggregate(entities: &[String], valid_until: i64) -> String {
+        let body: String = entities.iter().map(|e| format!("\n  {}", e.trim_start_matches(r#"<?xml version="1.0"?>"#))).collect();
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- a federation's aggregate -->\n<md:EntitiesDescriptor xmlns:md=\"{METADATA}\" ID=\"_agg\" Name=\"urn:example:federation\" validUntil=\"{}\">{body}\n</md:EntitiesDescriptor>\n", instant(valid_until))
+    }
+
+    /// `xml`, an aggregate, signed at its root as federations sign theirs: `uri` is `#_agg`,
+    /// or `""` for the whole document.
+    pub fn signed_aggregate(xml: &str, s: &Signer, uri: &str) -> String {
+        s.sign_root_first(xml, "_agg", uri)
     }
 
     /// `xml` with what a federation adds to its IdPs (ADR 0282): an `mdui:DisplayName` and

@@ -69,11 +69,11 @@ fn qname<'i>(n: Node<'_, 'i>) -> &'i str {
     &rest[..rest.find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>').unwrap_or(rest.len())]
 }
 
-fn prefix(qname: &str) -> &str {
+pub(super) fn prefix(qname: &str) -> &str {
     qname.split_once(':').map_or("", |(p, _)| p)
 }
 
-fn escape_text(s: &str, out: &mut String) {
+pub(super) fn escape_text(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -85,7 +85,7 @@ fn escape_text(s: &str, out: &mut String) {
     }
 }
 
-fn escape_attr(s: &str, out: &mut String) {
+pub(super) fn escape_attr(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -297,6 +297,133 @@ fn algorithm<'a>(n: Node<'a, '_>, name: &str) -> Result<&'a str, Invalid> {
     n.attribute("Algorithm").ok_or(Invalid("bad_algorithm"))
 }
 
+/// A Reference's DigestMethod: SHA-256, SHA-384 or SHA-512, never SHA-1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DigestAlg {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+/// A digest computed piece by piece, for a document too big to canonicalize in memory.
+pub enum Hasher {
+    Sha256(Sha256),
+    Sha384(Sha384),
+    Sha512(Sha512),
+}
+
+impl Hasher {
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            Hasher::Sha256(h) => h.update(data),
+            Hasher::Sha384(h) => h.update(data),
+            Hasher::Sha512(h) => h.update(data),
+        }
+    }
+
+    pub fn finish(self) -> Vec<u8> {
+        match self {
+            Hasher::Sha256(h) => h.finalize().to_vec(),
+            Hasher::Sha384(h) => h.finalize().to_vec(),
+            Hasher::Sha512(h) => h.finalize().to_vec(),
+        }
+    }
+}
+
+impl DigestAlg {
+    fn parse(uri: &str) -> Result<DigestAlg, Invalid> {
+        match uri {
+            SHA256 => Ok(DigestAlg::Sha256),
+            SHA384 => Ok(DigestAlg::Sha384),
+            SHA512 => Ok(DigestAlg::Sha512),
+            SHA1 => Err(Invalid("weak_algorithm")),
+            _ => Err(Invalid("bad_algorithm")),
+        }
+    }
+
+    pub fn hasher(self) -> Hasher {
+        match self {
+            DigestAlg::Sha256 => Hasher::Sha256(Sha256::new()),
+            DigestAlg::Sha384 => Hasher::Sha384(Sha384::new()),
+            DigestAlg::Sha512 => Hasher::Sha512(Sha512::new()),
+        }
+    }
+
+    pub fn digest(self, data: &[u8]) -> Vec<u8> {
+        let mut h = self.hasher();
+        h.update(data);
+        h.finish()
+    }
+}
+
+/// An enveloped `ds:Signature`, read and held to the one shape we take: what it references
+/// (`uri`), how that is canonicalized (`prefixes`, the Exclusive C14N PrefixList after the
+/// enveloped-signature transform) and digested, and the signature over its SignedInfo. What
+/// it covers is digested by the caller, in memory (`verify_enveloped`) or streamed (a
+/// federation's aggregate, ADR 0301), and checked with `verify`.
+pub struct Signature {
+    pub uri: String,
+    pub prefixes: Vec<String>,
+    pub digest: DigestAlg,
+    claimed: Vec<u8>,
+    /// The canonical SignedInfo, which the signature value is over.
+    info: String,
+    alg: (KeyKind, &'static dyn aws_lc_rs::signature::VerificationAlgorithm),
+    value: Vec<u8>,
+}
+
+impl Signature {
+    pub fn read(sig: Node) -> Result<Signature, Invalid> {
+        let (signed_info, value) = match elements(sig).as_slice() {
+            [si, sv] => (*si, *sv),
+            [si, sv, ki] if is(*ki, DSIG, "KeyInfo") => (*si, *sv),
+            _ => return Err(Invalid("bad_signature")),
+        };
+        if !is(sig, DSIG, "Signature") || !is(signed_info, DSIG, "SignedInfo") || !is(value, DSIG, "SignatureValue") {
+            return Err(Invalid("bad_signature"));
+        }
+        let [c14n, method, reference] = elements(signed_info)[..] else {
+            return Err(Invalid("bad_signature"));
+        };
+        if algorithm(c14n, "CanonicalizationMethod")? != EXC_C14N {
+            return Err(Invalid("bad_algorithm"));
+        }
+        let signed_info_prefixes = inclusive_prefixes(c14n)?;
+        let alg = signature_algorithm(algorithm(method, "SignatureMethod")?)?;
+        if !is(reference, DSIG, "Reference") {
+            return Err(Invalid("bad_signature"));
+        }
+        let uri = reference.attribute("URI").ok_or(Invalid("wrapped"))?.to_string();
+        let [transforms, digest_method, digest_value] = elements(reference)[..] else {
+            return Err(Invalid("bad_signature"));
+        };
+        if !is(transforms, DSIG, "Transforms") || !is(digest_value, DSIG, "DigestValue") {
+            return Err(Invalid("bad_signature"));
+        }
+        let [enveloped, exc] = elements(transforms)[..] else {
+            return Err(Invalid("bad_algorithm"));
+        };
+        if algorithm(enveloped, "Transform")? != ENVELOPED || !elements(enveloped).is_empty() || algorithm(exc, "Transform")? != EXC_C14N {
+            return Err(Invalid("bad_algorithm"));
+        }
+        let prefixes = inclusive_prefixes(exc)?;
+        let digest = DigestAlg::parse(algorithm(digest_method, "DigestMethod")?)?;
+        let claimed = base64(digest_value.text().unwrap_or("")).ok_or(Invalid("bad_signature"))?;
+        let info = exc_c14n(signed_info, None, &signed_info_prefixes)?;
+        let value = base64(value.text().unwrap_or("")).ok_or(Invalid("bad_signature"))?;
+        Ok(Signature { uri, prefixes, digest, claimed, info, alg, value })
+    }
+
+    /// Whether `digest`, of what `uri` references canonicalized with `prefixes`, is the one the
+    /// SignedInfo names, and the SignedInfo is signed by one of `certs`.
+    pub fn verify(&self, digest: &[u8], certs: &[Cert]) -> Result<(), Invalid> {
+        if !crate::same(digest, &self.claimed) {
+            return Err(Invalid("bad_signature"));
+        }
+        if certs.iter().any(|c| c.verifies(self.alg, self.info.as_bytes(), &self.value)) { Ok(()) } else { Err(Invalid("bad_signature")) }
+    }
+}
+
 /// Checks the enveloped signature of `signed` (its direct `ds:Signature` child) with one of
 /// `certs`. Ok(false): it has none. Err: it has one that doesn't verify, or isn't one we take.
 pub fn verify_enveloped(signed: Node, certs: &[Cert]) -> Result<bool, Invalid> {
@@ -307,57 +434,14 @@ pub fn verify_enveloped(signed: Node, certs: &[Cert]) -> Result<bool, Invalid> {
         _ => return Err(Invalid("wrapped")),
     };
     let id = signed.attribute("ID").ok_or(Invalid("wrapped"))?;
-    let (signed_info, value) = match elements(sig).as_slice() {
-        [si, sv] => (*si, *sv),
-        [si, sv, ki] if is(*ki, DSIG, "KeyInfo") => (*si, *sv),
-        _ => return Err(Invalid("bad_signature")),
-    };
-    if !is(signed_info, DSIG, "SignedInfo") || !is(value, DSIG, "SignatureValue") {
-        return Err(Invalid("bad_signature"));
-    }
-    let [c14n, method, reference] = elements(signed_info)[..] else {
-        return Err(Invalid("bad_signature"));
-    };
-    if algorithm(c14n, "CanonicalizationMethod")? != EXC_C14N {
-        return Err(Invalid("bad_algorithm"));
-    }
-    let signed_info_prefixes = inclusive_prefixes(c14n)?;
-    let alg = signature_algorithm(algorithm(method, "SignatureMethod")?)?;
-    if !is(reference, DSIG, "Reference") {
-        return Err(Invalid("bad_signature"));
-    }
+    let s = Signature::read(sig)?;
     // The signature covers the element it sits in, and nothing else.
-    if reference.attribute("URI") != Some(format!("#{id}").as_str()) {
+    if s.uri != format!("#{id}") {
         return Err(Invalid("wrapped"));
     }
-    let [transforms, digest_method, digest_value] = elements(reference)[..] else {
-        return Err(Invalid("bad_signature"));
-    };
-    if !is(transforms, DSIG, "Transforms") || !is(digest_value, DSIG, "DigestValue") {
-        return Err(Invalid("bad_signature"));
-    }
-    let [enveloped, exc] = elements(transforms)[..] else {
-        return Err(Invalid("bad_algorithm"));
-    };
-    if algorithm(enveloped, "Transform")? != ENVELOPED || !elements(enveloped).is_empty() || algorithm(exc, "Transform")? != EXC_C14N {
-        return Err(Invalid("bad_algorithm"));
-    }
-    let reference_prefixes = inclusive_prefixes(exc)?;
-    let canonical = exc_c14n(signed, Some(sig), &reference_prefixes)?;
-    let digest = match algorithm(digest_method, "DigestMethod")? {
-        SHA256 => Sha256::digest(canonical.as_bytes()).to_vec(),
-        SHA384 => Sha384::digest(canonical.as_bytes()).to_vec(),
-        SHA512 => Sha512::digest(canonical.as_bytes()).to_vec(),
-        SHA1 => return Err(Invalid("weak_algorithm")),
-        _ => return Err(Invalid("bad_algorithm")),
-    };
-    let claimed = base64(digest_value.text().unwrap_or("")).ok_or(Invalid("bad_signature"))?;
-    if !crate::same(&digest, &claimed) {
-        return Err(Invalid("bad_signature"));
-    }
-    let info = exc_c14n(signed_info, None, &signed_info_prefixes)?;
-    let value = base64(value.text().unwrap_or("")).ok_or(Invalid("bad_signature"))?;
-    if certs.iter().any(|c| c.verifies(alg, info.as_bytes(), &value)) { Ok(true) } else { Err(Invalid("bad_signature")) }
+    let canonical = exc_c14n(signed, Some(sig), &s.prefixes)?;
+    s.verify(&s.digest.digest(canonical.as_bytes()), certs)?;
+    Ok(true)
 }
 
 /// `xml` (one message, whose root has `ID` = `id` and an `Issuer` first) with an enveloped
@@ -450,26 +534,44 @@ pub mod test_signer {
         pub fn sign(&self, xml: &str, id: &str) -> String {
             let doc = parse(xml).unwrap();
             let el = doc.descendants().find(|n| n.attribute("ID") == Some(id)).unwrap();
+            let at = el.first_element_child().unwrap().range().end;
+            format!("{}{}{}", &xml[..at], self.signature(xml, id, &format!("#{id}")), &xml[at..])
+        }
+
+        /// `xml` with an enveloped signature over its root, whose ID is `id`, as its first
+        /// child, where metadata's schema puts it. `uri` is the Reference: `#<id>`, or `""`
+        /// for the whole document, as some federations sign their aggregates (ADR 0301).
+        pub fn sign_root_first(&self, xml: &str, id: &str, uri: &str) -> String {
+            let root = lenient(xml).root_element().range();
+            let at = root.start + xml[root.clone()].find('>').unwrap() + 1;
+            format!("{}{}{}", &xml[..at], self.signature(xml, id, uri), &xml[at..])
+        }
+
+        fn signature(&self, xml: &str, id: &str, uri: &str) -> String {
+            let doc = lenient(xml);
+            let el = doc.descendants().find(|n| n.attribute("ID") == Some(id)).unwrap();
             let canonical = exc_c14n(el, None, &[]).unwrap();
             let (digest_alg, digest) = match self.alg {
                 ECDSA_SHA384 => (SHA384, STANDARD.encode(Sha384::digest(canonical.as_bytes()))),
                 _ => (SHA256, STANDARD.encode(Sha256::digest(canonical.as_bytes()))),
             };
             let signed_info = format!(
-                r##"<ds:SignedInfo xmlns:ds="{DSIG}"><ds:CanonicalizationMethod Algorithm="{EXC_C14N}"/><ds:SignatureMethod Algorithm="{}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED}"/><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="{digest_alg}"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
+                r##"<ds:SignedInfo xmlns:ds="{DSIG}"><ds:CanonicalizationMethod Algorithm="{EXC_C14N}"/><ds:SignatureMethod Algorithm="{}"/><ds:Reference URI="{uri}"><ds:Transforms><ds:Transform Algorithm="{ENVELOPED}"/><ds:Transform Algorithm="{EXC_C14N}"/></ds:Transforms><ds:DigestMethod Algorithm="{digest_alg}"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
                 self.alg
             );
             let info = parse(&signed_info).unwrap();
             let value = self.sign_raw(exc_c14n(info.root_element(), None, &[]).unwrap().as_bytes());
             let body = signed_info.replacen(&format!(r#"<ds:SignedInfo xmlns:ds="{DSIG}">"#), "<ds:SignedInfo>", 1);
-            let sig = format!(
+            format!(
                 r#"<ds:Signature xmlns:ds="{DSIG}">{body}<ds:SignatureValue>{value}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>"#,
                 self.cert
-            );
-            let first = el.first_element_child().unwrap();
-            let at = first.range().end;
-            format!("{}{sig}{}", &xml[..at], &xml[at..])
+            )
         }
+    }
+
+    /// `xml` parsed as metadata is, comments and all, however big.
+    fn lenient(xml: &str) -> Document<'_> {
+        Document::parse_with_options(xml, ParsingOptions { allow_dtd: false, nodes_limit: u32::MAX, ..ParsingOptions::default() }).unwrap()
     }
 
     /// Two IdP keys, made once per test run (RSA key generation is slow).
