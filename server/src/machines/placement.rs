@@ -355,6 +355,7 @@ pub fn failed(app: &crate::AppState, by: &Who, user_id: &str, m: Option<&Machine
         target_type: if m.is_some() { "machine" } else { "user" }.into(),
         target_id: m.map_or(user_id, |m| &m.id).to_string(),
         link: None,
+        ..Default::default()
     };
     notify::alert(app, a, "machines");
 }

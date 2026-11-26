@@ -293,7 +293,10 @@ pub fn approval_message(n: &Notice) -> Option<(String, String, Value)> {
             format!("This is a test. Approvals for {} will reach this phone.", if n.bot_name.is_empty() { "your Bots" } else { &n.bot_name }),
             json!({ "type": "test", "url": "/home" }),
         ),
-        NoticeKind::Alert => return None,
+        NoticeKind::Alert => {
+            let w = n.alert.as_ref()?.audience.as_ref()?;
+            (clip(&w.push_title), clip(&w.push_body), json!({ "type": w.push_type, "url": format!("/{}", w.page) }))
+        }
     })
 }
 
@@ -576,7 +579,12 @@ mod tests {
         for secret in ["git push", "Bash", "Pushes to"] {
             assert!(!all.contains(secret), "{all}");
         }
-        assert!(approval_message(&Notice { kind: NoticeKind::Alert, ..n }).is_none(), "alerts are for admins' email and webhook");
+        let mut a = super::super::Alert { event: "role.requested".into(), title: "ada@example.com asks for Helpdesk".into(), lines: vec!["Why: ticket 42".into()], ..Default::default() };
+        let alert = Notice { kind: NoticeKind::Alert, alert: Some(a.clone()), ..n };
+        assert!(approval_message(&alert).is_none(), "alerts with no audience are for admins' email and webhook");
+        a.audience = Some(super::super::Audience { push_title: "Request for a team role".into(), push_body: "Someone on Alpha asks for a role.".into(), push_type: "role_request", page: "team", ..Default::default() });
+        let (title, body, data) = approval_message(&Notice { alert: Some(a), ..alert }).unwrap();
+        assert_eq!((title.as_str(), body.as_str(), data), ("Request for a team role", "Someone on Alpha asks for a role.", json!({ "type": "role_request", "url": "/team" })));
     }
 
     /// Expo's API on loopback: answers with `tickets`, keeps each request.
