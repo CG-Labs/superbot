@@ -252,9 +252,9 @@ describe("UsersAdmin", () => {
     const { api, user } = await open([owner, alex]);
     api.teammateAccounts.mockRejectedValueOnce(new Error("Server unreachable"));
     await user.press(screen.getByLabelText("User Alex"));
-    expect(await screen.findByText("Teammate accounts here")).toBeOnTheScreen();
-    expect(screen.getByText("Server unreachable")).toBeOnTheScreen();
-    await user.press(screen.getByText("Retry"));
+    expect(await screen.findByRole("heading", { name: "Teammate accounts here" })).toBeOnTheScreen();
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load teammate accounts. Server unreachable");
+    await user.press(screen.getByRole("button", { name: "Try again" }));
     expect(api.teammateAccounts).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(screen.queryByText("Teammate accounts here")).toBeNull());
   });
@@ -271,11 +271,49 @@ describe("UsersAdmin", () => {
     api.userSessions.mockRejectedValueOnce(new Error("Server unreachable"));
     api.userBots.mockRejectedValueOnce(new Error("Server unreachable"));
     await user.press(screen.getByLabelText("User Alex"));
-    expect(await screen.findAllByText("Server unreachable")).toHaveLength(2);
-    expect(screen.getByText("Sign out everywhere")).toBeOnTheScreen();
-    await user.press(screen.getAllByText("Retry")[0]);
+    expect(await screen.findByText("Couldn't load sessions. Server unreachable")).toBeOnTheScreen();
+    expect(screen.getByText("Couldn't load Bot access. Server unreachable")).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Sign Alex out everywhere" })).toBeOnTheScreen();
+    await user.press(screen.getAllByRole("button", { name: "Try again" })[0]);
     expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
-    expect(screen.queryByText("Server unreachable")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows skeletons while a user's sessions and Bot access load", async () => {
+    const { api, user } = await open([owner, alex]);
+    let sessions: (v: unknown) => void = () => {};
+    api.userSessions.mockImplementationOnce(() => new Promise((r) => (sessions = r as typeof sessions)));
+    api.userBots.mockImplementationOnce(() => new Promise(() => {}));
+    await user.press(screen.getByLabelText("User Alex"));
+    expect(screen.getByRole("progressbar", { name: "Loading Alex's sessions" })).toBeOnTheScreen();
+    expect(screen.getByRole("progressbar", { name: "Loading Alex's Bot access" })).toBeOnTheScreen();
+    await act(async () => sessions([]));
+    expect(screen.queryByRole("progressbar", { name: "Loading Alex's sessions" })).toBeNull();
+    expect(screen.getByText("Not signed in anywhere.")).toBeOnTheScreen();
+  });
+
+  it("names a user's section headings and actions for screen readers", async () => {
+    const { user } = await open([owner, { ...alex, mfa: { enabled: true, enabledAt: 1 } }]);
+    await user.press(screen.getByLabelText("User Alex"));
+    await screen.findByText(/^Scout/);
+    expect(screen.getByLabelText("User Alex")).toBeSelected();
+    expect(screen.getByLabelText("User Owner")).not.toBeSelected();
+    for (const h of ["Alex", "Role", "Status", "Sign-in code", "Sessions", "Two-factor authentication", "Single sign-on", "Bot access"]) {
+      expect(screen.getByRole("heading", { name: h })).toBeOnTheScreen();
+    }
+    expect(screen.getByRole("button", { name: "Disable Alex" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "New sign-in code for Alex" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Reset Alex's two-factor authentication" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Unlink GitHub" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Link GitHub account" })).toBeDisabled();
+  });
+
+  it("shows an action that failed in plain words", async () => {
+    const { api, user } = await open([owner, alex]);
+    api.patchUser.mockRejectedValueOnce(new ApiError("HTTP 500", 500));
+    await user.press(screen.getByLabelText("User Alex"));
+    await user.press(screen.getByRole("radio", { name: "Admin" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The server had a problem. Try again in a moment.");
   });
 
   it("links an SSO account by its id at the provider", async () => {
@@ -460,6 +498,94 @@ describe("UsersAdmin", () => {
     await screen.findByLabelText("User Alex");
     expect(screen.queryByTestId("signup-requests")).toBeNull();
     expect(screen.queryByText("Not found")).toBeNull();
+  });
+
+  it("shows a skeleton while people load, then a retry when they don't", async () => {
+    const api = fakeApi([owner, alex]);
+    let fail: (e: Error) => void = () => {};
+    api.users.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await render(<UsersAdmin api={api as unknown as SuperBotApi} meId="operator" onBack={jest.fn()} />);
+    expect(screen.getByRole("progressbar", { name: "Loading users" })).toBeOnTheScreen();
+    await act(async () => fail(new TypeError("Failed to fetch")));
+    expect(screen.queryByRole("progressbar", { name: "Loading users" })).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load users. Can't reach the server. Check your connection and try again.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("User Alex")).toBeOnTheScreen();
+    expect(api.users).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says when there are no users yet", async () => {
+    const api = fakeApi([]);
+    await render(<UsersAdmin api={api as unknown as SuperBotApi} meId="operator" onBack={jest.fn()} />);
+    expect(await screen.findByRole("heading", { name: "No users yet" })).toBeOnTheScreen();
+  });
+
+  it("says when a search matches nobody", async () => {
+    const { user } = await open([owner, alex]);
+    await user.type(screen.getByLabelText("Search people"), "zzz");
+    expect(screen.getByRole("heading", { name: "Nobody matches" })).toBeOnTheScreen();
+    expect(screen.queryByLabelText("User Alex")).toBeNull();
+  });
+
+  it("says Adding… on the busy invite button, and shows a failed add in plain words", async () => {
+    const { api, user } = await open([owner, alex]);
+    let fail: (e: Error) => void = () => {};
+    api.createUser.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await user.press(screen.getByText("Add user"));
+    expect(screen.getByRole("heading", { name: "Add user" })).toBeOnTheScreen();
+    expect(screen.getByRole("switch", { name: "Make a sign-in code" })).toBeOnTheScreen();
+    await user.type(screen.getByLabelText("Email"), "sam@example.com");
+    await user.press(screen.getAllByRole("button", { name: "Add user" }).at(-1)!);
+    const busy = screen.getByRole("button", { name: "Adding…" });
+    expect(busy).toBeDisabled();
+    expect(busy).toBeBusy();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    await act(async () => fail(new ApiError("HTTP 500", 500)));
+    expect(screen.getByRole("alert")).toHaveTextContent("The server had a problem. Try again in a moment.");
+    expect(screen.getAllByRole("button", { name: "Add user" }).at(-1)).not.toBeBusy();
+  });
+
+  it("says when a user was added but their code wasn't made", async () => {
+    const { api, user } = await open([owner, alex]);
+    api.createLoginCode.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    await user.press(screen.getByText("Add user"));
+    await user.type(screen.getByLabelText("Email"), "sam@example.com");
+    await user.type(screen.getByLabelText("Name"), "Sam");
+    await user.press(screen.getAllByRole("button", { name: "Add user" }).at(-1)!);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Sam was added, but no code was made: Can't reach the server. Check your connection and try again. Make one from their page.",
+    );
+  });
+
+  it("says Approving… on the busy approve button", async () => {
+    const { api, user } = await open([owner, alex], [ada]);
+    let fail: (e: Error) => void = () => {};
+    api.approveSignup.mockImplementationOnce(() => new Promise((_, reject) => (fail = reject)));
+    await user.press(await screen.findByLabelText("Request from Ada Lovelace"));
+    expect(screen.getByRole("heading", { name: "Request for access" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Ada Lovelace" })).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Approve" }));
+    const busy = screen.getByRole("button", { name: "Approving…" });
+    expect(busy).toBeDisabled();
+    expect(busy).toBeBusy();
+    expect(screen.getByRole("button", { name: "Reject" })).not.toBeBusy();
+    await act(async () => fail(new ApiError("That request was already handled.", 409)));
+    expect(screen.getByRole("alert")).toHaveTextContent("That request was already handled.");
+    expect(screen.getByRole("button", { name: "Approve" })).toBeEnabled();
+  });
+
+  it("shows requests that didn't load with a retry", async () => {
+    const api = fakeApi([owner, alex], [ada]);
+    api.signups.mockRejectedValueOnce(new ApiError("HTTP 500", 500));
+    await render(<UsersAdmin api={api as unknown as SuperBotApi} meId="operator" onBack={jest.fn()} />);
+    await screen.findByLabelText("User Alex");
+    expect(screen.getByRole("heading", { name: "Requests" })).toBeOnTheScreen();
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load requests. The server had a problem. Try again in a moment.");
+    await userEvent.setup().press(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Request from Ada Lovelace")).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Requests · 1" })).toBeOnTheScreen();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("searches by name, email, role, and provider", () => {

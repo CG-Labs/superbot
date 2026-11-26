@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { ApiError, type SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
+import { errorText, friendlyError } from "../src/errors";
 import {
   approveCap,
   approveChoices,
@@ -29,6 +30,9 @@ import {
 } from "../src/roles";
 import { hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { AdminUser, BuiltInRole, CustomRole, RoleDraft, RoleGiving, RoleRequest, RolesView, Team } from "../src/types";
+import { EmptyState } from "./EmptyState";
+import { ErrorState, InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
 import { Chips } from "./Chips";
 import { kit, PageHeader, Spinner } from "./ui";
 
@@ -40,14 +44,15 @@ interface Props {
 
 type Picked = { kind: "builtIn"; id: string } | { kind: "custom"; id: string } | { kind: "new" } | null;
 
-const message = (err: unknown) => (err instanceof Error ? err.message : "Failed");
 const personName = (p: { id: string; name?: string | null; email?: string | null }) => p.name || p.email || p.id;
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   const styles = useStyles();
   return (
     <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{title}</Text>
+      <Text style={styles.sectionTitle} role="heading">
+        {title}
+      </Text>
       {children}
     </View>
   );
@@ -86,7 +91,9 @@ function BuiltInDetail({ role, view }: { role: BuiltInRole; view: RolesView }) {
   return (
     <View style={styles.wrap}>
       <View>
-        <Text style={styles.name}>{role.name}</Text>
+        <Text style={styles.name} role="heading">
+          {role.name}
+        </Text>
         <Text style={styles.faint}>Built in. It can&apos;t be changed; give it from Users.</Text>
       </View>
       <Section title="Can do">
@@ -104,6 +111,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [holders, setHolders] = useState<CustomRole["holders"] | null>(null);
+  const [holdersError, setHoldersError] = useState<string | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
   const [query, setQuery] = useState("");
@@ -120,9 +128,18 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
     setTeams(allTeams);
   }, [api, role]);
 
-  useEffect(() => {
-    loadHolders().catch((err) => setError(message(err)));
+  const fetchHolders = useCallback(async () => {
+    try {
+      await loadHolders();
+      setHoldersError(null);
+    } catch (err) {
+      setHoldersError(errorText(err, "Couldn't load who has it"));
+    }
   }, [loadHolders]);
+
+  useEffect(() => {
+    void fetchHolders();
+  }, [fetchHolders]);
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -130,7 +147,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
     try {
       await action();
     } catch (err) {
-      setError(message(err));
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
@@ -250,12 +267,14 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
   return (
     <View style={styles.wrap}>
       <View>
-        <Text style={styles.name}>{role ? role.name : "New role"}</Text>
+        <Text style={styles.name} role="heading">
+          {role ? role.name : "New role"}
+        </Text>
         <Text style={styles.faint}>
           {role ? `${holdersLabel(role)} · changed ${new Date(role.updatedAt).toLocaleDateString()}` : "A base role plus permissions an admin gives away. It never adds up to admin."}
         </Text>
       </View>
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <InlineError message={error} /> : null}
 
       <Section title="Name">
         <TextInput
@@ -309,7 +328,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
           accessibilityState={{ checked: requestable, disabled: busy || !maxDays }}
           accessibilityLabel="People may request it"
         >
-          <Text style={[styles.check, requestable && styles.checkOn]}>{requestable ? "✓" : ""}</Text>
+          <Text style={[styles.check, requestable && styles.checkOn]} maxFontSizeMultiplier={1.3}>{requestable ? "✓" : ""}</Text>
           <View style={styles.fill}>
             <Text style={styles.text}>People may request it</Text>
             <Text style={styles.dim}>
@@ -325,7 +344,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
           accessibilityState={{ checked: approvals === 2, disabled: busy || !requestable }}
           accessibilityLabel="Needs two approvers"
         >
-          <Text style={[styles.check, approvals === 2 && styles.checkOn]}>{approvals === 2 ? "✓" : ""}</Text>
+          <Text style={[styles.check, approvals === 2 && styles.checkOn]} maxFontSizeMultiplier={1.3}>{approvals === 2 ? "✓" : ""}</Text>
           <View style={styles.fill}>
             <Text style={styles.text}>Needs two approvers</Text>
             <Text style={styles.dim}>
@@ -350,7 +369,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
               accessibilityState={{ checked: on, disabled: busy }}
               accessibilityLabel={p.name}
             >
-              <Text style={[styles.check, on && styles.checkOn]}>{on ? "✓" : ""}</Text>
+              <Text style={[styles.check, on && styles.checkOn]} maxFontSizeMultiplier={1.3}>{on ? "✓" : ""}</Text>
               <View style={styles.fill}>
                 <Text style={styles.text}>
                   {p.name}
@@ -397,7 +416,11 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
 
           <Section title="Across the server">
             {holders == null ? (
-              <Spinner />
+              holdersError ? (
+                <InlineError message={holdersError} onRetry={fetchHolders} />
+              ) : (
+                <ListSkeleton label="Loading who has it" rows={2} />
+              )
             ) : holders.users.length ? (
               holders.users.map((u) => (
                 <View key={u.id} style={styles.item}>
@@ -411,7 +434,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
                 </View>
               ))
             ) : (
-              <Text style={styles.dim}>Nobody has it across the server.</Text>
+              <EmptyState compact glyph="+" title="Nobody has it across the server" message="Search people below to give it to someone." />
             )}
             <TextInput
               style={styles.input}
@@ -481,7 +504,7 @@ function RoleEditor({ api, view, role, meId, onSaved, onDeleted }: { api: SuperB
                   })}
               </>
             ) : holders ? (
-              <Text style={styles.dim}>No teams yet.</Text>
+              <EmptyState compact glyph="+" title="No teams yet" message="Make a team first to give the role within it." />
             ) : null}
           </Section>
         </>
@@ -548,7 +571,7 @@ export function RequestRow({
       else await deny(q.id, why);
       await onDecided();
     } catch (err) {
-      setError(message(err));
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
@@ -564,7 +587,7 @@ export function RequestRow({
         {requestStatusLabel(q, Date.now())}
       </Text>
       {first ? <Text style={styles.faint}>{first}.</Text> : null}
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <InlineError message={error} /> : null}
       {yours ? (
         <Text style={styles.faint}>Your own request: {decidesYours} decides it.</Text>
       ) : (
@@ -612,7 +635,7 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
     } catch (err) {
       setRequests([]);
       // A server from before requests for roles (ADR 0209) has none to show.
-      setRequestsError(err instanceof ApiError && err.status === 404 ? null : message(err));
+      setRequestsError(err instanceof ApiError && err.status === 404 ? null : errorText(err, "Couldn't load requests for roles"));
     }
   }, [api]);
 
@@ -621,7 +644,7 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
       setView(await api.roles());
       setError(null);
     } catch (err) {
-      setError(message(err));
+      setError(friendlyError(err));
     }
     await loadRequests();
   }, [api, loadRequests]);
@@ -657,19 +680,17 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
       <PageHeader title="Roles" onBack={onBack} right={<Button label="New role" primary disabled={!view} onPress={() => setPicked({ kind: "new" })} />} />
       <View style={styles.body}>
         <View style={wide ? styles.listPaneWide : styles.listPane}>
-          {error ? <Text style={styles.error}>{error}</Text> : null}
-          {!view && !error ? <Spinner style={styles.spinner} /> : null}
+          {error && !view ? <ErrorState title="Couldn't load roles" message={error} onRetry={load} /> : null}
+          {!view && !error ? <ListSkeleton label="Loading roles" rows={3} /> : null}
           {view ? (
             <ScrollView contentContainerStyle={styles.list}>
-              {requestsError ? (
-                <View style={styles.request}>
-                  <Text style={styles.error} accessibilityRole="alert">{`Couldn't load requests for roles: ${requestsError}`}</Text>
-                  <Button label="Try again" a11y="Load requests again" onPress={() => void loadRequests()} />
-                </View>
-              ) : null}
+              {error ? <InlineError message={`Couldn't load roles. ${error}`} onRetry={load} /> : null}
+              {requestsError ? <InlineError message={requestsError} onRetry={loadRequests} /> : null}
               {requests.length ? (
                 <>
-                  <Text style={styles.heading}>Requests ({requests.length})</Text>
+                  <Text style={styles.heading} role="heading">
+                    Requests ({requests.length})
+                  </Text>
                   {requests.map((q) => (
                     <RequestRow
                       key={q.id}
@@ -682,7 +703,9 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
                   ))}
                 </>
               ) : null}
-              <Text style={styles.heading}>Built in</Text>
+              <Text style={styles.heading} role="heading">
+                Built in
+              </Text>
               <View style={styles.listCard}>
                 {view.builtIn.map((r, i) => (
                   <Pressable
@@ -691,13 +714,16 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
                     onPress={() => setPicked({ kind: "builtIn", id: r.id })}
                     accessibilityRole="button"
                     accessibilityLabel={`Role ${r.name}`}
+                    accessibilityState={{ selected: picked?.kind === "builtIn" && picked.id === r.id }}
                   >
                     <Text style={styles.rowName}>{r.name}</Text>
                     <Text style={styles.faint}>{r.permissions.length} permissions</Text>
                   </Pressable>
                 ))}
               </View>
-              <Text style={styles.heading}>Custom</Text>
+              <Text style={styles.heading} role="heading">
+                Custom
+              </Text>
               <View style={styles.listCard}>
                 {view.roles.map((r, i) => (
                   <Pressable
@@ -706,6 +732,7 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
                     onPress={() => setPicked({ kind: "custom", id: r.id })}
                     accessibilityRole="button"
                     accessibilityLabel={`Role ${r.name}`}
+                    accessibilityState={{ selected: picked?.kind === "custom" && picked.id === r.id }}
                   >
                     <Text style={styles.rowName}>{r.name}</Text>
                     <Text style={styles.faint}>
@@ -713,7 +740,7 @@ export function RolesAdmin({ api, meId, onBack }: Props) {
                     </Text>
                   </Pressable>
                 ))}
-                {!view.roles.length ? <Text style={styles.empty}>No custom roles yet. Make one to give part of admin away.</Text> : null}
+                {!view.roles.length ? <EmptyState compact glyph="+" title="No custom roles yet" message="Make one to give part of admin away." /> : null}
               </View>
             </ScrollView>
           ) : null}
@@ -747,7 +774,6 @@ const useStyles = themedStyles((t) => {
     listPane: { flex: 1, padding: t.space.md },
     listPaneWide: { width: 400, padding: t.space.md, backgroundColor: t.c.surface, borderRightWidth: hairline, borderRightColor: t.c.border },
     list: { gap: t.space.md, paddingBottom: t.space.xl },
-    spinner: { marginTop: t.space.xl },
     heading: k.section,
     listCard: { ...k.card, padding: 0, gap: 0, overflow: "hidden" },
     listRow: { paddingVertical: t.space.md, paddingHorizontal: t.space.lg, gap: t.space.xxs, borderTopWidth: hairline, borderTopColor: t.c.border },
@@ -764,7 +790,6 @@ const useStyles = themedStyles((t) => {
     dim: k.dim,
     faint: k.faint,
     warn: k.warn,
-    error: k.error,
     empty: k.empty,
     section: k.card,
     sectionTitle: k.cardTitle,

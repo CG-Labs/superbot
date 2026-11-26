@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Switch, Text, TextInput, View } from "react-native";
+import { Pressable, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
+import { friendlyError } from "../src/errors";
 import { CODE_TTLS, ROLES } from "../src/invite";
 import { themedStyles, useTheme } from "../src/theme";
 import type { AdminUser, LoginCode, Role } from "../src/types";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
+import { InlineError } from "./ErrorState";
 import { kit, usePlaceholder } from "./ui";
 
 interface Props {
@@ -40,8 +42,8 @@ export function InviteUserForm({ api, onCreated, onClose, onBusy }: Props) {
       if (!withCode) return onClose();
       setMade({ user, code: await api.createLoginCode(user.id, ttl) });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed";
-      setError(user ? `${user.name} was added, but no code was made: ${msg}. Make one from their page.` : msg);
+      const msg = friendlyError(err);
+      setError(user ? `${user.name} was added, but no code was made: ${msg.replace(/\.$/, "")}. Make one from their page.` : msg);
     } finally {
       setBusy(false);
     }
@@ -90,13 +92,25 @@ export function InviteUserForm({ api, onCreated, onClose, onBusy }: Props) {
       ) : (
         <Text style={styles.hint}>They can sign in with SSO once you link their account, or you can make a code later.</Text>
       )}
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <InlineError message={error} /> : null}
       <View style={styles.actions}>
-        <Pressable style={({ pressed }) => [styles.btn, pressed && styles.pressed, busy && styles.disabled]} disabled={busy} onPress={onClose}>
+        <Pressable
+          style={({ pressed }) => [styles.btn, pressed && styles.pressed, busy && styles.disabled]}
+          disabled={busy}
+          onPress={onClose}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: busy }}
+        >
           <Text style={styles.btnText}>Cancel</Text>
         </Pressable>
-        <Pressable style={[styles.btn, styles.primary, (busy || !email.trim()) && styles.disabled]} disabled={busy || !email.trim()} onPress={() => void submit()}>
-          {busy ? <ActivityIndicator color={t.c.onAccent} /> : <Text style={[styles.btnText, styles.primaryText]}>Add user</Text>}
+        <Pressable
+          style={[styles.btn, styles.primary, (busy || !email.trim()) && styles.disabled]}
+          disabled={busy || !email.trim()}
+          onPress={() => void submit()}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: busy || !email.trim(), busy }}
+        >
+          <Text style={[styles.btnText, styles.primaryText]}>{busy ? "Adding…" : "Add user"}</Text>
         </Pressable>
       </View>
     </View>
@@ -112,7 +126,6 @@ const useStyles = themedStyles((t) => {
     hint: k.faint,
     text: { ...k.text, flex: 1 },
     switchRow: { flexDirection: "row", alignItems: "center", gap: t.space.md, marginTop: t.space.sm },
-    error: k.error,
     actions: { ...k.actions, justifyContent: "flex-end", marginTop: t.space.md },
     btn: { ...k.btn, minWidth: 90 },
     btnText: k.btnText,

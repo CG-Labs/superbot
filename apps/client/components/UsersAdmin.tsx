@@ -10,6 +10,10 @@ import {
   View,
 } from "react-native";
 import type { SuperBotApi } from "../src/api";
+import { errorText } from "../src/errors";
+import { EmptyState } from "./EmptyState";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
 import { relativeTime, ROLES, signInMethod } from "../src/invite";
 import { fetchSsoProviders, type SsoProvider } from "../src/sso";
 import { endsLabel } from "../src/roles";
@@ -37,7 +41,13 @@ function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers:
   const styles = useStyles();
   const label = (id: string) => providers.find((p) => p.id === id)?.label ?? id;
   return (
-    <Pressable style={[styles.row, selected && styles.selected]} onPress={onPress} accessibilityRole="button" accessibilityLabel={`User ${u.name}`}>
+    <Pressable
+      style={[styles.row, selected && styles.selected]}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`User ${u.name}`}
+      accessibilityState={{ selected }}
+    >
       <View style={styles.rowMain}>
         <Text style={styles.name} numberOfLines={1}>
           {u.name}
@@ -98,7 +108,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
       setUsers(await api.users());
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't load users");
+      setError(errorText(err, "Couldn't load users"));
     }
   }, [api]);
 
@@ -144,9 +154,10 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
             placeholderTextColor={t.c.textFaint}
             value={query}
             onChangeText={setQuery}
+            accessibilityLabel="Search people"
           />
-          {error ? <Text style={styles.error}>{error}</Text> : null}
-          {users == null && !error ? <Spinner style={{ marginTop: 20 }} /> : null}
+          {error ? <InlineError message={error} onRetry={load} /> : null}
+          {users == null && !error ? <ListSkeleton label="Loading users" rows={4} /> : null}
           <ScrollView contentContainerStyle={styles.list}>
             <SignupRequests
               api={api}
@@ -158,7 +169,13 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
             {list.map((u) => (
               <UserRow key={u.id} u={u} providers={providers} selected={u.id === selectedId} onPress={() => setSelectedId(u.id)} />
             ))}
-            {users && !list.length ? <Text style={styles.empty}>{query ? "Nobody matches." : "No users yet."}</Text> : null}
+            {users && !list.length ? (
+              query ? (
+                <EmptyState compact glyph="⌕" title="Nobody matches" message="Try a name, email, role, or sign-in provider." />
+              ) : (
+                <EmptyState compact glyph="+" title="No users yet" message="Add someone with Add user, or approve a request above." />
+              )
+            ) : null}
           </ScrollView>
         </View>
         {wide ? (
@@ -188,7 +205,9 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
       >
         <View style={styles.backdrop}>
           <ScrollView style={styles.sheet} contentContainerStyle={styles.sheetBody}>
-            <Text style={styles.sheetTitle}>Add user</Text>
+            <Text style={styles.sheetTitle} role="heading">
+              Add user
+            </Text>
             {inviting ? (
               <InviteUserForm
                 api={api}

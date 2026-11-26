@@ -2,9 +2,12 @@ import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { chainLines, shortHash, type ChainLine } from "../src/auditChain";
+import { errorText, friendlyError } from "../src/errors";
 import { hairline, type Theme, themedStyles, type, useTheme } from "../src/theme";
 import type { AuditChainState, AuditVerifyReport } from "../src/types";
-import { kit, Spinner } from "./ui";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "auditChain" | "auditVerify">;
@@ -37,7 +40,7 @@ export function AuditChainPanel({ api }: Props) {
       setState(await api.auditChain());
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't load the chain's state");
+      setError(errorText(err, "Couldn't load the chain's state"));
     }
   }, [api]);
 
@@ -51,7 +54,7 @@ export function AuditChainPanel({ api }: Props) {
       setResult(checkResult(await api.auditVerify()));
       await load();
     } catch (err) {
-      setResult({ label: "This check", text: err instanceof Error ? err.message : "The check failed", tone: "bad" });
+      setResult({ label: "This check", text: friendlyError(err, "The check failed. Try again."), tone: "bad" });
     } finally {
       setChecking(false);
     }
@@ -62,7 +65,9 @@ export function AuditChainPanel({ api }: Props) {
   return (
     <View style={styles.panel} testID="audit-chain">
       <View style={styles.top}>
-        <Text style={styles.title}>Hash chain</Text>
+        <Text style={styles.title} role="heading">
+          Hash chain
+        </Text>
         <Pressable onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Refresh the chain's state" style={styles.refresh}>
           <Text style={styles.link}>Refresh</Text>
         </Pressable>
@@ -70,10 +75,10 @@ export function AuditChainPanel({ api }: Props) {
           <Text style={styles.btnText}>{checking ? "Checking…" : "Check now"}</Text>
         </Pressable>
       </View>
-      {error ? <Text style={styles.error}>{error}</Text> : null}
-      {!state && !error ? <Spinner /> : null}
+      {error ? <InlineError message={error} onRetry={load} /> : null}
+      {!state && !error ? <ListSkeleton label="Checking the chain" rows={2} /> : null}
       {lines.map((l, i) => (
-        <View key={`${i}:${l.label}`} style={[styles.line, i === 0 && styles.lineFirst]} accessibilityLabel={`${l.label}: ${l.text}`}>
+        <View key={`${i}:${l.label}`} style={[styles.line, i === 0 && styles.lineFirst]} accessible accessibilityLabel={`${l.label}: ${l.text}`}>
           <View style={[styles.dot, { backgroundColor: tone[l.tone] }]} />
           <Text style={styles.label}>{l.label}</Text>
           <Text style={[styles.text, l.tone === "bad" && styles.bad]} selectable>
@@ -114,6 +119,5 @@ const useStyles = themedStyles((t) => {
     text: { color: t.c.text, ...type(t, "sm"), flex: 1, minWidth: 200 },
     bad: { color: t.c.danger },
     faint: { ...k.faint, fontFamily: t.font.mono, paddingTop: t.space.sm, borderTopWidth: hairline, borderTopColor: t.c.border },
-    error: k.error,
   });
 });

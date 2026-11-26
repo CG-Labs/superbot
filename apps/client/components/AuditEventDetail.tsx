@@ -48,7 +48,7 @@ export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
   return (
     <View style={styles.root} testID="audit-event-detail">
       <View style={styles.top}>
-        <Text style={styles.action} selectable>
+        <Text style={styles.action} role="heading" selectable>
           {e.action}
         </Text>
         <Text style={[styles.tag, e.outcome === "success" ? styles.okTag : styles.badTag]}>{e.outcome}</Text>
@@ -57,7 +57,9 @@ export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
 
       {decision ? (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Decision</Text>
+          <Text style={styles.sectionTitle} role="heading">
+            Decision
+          </Text>
           <View style={styles.group}>
             <Text style={[styles.verdict, e.action !== "approval.approved" && styles.verdictBad]}>{decision.verdict}</Text>
             {decision.lines.map(([label, value]) => (
@@ -68,7 +70,9 @@ export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
       ) : null}
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Event</Text>
+        <Text style={styles.sectionTitle} role="heading">
+          Event
+        </Text>
         <View style={styles.group}>
           {eventFields(e, { nameOf, botName }).map(([label, value], i) => (
             <Row key={label} label={label} value={value} first={i === 0} />
@@ -78,7 +82,9 @@ export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
 
       {details ? (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Details</Text>
+          <Text style={styles.sectionTitle} role="heading">
+            Details
+          </Text>
           <Text style={styles.code} selectable>
             {details}
           </Text>
@@ -86,13 +92,16 @@ export function AuditEventDetail({ e, botName, nameOf, onPivot }: Props) {
       ) : null}
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Show</Text>
+        <Text style={styles.sectionTitle} role="heading">
+          Show
+        </Text>
         <View style={styles.group}>
           {pivotsFor(e, { nameOf, botName }).map((p, i) => (
             <Pressable
               key={p.label}
               onPress={() => onPivot(p.filters)}
               accessibilityRole="button"
+              accessibilityLabel={p.label}
               style={({ pressed }) => [styles.pivot, i === 0 && styles.fieldFirst, pressed && styles.pivotPressed]}
             >
               <Text style={styles.link}>{p.label} ›</Text>

@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { ApiError, type SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
+import { errorText, friendlyError } from "../src/errors";
+import { InlineError } from "./ErrorState";
 import { APPROVAL_TTLS, relativeTime, ROLES, SIGN_IN_CHOICES } from "../src/invite";
-import { themedStyles, type, useTheme } from "../src/theme";
+import { themedStyles, type } from "../src/theme";
 import type { Role, SignupApproval, SignupRequest } from "../src/types";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
@@ -30,30 +32,30 @@ function Review({
   onBusy: (busy: boolean) => void;
 }) {
   const styles = useStyles();
-  const t = useTheme();
   const placeholder = usePlaceholder();
   const [role, setRole] = useState<Role>("member");
   const [ttl, setTtl] = useState<number>(APPROVAL_TTLS[1].minutes);
   const [reason, setReason] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [doing, setDoing] = useState<"approve" | "reject" | null>(null);
+  const busy = doing !== null;
   const [error, setError] = useState<string | null>(null);
   const [made, setMade] = useState<SignupApproval | null>(null);
   useEffect(() => onBusy(busy), [busy, onBusy]);
 
-  const run = async (f: () => Promise<void>) => {
-    setBusy(true);
+  const run = async (what: "approve" | "reject", f: () => Promise<void>) => {
+    setDoing(what);
     setError(null);
     try {
       await f();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed");
+      setError(friendlyError(err));
     } finally {
-      setBusy(false);
+      setDoing(null);
     }
   };
 
   const approve = () =>
-    run(async () => {
+    run("approve", async () => {
       const a = await api.approveSignup(request.id, { role, ttlMinutes: ttl });
       onApproved(a);
       setMade(a);
@@ -61,7 +63,7 @@ function Review({
 
   const reject = async () => {
     if (!(await confirmAsync(`Reject ${request.name}'s request?`, "Nobody is told. You can still add them later.", "Reject"))) return;
-    void run(async () => {
+    void run("reject", async () => {
       await api.rejectSignup(request.id, reason.trim());
       onClose();
     });
@@ -83,7 +85,9 @@ function Review({
   const roleHint = ROLES.find((r) => r.role === role)?.hint;
   return (
     <View style={styles.form}>
-      <Text style={styles.name}>{request.name}</Text>
+      <Text style={styles.name} role="heading">
+        {request.name}
+      </Text>
       <Text style={styles.dim} selectable>
         {request.email}
       </Text>
@@ -116,17 +120,35 @@ function Review({
         maxLength={500}
         accessibilityLabel="Reason"
       />
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {error ? <InlineError message={error} /> : null}
       <View style={styles.actions}>
-        <Pressable style={({ pressed }) => [styles.btn, pressed && styles.pressed, busy && styles.disabled]} disabled={busy} onPress={onClose} accessibilityRole="button">
+        <Pressable
+          style={({ pressed }) => [styles.btn, pressed && styles.pressed, busy && styles.disabled]}
+          disabled={busy}
+          onPress={onClose}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: busy }}
+        >
           <Text style={styles.btnText}>Cancel</Text>
         </Pressable>
-        <Pressable style={[styles.btn, styles.dangerBtn, busy && styles.disabled]} disabled={busy} onPress={() => void reject()} accessibilityRole="button">
-          <Text style={[styles.btnText, styles.danger]}>Reject</Text>
+        <Pressable
+          style={[styles.btn, styles.dangerBtn, busy && styles.disabled]}
+          disabled={busy}
+          onPress={() => void reject()}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: busy, busy: doing === "reject" }}
+        >
+          <Text style={[styles.btnText, styles.danger]}>{doing === "reject" ? "Rejecting…" : "Reject"}</Text>
         </Pressable>
         {request.existingUser ? null : (
-          <Pressable style={[styles.btn, styles.primary, busy && styles.disabled]} disabled={busy} onPress={() => void approve()} accessibilityRole="button">
-            {busy ? <ActivityIndicator color={t.c.onAccent} /> : <Text style={[styles.btnText, styles.primaryText]}>Approve</Text>}
+          <Pressable
+            style={[styles.btn, styles.primary, busy && styles.disabled]}
+            disabled={busy}
+            onPress={() => void approve()}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: busy, busy: doing === "approve" }}
+          >
+            <Text style={[styles.btnText, styles.primaryText]}>{doing === "approve" ? "Approving…" : "Approve"}</Text>
           </Pressable>
         )}
       </View>
@@ -157,7 +179,7 @@ export function SignupRequests({ api, onApproved }: Props) {
       setError(null);
     } catch (err) {
       setList([]);
-      setError(err instanceof ApiError && err.status === 404 ? null : err instanceof Error ? err.message : "Couldn't load requests");
+      setError(err instanceof ApiError && err.status === 404 ? null : errorText(err, "Couldn't load requests"));
     }
   }, [api]);
 
@@ -176,8 +198,10 @@ export function SignupRequests({ api, onApproved }: Props) {
     <>
       {list.length || error ? (
         <View style={styles.section} testID="signup-requests">
-          <Text style={styles.heading}>Requests{list.length ? ` · ${list.length}` : ""}</Text>
-          {error ? <Text style={styles.error}>{error}</Text> : null}
+          <Text style={styles.heading} role="heading">
+            Requests{list.length ? ` · ${list.length}` : ""}
+          </Text>
+          {error ? <InlineError message={error} onRetry={load} /> : null}
           {list.map((r, i) => (
             <Pressable key={r.id} style={[styles.row, i === 0 && styles.rowFirst]} onPress={() => setOpen(r)} accessibilityRole="button" accessibilityLabel={`Request from ${r.name}`}>
               <View style={styles.rowMain}>
@@ -207,7 +231,9 @@ export function SignupRequests({ api, onApproved }: Props) {
       >
         <View style={styles.backdrop}>
           <ScrollView style={styles.sheet} contentContainerStyle={styles.sheetBody}>
-            <Text style={styles.title}>Request for access</Text>
+            <Text style={styles.title} role="heading">
+              Request for access
+            </Text>
             {open ? (
               <Review
                 api={api}
@@ -249,7 +275,6 @@ const useStyles = themedStyles((t) => {
     hint: k.faint,
     warn: k.warn,
     input: k.input,
-    error: { ...k.error, padding: t.space.xs },
     actions: { ...k.actions, justifyContent: "flex-end", marginTop: t.space.md },
     btn: { ...k.btn, minWidth: 90 },
     btnText: k.btnText,

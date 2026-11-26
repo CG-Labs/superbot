@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent, waitFor, within } from "@testing-library/react-native";
+import { act, render, screen, userEvent, waitFor, within } from "@testing-library/react-native";
 import { AccessReview } from "../AccessReview";
 import { ApiError, type SuperBotApi } from "../../src/api";
 import { saveCsv } from "../../src/saveCsv";
@@ -76,7 +76,7 @@ describe("AccessReview", () => {
     expect(bo.getByText("Disabled")).toBeOnTheScreen();
     expect(bo.getByText("SCIM: okta")).toBeOnTheScreen();
     expect(bo.getByText("Last sign-in: Never signed in")).toBeOnTheScreen();
-    expect(screen.getByText("None yet.")).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "No sign-offs yet" })).toBeOnTheScreen();
   });
 
   it("lists service accounts with their owner, what they can use, flags and tokens", async () => {
@@ -150,7 +150,7 @@ describe("AccessReview", () => {
     expect(api.completeAccessReview).toHaveBeenCalledWith("d1", "checked");
     expect(await screen.findByText(/^Signed off at/)).toBeOnTheScreen();
     expect(screen.getByText("checked")).toBeOnTheScreen();
-    expect(screen.queryByText("None yet.")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "No sign-offs yet" })).toBeNull();
   });
 
   it("drops the sign-off message once a reload shows different access", async () => {
@@ -210,8 +210,47 @@ describe("AccessReview", () => {
     api.accessReview.mockRejectedValueOnce(new Error("Network down"));
     const user = userEvent.setup();
     await render(<AccessReview api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
-    await user.press(await screen.findByText("Retry"));
+    expect(await screen.findByText("Couldn't load the access review")).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Try again" }));
     expect(await screen.findByTestId("access-review")).toBeOnTheScreen();
     expect(screen.queryByText("Network down")).toBeNull();
+  });
+
+  it("shows a skeleton while the report loads", async () => {
+    const api = fakeApi();
+    let finish: (r: Report) => void = () => {};
+    api.accessReview.mockImplementationOnce(() => new Promise<Report>((r) => (finish = r)));
+    await render(<AccessReview api={api as unknown as SuperBotApi} onBack={jest.fn()} />);
+    expect(screen.getByRole("progressbar", { name: "Loading the access review" })).toBeOnTheScreen();
+    await act(async () => finish(report()));
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByTestId("access-review")).toBeOnTheScreen();
+  });
+
+  it("keeps the report when a reload fails, with a retry", async () => {
+    const { api, user } = await open();
+    api.accessReview.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    await user.press(screen.getByText("Reload"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load the access review. Can't reach the server. Check your connection and try again.");
+    expect(screen.getByTestId("access-review")).toBeOnTheScreen();
+    await user.press(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(api.accessReview).toHaveBeenCalledTimes(3);
+  });
+
+  it("titles its card and sections as headings, and says when nobody has signed off", async () => {
+    await open();
+    expect(screen.getByRole("heading", { name: "Sign off" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "Past sign-offs" })).toBeOnTheScreen();
+    expect(screen.getByRole("heading", { name: "No sign-offs yet" })).toBeOnTheScreen();
+    expect(screen.getAllByRole("heading", { name: /\(1\)$/ })).toHaveLength(2);
+  });
+
+  it("shows a failed sign-off as an alert", async () => {
+    const api = fakeApi();
+    api.completeAccessReview.mockRejectedValueOnce(new ApiError("HTTP 500", 500));
+    const { user } = await open(api);
+    await user.press(screen.getByText("Mark as reviewed"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The server had a problem. Try again in a moment.");
   });
 });
