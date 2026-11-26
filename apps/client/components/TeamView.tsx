@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { checkoutNotice, limitSummary, openBillingPage } from "../src/billing";
 import { confirmAsync } from "../src/dialogs";
@@ -23,12 +23,12 @@ import {
   teamApproveBlocked,
   teamRegionLine,
   teamSubscriptionLine,
-  type Tone,
 } from "../src/team";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type } from "../src/theme";
 import type { CustomRoleRef, MyTeamInvite, RoleRequest, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
 import { Chips } from "./Chips";
 import { RequestRow } from "./RolesAdmin";
+import { kit, PageHeader, Spinner, usePlaceholder } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -48,13 +48,6 @@ const CONFIRM_TRIES = 20;
 
 const message = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
-const TONE: Record<Tone, object> = {
-  ok: { color: colors.accent },
-  warn: { color: colors.warning },
-  bad: { color: colors.danger },
-  dim: { color: colors.textDim },
-};
-
 /** Giving a teammate one of the team's custom roles, for how long (ADR 0254). */
 function GiveRole({
   choices,
@@ -70,6 +63,7 @@ function GiveRole({
   onGive: (roleId: string, ends: string) => void;
   onCancel: () => void;
 }) {
+  const styles = useStyles();
   const [roleId, setRoleId] = useState((choices.find((c) => c.id === held?.id) ?? choices[0]).id);
   const choice = choices.find((c) => c.id === roleId) ?? choices[0];
   const [ends, setEnds] = useState(() => (held && held.id === choice.id ? endNear(choice.maxDays, held.expiresAt, Date.now()) : defaultEnd(choice.maxDays)));
@@ -97,6 +91,7 @@ function GiveRole({
 
 function MemberRow({
   m,
+  first,
   team,
   meId,
   manage,
@@ -107,6 +102,7 @@ function MemberRow({
   onTakeRole,
 }: {
   m: TeamMember;
+  first: boolean;
   team: Team;
   meId?: string | null;
   manage: boolean;
@@ -116,6 +112,7 @@ function MemberRow({
   onGiveRole: (m: TeamMember, roleId: string, ends: string) => void;
   onTakeRole: (m: TeamMember) => void;
 }) {
+  const styles = useStyles();
   const [giving, setGiving] = useState(false);
   const roles = manage ? assignableRoles(team.role, m) : [];
   const status = manage ? machineStatus(m.machine) : null;
@@ -123,9 +120,9 @@ function MemberRow({
   const roleLine = customRoleLine(m.customRole);
   const who = m.name ?? m.email ?? m.id;
   return (
-    <View style={styles.member} accessibilityLabel={`Teammate ${m.name ?? m.email ?? m.id}`}>
+    <View style={[styles.member, first && styles.memberFirst]} accessibilityLabel={`Teammate ${m.name ?? m.email ?? m.id}`}>
       <View style={styles.memberHead}>
-        <View style={{ flex: 1, minWidth: 0 }}>
+        <View style={styles.grow}>
           <Text style={styles.name} numberOfLines={1}>
             {m.name ?? m.email ?? m.id}
             {m.id === meId ? <Text style={styles.faint}> · you</Text> : null}
@@ -137,7 +134,7 @@ function MemberRow({
       </View>
       {status ? (
         <View testID={`machine-${m.id}`}>
-          <Text style={[styles.status, TONE[status.tone]]}>{status.label}</Text>
+          <Text style={[styles.status, styles[status.tone]]}>{status.label}</Text>
           {status.detail ? <Text style={styles.faint}>{status.detail}</Text> : null}
         </View>
       ) : null}
@@ -190,6 +187,7 @@ function MemberRow({
 
 /** The team's plan (ADR 0093): who pays for everyone's, and for owners and admins, its seats and Stripe's pages. */
 function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage: boolean; busy: boolean; onBuy: (tier: string) => void; onPortal: () => void }) {
+  const styles = useStyles();
   const status = teamSubscriptionLine(b);
   const seats = seatsLine(b);
   const change = manage && b.canChange !== false;
@@ -200,7 +198,7 @@ function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage
         <Text style={styles.name}>{b.plan ? `${b.plan.label} plan` : "No team plan"}</Text>
         <Text style={styles.dim}>{teamPlanLine(b)}</Text>
         {status ? <Text style={styles.dim}>{status}</Text> : null}
-        {seats ? <Text style={[styles.status, TONE[seats.tone]]}>{seats.text}</Text> : null}
+        {seats ? <Text style={[styles.status, styles[seats.tone]]}>{seats.text}</Text> : null}
         {change && b.portal ? (
           <Pressable style={[styles.btn, styles.self]} disabled={busy} onPress={onPortal} accessibilityRole="link" accessibilityHint="Opens Stripe's billing page">
             <Text style={styles.btnText}>Manage billing</Text>
@@ -226,6 +224,8 @@ function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage
 
 /** Your team (ADR 0087, 0088): its people and, for owners and admins, their machines, invites, roles and offboarding. */
 export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBillingPage }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const [team, setTeam] = useState<Team | null | undefined>(undefined);
   const [invites, setInvites] = useState<MyTeamInvite[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -342,16 +342,10 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
 
   return (
     <View style={styles.root}>
-      <View style={styles.header}>
-        <Pressable onPress={onBack} accessibilityRole="button" accessibilityLabel="Back to Bots">
-          <Text style={styles.back}>‹ Bots</Text>
-        </Pressable>
-        <Text style={styles.title}>{team ? team.name : "Team"}</Text>
-        {busy ? <ActivityIndicator color={colors.textDim} /> : null}
-      </View>
+      <PageHeader title={team ? team.name : "Team"} onBack={onBack} right={busy ? <Spinner /> : null} />
       <ScrollView contentContainerStyle={styles.body}>
         {notice ? (
-          <Text style={[styles.status, notice.good ? TONE.ok : TONE.dim]} accessibilityRole="alert">
+          <Text style={[styles.status, notice.good ? styles.ok : styles.dim]} accessibilityRole="alert">
             {notice.text}
           </Text>
         ) : null}
@@ -360,7 +354,7 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
             {error}
           </Text>
         ) : null}
-        {team === undefined ? <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} /> : null}
+        {team === undefined ? <Spinner style={styles.loading} /> : null}
 
         {team === null ? <Text style={styles.empty}>You aren't on a team.</Text> : null}
         {team === null && invites.length ? (
@@ -402,44 +396,46 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
             {manage ? (
               <View style={styles.section}>
                 <Text style={styles.sectionTitle}>Invite a teammate</Text>
-                <Text style={styles.faint}>They join when they accept, signed in with this email.{team.machines ? " Joining gives them a machine of their own." : ""}</Text>
-                <TextInput
-                  style={styles.input}
-                  value={email}
-                  onChangeText={setEmail}
-                  placeholder="name@example.com"
-                  placeholderTextColor={colors.textFaint}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  keyboardType="email-address"
-                  accessibilityLabel="Teammate's email"
-                />
-                <Chips
-                  options={[
-                    { value: "member" as const, label: "Member" },
-                    { value: "admin" as const, label: "Admin" },
-                  ]}
-                  value={role}
-                  onChange={setRole}
-                  disabled={busy}
-                />
-                <Pressable style={[styles.primaryBtn, styles.self]} disabled={busy} onPress={invite} accessibilityRole="button">
-                  <Text style={styles.primaryText}>Send invite</Text>
-                </Pressable>
-                {team.invites?.length ? (
-                  <View style={{ gap: 6 }} testID="team-invites">
-                    {team.invites.map((i) => (
-                      <View key={i.id} style={styles.inviteRow}>
-                        <Text style={[styles.dim, { flex: 1 }]} numberOfLines={1}>
-                          {i.email} · {TEAM_ROLE_LABEL[i.role]} · until {new Date(i.expiresAt).toLocaleDateString()}
-                        </Text>
-                        <Pressable disabled={busy} onPress={() => run(() => api.cancelTeamInvite(i.id))} accessibilityRole="button" accessibilityLabel={`Cancel invite for ${i.email}`}>
-                          <Text style={styles.link}>Cancel</Text>
-                        </Pressable>
-                      </View>
-                    ))}
-                  </View>
-                ) : null}
+                <View style={styles.card}>
+                  <Text style={styles.faint}>They join when they accept, signed in with this email.{team.machines ? " Joining gives them a machine of their own." : ""}</Text>
+                  <TextInput
+                    style={styles.input}
+                    value={email}
+                    onChangeText={setEmail}
+                    placeholder="name@example.com"
+                    placeholderTextColor={placeholder}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    keyboardType="email-address"
+                    accessibilityLabel="Teammate's email"
+                  />
+                  <Chips
+                    options={[
+                      { value: "member" as const, label: "Member" },
+                      { value: "admin" as const, label: "Admin" },
+                    ]}
+                    value={role}
+                    onChange={setRole}
+                    disabled={busy}
+                  />
+                  <Pressable style={[styles.primaryBtn, styles.self]} disabled={busy} onPress={invite} accessibilityRole="button">
+                    <Text style={styles.primaryText}>Send invite</Text>
+                  </Pressable>
+                  {team.invites?.length ? (
+                    <View style={styles.invites} testID="team-invites">
+                      {team.invites.map((i) => (
+                        <View key={i.id} style={styles.inviteRow}>
+                          <Text style={[styles.dim, styles.grow]} numberOfLines={1}>
+                            {i.email} · {TEAM_ROLE_LABEL[i.role]} · until {new Date(i.expiresAt).toLocaleDateString()}
+                          </Text>
+                          <Pressable disabled={busy} onPress={() => run(() => api.cancelTeamInvite(i.id))} accessibilityRole="button" accessibilityLabel={`Cancel invite for ${i.email}`}>
+                            <Text style={styles.link}>Cancel</Text>
+                          </Pressable>
+                        </View>
+                      ))}
+                    </View>
+                  ) : null}
+                </View>
               </View>
             ) : null}
 
@@ -472,9 +468,11 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
 
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>People</Text>
-              {team.members.map((m) => (
-                <MemberRow key={m.id} m={m} team={team} meId={meId} manage={manage} busy={busy} onRole={changeRole} onRemove={remove} onGiveRole={giveRole} onTakeRole={takeRole} />
-              ))}
+              <View style={styles.list}>
+                {team.members.map((m, i) => (
+                  <MemberRow key={m.id} m={m} first={i === 0} team={team} meId={meId} manage={manage} busy={busy} onRole={changeRole} onRemove={remove} onGiveRole={giveRole} onTakeRole={takeRole} />
+                ))}
+              </View>
             </View>
 
             {canWrite ? (
@@ -495,44 +493,44 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  body: { padding: 16, gap: 12, maxWidth: 760, width: "100%", alignSelf: "center" },
-  section: { gap: 8, marginTop: 8 },
-  sectionTitle: { color: colors.text, fontSize: 16, fontWeight: "600" },
-  member: { gap: 8, padding: 12, borderRadius: 14, borderWidth: 1, borderColor: colors.border },
-  memberHead: { flexDirection: "row", alignItems: "center", gap: 8 },
-  card: { gap: 6, padding: 12, borderRadius: 14, borderWidth: 1, borderColor: colors.border },
-  name: { color: colors.text, fontSize: 16 },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 12 },
-  status: { fontSize: 14 },
-  tag: { color: colors.textDim, fontSize: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2 },
-  roleTag: { color: colors.blueDot, borderColor: "#24406e" },
-  badTag: { color: colors.danger, borderColor: "#5a2a2c" },
-  input: {
-    backgroundColor: colors.bgHover,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-  },
-  actions: { flexDirection: "row", gap: 8 },
-  self: { alignSelf: "flex-start" },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  primaryText: { color: "#111", fontSize: 15 },
-  btn: { borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16 },
-  btnText: { color: colors.text, fontSize: 15 },
-  dangerBtn: { alignSelf: "flex-start", borderWidth: 1, borderColor: "#5a2a2c", borderRadius: 999, paddingVertical: 6, paddingHorizontal: 14 },
-  dangerText: { color: colors.danger, fontSize: 14 },
-  inviteRow: { flexDirection: "row", alignItems: "center", gap: 8 },
-  rolePanel: { gap: 8, paddingTop: 4 },
-  link: { color: colors.blueDot },
-  empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
-  error: { color: colors.danger },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    body: k.body,
+    loading: { marginTop: t.space.xl },
+    section: { gap: t.space.sm },
+    sectionTitle: { ...k.section, marginTop: t.space.sm, marginBottom: 0 },
+    list: { ...k.card, gap: 0, paddingVertical: t.space.xs },
+    member: { gap: t.space.sm, paddingVertical: t.space.md, borderTopWidth: hairline, borderTopColor: t.c.border },
+    memberFirst: { borderTopWidth: 0 },
+    memberHead: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
+    grow: { flex: 1, minWidth: 0 },
+    card: { ...k.card, gap: t.space.sm },
+    name: k.strong,
+    dim: k.dim,
+    faint: k.faint,
+    status: { ...type(t, "sm"), fontWeight: t.font.weight.medium },
+    ok: { color: t.c.success },
+    warn: { color: t.c.warning },
+    bad: { color: t.c.danger },
+    tag: k.tag,
+    roleTag: k.tagAccent,
+    badTag: k.tagDanger,
+    input: k.input,
+    actions: k.actions,
+    self: { alignSelf: "flex-start" },
+    primaryBtn: { ...k.btn, ...k.primary },
+    primaryText: { ...k.btnText, ...k.primaryText },
+    btn: k.btn,
+    btnText: k.btnText,
+    dangerBtn: { ...k.btn, ...k.danger, alignSelf: "flex-start" },
+    dangerText: { ...k.btnText, ...k.dangerText },
+    invites: { gap: 0 },
+    inviteRow: k.row,
+    rolePanel: { ...k.inset, marginTop: t.space.xs },
+    link: { ...k.link, ...type(t, "sm") },
+    empty: k.empty,
+    error: k.error,
+  });
 });

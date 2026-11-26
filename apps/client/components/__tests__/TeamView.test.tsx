@@ -443,4 +443,12 @@ describe("TeamView", () => {
     await user.press(card.getByText("Decline"));
     expect(api.declineTeamInvite).toHaveBeenCalledWith("ti1");
   });
+
+  it("titles the screen with the team's name and goes back to the Bots", async () => {
+    const onBack = jest.fn();
+    await render(<TeamView api={fakeApi(teamAs("member")) as unknown as SuperBotApi} canWrite onBack={onBack} />);
+    expect(await screen.findByRole("header", { name: "Alpha" })).toBeOnTheScreen();
+    await userEvent.setup().press(screen.getByRole("button", { name: "Back to Bots" }));
+    expect(onBack).toHaveBeenCalled();
+  });
 });

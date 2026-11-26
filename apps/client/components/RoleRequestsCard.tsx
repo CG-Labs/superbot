@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { ApiError, type SuperBotApi } from "../src/api";
 import { hoursLabel, requestChoices, requestDraftError, requestStatusLabel } from "../src/roles";
-import { colors } from "../src/theme";
+import { themedStyles, useTheme } from "../src/theme";
 import type { MyRoleRequests, RequestableRole } from "../src/types";
 import { Chips } from "./Chips";
+import { kit, Spinner } from "./ui";
 
 export type RoleRequestsApi = Pick<SuperBotApi, "myRoleRequests" | "requestRole" | "withdrawRoleRequest">;
 
@@ -23,6 +24,8 @@ function firstScope(r: RequestableRole | undefined): Scope {
  * nor on a server from before requests.
  */
 export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
+  const styles = useStyles();
+  const t = useTheme();
   const [view, setView] = useState<MyRoleRequests | null | undefined>(undefined);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [roleId, setRoleId] = useState("");
@@ -76,7 +79,7 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
             </Pressable>
           </>
         ) : (
-          <ActivityIndicator color={colors.textDim} />
+          <Spinner />
         )}
       </View>
     );
@@ -149,7 +152,7 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
             value={reason}
             onChangeText={setReason}
             placeholder="Why you need it (an admin sees this)"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             maxLength={500}
             multiline
             editable={!busy}
@@ -197,31 +200,23 @@ export function RoleRequestsCard({ api }: { api: RoleRequestsApi }) {
   );
 }
 
-const styles = StyleSheet.create({
-  card: { backgroundColor: colors.bgSidebar, borderRadius: 14, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.border },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  sectionTitle: { color: colors.textDim, fontSize: 13, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.5 },
-  line: { color: colors.text, fontSize: 14 },
-  good: { color: colors.accent },
-  error: { color: colors.danger },
-  warn: { color: colors.warning },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 13 },
-  list: { gap: 8, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 10 },
-  row: { flexDirection: "row", alignItems: "center", gap: 10 },
-  input: {
-    backgroundColor: colors.bgBubble,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    color: colors.text,
-    fontSize: 15,
-    minHeight: 64,
-    textAlignVertical: "top",
-  },
-  btn: { alignSelf: "flex-start", borderRadius: 999, borderWidth: 1, borderColor: colors.border, paddingVertical: 8, paddingHorizontal: 16 },
-  btnText: { color: colors.text, fontSize: 15 },
-  busy: { opacity: 0.6 },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    card: k.card,
+    cardTitle: k.cardTitle,
+    sectionTitle: { ...k.section, marginTop: 0, marginBottom: 0, paddingHorizontal: 0 },
+    line: k.text,
+    good: k.good,
+    error: k.error,
+    warn: k.warn,
+    dim: k.dim,
+    faint: k.faint,
+    list: { ...k.field, gap: t.space.sm },
+    row: { flexDirection: "row", alignItems: "center", gap: t.space.md },
+    input: { ...k.input, ...k.inputMultiline, minHeight: 64 },
+    btn: { ...k.btn, alignSelf: "flex-start" },
+    btnText: k.btnText,
+    busy: k.disabled,
+  });
 });

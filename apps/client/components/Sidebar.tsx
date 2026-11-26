@@ -5,7 +5,21 @@ import { workingLabel } from "../src/runQueue";
 import { canSeeServiceAccounts } from "../src/serviceAccounts";
 import { useSuperBot } from "../src/SuperBotContext";
 import { hairline, themedStyles, type, useTheme } from "../src/theme";
+import type { BotView } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
+import { EmptyState } from "./EmptyState";
+
+/** Glyph buttons keep their size at large text settings; their names are read out instead. */
+const GLYPH_SCALE = 1.3;
+
+/** What a screen reader says for a Bot in the list: its name, then anything waiting on it. */
+export function botRowLabel(b: BotView, opts: { unread: boolean; needsYou: boolean }): string {
+  const parts = [b.name];
+  if (opts.needsYou) parts.push("needs you on its screen");
+  else if (b.working) parts.push(workingLabel(b));
+  if (opts.unread) parts.push("unread");
+  return parts.join(", ");
+}
 
 interface Props {
   onSelectBot: (id: string) => void;
@@ -83,11 +97,15 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
         </Text>
         {canWrite ? (
           <Pressable style={({ pressed }) => [styles.iconBtn, pressed && styles.navPressed]} onPress={onNewBot} accessibilityRole="button" accessibilityLabel="New Bot">
-            <Text style={styles.iconText}>+</Text>
+            <Text style={styles.iconText} maxFontSizeMultiplier={GLYPH_SCALE}>
+              +
+            </Text>
           </Pressable>
         ) : null}
         <Pressable style={({ pressed }) => [styles.iconBtn, pressed && styles.navPressed]} onPress={onLogout} accessibilityRole="button" accessibilityLabel="Sign out">
-          <Text style={styles.iconText}>⎋</Text>
+          <Text style={styles.iconText} maxFontSizeMultiplier={GLYPH_SCALE}>
+            ⎋
+          </Text>
         </Pressable>
       </View>
       <TextInput
@@ -103,6 +121,9 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
           <Pressable
             style={({ pressed }) => [styles.primary, activeId === primary.id && styles.primaryActive, pressed && styles.navPressed]}
             onPress={() => onSelectBot(primary.id)}
+            role="button"
+            aria-label={botRowLabel(primary, { unread: !!primary.unread && activeId !== primary.id, needsYou: !!handoffs[primary.id] })}
+            aria-selected={activeId === primary.id}
           >
             <BotAvatar color={primary.color} shape={primary.shape} size={56} outline={edge} />
             <View style={styles.meta}>
@@ -120,6 +141,9 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
               key={b.id}
               style={({ pressed }) => [styles.row, activeId === b.id && styles.active, pressed && styles.navPressed]}
               onPress={() => onSelectBot(b.id)}
+              role="button"
+              aria-label={botRowLabel(b, { unread: !!b.unread && activeId !== b.id, needsYou: !!handoffs[b.id] })}
+              aria-selected={activeId === b.id}
             >
               <BotAvatar color={b.color} shape={b.shape} size={40} outline={edge} />
               <View style={styles.meta}>
@@ -140,12 +164,40 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
             </Pressable>
           ))}
           {!list.length ? (
-            <Text style={styles.empty}>{showHidden ? "No hidden bots" : "No bots yet"}</Text>
+            q ? (
+              <EmptyState
+                compact
+                title="No matches"
+                message={`No ${showHidden ? "hidden " : ""}Bots match “${filter}”.`}
+                action={{ label: "Clear search", onPress: () => setFilter("") }}
+              />
+            ) : showHidden ? (
+              <EmptyState compact title="No hidden Bots" message="Bots you hide from the sidebar wait here." />
+            ) : primary ? (
+              canWrite ? (
+                <EmptyState
+                  compact
+                  title={`Just ${primary.name} so far`}
+                  message="Make more Bots for different jobs, each with its own computer."
+                  action={{ label: "New Bot", onPress: onNewBot }}
+                />
+              ) : null
+            ) : !compact ? null : (
+              // Wide windows say this in the chat pane beside the list.
+              <EmptyState
+                compact
+                glyph="+"
+                title="No Bots yet"
+                message={canWrite ? "Make a Bot to start chatting. Each one has its own computer." : "Bots shared with you show up here."}
+                action={canWrite ? { label: "New Bot", onPress: onNewBot } : undefined}
+              />
+            )
           ) : null}
         </View>
         <View style={styles.divider} />
         {nav(showHidden ? "Back to bots" : "Hidden bots", () => setShowHidden(!showHidden))}
         {nav("Approvals", onOpenApprovals, {
+          a11yLabel: approvals.length ? `Approvals, ${approvals.length} waiting` : undefined,
           strong: approvals.length > 0,
           trailing: approvals.length ? (
             <View style={styles.badge}>
@@ -270,7 +322,6 @@ const useStyles = themedStyles((t) =>
       borderRadius: 4,
       backgroundColor: t.c.accent,
     },
-    empty: { color: t.c.textFaint, padding: t.space.md, textAlign: "center", ...type(t, "sm") },
     divider: { height: hairline, backgroundColor: t.c.border, marginVertical: t.space.md, marginHorizontal: t.space.sm },
     section: {
       color: t.c.textFaint,

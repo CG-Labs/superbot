@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
 import { keeperQuestion, keepersQuestion } from "../src/access";
 import type { SuperBotApi } from "../src/api";
 import { COPY_LABEL, copyText } from "../src/clipboard";
@@ -27,9 +27,10 @@ import {
   toggleScope,
   tokenStatus,
 } from "../src/serviceAccounts";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type, useTheme } from "../src/theme";
 import type { CustomRole, MintedServiceToken, ServiceAccount, ServiceAccountChoices, ServiceAccountDraft, ServiceAccountsView, Team } from "../src/types";
 import { Chips } from "./Chips";
+import { kit, PageHeader, Spinner } from "./ui";
 
 interface Props {
   api: SuperBotApi;
@@ -52,19 +53,25 @@ type Picked = { kind: "account"; id: string } | { kind: "new" } | null;
 
 const message = (err: unknown) => (err instanceof Error ? err.message : "Failed");
 
+const InSection = React.createContext(false);
+
+/** A card, or a titled part of one when it sits inside another section. */
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  const styles = useStyles();
+  const nested = React.useContext(InSection);
   return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{title}</Text>
-      {children}
+    <View style={nested ? styles.subsection : styles.section}>
+      <Text style={nested ? styles.subsectionTitle : styles.sectionTitle}>{title}</Text>
+      <InSection.Provider value>{children}</InSection.Provider>
     </View>
   );
 }
 
 function Button({ label, a11y, onPress, danger, primary, disabled }: { label: string; a11y?: string; onPress: () => void; danger?: boolean; primary?: boolean; disabled?: boolean }) {
+  const styles = useStyles();
   return (
     <Pressable
-      style={[styles.btn, primary && styles.primaryBtn, danger && styles.dangerBtn, disabled && styles.disabled]}
+      style={({ pressed }) => [styles.btn, pressed && !primary && !danger && styles.pressed, primary && styles.primaryBtn, danger && styles.dangerBtn, disabled && styles.disabled]}
       disabled={disabled}
       onPress={onPress}
       accessibilityRole="button"
@@ -77,6 +84,7 @@ function Button({ label, a11y, onPress, danger, primary, disabled }: { label: st
 }
 
 function Tags({ names, empty }: { names: string[]; empty: string }) {
+  const styles = useStyles();
   if (!names.length) return <Text style={styles.dim}>{empty}</Text>;
   return (
     <View style={styles.tags}>
@@ -94,6 +102,7 @@ function Tags({ names, empty }: { names: string[]; empty: string }) {
  * is the end of it: rotating or making another token is the only way to get one.
  */
 function TokenReveal({ minted, onDone }: { minted: MintedServiceToken; onDone: () => void }) {
+  const styles = useStyles();
   const [copied, setCopied] = useState<boolean | null>(null);
   return (
     <View style={styles.reveal} testID="token-reveal">
@@ -132,6 +141,8 @@ function AccountForm({
   editing: boolean;
   admin: boolean;
 }) {
+  const styles = useStyles();
+  const t = useTheme();
   const custom = choices.roles.find((r) => r.id === draft.role && !r.builtIn);
   const teams = teamOptions(choices, kept?.team);
   const keepRole = kept && draft.team === (kept.team?.id ?? "") ? kept.role : null;
@@ -143,7 +154,7 @@ function AccountForm({
           value={draft.name}
           onChangeText={(name) => setDraft({ ...draft, name })}
           placeholder="HR sync"
-          placeholderTextColor={colors.textFaint}
+          placeholderTextColor={t.c.textFaint}
           maxLength={60}
           accessibilityLabel="Service account name"
         />
@@ -152,7 +163,7 @@ function AccountForm({
           value={draft.description}
           onChangeText={(description) => setDraft({ ...draft, description })}
           placeholder="What calls with it (optional)"
-          placeholderTextColor={colors.textFaint}
+          placeholderTextColor={t.c.textFaint}
           multiline
           maxLength={500}
           accessibilityLabel="Service account description"
@@ -184,7 +195,7 @@ function AccountForm({
             value={draft.owner}
             onChangeText={(owner) => setDraft({ ...draft, owner })}
             placeholder="Owner's email or id"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             autoCapitalize="none"
             autoCorrect={false}
             accessibilityLabel="Owner's email or id"
@@ -197,6 +208,7 @@ function AccountForm({
 }
 
 function NewAccount({ api, view, choices, admin, onBusy, onCreated }: { api: SuperBotApi; view: ServiceAccountsView; choices: ServiceAccountChoices; admin: boolean; onBusy: (busy: boolean) => void; onCreated: (account: ServiceAccount, minted: MintedServiceToken | null, error: string | null) => Promise<void> }) {
+  const styles = useStyles();
   const [draft, setDraft] = useState<ServiceAccountDraft>(emptyDraft());
   const [firstToken, setFirstToken] = useState(true);
   const [days, setDays] = useState(view.defaultDays);
@@ -282,6 +294,8 @@ function AccountDetail({
   onBusy: (busy: boolean) => void;
   notice: string | null;
 }) {
+  const styles = useStyles();
+  const t = useTheme();
   const [full, setFull] = useState<ServiceAccount | null>(null);
   const [draft, setDraft] = useState<ServiceAccountDraft>(draftOf(account));
   const base = useRef(draftOf(account));
@@ -433,8 +447,8 @@ function AccountDetail({
       {full && (keptBots.length || keepable.length) ? (
         <Section title={`Bots it keeps (${keptBots.length} of ${view.maxKeptBots ?? 20})`}>
           {keptBots.map((b) => (
-            <View key={b.id} style={styles.row}>
-              <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
+            <View key={b.id} style={styles.item}>
+              <Text style={styles.itemText} numberOfLines={1}>
                 {b.name}
               </Text>
               <Button label="Take back" a11y={`Take ${b.name} back`} disabled={busy} onPress={() => void takeBack(b)} />
@@ -476,12 +490,12 @@ function AccountDetail({
 
       <Section title={`Tokens${tokens ? ` (${sa.tokens} live)` : ""}`}>
         {tokens == null ? (
-          <ActivityIndicator color={colors.textDim} />
+          <Spinner />
         ) : tokens.length ? (
           tokens.map((t) => (
             <View key={t.id} style={styles.token}>
               <View style={styles.row}>
-                <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
+                <Text style={styles.itemText} numberOfLines={1}>
                   {t.name} <Text style={styles.mono}>{t.preview}</Text>
                 </Text>
                 {canRotate(t) && manage ? (
@@ -523,7 +537,7 @@ function AccountDetail({
             value={tokenName}
             onChangeText={setTokenName}
             placeholder="Token name (optional), e.g. CI"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={t.c.textFaint}
             maxLength={60}
             accessibilityLabel="Token name"
           />
@@ -569,6 +583,7 @@ function AccountDetail({
  * any other owner sees theirs, revokes their tokens and disables them (ADR 0239).
  */
 export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
+  const styles = useStyles();
   const { width } = useWindowDimensions();
   const wide = width >= 900;
   const [view, setView] = useState<ServiceAccountsView | null>(null);
@@ -654,51 +669,52 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
 
   return (
     <View style={styles.root}>
-      <View style={styles.header}>
-        <Pressable onPress={onBack} disabled={busy} accessibilityState={{ disabled: busy }} accessibilityRole="button" accessibilityLabel="Back to Bots">
-          <Text style={styles.back}>‹ Bots</Text>
-        </Pressable>
-        <Text style={styles.title}>{own ? "Your service accounts" : "Service accounts"}</Text>
-        {manage ? <Button label="New service account" primary disabled={!view || busy} onPress={() => pick({ kind: "new" })} /> : null}
-      </View>
+      <PageHeader
+        title={own ? "Your service accounts" : "Service accounts"}
+        onBack={onBack}
+        backDisabled={busy}
+        right={manage ? <Button label="New service account" primary disabled={!view || busy} onPress={() => pick({ kind: "new" })} /> : null}
+      />
       <View style={styles.body}>
         <View style={wide ? styles.listPaneWide : styles.listPane}>
           {error ? <Text style={styles.error}>{error}</Text> : null}
-          {!view && !error ? <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} /> : null}
+          {!view && !error ? <Spinner style={styles.spinner} /> : null}
           {view ? (
-            <ScrollView contentContainerStyle={{ gap: 4, paddingBottom: 24 }}>
-              {view.serviceAccounts.map((s) => (
-                <Pressable
-                  key={s.id}
-                  style={[styles.listRow, picked?.kind === "account" && picked.id === s.id && styles.selected]}
-                  onPress={() => pick({ kind: "account", id: s.id })}
-                  disabled={busy}
-                  accessibilityState={{ disabled: busy }}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Service account ${s.name}`}
-                >
-                  <Text style={styles.text}>
-                    {s.name}
-                    {s.status === "disabled" ? <Text style={styles.warn}> · disabled</Text> : null}
-                    {!s.ownerActive ? <Text style={styles.warn}> · owner inactive</Text> : null}
-                    {s.ownerActive && s.ownerOnTeam === false ? <Text style={styles.warn}> · owner off its team</Text> : null}
+            <ScrollView contentContainerStyle={styles.list}>
+              <View style={styles.listCard}>
+                {view.serviceAccounts.map((s, i) => (
+                  <Pressable
+                    key={s.id}
+                    style={({ pressed }) => [styles.listRow, i === 0 && styles.listRowFirst, pressed && styles.pressed, picked?.kind === "account" && picked.id === s.id && styles.selected]}
+                    onPress={() => pick({ kind: "account", id: s.id })}
+                    disabled={busy}
+                    accessibilityState={{ disabled: busy }}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Service account ${s.name}`}
+                  >
+                    <Text style={styles.rowName}>
+                      {s.name}
+                      {s.status === "disabled" ? <Text style={styles.warn}> · disabled</Text> : null}
+                      {!s.ownerActive ? <Text style={styles.warn}> · owner inactive</Text> : null}
+                      {s.ownerActive && s.ownerOnTeam === false ? <Text style={styles.warn}> · owner off its team</Text> : null}
+                    </Text>
+                    <Text style={styles.faint}>
+                      {roleLabel(s)} · {s.tokens} live {s.tokens === 1 ? "token" : "tokens"}
+                      {s.keptBots ? ` · keeps ${s.keptBots} ${s.keptBots === 1 ? "Bot" : "Bots"}` : ""} · {lastUsedLabel(s.lastUsedAt).toLowerCase()}
+                    </Text>
+                  </Pressable>
+                ))}
+                {!view.serviceAccounts.length ? (
+                  <Text style={styles.empty}>
+                    {!manage ? "You own no service accounts." : own ? "You own no service accounts yet. Make one for each script or integration of yours that calls the API." : "No service accounts yet. Make one for each script or integration that calls the API."}
                   </Text>
-                  <Text style={styles.faint}>
-                    {roleLabel(s)} · {s.tokens} live {s.tokens === 1 ? "token" : "tokens"}
-                    {s.keptBots ? ` · keeps ${s.keptBots} ${s.keptBots === 1 ? "Bot" : "Bots"}` : ""} · {lastUsedLabel(s.lastUsedAt).toLowerCase()}
-                  </Text>
-                </Pressable>
-              ))}
-              {!view.serviceAccounts.length ? (
-                <Text style={styles.empty}>
-                  {!manage ? "You own no service accounts." : own ? "You own no service accounts yet. Make one for each script or integration of yours that calls the API." : "No service accounts yet. Make one for each script or integration that calls the API."}
-                </Text>
-              ) : null}
+                ) : null}
+              </View>
             </ScrollView>
           ) : null}
         </View>
         {wide ? (
-          <ScrollView style={styles.detailPane} contentContainerStyle={{ padding: 20 }}>
+          <ScrollView style={styles.detailPane} contentContainerStyle={styles.detailBody}>
             {detail ?? <Text style={styles.empty}>{manage ? "Pick a service account to see its tokens, or make a new one." : "Pick a service account to see its tokens and what it can use."}</Text>}
           </ScrollView>
         ) : null}
@@ -709,7 +725,7 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
             <Pressable style={styles.modalHeader} onPress={() => pick(null)} accessibilityRole="button">
               <Text style={styles.back}>‹ Service accounts</Text>
             </Pressable>
-            <ScrollView contentContainerStyle={{ padding: 16, paddingRight: 20 }}>{detail}</ScrollView>
+            <ScrollView contentContainerStyle={styles.modalBody}>{detail}</ScrollView>
           </View>
         </Modal>
       ) : null}
@@ -717,56 +733,72 @@ export function ServiceAccountsAdmin({ api, onBack, admin }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
-  back: { color: colors.blueDot, fontSize: 16 },
-  title: { color: colors.text, fontSize: 20, fontWeight: "600", flex: 1 },
-  body: { flex: 1, flexDirection: "row" },
-  listPane: { flex: 1, padding: 12 },
-  listPaneWide: { width: 400, padding: 12, borderRightWidth: 1, borderRightColor: colors.border },
-  detailPane: { flex: 1 },
-  listRow: { padding: 12, borderRadius: 14, gap: 2 },
-  selected: { backgroundColor: colors.bgActive },
-  wrap: { gap: 16 },
-  name: { color: colors.text, fontSize: 22, fontWeight: "600" },
-  text: { color: colors.text },
-  dim: { color: colors.textDim },
-  faint: { color: colors.textFaint, fontSize: 13 },
-  mono: { color: colors.textDim, fontFamily: "monospace", fontSize: 13 },
-  warn: { color: colors.warning },
-  error: { color: colors.danger, padding: 4 },
-  empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
-  section: { gap: 8, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 12 },
-  sectionTitle: { color: colors.textDim, fontSize: 13, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.5 },
-  row: { flexDirection: "row", alignItems: "center", gap: 10, flexWrap: "wrap" },
-  token: { gap: 4, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: colors.border },
-  rotate: { gap: 8, paddingTop: 6 },
-  reveal: { gap: 10, backgroundColor: colors.bgBubble, borderRadius: 14, padding: 14, borderWidth: 1, borderColor: "#2d4a33" },
-  secret: { color: colors.text, fontFamily: "monospace", fontSize: 13, backgroundColor: "#151515", borderRadius: 10, padding: 10 },
-  perm: { flexDirection: "row", gap: 10, alignItems: "center", paddingVertical: 4 },
-  check: { width: 22, height: 22, borderRadius: 6, borderWidth: 1, borderColor: "#3a3a3a", color: "#111", textAlign: "center", lineHeight: 20, fontSize: 14 },
-  checkOn: { backgroundColor: "#f2f2f2", borderColor: "#f2f2f2" },
-  tags: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  tag: { color: colors.textDim, fontSize: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2 },
-  input: {
-    backgroundColor: colors.bgBubble,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    color: colors.text,
-    fontSize: 15,
-  },
-  multiline: { minHeight: 64, textAlignVertical: "top" },
-  btn: { paddingVertical: 7, paddingHorizontal: 16, borderRadius: 999, borderWidth: 1, borderColor: "#3a3a3a" },
-  btnText: { color: colors.text, fontSize: 14 },
-  primaryBtn: { backgroundColor: "#f2f2f2", borderColor: "#f2f2f2" },
-  primaryText: { color: "#111" },
-  dangerBtn: { borderColor: "#5a2a2c" },
-  dangerText: { color: colors.danger },
-  disabled: { opacity: 0.5 },
-  modalRoot: { flex: 1, backgroundColor: colors.bgMain, paddingTop: 32 },
-  modalHeader: { padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border, backgroundColor: colors.bgMain },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    back: k.backText,
+    body: { flex: 1, flexDirection: "row" },
+    listPane: { flex: 1, padding: t.space.md },
+    listPaneWide: { width: 400, padding: t.space.md, backgroundColor: t.c.surface, borderRightWidth: hairline, borderRightColor: t.c.border },
+    list: { gap: t.space.md, paddingBottom: t.space.xl },
+    spinner: { marginTop: t.space.xl },
+    listCard: { ...k.card, padding: 0, gap: 0, overflow: "hidden" },
+    listRow: { paddingVertical: t.space.md, paddingHorizontal: t.space.lg, gap: t.space.xxs, borderTopWidth: hairline, borderTopColor: t.c.border },
+    listRowFirst: { borderTopWidth: 0 },
+    rowName: { ...k.text, fontWeight: t.font.weight.medium },
+    pressed: k.btnPressed,
+    selected: { backgroundColor: t.c.selected },
+    detailPane: { flex: 1 },
+    detailBody: { padding: t.space.xl, width: "100%", maxWidth: 760, alignSelf: "center" },
+    wrap: { gap: t.space.lg },
+    name: { color: t.c.text, ...type(t, "xl"), fontWeight: t.font.weight.semibold },
+    text: k.text,
+    dim: k.dim,
+    faint: k.faint,
+    mono: { ...k.mono, color: t.c.textMuted },
+    warn: k.warn,
+    error: k.error,
+    empty: k.empty,
+    section: k.card,
+    sectionTitle: k.cardTitle,
+    subsection: k.field,
+    subsectionTitle: k.label,
+    row: k.actions,
+    item: { ...k.row, flexWrap: "wrap" },
+    itemText: { ...k.text, flex: 1 },
+    token: { gap: t.space.xs, paddingTop: t.space.md, borderTopWidth: hairline, borderTopColor: t.c.border },
+    rotate: { ...k.inset, marginTop: t.space.xs },
+    reveal: { ...k.noticeWarn, gap: t.space.md },
+    secret: { ...k.mono, backgroundColor: t.c.raised, borderRadius: t.radius.sm, padding: t.space.md },
+    perm: { flexDirection: "row", gap: t.space.md, alignItems: "center", paddingVertical: t.space.xs },
+    check: {
+      width: 22,
+      height: 22,
+      borderRadius: t.radius.sm,
+      borderWidth: 1.5,
+      borderColor: t.c.borderStrong,
+      color: t.c.onAccent,
+      textAlign: "center",
+      ...type(t, "sm"),
+      lineHeight: 19,
+      fontWeight: t.font.weight.bold,
+      overflow: "hidden",
+    },
+    checkOn: { backgroundColor: t.c.accent, borderColor: t.c.accent },
+    tags: k.tags,
+    tag: k.tag,
+    input: k.input,
+    multiline: k.inputMultiline,
+    btn: { ...k.btn, alignSelf: "flex-start" },
+    btnText: k.btnText,
+    primaryBtn: k.primary,
+    primaryText: k.primaryText,
+    dangerBtn: k.danger,
+    dangerText: k.dangerText,
+    disabled: k.disabled,
+    modalRoot: { flex: 1, backgroundColor: t.c.bg, paddingTop: t.space.xxl },
+    modalHeader: { ...k.header, minHeight: 0 },
+    modalBody: { padding: t.space.lg, paddingBottom: t.space.xxxl },
+  });
 });

@@ -1,12 +1,13 @@
 import React from "react";
 import { Redirect, router } from "expo-router";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ServiceAccountsAdmin } from "../components/ServiceAccountsAdmin";
+import { kit, Spinner } from "../components/ui";
 import { isAdmin } from "../src/admin";
 import { canSeeServiceAccounts } from "../src/serviceAccounts";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors } from "../src/theme";
+import { themedStyles } from "../src/theme";
 
 /**
  * Admins manage every service account; anyone whose role holds users.manage, the ones they
@@ -14,11 +15,12 @@ import { colors } from "../src/theme";
  * (ADR 0239). The server checks it all; this just says so to everyone else.
  */
 export default function ServiceAccountsScreen() {
+  const styles = useStyles();
   const { ready, api, me } = useSuperBot();
   if (!ready) {
     return (
       <View style={styles.loading}>
-        <ActivityIndicator color={colors.textDim} />
+        <Spinner />
       </View>
     );
   }
@@ -40,10 +42,13 @@ export default function ServiceAccountsScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bgMain },
-  loading: { flex: 1, justifyContent: "center", backgroundColor: colors.bgMain },
-  denied: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12, padding: 24 },
-  text: { color: colors.text, fontSize: 16, textAlign: "center" },
-  link: { color: colors.blueDot },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    root: k.root,
+    loading: k.center,
+    denied: k.center,
+    text: k.text,
+    link: k.link,
+  });
 });

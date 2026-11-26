@@ -1,5 +1,5 @@
 import React from "react";
-import { act, render, screen, userEvent } from "@testing-library/react-native";
+import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
 import { ScreenViewer } from "../ScreenViewer";
 import type { Message } from "../../src/types";
 
@@ -65,6 +65,22 @@ describe("ScreenViewer", () => {
     expect(screen.getByRole("button", { name: "Take over" })).toBeDisabled();
   });
 
+  it("shows the screen starting, and tries again at once on request", async () => {
+    let fail!: (err: Error) => void;
+    const fetchUrl = jest
+      .fn()
+      .mockImplementationOnce(() => new Promise<string>((_, reject) => (fail = reject)))
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a");
+    await render(<ScreenViewer botId="b1" botName="Ada" fetchUrl={fetchUrl} onClose={jest.fn()} retryMs={60_000} />);
+    expect(screen.getByRole("progressbar", { name: "Starting Ada's screen" })).toBeOnTheScreen();
+
+    await act(async () => fail(new Error("The screen is starting.")));
+    expect(screen.getByRole("alert")).toHaveTextContent(/Can't show Ada's screen.*The screen is starting\./);
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+    expect(await screen.findByTestId("screen-frame")).toBeOnTheScreen();
+    expect(fetchUrl).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps the screen alive and drops control when the link changes", async () => {
     jest.useFakeTimers();
     try {
@@ -128,6 +144,58 @@ describe("ScreenViewer", () => {
       expect(fetchUrl).toHaveBeenCalledTimes(3);
       expect(screen.getByTestId("screen-frame")).toHaveTextContent(/token=b/);
       expect(screen.getByTestId("screen-shield")).toBeOnTheScreen();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("still drops control after Try again if the screen restarted", async () => {
+    const fetchUrl = jest
+      .fn()
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a")
+      .mockRejectedValueOnce(new Error("The screen is starting."))
+      .mockResolvedValueOnce("https://h/screen/6902/?token=b");
+    jest.useFakeTimers();
+    try {
+      await render(
+        <ScreenViewer botId="b1" botName="Ada" fetchUrl={fetchUrl} onClose={jest.fn()} initialControl refreshMs={1000} retryMs={60_000} />,
+      );
+      expect(await screen.findByTestId("screen-frame")).toHaveTextContent(/token=a/);
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.getByRole("button", { name: "Give back" })).toBeOnTheScreen();
+
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+      expect(fetchUrl).toHaveBeenCalledTimes(3);
+      expect(screen.getByTestId("screen-frame")).toHaveTextContent(/token=b/);
+      expect(screen.getByTestId("screen-shield")).toBeOnTheScreen();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("keeps control after Try again when it's still the same screen", async () => {
+    const fetchUrl = jest
+      .fn()
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a")
+      .mockRejectedValueOnce(new Error("The screen is busy."))
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a");
+    jest.useFakeTimers();
+    try {
+      await render(<ScreenViewer botId="b1" botName="Ada" fetchUrl={fetchUrl} onClose={jest.fn()} refreshMs={1000} retryMs={60_000} />);
+      expect(await screen.findByTestId("screen-frame")).toHaveTextContent(/token=a/);
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Take over" })));
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.getByRole("alert")).toHaveTextContent(/busy/);
+
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+      expect(fetchUrl).toHaveBeenCalledTimes(3);
+      expect(screen.getByTestId("screen-frame")).toHaveTextContent(/token=a/);
+      expect(screen.getByRole("button", { name: "Give back" })).toBeOnTheScreen();
+      expect(screen.queryByTestId("screen-shield")).toBeNull();
     } finally {
       jest.useRealTimers();
     }

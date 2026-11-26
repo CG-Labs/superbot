@@ -45,14 +45,14 @@ describe("TwoFactorCard", () => {
     expect(screen.queryByText("Required for")).not.toBeOnTheScreen();
   });
 
-  it("keeps the recovery codes dark in the dark-only settings card, even on a light device", async () => {
-    mockScheme = "light";
+  it.each(["light", "dark"] as const)("shows the recovery codes in the card's %s theme", async (scheme) => {
+    mockScheme = scheme;
     const user = userEvent.setup();
     await render(<TwoFactorCard api={fakeApi(on)} />);
     await user.press(await screen.findByText("New recovery codes"));
     await user.type(screen.getByLabelText("Code or recovery code"), "654321");
     await user.press(screen.getByText("Make new codes"));
-    expect(await screen.findByText("ccccc-ddddd")).toHaveStyle({ color: themes.dark.c.text });
+    expect(await screen.findByText("ccccc-ddddd")).toHaveStyle({ color: themes[scheme].c.text });
     mockScheme = null;
   });
 

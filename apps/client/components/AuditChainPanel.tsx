@@ -1,15 +1,16 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { chainLines, shortHash, type ChainLine } from "../src/auditChain";
-import { colors } from "../src/theme";
+import { hairline, type Theme, themedStyles, type, useTheme } from "../src/theme";
 import type { AuditChainState, AuditVerifyReport } from "../src/types";
+import { kit, Spinner } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "auditChain" | "auditVerify">;
 }
 
-const TONES: Record<ChainLine["tone"], string> = { ok: colors.accent, warn: colors.warning, bad: colors.danger, dim: colors.textDim };
+const tones = (t: Theme): Record<ChainLine["tone"], string> => ({ ok: t.c.success, warn: t.c.warning, bad: t.c.danger, dim: t.c.textMuted });
 
 function checkResult(r: AuditVerifyReport): ChainLine {
   const c = r.checkpoints;
@@ -24,6 +25,8 @@ function checkResult(r: AuditVerifyReport): ChainLine {
 
 /** The audit chain's state, read-only (ADR 0149): last check, head, signed checkpoint, timestamps, SIEM lag. */
 export function AuditChainPanel({ api }: Props) {
+  const styles = useStyles();
+  const tone = tones(useTheme());
   const [state, setState] = useState<AuditChainState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
@@ -60,18 +63,18 @@ export function AuditChainPanel({ api }: Props) {
     <View style={styles.panel} testID="audit-chain">
       <View style={styles.top}>
         <Text style={styles.title}>Hash chain</Text>
-        <Pressable onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Refresh the chain's state">
+        <Pressable onPress={() => void load()} accessibilityRole="button" accessibilityLabel="Refresh the chain's state" style={styles.refresh}>
           <Text style={styles.link}>Refresh</Text>
         </Pressable>
-        <Pressable style={[styles.btn, checking && styles.busy]} onPress={() => void check()} disabled={checking} accessibilityRole="button" accessibilityState={{ disabled: checking, busy: checking }}>
+        <Pressable style={({ pressed }) => [styles.btn, pressed && styles.btnPressed, checking && styles.busy]} onPress={() => void check()} disabled={checking} accessibilityRole="button" accessibilityState={{ disabled: checking, busy: checking }}>
           <Text style={styles.btnText}>{checking ? "Checking…" : "Check now"}</Text>
         </Pressable>
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {!state && !error ? <ActivityIndicator color={colors.textDim} /> : null}
+      {!state && !error ? <Spinner /> : null}
       {lines.map((l, i) => (
-        <View key={`${i}:${l.label}`} style={styles.line} accessibilityLabel={`${l.label}: ${l.text}`}>
-          <View style={[styles.dot, { backgroundColor: TONES[l.tone] }]} />
+        <View key={`${i}:${l.label}`} style={[styles.line, i === 0 && styles.lineFirst]} accessibilityLabel={`${l.label}: ${l.text}`}>
+          <View style={[styles.dot, { backgroundColor: tone[l.tone] }]} />
           <Text style={styles.label}>{l.label}</Text>
           <Text style={[styles.text, l.tone === "bad" && styles.bad]} selectable>
             {l.text}
@@ -87,19 +90,30 @@ export function AuditChainPanel({ api }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  panel: { gap: 8, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border, backgroundColor: colors.bgSidebar },
-  top: { flexDirection: "row", alignItems: "center", gap: 16 },
-  title: { color: colors.text, fontSize: 16, fontWeight: "600", flex: 1 },
-  link: { color: colors.blueDot },
-  btn: { borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 14 },
-  btnText: { color: colors.text },
-  busy: { opacity: 0.6 },
-  line: { flexDirection: "row", alignItems: "flex-start", gap: 8, flexWrap: "wrap" },
-  dot: { width: 8, height: 8, borderRadius: 4, marginTop: 6 },
-  label: { color: colors.textDim, width: 120 },
-  text: { color: colors.text, flex: 1, minWidth: 200 },
-  bad: { color: colors.danger },
-  faint: { color: colors.textFaint, fontSize: 12, fontFamily: "monospace" },
-  error: { color: colors.danger },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    panel: { ...k.card, gap: t.space.xs, marginHorizontal: t.space.lg, marginTop: t.space.md, marginBottom: t.space.xs },
+    top: { flexDirection: "row", alignItems: "center", gap: t.space.sm, marginBottom: t.space.xs },
+    title: { ...k.cardTitle, flex: 1 },
+    refresh: { paddingHorizontal: t.space.sm, paddingVertical: t.space.xs },
+    link: k.link,
+    btn: { ...k.btn, ...k.btnSmall },
+    btnPressed: k.btnPressed,
+    btnText: k.btnText,
+    busy: k.disabled,
+    line: { ...k.row, alignItems: "flex-start", flexWrap: "wrap", gap: t.space.sm, paddingVertical: t.space.sm },
+    lineFirst: k.rowFirst,
+    dot: {
+      width: t.space.sm,
+      height: t.space.sm,
+      borderRadius: t.radius.pill,
+      marginTop: (t.font.lineHeight.sm - t.space.sm) / 2,
+    },
+    label: { ...k.dim, width: 120 },
+    text: { color: t.c.text, ...type(t, "sm"), flex: 1, minWidth: 200 },
+    bad: { color: t.c.danger },
+    faint: { ...k.faint, fontFamily: t.font.mono, paddingTop: t.space.sm, borderTopWidth: hairline, borderTopColor: t.c.border },
+    error: k.error,
+  });
 });

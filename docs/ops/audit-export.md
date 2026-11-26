@@ -136,6 +136,7 @@ In `.env` (installer) or `deploy/docker/.env` (Compose), then restart botd:
 | `AUDIT_EXPORT_START` | `all` | For a new sink: `all` sends the history still in the database first, `new` only events from now on. A named sink can have its own, `AUDIT_EXPORT_START_<NAME>` |
 | `AUDIT_EXPORT_COMPRESS` | `off` | `gzip`: webhook, Azure Monitor and Datadog request bodies go gzipped (Google SecOps stays plain), with `Content-Encoding: gzip`. A named sink can have its own, `AUDIT_EXPORT_COMPRESS_<NAME>` ([below](#compression)) |
 | `AUDIT_EXPORT_LABELS` | none | Datadog and Google SecOps only: `key=value` pairs split by commas, such as `env=prod,tenant=acme`, sent beside each event as Datadog tags or SecOps ingestion labels. A named sink can have its own, `AUDIT_EXPORT_LABELS_<NAME>`; `AUDIT_EXPORT_NAMESPACE` is SecOps's namespace ([below](#labels)) |
+| `AUDIT_EXPORT_DATA_REGION` | none | The data region each sink keeps what it gets in, such as `gb-lon`. A sink stated to be outside a pinned person's region gets their events as sealed rows, without their details. A named sink can have its own, `AUDIT_EXPORT_DATA_REGION_<NAME>`, or `off` ([below](#pinned-peoples-audit-details)) |
 
 A bad value stops botd at startup with a message naming the setting. URLs with a username, password, query or fragment are refused, so put tokens in `AUDIT_EXPORT_HEADERS`.
 
@@ -257,7 +258,7 @@ This checks the chain as usual and also reads the whole archive (`GET /api/audit
 - the archive begins with the first event botd sent it, and reaches the last event botd says it delivered;
 - every archived event has the same hash in this server's log. This catches a log rebuilt after an event was changed: its own chain verifies, but it no longer matches what was archived. It's the same as pinning every event (`--pin`). While the event is still here, what the archive says it was must also match this server's row: its fields, and, unless an erasure has since rewritten them, the personal ones.
 
-The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired`, `checkpoints`, `timestamps` and `trustedTimestamps` (null without `AUDIT_TIMESTAMP_CA_FILE`), with the newest timestamp as `lastTimestamp`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `bound`, `boundFixed` and `unbound` count the copies whose hash vouches for every field (they have `chainSalt`), only the fields no erasure changes (erased or redacted on the way out), or nothing (sent before `digestsAfter`). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
+The check fails, and exits 1, if any of that doesn't hold. `firstBroken` then names the first event here that differs from the archive (reason `archive`). The answer's `archive` block counts `objects`, `events`, `matched`, `gone` (deleted here by retention, with the anchor's hash still checked), `mismatched`, `altered`, `missing`, `locked`, `lockExpired`, `checkpoints`, `timestamps` and `trustedTimestamps` (null without `AUDIT_TIMESTAMP_CA_FILE`), with the newest timestamp as `lastTimestamp`. It also counts `repeated` (events a restarted export wrote twice), `retried` (extra identical versions of an object) and `hidden` (objects behind a delete marker, which are still read). `bound`, `boundFixed` and `unbound` count the copies whose hash vouches for every field (they have `chainSalt`), only the fields no erasure changes (erased or redacted on the way out), or nothing (sent before `digestsAfter`). `heldBack` counts the matched events the archive holds only the sealed row of, because another region's chat store kept their details when they were sent ([below](#pinned-peoples-audit-details)). `firstProblems` lists the first 20 problems, each with a `key`, `id` and one of these reasons:
 
 | Reason | Meaning |
 |---|---|
@@ -562,6 +563,23 @@ AUDIT_EXPORT_NAMESPACE_SECOPS=prod-eu
 - **Not evidence.** Labels go beside the line, never in it or on the chain: `botctl audit verify-lines` neither needs nor checks them. Changing them doesn't restart a sink, and events already sent keep the labels they had.
 - **Status.** The startup log says `tagged ...` or `labelled ..., in namespace ...`, and `botctl audit siem` shows `datadog.tags`, `googleSecOps.labels` and `googleSecOps.namespace`.
 
+## Pinned people's audit details
+
+A person pinned to a region with a chat store has the details of their audit events (who, IP address, browser, session, what changed) kept in that store, not in botd's own log ([ADR 0316](../adr/0316-audit-details-in-the-regional-store.md), [ADR 0321](../adr/0321-events-about-a-pinned-person-in-their-store.md)). Say where each sink keeps what it gets, and the export keeps those details in the region too. Design: [ADR 0330](../adr/0330-audit-export-held-to-a-pins-region.md).
+
+```sh
+AUDIT_EXPORT=london=https://<london-collector>/ingest,soc=syslog+tls://<us-soc-host>,s3://<us-bucket>/<prefix>
+AUDIT_EXPORT_DATA_REGION=us-east-1
+AUDIT_EXPORT_DATA_REGION_LONDON=gb-lon
+```
+
+- **Settings.** `AUDIT_EXPORT_DATA_REGION` is the region every sink is in. `AUDIT_EXPORT_DATA_REGION_<NAME>` is a named sink's own and wins; `off` says that sink's region isn't stated. Above, `london` is in `gb-lon` and `soc` and the archive are in `us-east-1`. A region is lowercase letters, digits and inner dashes, as `MACHINE_REGIONS` names them, but it needn't be one of them. botd can't see where a SIEM or a bucket keeps data, so this is your statement, as `SERVER_DATA_REGION` is.
+- **What each sink gets.** An event whose details `gb-lon`'s chat store keeps goes whole to `london`. `soc` and the archive get its sealed row: `details` is `{"inChatStore":"gb-lon"}`, every other field an erasure may rewrite (`actorId`, `actorName`, `actorEmail`, `actorSubject`, `targetId`, `ip`, `userAgent`, `sessionId`, `onBehalfOf`) is null, and `chainSalt` is left out. They still get every event, in order, with its kind, outcome, time, roles and Bot, and its `chainDigest`, so the line still gives its `chainHash` and the chain runs on. Events whose details are in botd's own log go whole to every sink. A sink with no stated region gets every event whole, as before.
+- **What decides it.** botd's own row says which store keeps an event's details when the batch goes. A pin, unpin or move after that changes nothing already sent, and changing a sink's region doesn't resend anything. An archive batch that is retried holds back the same events as its first try, so it stays one object: botd records them when it cuts the batch. A batch cut before this version went whole, so its retries go whole too.
+- **Checks.** `botctl audit verify-lines` counts a sealed row as `boundFixed`, as it does an erased event. The [archive check](#check-the-archive) holds it to the fields no erasure may change, and counts it as `heldBack`, only where botd recorded sending it sealed: an archived line that only looks sealed is held to every field, so a copy stripped of an event's details fails as `contents`.
+- **Status.** `botctl audit siem` shows each sink's `dataRegion`, and `heldBack`, the events sent to it as sealed rows since botd started. The startup log names each sink's region.
+- **Residency reports.** A pin's report lists each sink by name and kind, never its address, with its region and whether it gets their events whole. What the pin doesn't cover names the sinks that get them whole and aren't stated to be in the pin's region. Until every one of their events' details is in the store (the report's chat section counts any left in botd's own database), a sink outside the region gets those few whole, and the report says how many (`partly`).
+
 ## Compression
 
 Audit lines compress about tenfold. Gzip is off by default, so keys and bodies stay as downstream tools expect; turn it on where they take it. Design: [ADR 0227](../adr/0227-gzip-for-the-audit-export.md).
@@ -607,7 +625,7 @@ It prints a JSON report: per host, `events`, `copies`, `first` and `firstPrev` (
 What it can't tell you:
 
 - that nothing is missing at the start or the end. Compare `first` and `head` with what botd says it delivered (`botctl audit siem`), or pin a head kept elsewhere: the last `audit.checkpoint` you trust signs it;
-- what a line without `chainSalt` said in its personal fields and `details`. Those are erased or redacted events, and `boundFixed` counts them;
+- what a line without `chainSalt` said in its personal fields and `details`. Those are erased or redacted events, or pinned people's events sent to a sink outside their region, and `boundFixed` counts them;
 - anything about events sent before `digestsAfter`, beyond their links. Check them with `botctl audit verify --archive` while their rows are still here;
 - whether a TSA certificate was revoked. It checks the TSA's chain at the token's time, so a certificate that has since expired still holds, and it reads no revocation list.
 
