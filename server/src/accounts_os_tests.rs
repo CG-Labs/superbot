@@ -584,15 +584,24 @@ async fn user_bs_run_cannot_see_or_control_user_as_screen() {
     assert!(crate::screen::held_by(&c, uid_of(&b_acct)).await, "it is B's, as /proc/net/tcp says");
     drop(squatter);
 
-    // A stopped screen leaves nothing of A's running, and its cookie is gone.
+    // Given to B, A's Bot never hands B's account A's screen: it starts B's own.
+    iso.make_bot_dirs_in(Space::User(&b.owner_id), &a.id).unwrap();
+    let b_owner = crate::screen::Owner::new(&iso, Space::User(&b.owner_id), &a.id).unwrap();
+    let moved = screens.ensure(&a.id, Some(&b_owner), |_| false).await.unwrap();
+    assert_ne!(moved.xauthority, info.xauthority, "B's own cookie");
+    let moved_sock = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{}", &moved.display[1..]));
+    assert_eq!(std::fs::metadata(&moved_sock).unwrap().uid(), uid_of(&b_acct), "B's own display");
+    assert!(!cookie.exists(), "A's screen stopped first");
+
+    // A stopped screen leaves nothing running, and its cookie is gone.
     screens.remove(&a.id).await;
     let start = Instant::now();
-    while std::fs::symlink_metadata(&sock).is_ok() {
-        assert!(start.elapsed() < Duration::from_secs(15), "A's X server is still up");
+    while std::fs::symlink_metadata(&sock).is_ok() || std::fs::symlink_metadata(&moved_sock).is_ok() {
+        assert!(start.elapsed() < Duration::from_secs(15), "an X server is still up");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!cookie.exists());
-    while view(info.port, &info.token).await != "refused" {
+    assert!(!cookie.exists() && !std::path::Path::new(moved.xauthority.as_deref().unwrap()).exists());
+    while view(info.port, &info.token).await != "refused" || view(moved.port, &moved.token).await != "refused" {
         assert!(start.elapsed() < Duration::from_secs(15), "something still answers on A's viewer port");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

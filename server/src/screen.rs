@@ -13,6 +13,7 @@
 use crate::accounts::{Isolation, RunAs, Space};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -215,6 +216,11 @@ impl Owner {
         Some(Owner { uid, home: iso.home_in(space)?, cookie: iso.bot_settings_in(space, bot_id)?.join(COOKIE), state: iso.bot_state_in(space, bot_id)?, run })
     }
 
+    /// Who it is and where its files are: two owners alike here share a screen.
+    fn id(&self) -> (&str, u32, &Path) {
+        (&self.run.account, self.uid, &self.cookie)
+    }
+
     fn key(&self, bot_id: &str) -> String {
         crate::machines::wire::screen_key(bot_id, self.run.teammate.as_deref())
     }
@@ -328,12 +334,14 @@ impl Screens {
         let mut live = self.live.lock().await;
         let mut was = None;
         if let Some(s) = live.get_mut(&key) {
-            if s.alive() {
+            // A Bot given to someone else keeps its key: the old owner's screen isn't the new one's.
+            let same = s.owner.as_ref().map(Owner::id) == owner.map(Owner::id);
+            if same && s.alive() {
                 s.used = Instant::now();
                 return Ok(self.info(s));
             }
-            let s = live.remove(&key).unwrap(); // something crashed: start over
-            was = Some(s.display);
+            let s = live.remove(&key).unwrap(); // something crashed, or another account's: start over
+            was = same.then_some(s.display);
             stop(s).await;
         }
         if live.len() >= self.max as usize {
@@ -591,16 +599,49 @@ fn abstract_name(n: u16) -> String {
 }
 
 fn connect_abstract(n: u16) -> std::io::Result<std::os::unix::net::UnixStream> {
-    use std::os::linux::net::SocketAddrExt;
-    let addr = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name(n).as_bytes())?;
-    std::os::unix::net::UnixStream::connect_addr(&addr)
+    connect_now(abstract_name(n).as_bytes(), true)
+}
+
+/// Connects to a Unix socket at path `name` (or that `abstract` name) without waiting:
+/// a listener whose queue another account filled gets `WouldBlock`, never a botd
+/// stuck while it holds every screen's lock.
+fn connect_now(name: &[u8], abstract_: bool) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: socket() takes no pointers; a valid fd it returns is owned here alone.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: sockaddr_un is plain data; all zeroes is a valid value.
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let start = usize::from(abstract_);
+    if start + name.len() >= sa.sun_path.len() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    for (i, b) in name.iter().enumerate() {
+        sa.sun_path[start + i] = *b as libc::c_char;
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + start + name.len() + usize::from(!abstract_);
+    // SAFETY: `sa` is a valid sockaddr_un of at least `len` bytes for the call.
+    let r = unsafe { libc::connect(fd, (&raw const sa).cast(), len as libc::socklen_t) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let s = std::os::unix::net::UnixStream::from(owned);
+    s.set_nonblocking(false)?;
+    Ok(s)
 }
 
 /// Whether display `n` is free to start on: no X server answers there, and nothing is
 /// left in its place that botd can't remove (another account's file in a folder of root's).
 fn display_clear(n: u16) -> bool {
-    if connect_abstract(n).is_ok() {
-        return false;
+    match connect_abstract(n) {
+        Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) || e.kind() == std::io::ErrorKind::NotFound => {}
+        // Answered, or held with a full queue: someone's.
+        _ => return false,
     }
     let Some((sock, lock)) = x11_paths(n) else { return false };
     [sock, lock].iter().all(|p| match std::fs::remove_file(p) {
@@ -627,6 +668,7 @@ const NO_COOKIE: [u8; 12] = [b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 fn lets_anyone_in(s: &mut std::os::unix::net::UnixStream) -> std::io::Result<bool> {
     use std::io::{Read, Write};
     s.set_read_timeout(Some(Duration::from_secs(3)))?;
+    s.set_write_timeout(Some(Duration::from_secs(3)))?;
     s.write_all(&NO_COOKIE)?;
     let mut status = [0u8; 1];
     s.read_exact(&mut status)?;
@@ -640,7 +682,7 @@ fn check_display(sock: &Path, n: u16, uid: u32) -> Result<(), String> {
     if !m.file_type().is_socket() || m.uid() != uid {
         return Err(format!("{} isn't the account's socket", sock.display()));
     }
-    let mut s = std::os::unix::net::UnixStream::connect(sock).map_err(|e| e.to_string())?;
+    let mut s = connect_now(sock.as_os_str().as_bytes(), false).map_err(|e| e.to_string())?;
     if peer_uid(&s) != Some(uid) {
         return Err(format!("another account's X server answers at {}", sock.display()));
     }
@@ -983,6 +1025,33 @@ mod tests {
     }
 
     #[test]
+    fn a_socket_another_account_stopped_accepting_on_never_holds_botd_up() {
+        use std::os::fd::AsRawFd;
+        use std::os::linux::net::SocketAddrExt;
+        let name = format!("superbot-test-{}", crate::short_id());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let l = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        // SAFETY: a valid listening socket; listen() again only shortens its queue.
+        assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+        let start = Instant::now();
+        let mut held = Vec::new();
+        let full = loop {
+            match connect_now(name.as_bytes(), true) {
+                Ok(c) => held.push(c),
+                Err(e) => break e,
+            }
+            assert!(held.len() < 10, "the queue never filled");
+        };
+        assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock, "{full}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let c = connect_now(name.as_bytes(), true);
+        assert!(c.is_err(), "still full, still no wait");
+        drop(l);
+        let gone = connect_now(name.as_bytes(), true).unwrap_err();
+        assert_eq!(gone.raw_os_error(), Some(libc::ECONNREFUSED), "nobody there: free to take");
+    }
+
+    #[test]
     fn a_display_that_lets_anyone_in_is_refused() {
         use std::io::{Read, Write};
         let dir = std::env::temp_dir().join(format!("superbot-x-{}", crate::short_id()));
@@ -997,7 +1066,7 @@ mod tests {
             c.write_all(&[status]).unwrap();
         };
         for (status, open) in [(1, true), (0, false), (2, false)] {
-            let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let mut s = connect_now(path.as_os_str().as_bytes(), false).unwrap();
             assert_eq!(peer_uid(&s), Some(unsafe { libc::getuid() }));
             let asked = std::thread::scope(|t| {
                 t.spawn(|| answer(status));

@@ -1411,9 +1411,15 @@ impl App {
             if spot.screens
                 && spot.machine.is_none()
                 && let Some(screens) = &self.screens
-                && let Ok(info) = screens.ensure(&bot.id, screen_owner.as_ref(), |id| self.is_running(id)).await
             {
-                env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
+                match screens.ensure(&bot.id, screen_owner.as_ref(), |id| self.is_running(id)).await {
+                    Ok(info) => env.extend(screen::bot_env(&info, &bot.id, &bot_dir)),
+                    Err(e) if e == screen::ALL_BUSY || screen_owner.is_none() => {}
+                    Err(e) => {
+                        let d = json!({ "reason": e, "owner": bot.owner_id, "forUser": teammate, "runId": run_id });
+                        self.db.record(&by.event("screen.start_failed").target("bot", &bot.id).bot(&bot.id).outcome(Outcome::Failure).details(d));
+                    }
+                }
             }
             let mut invoked = json!({
                 "harness": bot.harness, "model": route.model, "effort": route.effort, "provider": route.provider, "tier": tier, "policy": policy.mode,

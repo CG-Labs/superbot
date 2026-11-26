@@ -2907,6 +2907,12 @@ pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::U
     if let Some(sa) = &bot.service_account_id {
         service_accounts::note_released(app, by, sa, std::slice::from_ref(id), "bot_owner_changed");
     }
+    // With per-user accounts its screens are the old owner's account's: they go, and the new owner's start fresh.
+    if app.isolation().is_some()
+        && let Some(screens) = &app.screens
+    {
+        screens.remove(id).await;
+    }
     acl_changed(app, by, id, true).await;
     // It runs on the new owner's machine now: teammates may have no use for the old one.
     machines::offboard::check_owner(app, by, &bot.owner_id);
