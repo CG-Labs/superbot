@@ -181,3 +181,21 @@ async fn verify_takes_a_range_and_keys() {
         assert_eq!(call(port, "GET", &format!("/api/audit/verify?{bad}"), &admin, "").await.0, 400, "{bad}");
     }
 }
+
+/// ADR 0322: the audit trail's alert rules use only metrics `/metrics` writes, with a sink
+/// and a TSA set.
+#[tokio::test]
+async fn the_audit_trail_rules_use_only_metrics_botd_writes() {
+    let (_, app, _, _) = serve_app().await;
+    let (url, _) = tsa(Arc::new(FakeTsa::new()), 0, None).await;
+    checkpoints_with(&app, &[("AUDIT_CHECKPOINT_MINUTES", "0"), ("AUDIT_TIMESTAMP_URL", &url)]);
+    let (sink, _) = collector(0).await;
+    export_to(&app, &[("AUDIT_EXPORT", &sink)]);
+    let m = crate::obs::render(&app);
+    let types: std::collections::BTreeSet<String> = m.lines().filter_map(|l| Some(l.strip_prefix("# TYPE ")?.split(' ').next()?.to_string())).collect();
+    let used = crate::machines_placement_tests::metric_names(include_str!("../../deploy/prometheus/superbot-audit-trail.rules.yml"));
+    assert!(used.len() >= 4, "{used:?}");
+    let missing: Vec<_> = used.difference(&types).collect();
+    assert!(missing.is_empty(), "the audit trail rules use metrics botd doesn't write: {missing:?}");
+    assert!(m.contains(r#"superbot_events_total{event="audit.verified",outcome="failure"} 0"#), "the chain check alert sees the first failure");
+}

@@ -43,6 +43,8 @@ Runbooks for the incidents support sees most:
 | [SCIM provisioning](runbook-scim.md) | The identity provider stops adding or removing people: every reason botd refuses a request, a stopped token, leavers who keep access |
 | [Backups failing or late](runbook-backups.md) | Server or machine backups fail, stay on the host, or fall behind their RPO |
 | [License and seats](runbook-license.md) | The license is ending, has ended or won't install, Bots stopped for it, or no seat is left |
+| [Secrets store](runbook-secrets.md) | Vault or a cloud secret manager can't be read or signed in to, runs are refused for it, or per-run credentials fail |
+| [Audit trail](runbook-audit-trail.md) | The SIEM export fails or a sink was stopped, timestamps fail, or a check of the audit log's chain fails |
 
 The health score's signals, the monthly health check's items and bundle triage's findings each point at one of these.
 
