@@ -1,9 +1,13 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
+import { errorText, friendlyError } from "../src/errors";
 import { lastLink, loginLine, plainOutput, type LoginStream } from "../src/teammateLogins";
-import { colors, HARNESS_NAMES } from "../src/theme";
+import { hairline, HARNESS_NAMES, themedStyles, type } from "../src/theme";
 import type { LoginEvent, TeammateLoginsView } from "../src/types";
+import { InlineError } from "./ErrorState";
+import { ListSkeleton } from "./Skeleton";
+import { kit, usePlaceholder } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "teammateLogins" | "startTeammateLogin" | "teammateLoginInput" | "stopTeammateLogin" | "teammateLogout">;
@@ -29,8 +33,12 @@ interface Running {
  * used for you, and nobody else can use yours.
  */
 export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const [view, setView] = useState<TeammateLoginsView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Why your login couldn't be checked, apart from a failed action, so it can offer a retry. */
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [running, setRunning] = useState<Running | null>(null);
   const [code, setCode] = useState("");
@@ -41,11 +49,11 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
   const load = useCallback(async () => {
     try {
       setView(await api.teammateLogins(ownerId));
-      setError(null);
+      setLoadError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setLoadError(errorText(e, `Couldn't check your ${name} login`));
     }
-  }, [api, ownerId]);
+  }, [api, ownerId, name]);
 
   useEffect(() => {
     void load();
@@ -78,7 +86,7 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
     r.stream = api.startTeammateLogin(ownerId, harness, onEvent);
     update(r);
     r.stream.done
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setError(friendlyError(e)))
       .finally(() => {
         if (runningRef.current === r) update(null);
         void load();
@@ -93,7 +101,7 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
       await api.teammateLoginInput(ownerId, id, code);
       setCode("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(false);
     }
@@ -112,7 +120,7 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
       setView(await api.teammateLogout(ownerId, harness));
       setNotice("Logged out.");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
     } finally {
       setBusy(false);
     }
@@ -124,8 +132,14 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
 
   return (
     <View style={styles.box}>
-      <Text style={styles.title}>Your {name} login</Text>
-      <Text style={styles.dim}>{view ? loginLine(login, ownerName, view.on ?? "machine") : error ? "" : "Checking…"}</Text>
+      <Text style={styles.title} role="heading">
+        Your {name} login
+      </Text>
+      {view ? (
+        <Text style={styles.dim}>{loginLine(login, ownerName, view.on ?? "machine")}</Text>
+      ) : loadError ? null : (
+        <ListSkeleton label={`Loading your ${name} login`} rows={1} />
+      )}
       {running ? (
         <>
           <Text style={styles.terminal} selectable>
@@ -142,7 +156,7 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
               value={code}
               onChangeText={setCode}
               placeholder="Paste the code it asks for"
-              placeholderTextColor={colors.textFaint}
+              placeholderTextColor={placeholder}
               autoCapitalize="none"
               autoCorrect={false}
               secureTextEntry
@@ -169,34 +183,29 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
         )
       ) : null}
       {notice ? <Text style={styles.dim}>{notice}</Text> : null}
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {loadError ? <InlineError message={loadError} onRetry={load} /> : null}
+      {error ? <InlineError message={error} /> : null}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  box: { width: "100%", gap: 8, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
-  title: { color: colors.text },
-  dim: { color: colors.textDim },
-  row: { flexDirection: "row", alignItems: "center", gap: 10 },
-  input: {
-    flex: 1,
-    color: colors.text,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-  },
-  terminal: {
-    color: colors.text,
-    fontFamily: "monospace",
-    fontSize: 12,
-    backgroundColor: colors.bgMain,
-    padding: 8,
-    borderRadius: 6,
-  },
-  link: { color: colors.blueDot },
-  danger: { color: colors.danger },
-  error: { color: colors.danger },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    box: { width: "100%", gap: t.space.sm, paddingVertical: t.space.sm, borderBottomWidth: hairline, borderBottomColor: t.c.border },
+    title: { ...k.text, fontWeight: t.font.weight.medium },
+    dim: { color: t.c.textMuted, ...type(t, "md") },
+    row: { flexDirection: "row", alignItems: "center", gap: t.space.sm },
+    input: { ...k.input, flex: 1, paddingVertical: t.space.xs },
+    terminal: {
+      color: t.c.text,
+      fontFamily: t.font.mono,
+      ...type(t, "xs"),
+      backgroundColor: t.c.codeBg,
+      padding: t.space.sm,
+      borderRadius: t.radius.sm,
+    },
+    link: k.link,
+    danger: { color: t.c.danger, ...type(t, "md") },
+  });
 });

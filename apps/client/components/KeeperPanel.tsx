@@ -3,9 +3,12 @@ import { StyleSheet, Text, View } from "react-native";
 import { keeperChoices, keeperQuestion } from "../src/access";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
-import { colors } from "../src/theme";
+import { errorText, friendlyError } from "../src/errors";
+import { hairline, themedStyles, type } from "../src/theme";
 import type { BotAccessView } from "../src/types";
 import { Chips } from "./Chips";
+import { InlineError } from "./ErrorState";
+import { kit } from "./ui";
 
 interface Props {
   api: Pick<SuperBotApi, "getBotAccess" | "keepBot" | "releaseKeptBot">;
@@ -21,8 +24,11 @@ interface Props {
  * server offers only accounts that could keep it, and none on a primary Bot.
  */
 export function KeeperPanel({ api, botId, botName, keptBy }: Props) {
+  const styles = useStyles();
   const [view, setView] = useState<BotAccessView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Why the accounts didn't load, apart from a refused hand-over, so it can offer a retry. */
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // Only the latest request's answer is shown, so a slow older read can't undo a newer one.
   const latest = useRef(0);
@@ -38,9 +44,9 @@ export function KeeperPanel({ api, botId, botName, keptBy }: Props) {
   const load = useCallback(async () => {
     try {
       await fetchView(() => api.getBotAccess(botId));
-      setError(null);
+      setLoadError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setLoadError(errorText(e, "Couldn't load the service accounts"));
     }
   }, [api, botId, fetchView]);
 
@@ -52,8 +58,15 @@ export function KeeperPanel({ api, botId, botName, keptBy }: Props) {
     void load();
   }, [load, keptBy]);
 
-  if (error && !view) return <Text style={styles.error}>{error}</Text>;
-  if (!view?.keepers?.length) return null;
+  // Most Bots have no account to hand over to, so nothing shows until the list says there is one.
+  if (!view) {
+    return loadError ? (
+      <View style={styles.wrap}>
+        <InlineError message={loadError} onRetry={load} />
+      </View>
+    ) : null;
+  }
+  if (!view.keepers?.length) return null;
   const current = view.serviceAccount?.id ?? "";
   const choices = keeperChoices(view);
   const nameOf = (id: string) => view.keepers?.find((k) => k.id === id)?.name ?? view.serviceAccount?.name ?? null;
@@ -67,7 +80,7 @@ export function KeeperPanel({ api, botId, botName, keptBy }: Props) {
     try {
       await fetchView(() => (to ? api.keepBot(botId, to) : api.releaseKeptBot(botId)));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(friendlyError(e));
       // What the server holds now, keeping its refusal on screen.
       await fetchView(() => api.getBotAccess(botId)).catch(() => {});
     } finally {
@@ -82,14 +95,17 @@ export function KeeperPanel({ api, botId, botName, keptBy }: Props) {
       <Text style={styles.hint}>
         The account manages it within its role and tokens, at most {view.maxKeptBots ?? 20} Bots each. Its runs use the owner&apos;s keys and memory.
       </Text>
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {loadError ? <InlineError message={loadError} onRetry={load} /> : null}
+      {error ? <InlineError message={error} /> : null}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  wrap: { width: "100%", gap: 8, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
-  dim: { color: colors.textDim },
-  hint: { color: colors.textFaint, fontSize: 13 },
-  error: { color: colors.danger, width: "100%" },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    wrap: { width: "100%", gap: t.space.sm, paddingVertical: t.space.sm, borderBottomWidth: hairline, borderBottomColor: t.c.border },
+    dim: { color: t.c.textMuted, ...type(t, "md") },
+    hint: k.dim,
+  });
 });

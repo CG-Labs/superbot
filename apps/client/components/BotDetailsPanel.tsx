@@ -17,7 +17,7 @@ import { promptsFor } from "../src/prompts";
 import { cronLabel } from "../src/routines";
 import { workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
-import { colors, HARNESS_NAMES, ThemeScope } from "../src/theme";
+import { hairline, HARNESS_NAMES, themedStyles, type } from "../src/theme";
 import type { Routine } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
@@ -29,6 +29,7 @@ import { RoutineEditor } from "./RoutineEditor";
 import { ListSkeleton } from "./Skeleton";
 import { SuggestedPrompts } from "./SuggestedPrompts";
 import { TeammateLoginPanel } from "./TeammateLoginPanel";
+import { kit } from "./ui";
 
 interface Props {
   visible: boolean;
@@ -45,16 +46,8 @@ interface Props {
 /** "new" or the routine being edited, or "prompts"; null shows the details. */
 type Editing = "new" | "prompts" | Routine | null;
 
-/** Still dark-only (ADR 0335), so the shared chips inside it are held to dark too. */
-export function BotDetailsPanel(props: Props) {
-  return (
-    <ThemeScope scheme="dark">
-      <DetailsPanel {...props} />
-    </ThemeScope>
-  );
-}
-
-function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudit, onUsePrompt }: Props) {
+export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudit, onUsePrompt }: Props) {
+  const styles = useStyles();
   const {
     bots,
     activeId,
@@ -178,7 +171,7 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
   return (
     <Modal visible={visible} animationType={reduceMotion ? "none" : "slide"} transparent onRequestClose={close}>
       <View style={styles.backdrop}>
-        <ScrollView style={styles.panel} contentContainerStyle={styles.panelContent}>
+        <ScrollView style={styles.panel} contentContainerStyle={styles.panelContent} testID="bot-details">
           <Pressable style={styles.close} role="button" aria-label="Close details" onPress={close}>
             <Text style={styles.closeText} maxFontSizeMultiplier={1.3}>
               ✕
@@ -189,6 +182,7 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
           <BotAvatar color={bot.color} shape={bot.shape} size={90} />
           <TextInput
             style={styles.name}
+            aria-label="Bot name"
             value={name}
             editable={canManage}
             onChangeText={setName}
@@ -209,7 +203,9 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
             />
           ) : null}
           <View style={styles.sectionRow}>
-            <Text style={styles.sectionLabel}>Routines</Text>
+            <Text style={styles.sectionLabel} role="heading">
+              Routines
+            </Text>
             {canOperate ? (
               <Pressable role="button" aria-label="New routine" onPress={() => setEditing("new")}>
                 <Text style={styles.link}>+ New routine</Text>
@@ -217,17 +213,13 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
             ) : null}
           </View>
           {routinesState.loading && !routines.length ? (
-            <ThemeScope scheme="dark">
-              <View style={styles.state}>
-                <ListSkeleton label="Loading routines" rows={2} />
-              </View>
-            </ThemeScope>
+            <View style={styles.state}>
+              <ListSkeleton label="Loading routines" rows={2} />
+            </View>
           ) : routinesState.error ? (
-            <ThemeScope scheme="dark">
-              <View style={styles.state}>
-                <InlineError message={routinesState.error} onRetry={() => loadRoutines(bot.id)} />
-              </View>
-            </ThemeScope>
+            <View style={styles.state}>
+              <InlineError message={routinesState.error} onRetry={() => loadRoutines(bot.id)} />
+            </View>
           ) : routines.length ? (
             routines.map((r) => (
               <View key={r.id} style={styles.row}>
@@ -250,11 +242,11 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
               </View>
             ))
           ) : (
-            <ThemeScope scheme="dark">
-              <EmptyState compact title="No routines yet" message={`Routines run on a schedule, like a morning summary from ${bot.name}.`} />
-            </ThemeScope>
+            <EmptyState compact glyph="+" title="No routines yet" message={`Routines run on a schedule, like a morning summary from ${bot.name}.`} />
           )}
-          <Text style={styles.section}>Computer</Text>
+          <Text style={styles.section} role="heading">
+            Computer
+          </Text>
           <View style={styles.row}>
             <Text style={styles.dim}>{bot.working ? workingLabel(bot) : "Asleep"}</Text>
             {canOperate ? (
@@ -270,7 +262,9 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
               </Pressable>
             ) : null}
           </View>
-          <Text style={styles.section}>Settings</Text>
+          <Text style={styles.section} role="heading">
+            Settings
+          </Text>
           <View style={styles.row}>
             <Text style={styles.dim}>Runs on {HARNESS_NAMES[bot.harness] || bot.harness}</Text>
           </View>
@@ -287,18 +281,29 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
           ) : null}
           <View style={styles.row}>
             <Text style={styles.dim}>Hide from sidebar</Text>
-            <Switch value={bot.hidden} disabled={!canManage} onValueChange={(v) => void patchBot(bot.id, { hidden: v })} />
+            <Switch
+              aria-label="Hide from sidebar"
+              value={bot.hidden}
+              disabled={!canManage}
+              onValueChange={(v) => void patchBot(bot.id, { hidden: v })}
+            />
           </View>
           <View style={styles.row}>
             <Text style={styles.dim}>Ask before risky actions</Text>
             <Switch
+              aria-label="Ask before risky actions"
               value={bot.policy !== "bypass"}
               disabled={!can("admin")}
               onValueChange={(v) => void setBotPolicy(bot.id, v ? "ask" : "bypass")}
             />
           </View>
           {bot.policyOverride && can("admin") ? (
-            <Pressable style={styles.row} onPress={() => void setBotPolicy(bot.id, null)}>
+            <Pressable
+              style={styles.row}
+              role="button"
+              aria-label={`Use the default for all Bots (${policy?.mode ?? "ask"})`}
+              onPress={() => void setBotPolicy(bot.id, null)}
+            >
               <Text style={styles.policyLink}>Use the default for all Bots ({policy?.mode ?? "ask"})</Text>
             </Pressable>
           ) : null}
@@ -314,7 +319,9 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
           ) : null}
           {bot.visibility ? (
             <>
-              <Text style={styles.section}>Sharing</Text>
+              <Text style={styles.section} role="heading">
+                Sharing
+              </Text>
               <View style={styles.row}>
                 <Text style={styles.dim}>{sharingLabel(bot, me.id)}</Text>
               </View>
@@ -349,7 +356,9 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
           ) : null}
           {!bot.primary && canManage ? (
             <Pressable
-              style={styles.delete}
+              style={({ pressed }) => [styles.delete, pressed && styles.pressed]}
+              role="button"
+              aria-label="Delete bot"
               onPress={() => {
                 void confirmAsync(
                   `Delete ${bot.name}?`,
@@ -372,47 +381,51 @@ function DetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudi
   );
 }
 
-const styles = StyleSheet.create({
-  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
-  panel: {
-    backgroundColor: colors.bgSidebar,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    maxHeight: "85%",
-    flexGrow: 0,
-  },
-  panelContent: { padding: 20, gap: 10, alignItems: "center" },
-  close: { alignSelf: "flex-end" },
-  closeText: { color: colors.textDim, fontSize: 22 },
-  name: {
-    color: colors.text,
-    fontSize: 22,
-    fontWeight: "600",
-    textAlign: "center",
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    paddingVertical: 4,
-    width: "100%",
-  },
-  section: { alignSelf: "flex-start", color: colors.textFaint, marginTop: 8 },
-  sectionRow: { flexDirection: "row", alignItems: "center", width: "100%", marginTop: 8 },
-  sectionLabel: { color: colors.textFaint, flex: 1 },
-  link: { color: colors.blueDot },
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    width: "100%",
-    gap: 10,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-  },
-  rName: { color: colors.text },
-  rCron: { color: colors.textFaint, fontSize: 13 },
-  dim: { color: colors.textDim, flex: 1 },
-  policyLink: { color: colors.blueDot, flex: 1 },
-  harnessPick: { width: "100%", paddingVertical: 8 },
-  state: { width: "100%", paddingVertical: 8 },
-  delete: { marginTop: 16, padding: 12 },
-  deleteText: { color: colors.danger },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    backdrop: { flex: 1, backgroundColor: t.c.overlay, justifyContent: "flex-end" },
+    panel: {
+      backgroundColor: t.c.surface,
+      borderTopLeftRadius: t.radius.xl,
+      borderTopRightRadius: t.radius.xl,
+      maxHeight: "85%",
+      flexGrow: 0,
+    },
+    panelContent: { padding: t.space.xl, gap: t.space.sm, alignItems: "center" },
+    close: { alignSelf: "flex-end" },
+    closeText: { color: t.c.textMuted, fontSize: 22 },
+    name: {
+      color: t.c.text,
+      ...type(t, "xl"),
+      fontWeight: t.font.weight.semibold,
+      textAlign: "center",
+      borderBottomWidth: hairline,
+      borderBottomColor: t.c.border,
+      paddingVertical: t.space.xs,
+      width: "100%",
+    },
+    section: { alignSelf: "flex-start", color: t.c.textMuted, ...type(t, "sm"), fontWeight: t.font.weight.semibold, marginTop: t.space.sm },
+    sectionRow: { flexDirection: "row", alignItems: "center", width: "100%", marginTop: t.space.sm },
+    sectionLabel: { color: t.c.textMuted, ...type(t, "sm"), fontWeight: t.font.weight.semibold, flex: 1 },
+    link: k.link,
+    row: {
+      flexDirection: "row",
+      alignItems: "center",
+      width: "100%",
+      gap: t.space.sm,
+      paddingVertical: t.space.sm,
+      borderBottomWidth: hairline,
+      borderBottomColor: t.c.border,
+    },
+    rName: k.text,
+    rCron: { color: t.c.textMuted, ...type(t, "sm") },
+    dim: { color: t.c.textMuted, ...type(t, "md"), flex: 1 },
+    policyLink: { ...k.link, flex: 1 },
+    harnessPick: { width: "100%", paddingVertical: t.space.sm },
+    state: { width: "100%", paddingVertical: t.space.sm },
+    delete: { ...k.btn, ...k.danger, marginTop: t.space.lg },
+    deleteText: { ...k.btnText, ...k.dangerText },
+    pressed: { opacity: 0.7 },
+  });
 });

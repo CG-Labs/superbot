@@ -1,7 +1,9 @@
 import React from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { isStarter } from "../src/prompts";
-import { colors } from "../src/theme";
+import { hairline, themedStyles, type } from "../src/theme";
+import { EmptyState } from "./EmptyState";
+import { kit } from "./ui";
 
 interface Props {
   botName: string;
@@ -14,6 +16,7 @@ interface Props {
 
 /** A Bot's suggested prompts in its details (ADR 0054). Only for those who can run it. */
 export function SuggestedPrompts({ botName, prompts, onUse, onEdit }: Props) {
+  const styles = useStyles();
   if (!prompts.length && !onEdit) return null;
   return (
     <View style={styles.wrap}>
@@ -52,29 +55,31 @@ export function SuggestedPrompts({ botName, prompts, onUse, onEdit }: Props) {
           })}
         </View>
       ) : (
-        <Text style={styles.dim}>No suggested prompts</Text>
+        <EmptyState compact glyph="+" title="No suggested prompts" message="Add a few so people can start a chat with one tap." />
       )}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  wrap: { width: "100%", gap: 6, marginTop: 8 },
-  header: { flexDirection: "row", alignItems: "center" },
-  label: { color: colors.textFaint, flex: 1 },
-  link: { color: colors.blueDot },
-  card: {
-    backgroundColor: colors.bgBubble,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    overflow: "hidden",
-  },
-  item: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 12, paddingVertical: 12, minHeight: 44 },
-  divider: { borderTopWidth: 1, borderTopColor: colors.border },
-  pressed: { backgroundColor: colors.bgActive },
-  icon: { color: colors.blueDot, width: 18, textAlign: "center" },
-  text: { color: colors.text, flex: 1 },
-  chevron: { color: colors.textFaint, fontSize: 18 },
-  dim: { color: colors.textDim },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    wrap: { width: "100%", gap: t.space.xs, marginTop: t.space.sm },
+    header: { flexDirection: "row", alignItems: "center" },
+    label: { color: t.c.textMuted, ...type(t, "sm"), fontWeight: t.font.weight.semibold, flex: 1 },
+    link: k.link,
+    card: {
+      backgroundColor: t.c.raised,
+      borderRadius: t.radius.md,
+      borderWidth: hairline,
+      borderColor: t.c.border,
+      overflow: "hidden",
+    },
+    item: { flexDirection: "row", alignItems: "center", gap: t.space.sm, paddingHorizontal: t.space.md, paddingVertical: t.space.md, minHeight: 44 },
+    divider: { borderTopWidth: hairline, borderTopColor: t.c.border },
+    pressed: { backgroundColor: t.c.hover },
+    icon: { color: t.c.accentText, width: 18, textAlign: "center" },
+    text: { ...k.text, flex: 1 },
+    chevron: { color: t.c.textFaint, fontSize: 18 },
+  });
 });

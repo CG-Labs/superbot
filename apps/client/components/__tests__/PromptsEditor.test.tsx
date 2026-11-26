@@ -1,7 +1,9 @@
 import React from "react";
+import * as RN from "react-native";
 import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
 import { PromptsEditor } from "../PromptsEditor";
 import { DEFAULT_PROMPTS } from "../../src/prompts";
+import { themes } from "../../src/theme";
 
 describe("PromptsEditor", () => {
   it("starts from the defaults and saves an edited, cleaned list", async () => {
@@ -77,5 +79,25 @@ describe("PromptsEditor", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/owner or an admin/);
     await user.press(screen.getByRole("button", { name: "Cancel" }));
     expect(onCancel).toHaveBeenCalled();
+  });
+
+  it("says in plain words when it can't reach the server", async () => {
+    const user = userEvent.setup();
+    const onSave = jest.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    await render(<PromptsEditor prompts={["Hi"]} custom onSave={onSave} onCancel={jest.fn()} />);
+    await user.press(screen.getByRole("button", { name: "Save prompts" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Can't reach the server. Check your connection and try again.");
+  });
+
+  it.each(["light", "dark"] as const)("follows the device's %s setting, saving with the accent", async (scheme) => {
+    jest.spyOn(RN, "useColorScheme").mockReturnValue(scheme);
+    await render(<PromptsEditor prompts={["Hi"]} custom onSave={jest.fn()} onCancel={jest.fn()} />);
+    const c = themes[scheme].c;
+    expect(screen.getByRole("heading", { name: "Suggested prompts" })).toHaveStyle({ color: c.text });
+    expect(screen.getByRole("button", { name: "Save prompts" })).toHaveStyle({ backgroundColor: c.accent });
+    expect(screen.getByText("Save")).toHaveStyle({ color: c.onAccent });
+    expect(screen.getByText("+ Add prompt")).toHaveStyle({ color: c.accentText });
+    expect(screen.getByText("✕").props.maxFontSizeMultiplier).toBe(1.3);
+    jest.restoreAllMocks();
   });
 });

@@ -1,8 +1,11 @@
 import React, { useState } from "react";
 import { Pressable, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { CRON_PRESETS, draftFromRoutine, EMPTY_DRAFT, validateRoutine, type RoutineDraft } from "../src/routines";
-import { colors } from "../src/theme";
+import { friendlyError } from "../src/errors";
+import { themedStyles, type } from "../src/theme";
 import type { Routine } from "../src/types";
+import { InlineError } from "./ErrorState";
+import { kit, usePlaceholder } from "./ui";
 
 interface Props {
   /** The routine to edit; omit to create one. */
@@ -13,6 +16,8 @@ interface Props {
 }
 
 export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
+  const styles = useStyles();
+  const placeholder = usePlaceholder();
   const [draft, setDraft] = useState<RoutineDraft>(routine ? draftFromRoutine(routine) : EMPTY_DRAFT);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -24,7 +29,7 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
     try {
       await action();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed");
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
@@ -41,13 +46,15 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
 
   return (
     <View style={styles.form}>
-      <Text style={styles.heading}>{routine ? "Edit routine" : "New routine"}</Text>
+      <Text style={styles.heading} role="heading">
+        {routine ? "Edit routine" : "New routine"}
+      </Text>
       <Text style={styles.label}>Name</Text>
       <TextInput
         aria-label="Routine name"
         style={styles.input}
         placeholder="Morning email digest"
-        placeholderTextColor={colors.textFaint}
+        placeholderTextColor={placeholder}
         value={draft.name}
         maxLength={100}
         onChangeText={(name) => set({ name })}
@@ -65,7 +72,7 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
               style={[styles.chip, on && styles.chipOn]}
               onPress={() => set({ cron: p.cron })}
             >
-              <Text style={styles.chipText}>{p.label}</Text>
+              <Text style={[styles.chipText, on && styles.chipTextOn]}>{p.label}</Text>
             </Pressable>
           );
         })}
@@ -74,7 +81,7 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
         aria-label="Cron schedule"
         style={[styles.input, styles.mono]}
         placeholder="0 9 * * 1-5"
-        placeholderTextColor={colors.textFaint}
+        placeholderTextColor={placeholder}
         autoCapitalize="none"
         autoCorrect={false}
         value={draft.cron}
@@ -86,7 +93,7 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
         aria-label="Instruction"
         style={[styles.input, styles.multiline]}
         placeholder="Summarize my unread email and post the important ones here."
-        placeholderTextColor={colors.textFaint}
+        placeholderTextColor={placeholder}
         multiline
         value={draft.instruction}
         onChangeText={(instruction) => set({ instruction })}
@@ -95,22 +102,24 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
         <Text style={styles.rowText}>Enabled</Text>
         <Switch aria-label="Enabled" value={draft.enabled} onValueChange={(enabled) => set({ enabled })} />
       </View>
-      {error ? (
-        <Text style={styles.error} role="alert">
-          {error}
-        </Text>
-      ) : null}
+      {error ? <InlineError message={error} /> : null}
       <View style={styles.actions}>
         {routine && onDelete ? (
-          <Pressable role="button" aria-label="Delete routine" disabled={busy} onPress={() => void run(onDelete)}>
-            <Text style={styles.delete}>Delete</Text>
+          <Pressable
+            role="button"
+            aria-label="Delete routine"
+            disabled={busy}
+            style={[styles.delete, busy && styles.disabled]}
+            onPress={() => void run(onDelete)}
+          >
+            <Text style={styles.deleteText}>Delete</Text>
           </Pressable>
         ) : null}
         <View style={{ flex: 1 }} />
-        <Pressable role="button" aria-label="Cancel" disabled={busy} onPress={onCancel}>
-          <Text style={styles.cancel}>Cancel</Text>
+        <Pressable role="button" aria-label="Cancel" disabled={busy} style={styles.cancel} onPress={onCancel}>
+          <Text style={styles.cancelText}>Cancel</Text>
         </Pressable>
-        <Pressable role="button" aria-label="Save routine" style={styles.save} disabled={busy} onPress={save}>
+        <Pressable role="button" aria-label="Save routine" aria-busy={busy} style={[styles.save, busy && styles.disabled]} disabled={busy} onPress={save}>
           <Text style={styles.saveText}>{busy ? "Saving…" : "Save"}</Text>
         </Pressable>
       </View>
@@ -118,31 +127,37 @@ export function RoutineEditor({ routine, onSave, onDelete, onCancel }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
-  form: { width: "100%", gap: 8 },
-  heading: { color: colors.text, fontSize: 18, fontWeight: "700" },
-  label: { color: colors.textFaint, marginTop: 6 },
-  input: {
-    backgroundColor: colors.bgBubble,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 12,
-    color: colors.text,
-  },
-  mono: { fontFamily: "monospace" },
-  multiline: { minHeight: 96, textAlignVertical: "top" },
-  hint: { color: colors.textFaint, fontSize: 12 },
-  presets: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  chip: { borderWidth: 1, borderColor: colors.border, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
-  chipOn: { borderColor: colors.blue, backgroundColor: colors.bgActive },
-  chipText: { color: colors.text, fontSize: 13 },
-  row: { flexDirection: "row", alignItems: "center", paddingVertical: 6 },
-  rowText: { color: colors.text, flex: 1 },
-  error: { color: colors.danger },
-  actions: { flexDirection: "row", alignItems: "center", gap: 12, marginTop: 6 },
-  delete: { color: colors.danger, padding: 10 },
-  cancel: { color: colors.textDim, padding: 10 },
-  save: { backgroundColor: colors.blue, borderRadius: 10, paddingHorizontal: 20, paddingVertical: 10 },
-  saveText: { color: "#fff", fontWeight: "600" },
+const useStyles = themedStyles((t) => {
+  const k = kit(t);
+  return StyleSheet.create({
+    form: { width: "100%", gap: t.space.sm },
+    heading: k.cardTitle,
+    label: { ...k.dim, marginTop: t.space.xs },
+    input: k.input,
+    mono: { fontFamily: t.font.mono },
+    multiline: k.inputMultiline,
+    hint: k.faint,
+    presets: { flexDirection: "row", flexWrap: "wrap", gap: t.space.xs },
+    chip: {
+      borderWidth: 1,
+      borderColor: t.c.border,
+      backgroundColor: t.c.raised,
+      borderRadius: t.radius.pill,
+      paddingHorizontal: t.space.md,
+      paddingVertical: t.space.xs,
+    },
+    chipOn: { backgroundColor: t.c.text, borderColor: t.c.text },
+    chipText: { color: t.c.text, ...type(t, "sm") },
+    chipTextOn: { color: t.c.bg, fontWeight: t.font.weight.medium },
+    row: { flexDirection: "row", alignItems: "center", paddingVertical: t.space.xs },
+    rowText: { ...k.text, flex: 1 },
+    actions: { flexDirection: "row", alignItems: "center", gap: t.space.sm, marginTop: t.space.xs },
+    delete: { ...k.btn, ...k.danger },
+    deleteText: { ...k.btnText, ...k.dangerText },
+    cancel: { ...k.btn, ...k.ghost },
+    cancelText: { ...k.btnText, color: t.c.textMuted },
+    save: { ...k.btn, ...k.primary },
+    saveText: { ...k.btnText, ...k.primaryText },
+    disabled: k.disabled,
+  });
 });
