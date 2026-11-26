@@ -254,15 +254,29 @@ fn semver(v: &str) -> Option<(u64, u64, u64)> {
 
 /// The process holding a `flock` on `file`, from `/proc/locks`: botd holds one on its data
 /// lock all the time it runs. Read, never taken, so a botd starting now isn't turned away.
+/// The kernel names the file as `major:minor:inode` (device numbers in hex): an inode
+/// number alone also matches files on other filesystems.
 fn lock_holder(file: &Path, proc_locks: &str) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
-    let ino = std::fs::metadata(file).ok()?.ino();
+    let meta = std::fs::metadata(file).ok()?;
+    let want = (dev_major(meta.dev()), dev_minor(meta.dev()), meta.ino());
     proc_locks.lines().find_map(|l| {
         let f: Vec<&str> = l.split_whitespace().collect();
-        let (kind, pid, dev) = (f.get(1)?, f.get(4)?, f.get(5)?);
-        let inode: u64 = dev.rsplit(':').next()?.parse().ok()?;
-        (*kind == "FLOCK" && inode == ino).then(|| pid.parse().ok()).flatten()
+        let (kind, pid, at) = (f.get(1)?, f.get(4)?, f.get(5)?);
+        let mut p = at.split(':');
+        let (major, minor, inode) = (p.next()?, p.next()?, p.next()?);
+        let got = (u64::from_str_radix(major, 16).ok()?, u64::from_str_radix(minor, 16).ok()?, inode.parse::<u64>().ok()?);
+        (*kind == "FLOCK" && got == want).then(|| pid.parse().ok()).flatten()
     })
+}
+
+/// Linux's `dev_t` layout, as glibc's `major()` and `minor()` read it.
+fn dev_major(dev: u64) -> u64 {
+    ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xffff_f000)
+}
+
+fn dev_minor(dev: u64) -> u64 {
+    (dev & 0xff) | ((dev >> 12) & 0xffff_ff00)
 }
 
 /// Whether botd answers `GET /healthz` at `addr`.
@@ -1266,10 +1280,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("app.sqlite-lock");
         std::fs::write(&f, b"").unwrap();
-        let ino = std::fs::metadata(&f).unwrap().ino();
-        let locks = format!("1: POSIX  ADVISORY  WRITE 11 fd:01:{ino} 0 EOF\n2: -> FLOCK  ADVISORY  WRITE 12 fd:01:{ino} 0 EOF\n3: FLOCK  ADVISORY  WRITE 4242 fd:01:{ino} 0 EOF\n");
-        assert_eq!(lock_holder(&f, &locks), Some(4242));
-        assert_eq!(lock_holder(&f, "1: FLOCK  ADVISORY  WRITE 4242 fd:01:1 0 EOF\n"), None);
+        let meta = std::fs::metadata(&f).unwrap();
+        let (ino, at) = (meta.ino(), format!("{:02x}:{:02x}", dev_major(meta.dev()), dev_minor(meta.dev())));
+        let other = format!("{:02x}:{:02x}", dev_major(meta.dev()) + 1, dev_minor(meta.dev()));
+        let locks = format!("1: POSIX  ADVISORY  WRITE 11 {at}:{ino} 0 EOF\n2: -> FLOCK  ADVISORY  WRITE 12 {at}:{ino} 0 EOF\n3: FLOCK  ADVISORY  WRITE 5737 {other}:{ino} 0 EOF\n4: FLOCK  ADVISORY  WRITE 4242 {at}:{ino} 0 EOF\n");
+        assert_eq!(lock_holder(&f, &locks), Some(4242), "the same inode number on another device is another file");
+        assert_eq!(lock_holder(&f, &format!("1: FLOCK  ADVISORY  WRITE 4242 {at}:1 0 EOF\n")), None);
+        assert_eq!((dev_major(0x0803), dev_minor(0x0803)), (8, 3));
+        assert_eq!((dev_major(0x0010_0000_0000_fd01), dev_minor(0x0010_0000_0000_fd01)), (0x1000fd, 1));
         assert_eq!(lock_holder(&dir.join("missing"), &locks), None);
         assert_eq!(listen_addr(&settings(&[("HOST", "::1"), ("PORT", "8080")], &[])), "[::1]:8080");
         assert_eq!(listen_addr(&settings(&[], &[])), "127.0.0.1:3000");
