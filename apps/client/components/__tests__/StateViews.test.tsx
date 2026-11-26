@@ -165,6 +165,44 @@ describe("ConnectionBanner", () => {
   });
 });
 
+describe("on iOS, which has no live regions", () => {
+  const onPlatform = async (platform: string, body: (announce: jest.SpyInstance) => Promise<void>) => {
+    const announce = jest.spyOn(AccessibilityInfo, "announceForAccessibility").mockImplementation(() => {});
+    announce.mockClear();
+    const os = Platform.OS;
+    Object.defineProperty(Platform, "OS", { value: platform, configurable: true });
+    try {
+      await body(announce);
+    } finally {
+      Object.defineProperty(Platform, "OS", { value: os, configurable: true });
+    }
+  };
+
+  it("reads out errors and the connection banner when they change", () =>
+    onPlatform("ios", async (announce) => {
+      await render(<ErrorState title="Couldn't load this chat" message="Can't reach the server." />);
+      expect(announce).toHaveBeenLastCalledWith("Couldn't load this chat. Can't reach the server.");
+
+      await render(<InlineError message="Couldn't load routines." />);
+      expect(announce).toHaveBeenLastCalledWith("Couldn't load routines.");
+
+      announce.mockClear();
+      const banner = await render(<ConnectionBanner status="online" />);
+      expect(announce).not.toHaveBeenCalled();
+      await banner.rerender(<ConnectionBanner status="reconnecting" />);
+      expect(announce).toHaveBeenLastCalledWith("Reconnecting… New messages show up once you're back.");
+      await banner.rerender(<ConnectionBanner status="offline" />);
+      expect(announce).toHaveBeenLastCalledWith("You're offline. Chats catch up when you're back.");
+    }));
+
+  it("leaves other platforms to their live regions", () =>
+    onPlatform("android", async (announce) => {
+      await render(<ErrorState message="Can't reach the server." />);
+      await render(<ConnectionBanner status="offline" />);
+      expect(announce).not.toHaveBeenCalled();
+    }));
+});
+
 describe("toasts", () => {
   let api!: ToastApi;
   function Grab() {

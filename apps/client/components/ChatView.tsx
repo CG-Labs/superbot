@@ -9,6 +9,7 @@ import {
   View,
   type TextInputInstance,
 } from "react-native";
+import { useAnnounce } from "../src/announce";
 import { copyText, COPY_LABEL } from "../src/clipboard";
 import { friendlyError } from "../src/errors";
 import { isOpenHandoff } from "../src/handoff";
@@ -145,6 +146,9 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     onPrefilled?.();
     // onPrefilled is a new function on every parent render; only a new prefill matters.
   }, [prefill]);
+
+  const working = bot?.working ? `${workingLabel(bot)}…` : null;
+  useAnnounce(working);
 
   if (!bot) {
     return (
@@ -303,7 +307,7 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
         <View style={styles.working}>
           <ThinkingDots />
           <Text style={styles.workingText} aria-live="polite">
-            {workingLabel(bot)}…
+            {working}
           </Text>
           {canOperate ? (
             <Pressable

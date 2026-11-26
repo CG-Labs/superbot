@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import { useAnnounce } from "../src/announce";
 import { themedStyles, type } from "../src/theme";
 import { PillButton } from "./PillButton";
 
@@ -36,6 +37,7 @@ interface Props {
 export function ErrorState({ title = "Something went wrong", message, onRetry, retryLabel = "Try again" }: Props) {
   const styles = useStyles();
   const { busy, run } = useRetry(onRetry);
+  useAnnounce(`${title}. ${message}`);
   return (
     <View style={styles.full} testID="error-state">
       <View style={styles.circle} importantForAccessibility="no-hide-descendants" accessibilityElementsHidden>
@@ -60,6 +62,7 @@ export function ErrorState({ title = "Something went wrong", message, onRetry, r
 export function InlineError({ message, onRetry, retryLabel = "Try again" }: Omit<Props, "title">) {
   const styles = useStyles();
   const { busy, run } = useRetry(onRetry);
+  useAnnounce(message);
   return (
     <View style={styles.inline} testID="inline-error">
       <Text style={styles.inlineText} role="alert" aria-live="polite">

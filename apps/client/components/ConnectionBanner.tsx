@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
+import { useAnnounce } from "../src/announce";
 import { useOnline } from "../src/online";
 import { themedStyles, type } from "../src/theme";
 import { ThinkingDots } from "./Skeleton";
@@ -29,13 +30,15 @@ export function useConnectionStatus(connected: boolean, graceMs = RECONNECT_GRAC
 /** A slim strip at the top of the app while it's offline or reconnecting; nothing while online. */
 export function ConnectionBanner({ status }: { status: ConnectionStatus }) {
   const styles = useStyles();
-  if (status === "online") return null;
   const offline = status === "offline";
+  const message = offline ? "You're offline. Chats catch up when you're back." : "Reconnecting… New messages show up once you're back.";
+  useAnnounce(status === "online" ? null : message);
+  if (status === "online") return null;
   return (
     <View accessible role="status" aria-live="polite" style={[styles.banner, offline ? styles.offline : styles.reconnecting]} testID="connection-banner">
       {offline ? null : <ThinkingDots />}
       <Text style={[styles.text, offline ? styles.offlineText : styles.reconnectingText]}>
-        {offline ? "You're offline. Chats catch up when you're back." : "Reconnecting… New messages show up once you're back."}
+        {message}
       </Text>
     </View>
   );
