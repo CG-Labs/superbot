@@ -51,13 +51,13 @@ Details are codes, counts, provider ids and incident ids: never a person's name 
 
 - [ ] Sign-in: the score's `identity` reasons. Anything new goes to the [sign-in](runbook-sign-in.md) or [SAML](runbook-saml.md) runbook.
 - [ ] SAML (if used): `botctl sso saml <provider>` shows each IdP certificate's expiry; one within 60 days is in the customer's record, with who rotates it.
-- [ ] SCIM (if used): `botctl scim tokens` lists the tokens in use, and the IdP's provisioning log shows no errors. People who left are disabled.
+- [ ] SCIM (if used): `botctl scim tokens` lists the tokens in use, and the IdP's provisioning log shows no errors. People who left are disabled. If not, the [SCIM runbook](runbook-scim.md).
 - [ ] Roles: `botctl roles` matches what the customer expects; anyone with a custom role across the server still needs it ([roles runbook](runbook-custom-roles.md)).
 - [ ] Access review: the customer signed one off this quarter (`/api/access-review`, [ADR 0099](../adr/0099-access-review-report.md)), if their policy asks.
 
 ## 4. Data and backups
 
-- [ ] `botctl backups`: the newest copy off the host is within its RPO.
+- [ ] `botctl backups`: the newest copy off the host is within its RPO. If not, the [backups runbook](runbook-backups.md).
 - [ ] `botctl machine recovery` (managed machines): nothing past its RPO; last restores within the RTO.
 - [ ] Residency (if pinned): `botctl regions` shows no residency warnings ([residency runbook](runbook-residency.md)).
 - [ ] The next restore drill is booked ([TAM cadence](tam.md#cadence)).
@@ -71,7 +71,7 @@ Details are codes, counts, provider ids and incident ids: never a person's name 
 
 ## 6. The account
 
-- [ ] License (self-host): `botctl license` end date and seats; a renewal within 90 days is with the account owner.
+- [ ] License (self-host): `botctl license` end date and seats; a renewal within 90 days is with the account owner ([license runbook](runbook-license.md)).
 - [ ] Tickets: last month's [support report](support-report.md) for the customer (`botctl support-report <export> --customer "<customer>"`) has no miss without a cause; none open past its response target, none open for more than a month without a plan.
 - [ ] Anything from the customer since last time: changes to their IdP, network, team or plans that SuperBot should know about.
 
