@@ -11,7 +11,8 @@
 //!   hourly, a new subscription is opened before the old one is closed and read to its end,
 //!   so no event falls between them. When the old token may have stopped events early (botd
 //!   has a new one, or the new subscription opened at or after the old token's lease ran
-//!   out), everything is read again.
+//!   out), or the old stream ends any way but with Vault's answer to botd's close (ADR 0318),
+//!   everything is read again.
 //! - Each change is read again where it is applied, one after another, after the store's
 //!   epoch moves, so neither a read in flight nor the change's own can cache over a newer one.
 //!   A name changed again before it is read waits once; too many waiting make way for one
@@ -21,7 +22,9 @@
 //!   each time up to a minute.
 //! - Audited: `secret.vault_events` (`subscribed`, `lost`, `resumed`), and what each change
 //!   or gap read again as `secret.cache_refreshed`, with `trigger` `vault-event` or
-//!   `vault-events-resumed`, never a value.
+//!   `vault-events-resumed`, never a value. Whether a stream is open, and the changes,
+//!   losses and catch-ups so far, show in `botctl secrets backend` and `/metrics` (`Status`,
+//!   ADR 0318).
 //!
 //! Only the client side of RFC 6455 that this needs is here: the handshake over reqwest's
 //! upgraded connection, masked pings, pongs and a close out, and messages in.
@@ -63,6 +66,7 @@ mod timing {
     pub const MIN_RESUBSCRIBE: Duration = Duration::from_secs(10);
     /// Longest a frame botd sends may take to go out before the stream counts as lost.
     pub const WRITE_WAIT: Duration = Duration::from_secs(10);
+    /// Most a stream's reader holds for botd, in bytes, before the stream counts as ended.
     pub const MAX_WAITING: usize = 16 << 20;
 }
 #[cfg(test)]
