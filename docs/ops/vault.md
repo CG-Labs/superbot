@@ -338,7 +338,7 @@ botd's own token must still outlive the run (see above): Vault ends a token's le
 
 ## Day to day
 
-- **Rotate** a value in Vault (`vault kv put ...`). botd uses it within `SECRETS_CACHE_SECONDS`; no restart. To use it now, refresh botd's cache ([below](#rotating-a-value-now)). Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart; the refresh names them.
+- **Rotate** a value in Vault (`vault kv put ...`). botd uses it within `SECRETS_CACHE_SECONDS`; no restart. To use it now, refresh botd's cache ([below](#rotating-a-value-now)), or on Vault Enterprise let botd [follow Vault's change events](#following-vaults-change-events). Settings botd reads only at startup (Stripe, Linode, Incus, Turnstile, metrics and backup keys) need a restart; the refresh names them.
 - **Move a key from the sealed store to Vault**: put it in Vault, check `botctl secrets` shows the sealed copy as shadowed by `vault`, then `botctl secret rm NAME`.
 - **Audit**: `botctl audit --action secret.read` (or the client's audit log) shows each read that reached Vault and each failure, by name, never the value. AppRole, Kubernetes and JWT logins are `secret.vault_login`. Cache hits aren't logged; Vault's own audit device has its side.
 
@@ -365,6 +365,38 @@ vault read again: 1 name, 1 changed.
 - The API is `POST /api/secrets/refresh` with `{"names": [...]}` or no body, for admins. It answers 409 with `SECRETS_BACKEND=local` or while another refresh runs.
 
 See [ADR 0291](../adr/0291-refreshing-the-external-secrets-cache.md).
+
+## Following Vault's change events
+
+Off by default ([ADR 0306](../adr/0306-following-vaults-change-events.md)). On Vault Enterprise 1.16 or later, or HCP Vault Dedicated, botd can subscribe to Vault's event stream and read a name again as soon as it is written, patched, deleted or destroyed. A rotation then reaches new runs in about a second, with no `botctl secrets refresh` and whatever `SECRETS_CACHE_SECONDS` is. Vault's community edition and OpenBao have no event stream.
+
+Add to botd's policy (here with the default mount and prefix):
+
+```sh
+vault policy write superbot - <<'EOF'
+path "secret/data/superbot/*"       { capabilities = ["read", "list", "subscribe"] subscribe_event_types = ["kv-v2/*"] }
+path "secret/metadata/superbot/*"   { capabilities = ["list", "subscribe"]         subscribe_event_types = ["kv-v2/*"] }
+path "secret/+/superbot/*"          { capabilities = ["list", "subscribe"]         subscribe_event_types = ["kv-v2/*"] }
+path "sys/events/subscribe/kv-v2/*" { capabilities = ["read"] }
+EOF
+```
+
+The `+` line covers the `delete/`, `undelete/` and `destroy/` paths those events name. Then in `.env`:
+
+```sh
+VAULT_EVENTS=1
+```
+
+The startup line ends `following Vault's change events`. If Vault won't take the subscription, botd doesn't start, and says why: Vault answered 404 (not Enterprise, or older than 1.16), 403 (the policy above), or a redirect (point `VAULT_ADDR` at the active node or a performance standby).
+
+- **Which changes**: only botd's own names, in its mount, prefix, namespace and folders (`users/<id>/` too with `SECRETS_USER_FOLDERS=1`). Other paths' events are ignored and cost no request.
+- **Reading again**: each read asks for the event's `vault_index`, so a standby that hasn't caught up can't answer with the old value. It is cached, redacted and audited like any read. If it fails, nothing is cached for the name and runs that need it are refused until Vault answers.
+- **Startup settings** botd read once (Stripe, Linode, Incus, ...) still need a restart. The log says so for each.
+- **Staying subscribed**: botd pings every 30 s, and subscribes again before its token is due, when its token changes, and at least hourly, opening the new stream before closing the old, so no event is missed. A stream that drops is subscribed to again after 1 s, then up to a minute apart. Once it is back, botd reads every cached answer again, since events may have been missed. Meanwhile the cache time bounds how old an answer gets, and runs carry on.
+- **Network**: one long-lived HTTP/1.1 WebSocket to Vault. A proxy or load balancer in front of Vault must pass upgrades and keep idle connections open past 30 s.
+- **Audit**: `secret.vault_events` (`subscribed`, `lost` with the reason, `resumed`), and each change as `secret.cache_refreshed` by `system` with `trigger: vault-event`, the event type and the result (`changed`, `removed`, ...). After a gap, the read of everything is `trigger: vault-events-resumed`. Never a value.
+
+Running Bots keep the environment they started with, as with a refresh. Short-lived credentials for each run aren't cached, so events don't touch them.
 
 ## When Vault is down
 
