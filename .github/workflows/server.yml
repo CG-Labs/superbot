@@ -185,7 +185,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - run: shellcheck -S warning deploy/*.sh deploy/docker/*.sh
 
-  # ADR 0090, ADR 0104, ADR 0106, ADR 0110, ADR 0113, ADR 0114: the SLO, sign-in, capacity, backup, error and backup encryption alert rules parse, and fire (and stay quiet) when they should.
+  # ADR 0090, ADR 0104, ADR 0106, ADR 0110, ADR 0113, ADR 0114, ADR 0318: the SLO, sign-in, capacity, backup, error, backup encryption and secrets change event alert rules parse, and fire (and stay quiet) when they should.
   prometheus-rules:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -217,6 +217,8 @@ jobs:
       - run: promtool test rules deploy/prometheus/superbot-errors.rules.test.yml
       - run: promtool check rules deploy/prometheus/superbot-health-score.rules.yml
       - run: promtool test rules deploy/prometheus/superbot-health-score.rules.test.yml
+      - run: promtool check rules deploy/prometheus/superbot-secrets-events.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-secrets-events.rules.test.yml
 
   backup-scripts:
     needs: rust

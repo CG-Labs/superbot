@@ -11,7 +11,8 @@
 //!   hourly, a new subscription is opened before the old one is closed and read to its end,
 //!   so no event falls between them. When the old token may have stopped events early (botd
 //!   has a new one, or the new subscription opened at or after the old token's lease ran
-//!   out), everything is read again.
+//!   out), or the old stream ends any way but with Vault's answer to botd's close (ADR 0318),
+//!   everything is read again.
 //! - Each change is read again where it is applied, one after another, after the store's
 //!   epoch moves, so neither a read in flight nor the change's own can cache over a newer one.
 //!   A name changed again before it is read waits once; too many waiting make way for one
@@ -21,7 +22,9 @@
 //!   each time up to a minute.
 //! - Audited: `secret.vault_events` (`subscribed`, `lost`, `resumed`), and what each change
 //!   or gap read again as `secret.cache_refreshed`, with `trigger` `vault-event` or
-//!   `vault-events-resumed`, never a value.
+//!   `vault-events-resumed`, never a value. Whether a stream is open, and the changes,
+//!   losses and catch-ups so far, show in `botctl secrets backend` and `/metrics` (`Status`,
+//!   ADR 0318).
 //!
 //! Only the client side of RFC 6455 that this needs is here: the handshake over reqwest's
 //! upgraded connection, masked pings, pongs and a close out, and messages in.
@@ -34,7 +37,7 @@ use crate::obs::log::{log_info, log_warn};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -63,6 +66,8 @@ mod timing {
     pub const MIN_RESUBSCRIBE: Duration = Duration::from_secs(10);
     /// Longest a frame botd sends may take to go out before the stream counts as lost.
     pub const WRITE_WAIT: Duration = Duration::from_secs(10);
+    /// Most a stream's reader holds for botd, in bytes, before the stream counts as ended.
+    pub const MAX_WAITING: usize = 16 << 20;
 }
 #[cfg(test)]
 mod timing {
@@ -72,6 +77,7 @@ mod timing {
     pub const BACKOFF_START: Duration = Duration::from_millis(50);
     pub const MIN_RESUBSCRIBE: Duration = Duration::from_millis(500);
     pub const WRITE_WAIT: Duration = Duration::from_millis(300);
+    pub const MAX_WAITING: usize = 64 << 10;
 }
 use timing::*;
 
@@ -492,18 +498,31 @@ enum End {
     Stopped,
 }
 
+/// What a frame takes of `MAX_WAITING` while it waits for botd.
+fn weight(f: &std::io::Result<Frame>) -> usize {
+    64 + match f {
+        Ok(Frame::Text(t)) => t.len(),
+        Ok(Frame::Ping(p)) => p.len(),
+        _ => 0,
+    }
+}
+
 /// One subscription being read: messages come from a task of their own, so a ping never
-/// interrupts a read halfway through a frame.
+/// interrupts a read halfway through a frame. That task never waits for botd to take them
+/// (up to `MAX_WAITING`), so it meets the stream's end as it comes, even while botd is
+/// opening the next subscription and takes nothing (ADR 0318).
 struct Stream {
     writer: tokio::io::WriteHalf<reqwest::Upgraded>,
-    rx: mpsc::Receiver<std::io::Result<Frame>>,
+    rx: mpsc::UnboundedReceiver<(usize, std::io::Result<Frame>)>,
+    /// Bytes read and not yet taken.
+    held: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
     token: Zeroizing<String>,
     due: Instant,
     late: bool,
     expires: Option<Instant>,
-    /// The reader met the stream's end (a close, an error, or none left), maybe while botd
-    /// was still opening the next one.
+    /// The reader met the stream's end (a close, an error, none left, or too much waiting),
+    /// maybe while botd was still opening the next one.
     ended: Arc<AtomicBool>,
     /// Vault answered a ping on this stream, so from then on it must keep doing so.
     answers: bool,
@@ -520,23 +539,35 @@ impl Drop for Stream {
 impl Stream {
     fn new(s: Subscribed) -> Stream {
         let (reader, writer) = tokio::io::split(s.io);
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
         let ended = Arc::new(AtomicBool::new(false));
-        let end = Arc::clone(&ended);
+        let held = Arc::new(AtomicUsize::new(0));
+        let (end, holding) = (Arc::clone(&ended), Arc::clone(&held));
         let task = tokio::spawn(async move {
             let mut r = Reader::new(reader, false);
             loop {
-                let f = r.next().await;
+                let mut f = r.next().await;
+                let w = weight(&f);
+                if holding.fetch_add(w, Ordering::SeqCst) + w > MAX_WAITING {
+                    f = Err(bad("more events waiting than botd takes"));
+                }
                 let last = matches!(f, Err(_) | Ok(Frame::Close));
                 if last {
                     end.store(true, Ordering::SeqCst);
                 }
-                if tx.send(f).await.is_err() || last {
+                if tx.send((w, f)).is_err() || last {
                     break;
                 }
             }
         });
-        Stream { writer, rx, task, token: s.token, due: s.due, late: s.late, expires: s.expires, ended, answers: false, waiting: None }
+        Stream { writer, rx, held, task, token: s.token, due: s.due, late: s.late, expires: s.expires, ended, answers: false, waiting: None }
+    }
+
+    /// The next frame the reader met; None once it is gone.
+    async fn recv(&mut self) -> Option<std::io::Result<Frame>> {
+        let (w, f) = self.rx.recv().await?;
+        self.held.fetch_sub(w, Ordering::SeqCst);
+        Some(f)
     }
 
     /// Sends a frame, within `WRITE_WAIT`: a peer that stops reading can't hold botd here.
@@ -558,7 +589,7 @@ impl Stream {
         loop {
             tokio::select! {
                 () = &mut due => return End::Due { catch_up: self.late },
-                m = self.rx.recv() => match m {
+                m = self.recv() => match m {
                     Some(Ok(Frame::Text(t))) => inner.announce(&t, users, tx),
                     Some(Ok(Frame::Binary)) => {}
                     Some(Ok(Frame::Ping(p))) => {
@@ -594,17 +625,103 @@ impl Stream {
     }
 
     /// Closes the stream once a new one is open, reading the events still on their way
-    /// until Vault closes its side or `DRAIN` is up.
-    async fn finish(mut self, inner: &Inner, users: bool, tx: &Tx) {
+    /// until Vault answers botd's close or `DRAIN` is up. Ok only when Vault's close came
+    /// after botd's: everything Vault sent before it arrived, and the new stream has the rest.
+    /// Otherwise why events may have been lost: the stream ended before botd closed it (as
+    /// Vault ended it, or the connection broke, perhaps while botd opened the new one), or
+    /// broke or went quiet before answering (ADR 0318).
+    async fn finish(mut self, inner: &Inner, users: bool, tx: &Tx) -> Result<(), String> {
         let until = tokio::time::Instant::now() + DRAIN;
-        let _ = tokio::time::timeout_at(until, self.send(CLOSE, &1000u16.to_be_bytes())).await;
-        while let Ok(Some(Ok(f))) = tokio::time::timeout_at(until, self.rx.recv()).await {
-            match f {
-                Frame::Text(t) => inner.announce(&t, users, tx),
-                Frame::Close => break,
-                _ => {}
-            }
+        let mut end = match self.ended.load(Ordering::SeqCst) {
+            true => Err("the old stream ended before botd closed it".to_string()),
+            false => Ok(()),
+        };
+        let sent = tokio::time::timeout_at(until, self.send(CLOSE, &1000u16.to_be_bytes())).await;
+        if end.is_ok() && !matches!(sent, Ok(Ok(()))) {
+            end = Err("botd couldn't close the old stream".into());
         }
+        loop {
+            let why = match tokio::time::timeout_at(until, self.recv()).await {
+                Ok(Some(Ok(Frame::Text(t)))) => {
+                    inner.announce(&t, users, tx);
+                    continue;
+                }
+                Ok(Some(Ok(Frame::Close))) => return end,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(e))) => format!("the old stream broke before Vault answered botd's close: {e}"),
+                Ok(None) => "the old stream ended before Vault answered botd's close".into(),
+                Err(_) => format!("Vault didn't answer botd's close of the old stream within {} s", DRAIN.as_secs()),
+            };
+            return end.and(Err(why));
+        }
+    }
+}
+
+/// What the stream is doing, for `botctl secrets backend` and `/metrics` (ADR 0318): counts
+/// and botd's own reasons, never a path, a value or Vault's text.
+#[derive(Default)]
+pub(crate) struct Status {
+    /// The first subscription was made: botd follows Vault's events.
+    on: AtomicBool,
+    following: AtomicBool,
+    /// When `following` last changed, in ms since the epoch.
+    since: AtomicI64,
+    changes: AtomicU64,
+    last_change: AtomicI64,
+    lost: AtomicU64,
+    catch_ups: AtomicU64,
+    last_loss: Mutex<Option<String>>,
+}
+
+impl Status {
+    fn following(&self, on: bool) {
+        self.since.store(crate::db::now(), Ordering::SeqCst);
+        self.following.store(on, Ordering::SeqCst);
+        self.on.store(true, Ordering::SeqCst);
+    }
+
+    fn lost(&self, why: &str) {
+        *self.last_loss.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
+        self.lost.fetch_add(1, Ordering::SeqCst);
+        self.following(false);
+    }
+
+    /// The stream is still open but may deliver nothing: the token it was made with ran out
+    /// and no new subscription could be made. Not a loss: nothing broke, and no catch-up yet.
+    fn stalled(&self, why: &str) {
+        if self.following.load(Ordering::SeqCst) {
+            *self.last_loss.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
+            self.following(false);
+        }
+    }
+
+    /// A new subscription replaced the one kept past its token.
+    fn renewed(&self) {
+        if !self.following.load(Ordering::SeqCst) {
+            self.following(true);
+        }
+    }
+
+    fn changed(&self) {
+        self.last_change.store(crate::db::now(), Ordering::SeqCst);
+        self.changes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn caught_up(&self) {
+        self.catch_ups.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// None until botd follows the events.
+    pub(crate) fn view(&self) -> Option<external::WatchStatus> {
+        self.on.load(Ordering::SeqCst).then(|| external::WatchStatus {
+            following: self.following.load(Ordering::SeqCst),
+            since_ms: self.since.load(Ordering::SeqCst),
+            changes: self.changes.load(Ordering::SeqCst),
+            last_change_ms: Some(self.last_change.load(Ordering::SeqCst)).filter(|t| *t > 0),
+            lost: self.lost.load(Ordering::SeqCst),
+            catch_ups: self.catch_ups.load(Ordering::SeqCst),
+            last_loss: self.last_loss.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        })
     }
 }
 
@@ -628,12 +745,16 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                 End::Lost(why) => break why,
                 End::Due { catch_up } => match inner.subscribe().await {
                     Ok(new) => {
-                        // Opened only after the old token ran out (a slow login or Vault), or
-                        // after the old stream ended: changes in between had no event.
-                        let catch_up = catch_up || stream.ended.load(Ordering::SeqCst) || stream.expires.is_some_and(|at| Instant::now() >= at);
-                        std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await;
+                        // Opened only after the old token ran out (a slow login or Vault):
+                        // changes in between had no event.
+                        let catch_up = catch_up || stream.expires.is_some_and(|at| Instant::now() >= at);
+                        let ended = std::mem::replace(&mut stream, Stream::new(new)).finish(&inner, users, &tx).await;
+                        inner.events.renewed();
                         if catch_up {
                             log_info!("Vault: subscribed to change events with a new token; reading every cached secret again, as the old stream may have stopped early (ADR 0306).");
+                            tx.send(Note::Resumed(None));
+                        } else if let Err(why) = ended {
+                            log_warn!("Vault: subscribed to change events again, but {why}; reading every cached secret again, as events may have been missed (ADR 0318).");
                             tx.send(Note::Resumed(None));
                         }
                     }
@@ -643,11 +764,21 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
                         log_warn!("Vault: couldn't renew the subscription to change events ({e}); keeping the current one (ADR 0306).");
                         stream.due = Instant::now() + MIN_RESUBSCRIBE;
                         stream.late = true;
+                        // Vault may keep a stream open, and answer its pings, after its token ran
+                        // out while sending nothing on it (ADR 0318). The saved end is from when it
+                        // opened; Vault Agent or botd may have renewed the same token since.
+                        if stream.expires.is_some_and(|at| Instant::now() >= at) {
+                            match inner.token_life(&stream.token, "auth/token/lookup-self", reqwest::Method::GET, None, false).await {
+                                Ok(Some((ttl, _))) => stream.expires = (ttl > 0).then(|| Instant::now() + Duration::from_secs(ttl)),
+                                _ => inner.events.stalled("the token the stream was made with ran out, and subscribing again failed"),
+                            }
+                        }
                     }
                 },
             }
         };
         drop(stream);
+        inner.events.lost(&why);
         log_warn!("Vault: change events stopped ({why}); subscribing again. Until then a change reaches botd within SECRETS_CACHE_SECONDS (ADR 0306).");
         audit_state(&addr, "lost", Some(&why));
         let mut wait = BACKOFF_START;
@@ -665,6 +796,7 @@ async fn follow(inner: Arc<Inner>, first: Subscribed, users: bool, tx: Tx) {
             }
         };
         log_info!("Vault: change events resumed; reading every cached secret again for changes made meanwhile (ADR 0306).");
+        inner.events.following(true);
         audit_state(&addr, "resumed", None);
         tx.send(Note::Resumed(None));
     }
@@ -683,12 +815,13 @@ fn audit_refresh(report: &Refresh, target: (&str, &str), trigger: &str, event: O
 
 /// Applies what the stream announces to the store, on a thread of its own: reads and
 /// refreshes block, and must not hold up the stream.
-fn apply(store: Weak<ExternalStore>, rx: Rx) {
+fn apply(store: Weak<ExternalStore>, rx: Rx, status: Arc<Status>) {
     while let Some(note) = rx.recv() {
         let Some(store) = store.upgrade() else { return };
         match note {
             Note::Changed { scope, name, event, index } => {
                 let Some(entry) = store.changed(&scope, &name, index.as_deref()) else { continue };
+                status.changed();
                 let folder = scope.folder('/');
                 if entry.restart {
                     log_warn!("Vault: {name} in {folder} changed ({event}), but botd read it at startup and keeps the old value until it restarts (ADR 0291).");
@@ -715,6 +848,7 @@ fn apply(store: Weak<ExternalStore>, rx: Rx) {
                     }
                 };
                 if let Some(r) = report {
+                    status.caught_up();
                     if !r.restart().is_empty() {
                         log_warn!("Vault: {} changed while change events were down, but botd read them at startup and keeps the old values until it restarts (ADR 0291).", r.restart().join(", "));
                     }
@@ -731,8 +865,10 @@ pub(super) fn start(vault: &Vault, store: Weak<ExternalStore>) -> Result<(), Err
     let users = store.upgrade().is_some_and(|s| s.user_folders());
     let first = vault.run(|i| async move { i.subscribe().await })?;
     audit_state(&vault.inner.cfg.addr, "subscribed", None);
+    vault.inner.events.following(true);
     let (tx, rx) = queue();
-    std::thread::Builder::new().name("vault-events".into()).spawn(move || apply(store, rx)).map_err(|e| unavailable("change events", e))?;
+    let status = Arc::clone(&vault.inner.events);
+    std::thread::Builder::new().name("vault-events".into()).spawn(move || apply(store, rx, status)).map_err(|e| unavailable("change events", e))?;
     vault.worker.spawn(follow(Arc::clone(&vault.inner), first, users, tx))
 }
 
@@ -774,6 +910,9 @@ pub(crate) mod tests {
         pub pongs: AtomicUsize,
         /// Close frames botd sent.
         pub closes: AtomicUsize,
+        /// What the stand-in does with botd's close: answer it (0), drop the connection
+        /// without a word (1), or leave it unanswered (2).
+        pub on_close: AtomicUsize,
         /// The `X-Vault-Index` of each KV read that had one.
         pub indexes: Mutex<Vec<String>>,
         /// The same, for each list.
@@ -859,7 +998,7 @@ pub(crate) mod tests {
             let io = hyper_util::rt::TokioIo::new(on.await.unwrap());
             let (r, mut w) = tokio::io::split(io);
             let (ctx, mut client) = mpsc::channel(16);
-            tokio::spawn(async move {
+            let reader = tokio::spawn(async move {
                 let mut r = Reader::new(r, true);
                 while let Ok(m) = r.next().await {
                     if ctx.send(m).await.is_err() {
@@ -881,7 +1020,11 @@ pub(crate) mod tests {
                         }
                         Some(Frame::Close) => {
                             hub.events.closes.fetch_add(1, Ordering::SeqCst);
-                            let _ = w.write_all(&frame(CLOSE, &1000u16.to_be_bytes(), None)).await;
+                            match hub.events.on_close.load(Ordering::SeqCst) {
+                                0 => { let _ = w.write_all(&frame(CLOSE, &1000u16.to_be_bytes(), None)).await; }
+                                1 => {}
+                                _ => { let _ = out.recv().await; }
+                            }
                             break;
                         }
                         Some(_) => {}
@@ -889,6 +1032,8 @@ pub(crate) mod tests {
                     },
                 }
             }
+            // Both halves go, so the connection closes now, not at botd's next frame.
+            reader.abort();
         });
         Response::builder()
             .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)
@@ -1038,6 +1183,8 @@ pub(crate) mod tests {
         assert!(x.watch().unwrap());
         assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 1);
         assert_eq!(*f.events.tokens.lock().unwrap(), ["hvs.events"]);
+        let w = x.watch_status().expect("following");
+        assert_eq!((w.following, w.changes, w.last_change_ms, w.lost, w.catch_ups), (true, 0, None, 0, 0));
         assert_eq!(audited(&url).iter().filter(|e| e.action == "secret.vault_events" && e.details["state"] == "subscribed").count(), 1);
         assert_eq!(get(&x, "EVENTS_ROTATED_TOKEN").as_deref(), Some("events-rotated-1"));
         assert_eq!(get(&x, "EVENTS_DELETED_TOKEN").as_deref(), Some("events-deleted-1"));
@@ -1086,6 +1233,9 @@ pub(crate) mod tests {
         f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_ROTATED_TOKEN"));
         wait_for(|| get(&x, "EVENTS_ROTATED_TOKEN").as_deref() == Some("events-rotated-3"));
         assert_eq!(f.reads.load(Ordering::SeqCst), reads + 1, "only the last event is for a name botd reads");
+        wait_for(|| x.watch_status().unwrap().changes == 5);
+        let w = x.watch_status().unwrap();
+        assert!(w.following && w.last_change_ms.is_some() && w.lost == 0, "{w:?}");
         wait_for(|| f.events.pongs.load(Ordering::SeqCst) > 0);
         for v in ["events-rotated-1", "events-rotated-2", "events-rotated-3", "events-startup-1", "events-startup-2", "events-deleted-1", "events-added-1"] {
             redact::forget(v);
@@ -1106,6 +1256,8 @@ pub(crate) mod tests {
         f.events.close_all();
         put(&f, "bots/EVENTS_GAP_TOKEN", "events-gap-2");
         wait_for(|| audited(&url).iter().any(|e| e.details["state"] == "lost"));
+        let w = x.watch_status().unwrap();
+        assert_eq!((w.following, w.lost, w.last_loss.as_deref()), (false, 1, Some("Vault closed the stream")));
         std::thread::sleep(BACKOFF_START * 4);
         assert_eq!(get(&x, "EVENTS_GAP_TOKEN").as_deref(), Some("events-gap-1"), "not yet: botd couldn't subscribe again");
         f.events.status.store(0, Ordering::SeqCst);
@@ -1114,6 +1266,7 @@ pub(crate) mod tests {
         assert_eq!((lost.outcome, lost.details["error"].as_str()), (Outcome::Failure, Some("Vault closed the stream")));
         assert!(audited(&url).iter().any(|e| e.details["state"] == "resumed"));
         wait_for(|| audited("vault").iter().any(|e| e.action == "secret.cache_refreshed" && e.details["trigger"] == "vault-events-resumed"));
+        wait_for(|| x.watch_status().is_some_and(|w| w.following && w.catch_ups >= 1));
 
         // A connection dropped without a word, then a server that stops answering pings.
         f.events.cut();
@@ -1124,6 +1277,7 @@ pub(crate) mod tests {
         wait_for(|| audited(&url).iter().any(|e| e.details["error"] == "Vault stopped answering pings"));
         f.events.silent.store(false, Ordering::SeqCst);
         wait_for(|| f.events.open() == 1 && f.events.subscriptions.load(Ordering::SeqCst) >= 4);
+        wait_for(|| x.watch_status().is_some_and(|w| w.following && w.lost >= 3));
         put(&f, "bots/EVENTS_GAP_TOKEN", "events-gap-3");
         f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_GAP_TOKEN"));
         wait_for(|| get(&x, "EVENTS_GAP_TOKEN").as_deref() == Some("events-gap-3"));
@@ -1141,12 +1295,14 @@ pub(crate) mod tests {
         let x = store(&url, &[("VAULT_AUTH", "approle"), ("VAULT_ROLE_ID", "role-1"), ("VAULT_SECRET_ID", "secret-id-1")], "3600");
         x.check().unwrap();
         x.watch().unwrap();
+        assert_eq!(get(&x, "EVENTS_MOVED_TOKEN").as_deref(), Some("events-moved-1"));
         wait_for(|| f.events.subscriptions.load(Ordering::SeqCst) >= 3 && f.events.closes.load(Ordering::SeqCst) >= 2);
         let tokens = f.events.tokens.lock().unwrap().clone();
         assert!(tokens.windows(2).all(|w| w[0] != w[1]), "each with a new login: {tokens:?}");
         assert!(f.events.open() <= 2, "the old one closed once the new one was open");
-        assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "no gap, so nothing to read again");
-        assert_eq!(get(&x, "EVENTS_MOVED_TOKEN").as_deref(), Some("events-moved-1"));
+        assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "no gap");
+        // Each old stream ended with Vault's answer to botd's close, so nothing was missed.
+        assert!(!caught_up("EVENTS_MOVED_TOKEN"), "nothing to read again");
         put(&f, "bots/EVENTS_MOVED_TOKEN", "events-moved-2");
         f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_MOVED_TOKEN"));
         wait_for(|| get(&x, "EVENTS_MOVED_TOKEN").as_deref() == Some("events-moved-2"));
@@ -1202,8 +1358,16 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 1);
         assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-1"));
+        // Past the lease it had at 1 s, but renewed in place (Vault still says it lives): followed.
+        assert!(x.watch_status().unwrap().following);
+        // Vault forgets the token: open and answering pings, but not counted as followed.
+        f.tokens.lock().unwrap().remove(0);
+        wait_for(|| !x.watch_status().unwrap().following);
+        let w = x.watch_status().unwrap();
+        assert!(w.lost == 0 && w.last_loss.as_deref().is_some_and(|l| l.contains("ran out")), "{w:?}");
         f.events.status.store(0, Ordering::SeqCst);
         wait_for(|| caught_up("EVENTS_LATE_TOKEN"));
+        assert!(x.watch_status().unwrap().following, "followed again with the new subscription");
         assert_eq!(get(&x, "EVENTS_LATE_TOKEN").as_deref(), Some("events-late-2"));
         assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "the old stream never broke");
         redact::forget("events-late-1");
@@ -1273,6 +1437,108 @@ pub(crate) mod tests {
         redact::forget("events-handoff-2");
     }
 
+    /// A store on 6 s AppRole logins with `name` cached: botd subscribes again at 4 s, before
+    /// the old token runs out, so only how the old stream ends can call for a catch-up.
+    fn six_second_logins(name: &str, value: &str) -> (String, F, Arc<ExternalStore>) {
+        let (url, f) = stand_in();
+        f.lease.store(6, Ordering::SeqCst);
+        put(&f, &format!("bots/{name}"), value);
+        let x = store(&url, &[("VAULT_AUTH", "approle"), ("VAULT_ROLE_ID", "role-1"), ("VAULT_SECRET_ID", "secret-id-1")], "3600");
+        x.check().unwrap();
+        x.watch().unwrap();
+        assert_eq!(get(&x, name).as_deref(), Some(value));
+        (url, f, x)
+    }
+
+    /// Holds the next subscription for a second, and waits until botd has asked for it.
+    fn while_the_next_subscription_opens(f: &F) {
+        f.events.delay_ms.store(1000, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(15);
+        while f.events.asked.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn opened_the_next(f: &F) {
+        let until = Instant::now() + Duration::from_secs(15);
+        while f.events.subscriptions.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f.events.delay_ms.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn an_old_stream_dropped_behind_queued_events_reads_everything_again() {
+        let (_, f, x) = six_second_logins("EVENTS_DROPPED_TOKEN", "events-dropped-1");
+        put(&f, "bots/EVENTS_QUEUED_TOKEN", "events-queued-1");
+        assert_eq!(get(&x, "EVENTS_QUEUED_TOKEN").as_deref(), Some("events-queued-1"));
+        while_the_next_subscription_opens(&f);
+        // More events than botd took to wait on the old stream while it opens the new one,
+        // then a change whose event the dropped connection lost.
+        put(&f, "bots/EVENTS_QUEUED_TOKEN", "events-queued-2");
+        for _ in 0..80 {
+            f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_QUEUED_TOKEN"));
+        }
+        put(&f, "bots/EVENTS_DROPPED_TOKEN", "events-dropped-2");
+        std::thread::sleep(Duration::from_millis(100));
+        f.events.cut();
+        opened_the_next(&f);
+        wait_for(|| caught_up("EVENTS_DROPPED_TOKEN"));
+        assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 2, "with the new subscription, not a later one");
+        assert_eq!(get(&x, "EVENTS_DROPPED_TOKEN").as_deref(), Some("events-dropped-2"), "a change with no event, read again");
+        assert_eq!(get(&x, "EVENTS_QUEUED_TOKEN").as_deref(), Some("events-queued-2"), "the events queued ahead of the drop still count");
+        for v in ["events-dropped-1", "events-dropped-2", "events-queued-1", "events-queued-2"] {
+            redact::forget(v);
+        }
+    }
+
+    /// botd closes the old stream after the handoff, and Vault drops the connection (`on_close`
+    /// 1) or never answers (2): what was on its way may be lost, so everything is read again.
+    fn a_close_vault_doesnt_answer_reads_everything_again(on_close: usize, name: &str) {
+        let (url, f, x) = six_second_logins(name, "events-unanswered-1");
+        f.events.on_close.store(on_close, Ordering::SeqCst);
+        put(&f, &format!("bots/{name}"), "events-unanswered-2");
+        let until = Instant::now() + Duration::from_secs(15);
+        while f.events.closes.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wait_for(|| caught_up(name));
+        assert_eq!(f.events.subscriptions.load(Ordering::SeqCst), 2, "with the new subscription, not a later one");
+        assert_eq!(get(&x, name).as_deref(), Some("events-unanswered-2"), "a change with no event, read again");
+        assert!(!audited(&url).iter().any(|e| e.details["state"] == "lost"), "the new stream is fine");
+        redact::forget("events-unanswered-1");
+        redact::forget("events-unanswered-2");
+    }
+
+    #[test]
+    fn an_old_stream_that_drops_instead_of_answering_botds_close_reads_everything_again() {
+        a_close_vault_doesnt_answer_reads_everything_again(1, "EVENTS_CLOSE_DROPPED_TOKEN");
+    }
+
+    #[test]
+    fn an_old_stream_that_never_answers_botds_close_reads_everything_again() {
+        a_close_vault_doesnt_answer_reads_everything_again(2, "EVENTS_CLOSE_IGNORED_TOKEN");
+    }
+
+    #[test]
+    fn too_many_events_waiting_end_the_old_stream_and_read_everything_again() {
+        let (_, f, x) = six_second_logins("EVENTS_FLOODED_TOKEN", "events-flooded-1");
+        while_the_next_subscription_opens(&f);
+        put(&f, "bots/EVENTS_FLOODED_TOKEN", "events-flooded-2");
+        let one = event("data-write", "data", "superbot/bots/EVENTS_OTHER_TOKEN").len();
+        for _ in 0..MAX_WAITING / one + 10 {
+            f.events.emit(&event("data-write", "data", "superbot/bots/EVENTS_OTHER_TOKEN"));
+        }
+        opened_the_next(&f);
+        wait_for(|| caught_up("EVENTS_FLOODED_TOKEN"));
+        assert_eq!(get(&x, "EVENTS_FLOODED_TOKEN").as_deref(), Some("events-flooded-2"));
+        redact::forget("events-flooded-1");
+        redact::forget("events-flooded-2");
+    }
+
     #[test]
     fn botd_wont_start_without_the_events_it_was_asked_to_follow() {
         let (url, f) = token_stand_in("hvs.refused");
@@ -1299,6 +1565,7 @@ pub(crate) mod tests {
         let off = external::from_env(&settings(&pairs), &EnvStore::fixed(&pairs)).unwrap().unwrap();
         assert!(!off.watch().unwrap());
         assert!(!off.describe().contains("change events"));
+        assert_eq!(off.watch_status(), None);
         let bad = [("SECRETS_BACKEND", "vault"), ("VAULT_ADDR", url.as_str()), ("VAULT_TOKEN", "hvs.off"), ("VAULT_EVENTS", "yes")];
         let e = external::from_env(&settings(&bad), &EnvStore::fixed(&bad)).err().unwrap();
         assert!(e.contains("VAULT_EVENTS must be 1"));

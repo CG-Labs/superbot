@@ -2010,7 +2010,35 @@ fn backend_summary(b: &Value) -> Result<String, String> {
         out += ")";
     }
     out += &format!("\n  {}", b["detail"].as_str().unwrap_or_default());
+    if let Some(e) = events_summary(&b["events"]) {
+        out += &format!("\n  {e}");
+    }
     if b["ok"] == true { Ok(out) } else { Err(out) }
+}
+
+/// The backend's change stream (ADR 0306), when it follows one (ADR 0318). A lost stream
+/// isn't an error: reads still work, and the cache time bounds how old an answer gets.
+fn events_summary(e: &Value) -> Option<String> {
+    if !e.is_object() {
+        return None;
+    }
+    let n = |k: &str| e[k].as_u64().unwrap_or(0);
+    let times = |k: &str| format!("{} time{}", n(k), if n(k) == 1 { "" } else { "s" });
+    let mut out = match e["following"] == true {
+        true => format!("Change events: followed for {}", ago(n("forSeconds"))),
+        false => format!("Change events: not followed for {}, subscribing again; meanwhile a change reaches botd within the cache time", ago(n("forSeconds"))),
+    };
+    out += &match e["lastChangeSecondsAgo"].as_u64() {
+        Some(s) => format!("; {} read again as {}, the last {} ago", n("changes"), if n("changes") == 1 { "it changed" } else { "they changed" }, ago(s)),
+        None => "; no changes yet".into(),
+    };
+    if n("lost") > 0 {
+        out += &format!("; lost {}, last: {}", times("lost"), e["lastLoss"].as_str().unwrap_or("unknown"));
+    }
+    if n("catchUps") > 0 {
+        out += &format!("; every cached secret read again {}, as events may have been missed", times("catchUps"));
+    }
+    Some(out + ".")
 }
 
 /// `POST /api/secrets/refresh`, for a terminal (ADR 0291): the names whose answer moved,
@@ -4766,6 +4794,20 @@ mod tests {
         let down = json!({ "backend": "vault", "description": "HashiCorp Vault at https://v", "ok": false, "detail": "vault can't be read" });
         assert!(backend_summary(&down).unwrap_err().ends_with("vault can't be read"), "a failing backend is an error, for scripts");
         assert!(backend_summary(&Value::Null).is_err());
+
+        // Vault's change events (ADR 0318): followed, then lost, which isn't an error.
+        let mut vault = json!({ "backend": "vault", "description": "HashiCorp Vault at https://v, following Vault's change events", "cacheSeconds": 3600, "ok": true, "detail": "vault answers: 4 names",
+            "events": { "following": true, "forSeconds": 7200, "changes": 0, "lastChangeSecondsAgo": null, "lost": 0, "catchUps": 0, "lastLoss": null } });
+        assert!(backend_summary(&vault).unwrap().ends_with("\n  Change events: followed for 2h; no changes yet."));
+        vault["events"] = json!({ "following": true, "forSeconds": 90, "changes": 1, "lastChangeSecondsAgo": 30, "lost": 1, "catchUps": 2, "lastLoss": "Vault closed the stream" });
+        assert!(
+            backend_summary(&vault).unwrap().ends_with("\n  Change events: followed for 1m; 1 read again as it changed, the last 30s ago; lost 1 time, last: Vault closed the stream; every cached secret read again 2 times, as events may have been missed."),
+            "{}",
+            backend_summary(&vault).unwrap()
+        );
+        vault["events"] = json!({ "following": false, "forSeconds": 40, "changes": 12, "lastChangeSecondsAgo": 4000, "lost": 3, "catchUps": 3, "lastLoss": "Vault stopped answering pings" });
+        let lost = backend_summary(&vault).expect("reads still work, so not an error");
+        assert!(lost.contains("Change events: not followed for 40s, subscribing again; meanwhile a change reaches botd within the cache time; 12 read again as they changed, the last 1h ago; lost 3 times, last: Vault stopped answering pings"), "{lost}");
     }
 
     #[test]
