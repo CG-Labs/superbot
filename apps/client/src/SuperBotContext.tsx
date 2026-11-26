@@ -32,6 +32,7 @@ import { createBody, patchBody, type RoutineDraft } from "./routines";
 import { signInWithSso } from "./sso";
 import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
+import { endUnsent } from "./unsent";
 import type {
   Approval,
   ApprovalScope,
@@ -349,6 +350,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
 
   const reset = () => {
     sseRef.current?.close();
+    endUnsent(clientRef.current);
     clientRef.current = null;
     setApi(null);
     offerInviteCode(null);

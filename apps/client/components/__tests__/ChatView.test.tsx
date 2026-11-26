@@ -5,6 +5,7 @@ import { ToastProvider } from "../Toast";
 import { copyText } from "../../src/clipboard";
 import { themes } from "../../src/theme";
 import type { BotView, Message } from "../../src/types";
+import { endUnsent } from "../../src/unsent";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
 jest.mock("../ModelBar", () => {
@@ -34,6 +35,7 @@ const list: Message[] = [
   { id: 4, botId: "b", role: "bot", text: "All green", at: 4 },
 ];
 const mockCtx: Record<string, unknown> = {
+  api: {},
   bots: [bot("a", "Ada"), bot("b", "Bob")],
   activeId: "b",
   messages: { b: list },
@@ -48,6 +50,7 @@ jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
 
 describe("ChatView", () => {
   afterEach(() => {
+    mockCtx.api = {};
     mockCtx.bots = [bot("a", "Ada"), bot("b", "Bob")];
     mockCtx.me = undefined;
     mockCtx.activeId = "b";
@@ -221,22 +224,49 @@ describe("ChatView", () => {
     expect(sendText).toHaveBeenCalledTimes(2);
   });
 
-  it("gives back a message that fails after its chat closed", async () => {
-    let fail!: (err: Error) => void;
-    mockCtx.sendText = jest.fn(() => new Promise<void>((_, reject) => (fail = reject)));
-    const ui = () => (
-      <ToastProvider>
-        <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />
-      </ToastProvider>
+  describe("a send that fails after its chat closed", () => {
+    const ui = (open: boolean) => (
+      <ToastProvider>{open ? <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} /> : null}</ToastProvider>
     );
-    const first = await render(ui());
-    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Ship it"));
-    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
-    await first.unmount();
-    await act(async () => fail(new TypeError("Network request failed")));
+    const sendThenClose = async () => {
+      let fail!: (err: Error) => void;
+      const sendText = jest.fn(() => new Promise<void>((_, reject) => (fail = reject)));
+      mockCtx.sendText = sendText;
+      const view = await render(ui(true));
+      await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Ship it"));
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+      await view.rerender(ui(false));
+      return { view, sendText, fail: (err: Error) => act(async () => fail(err)) };
+    };
 
-    await render(ui());
-    expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+    it("comes back when the chat opens again, and its Retry goes away", async () => {
+      const { view, fail } = await sendThenClose();
+      await fail(new TypeError("Network request failed"));
+      expect(screen.getByRole("button", { name: "Retry" })).toBeOnTheScreen();
+
+      await view.rerender(ui(true));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    });
+
+    it("is forgotten on sign-out, so the next account never sees it", async () => {
+      const { view, fail } = await sendThenClose();
+      endUnsent(mockCtx.api as object);
+      await fail(new TypeError("Network request failed"));
+      expect(screen.queryByTestId("toast")).toBeNull();
+
+      mockCtx.api = {};
+      await view.rerender(ui(true));
+      expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("");
+    });
+
+    it("can't be retried after sign-out", async () => {
+      const { sendText, fail } = await sendThenClose();
+      await fail(new TypeError("Network request failed"));
+      endUnsent(mockCtx.api as object);
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Retry" })));
+      expect(sendText).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("keeps a failed message with its own Bot when you've moved to another", async () => {
@@ -271,10 +301,9 @@ describe("ChatView", () => {
     mockCtx.activeId = "b";
     await view.rerender(ui());
     expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
 
-    mockCtx.activeId = "a";
-    await view.rerender(ui());
-    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Retry" })));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
     expect(sendText).toHaveBeenNthCalledWith(2, "Ship it", undefined, "b");
   });
 
