@@ -1863,11 +1863,18 @@ impl Check<'_> {
     }
 
     /// When `x` became an engineer, as of the period's last day: since joining when the
-    /// register marks them one, or since their assignment as holder or deputy of the
-    /// Engineering lead role began.
+    /// register marks them one, or since the start of their unbroken stretch as holder or
+    /// deputy of the Engineering lead role, so a change of the other person doesn't reset it.
     fn engineer_since(&self, x: &Person) -> Option<NaiveDate> {
         let last = self.cut().pred_opt()?;
-        let by_role = self.assignments_on(ENGINEERING_ROLE, last).filter(|a| a.holder == x.id || a.deputy.as_deref() == Some(x.id.as_str())).map(|a| a.from).min();
+        let theirs = |a: &&Role| a.role == ENGINEERING_ROLE && (a.holder == x.id || a.deputy.as_deref() == Some(x.id.as_str()));
+        let mut by_role = self.assignments_on(ENGINEERING_ROLE, last).filter(|a| theirs(a)).map(|a| a.from).min();
+        while let Some(since) = by_role {
+            match self.r.roles.iter().filter(theirs).filter(|a| a.until == Some(since)).map(|a| a.from).min() {
+                Some(from) if from < since => by_role = Some(from),
+                _ => break,
+            }
+        }
         [x.engineer.then_some(x.joined), by_role].into_iter().flatten().min().map(|d| d.max(x.joined))
     }
 
@@ -1908,16 +1915,20 @@ impl Check<'_> {
             }
             let mut screened: Vec<&Screening> = self.r.screenings.iter().filter(|s| s.person == x.id && s.at < cut).collect();
             screened.sort_by_key(|s| s.at);
+            let mut counted = Vec::new();
             for s in &screened {
                 if self.held(&s.by, &[SCREENER], s.at).is_none() {
                     s_wrong.push(json!(format!("{} on {}: {} didn't hold {SCREENER}", x.id, s.at, s.by)));
+                } else {
+                    counted.push(*s);
                 }
             }
             // Before access for anyone joining once the policy is approved; those already
-            // in scope then are screened, or exempted, within the grace period.
+            // in scope then are screened, or exempted, within the grace period. Only a record
+            // by the People lead or their deputy counts.
             let s_due = training_from.map(|f| if x.joined >= f { x.joined } else { plus(f, GRACE_DAYS) });
             if let Some(due) = s_due.filter(|d| at_end(x) && *d < cut) {
-                match screened.first() {
+                match counted.first() {
                     None => s_missing.push(json!(format!("{} (due {due})", x.id))),
                     Some(s) if s.at > due => s_late.push(json!(format!("{} ({}, due {due})", x.id, s.at))),
                     Some(_) => {}
@@ -3472,12 +3483,13 @@ mod tests {
         screenings.push(json!({ "person": "p-late", "kind": "check", "at": "2027-03-04", "by": "p-mgmt", "recordSha256": ZERO }));
         screenings.push(json!({ "person": "p-pre", "kind": "check", "at": "2027-03-18", "by": "p-sec", "recordSha256": ZERO }));
         screenings.push(json!({ "person": "p-eng", "kind": "check", "at": "2027-02-01", "by": "p-ops", "recordSha256": ZERO }));
+        screenings.push(json!({ "person": "p-ops", "kind": "exempt", "at": "2027-01-15", "by": "p-eng", "recordSha256": ZERO }));
         check(&v, &|c| {
             let (pe, rows) = c.people();
             let ex = &pe["exceptions"];
-            assert_eq!(ex["notScreened"], json!(["p-ops (due 2027-02-04)", "p-new (due 2027-03-10)"]), "before access once the policy is approved, within 30 days of it for those already in");
+            assert_eq!(ex["notScreened"], json!(["p-ops (due 2027-02-04)", "p-new (due 2027-03-10)"]), "before access once the policy is approved, within 30 days of it for those already in; p-ops's exemption by p-eng doesn't count");
             assert_eq!(ex["screenedLate"], json!(["p-late (2027-03-04, due 2027-03-03)"]));
-            assert_eq!(ex["screenerNotInRole"], json!(["p-eng on 2027-02-01: p-ops didn't hold People lead"]), "a deputy counts (p-sec for p-pre), anyone else doesn't");
+            assert_eq!(ex["screenerNotInRole"], json!(["p-eng on 2027-02-01: p-ops didn't hold People lead", "p-ops on 2027-01-15: p-eng didn't hold People lead"]), "a deputy counts (p-sec for p-pre), anyone else doesn't");
             let pre = pe["people"].as_array().unwrap().iter().find(|x| x["id"] == "p-pre").unwrap();
             assert_eq!((pre["screening"]["first"]["heldRole"].as_str(), pre["screening"]["due"].as_str()), (Some("People lead (deputy)"), Some("2027-03-20")), "{pre}");
             let gone = pe["people"].as_array().unwrap().iter().find(|x| x["id"] == "p-gone").unwrap();
@@ -3527,6 +3539,15 @@ mod tests {
             assert_eq!((person("p-mgmt")["engineer"].as_bool(), pe["summary"]["engineersAtEnd"].as_u64()), (Some(false), Some(3)));
             assert!(!rows.contains(&"CC1.4-1"), "an engineer overdue: {rows:?}");
             assert!(rows.contains(&"CC2.2-1"), "{rows:?}");
+        });
+        let mut v = good();
+        v["roles"][2]["until"] = json!("2027-03-10");
+        v["roles"].as_array_mut().unwrap().push(json!({ "role": "Engineering lead", "holder": "p-ops", "deputy": "p-eng", "from": "2027-03-10" }));
+        v["training"].as_array_mut().unwrap().retain(|t| !(t["person"] == "p-eng" && t["course"] == SECURE_DEVELOPMENT));
+        check(&v, &|c| {
+            let (pe, rows) = c.people();
+            assert_eq!(pe["exceptions"]["secureDevelopmentNotTrained"], json!(["p-eng (due 2027-02-04)"]), "swapping holder and deputy doesn't restart either's clock: {pe:#}");
+            assert!(!rows.contains(&"CC1.4-1"), "{rows:?}");
         });
     }
 
