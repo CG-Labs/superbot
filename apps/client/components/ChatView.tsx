@@ -66,6 +66,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
   const styles = useStyles();
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
+  const [composing, setComposing] = useState(false);
   const listRef = useRef<FlatList>(null);
   const inputRef = useRef<TextInputInstance>(null);
 
@@ -280,7 +281,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
             />
           )}
           {canOperate ? (
-            <View style={styles.composer}>
+            <View style={[styles.composer, composing && styles.composerFocused]}>
               <TextInput
                 ref={inputRef}
                 aria-label={`Message ${bot.name}`}
@@ -289,6 +290,8 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
                 placeholderTextColor={t.c.textFaint}
                 value={text}
                 onChangeText={setText}
+                onFocus={() => setComposing(true)}
+                onBlur={() => setComposing(false)}
                 multiline
                 onSubmitEditing={Platform.OS === "web" ? onSend : undefined}
               />
@@ -487,6 +490,11 @@ const useStyles = themedStyles((t) =>
       borderColor: t.c.border,
       backgroundColor: t.c.elevated,
       boxShadow: t.shadow.card,
+    },
+    // The input drops the browser's outline, so focus shows on the whole composer instead.
+    composerFocused: {
+      borderColor: t.c.accent,
+      boxShadow: `${t.shadow.card}, 0 0 0 3px ${t.c.accentSoft}`,
     },
     input: {
       flex: 1,

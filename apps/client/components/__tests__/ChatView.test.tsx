@@ -2,6 +2,7 @@ import React from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { ChatView, peerLabel } from "../ChatView";
 import { copyText } from "../../src/clipboard";
+import { themes } from "../../src/theme";
 import type { BotView, Message } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
@@ -127,5 +128,18 @@ describe("ChatView", () => {
     await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
     expect(screen.getByText("Pick a bot to start chatting")).toBeOnTheScreen();
     expect(screen.queryByLabelText(/^Message /)).toBeNull();
+  });
+
+  it("shows keyboard focus on the message box", async () => {
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    const box = screen.getByLabelText("Message Bob");
+    const accent = { borderColor: themes.light.c.accent };
+    expect(box.parent).not.toHaveStyle(accent);
+
+    await act(async () => fireEvent(box, "focus"));
+    expect(box.parent).toHaveStyle(accent);
+
+    await act(async () => fireEvent(box, "blur"));
+    expect(box.parent).not.toHaveStyle(accent);
   });
 });
