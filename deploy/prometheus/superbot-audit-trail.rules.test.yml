@@ -31,13 +31,15 @@ tests:
         alertname: SuperBotAuditExportFailing
         exp_alerts: []
 
-  # A sink taken out: a ticket for the hour after, not for one stopped long before.
+  # A sink taken out: a ticket for the hour after its stop, none with no sink stopped, and
+  # none once the stop is an hour old, though the sink stays stopped.
   - interval: 1m
     input_series:
-      - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="a:8080"}'
-        values: '0x30 1x150'
-      - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="b:8080"}'
-        values: '1x180'
+      # Stopped at 30m (1800 s).
+      - series: 'superbot_audit_export_last_stop_timestamp_seconds{job="superbot",instance="a:8080"}'
+        values: '0x30 1800x150'
+      - series: 'superbot_audit_export_last_stop_timestamp_seconds{job="superbot",instance="b:8080"}'
+        values: '0x180'
     alert_rule_test:
       - eval_time: 20m
         alertname: SuperBotAuditSinkStopped
@@ -53,6 +55,34 @@ tests:
               summary: An audit sink was taken out of the export
               description: "botd started without a sink it was sending audit events to, so that SIEM or archive gets nothing from now on. Find who changed AUDIT_EXPORT and why; if nobody can say, treat it as a security incident. See docs/support/runbook-audit-trail.md#a-sink-was-stopped."
       - eval_time: 150m
+        alertname: SuperBotAuditSinkStopped
+        exp_alerts: []
+
+  # Switching back to a stopped sink while taking out the one running: the count of stopped
+  # sinks stays at 1, but the new stop still raises a ticket.
+  - interval: 1m
+    input_series:
+      # Sink A stopped at 10m (600 s); at 70m A is set again and B taken out (4200 s).
+      - series: 'superbot_audit_export_stopped_sinks{job="superbot",instance="a:8080"}'
+        values: '0x10 1x170'
+      - series: 'superbot_audit_export_last_stop_timestamp_seconds{job="superbot",instance="a:8080"}'
+        values: '0x10 600x60 4200x110'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SuperBotAuditSinkStopped
+        exp_alerts: []
+      # 90 minutes after A's stop, 30 after B's: B's is the ticket.
+      - eval_time: 100m
+        alertname: SuperBotAuditSinkStopped
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+              instance: a:8080
+            exp_annotations:
+              summary: An audit sink was taken out of the export
+              description: "botd started without a sink it was sending audit events to, so that SIEM or archive gets nothing from now on. Find who changed AUDIT_EXPORT and why; if nobody can say, treat it as a security incident. See docs/support/runbook-audit-trail.md#a-sink-was-stopped."
+      - eval_time: 135m
         alertname: SuperBotAuditSinkStopped
         exp_alerts: []
 

@@ -27,8 +27,11 @@ groups:
           description: "botd has failed to deliver audit events to its {{ $labels.kind }} sink for 15 minutes. They wait in its database and nothing is lost yet. botctl audit siem shows the last error. See docs/support/runbook-audit-trail.md#the-export-is-failing."
 
       # A sink taken out of AUDIT_EXPORT (audit.export_stopped): from then on it gets nothing.
+      # For the hour after the newest stop, from its time in the audit log, so a restart doesn't
+      # raise it again. Not the count of stopped sinks: switching back to a stopped sink while
+      # taking out another leaves that flat.
       - alert: SuperBotAuditSinkStopped
-        expr: max by (job, instance) (delta(superbot_audit_export_stopped_sinks{job="superbot"}[1h])) > 0
+        expr: time() - max by (job, instance) (superbot_audit_export_last_stop_timestamp_seconds{job="superbot"} > 0) < 3600
         labels:
           severity: ticket
         annotations:
