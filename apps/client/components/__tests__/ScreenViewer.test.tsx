@@ -175,6 +175,32 @@ describe("ScreenViewer", () => {
     }
   });
 
+  it("keeps control after Try again when it's still the same screen", async () => {
+    const fetchUrl = jest
+      .fn()
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a")
+      .mockRejectedValueOnce(new Error("The screen is busy."))
+      .mockResolvedValueOnce("https://h/screen/6901/?token=a");
+    jest.useFakeTimers();
+    try {
+      await render(<ScreenViewer botId="b1" botName="Ada" fetchUrl={fetchUrl} onClose={jest.fn()} refreshMs={1000} retryMs={60_000} />);
+      expect(await screen.findByTestId("screen-frame")).toHaveTextContent(/token=a/);
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Take over" })));
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.getByRole("alert")).toHaveTextContent(/busy/);
+
+      await act(async () => fireEvent.press(screen.getByRole("button", { name: "Try again" })));
+      expect(fetchUrl).toHaveBeenCalledTimes(3);
+      expect(screen.getByTestId("screen-frame")).toHaveTextContent(/token=a/);
+      expect(screen.getByRole("button", { name: "Give back" })).toBeOnTheScreen();
+      expect(screen.queryByTestId("screen-shield")).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("hands the screen back with Done during a handoff", async () => {
     const user = userEvent.setup();
     const onHandoffDone = jest.fn().mockResolvedValue(undefined);
