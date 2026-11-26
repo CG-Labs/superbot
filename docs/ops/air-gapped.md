@@ -193,7 +193,7 @@ sudo bash install.sh --offline superbot-offline-0.1.0-x86_64.tar.gz --upgrade --
 
 If any of these fails, it says which and changes nothing. Otherwise it stops botd and puts back `.env` and DATA_DIR from before the upgrade. It keeps what they replace in `.env.before-rollback-<stamp>` and `DATA_DIR/.pre-restore-<stamp>/`, then installs the older bundle as usual. Delete those copies once SuperBot looks right. As on every install, the installer then sets the values it owns in that `.env` (`PORT`, `DATA_DIR` and the rest); if it pointed `DATA_DIR` elsewhere, the rollback is refused before anything changes. If the restore fails before it touches DATA_DIR, the `.env` goes back too and botd starts again as it was. If it fails while swapping DATA_DIR, botd stays stopped and the installer says how to move the data back from the newest `.pre-restore-*` folder. If the rollback stops after that, run the same command again before starting botd: it reinstalls the older release with nothing left to restore. Without `--rollback`, a downgrade is still refused, and says to add it when a backup that fits is there.
 
-A rollback doesn't touch per-user accounts and their folders, Hermes Agent in `/opt/hermes`, or the harness CLIs in `/opt/superbot-harnesses`: the installer says when their pins differ from the older release's. Users' machines keep what they had. To go back further than one upgrade, or with Docker Compose, restore a backup made on that release ([backup-restore.md](backup-restore.md)).
+A rollback doesn't touch per-user accounts and their folders, Hermes Agent in `/opt/hermes`, or the harness CLIs in `/opt/superbot-harnesses`: the installer says when their pins differ from the older release's. Users' machines keep what they had. To go back further than one upgrade, restore a backup made on that release ([backup-restore.md](backup-restore.md)). With Docker Compose, see [going back with Compose](#going-back-with-compose).
 
 ## Hermes Agent
 
@@ -318,7 +318,29 @@ It runs the image's botd through Compose (`docker compose run --rm --no-deps`, w
 
 A check that doesn't finish (botd killed, or a license or settings it can't read) stops it too, so a script that runs it before `up -d` never switches on a check that wasn't made. Nothing in the stack changes: the running botd keeps running, and no container is left. Then set `SUPERBOT_VERSION` (or `SUPERBOT_IMAGE`) in `.env` and `docker compose up -d`. Without `--image` it checks the image `.env` now names, if you changed it first. Compose's own options go after `--`: `check-compose --image <ref> -- -f docker-compose.yml -f docker-compose.prod.yml -p superbot`.
 
-It refuses a stack that has never run botd (there is nothing to upgrade, and a check would make its volumes), an image that isn't on the host (it never pulls; with a mirror, `docker pull` it first), and a Compose file that names botd's image without `SUPERBOT_IMAGE` (point it at the image there, or override it). It doesn't take a backup: for a way back, back up first with `docker compose exec botd superbot-backup` ([backup and restore](backup-restore.md#schedule)), since a release may migrate the database when it starts.
+It refuses a stack that has never run botd (there is nothing to upgrade, and a check would make its volumes), an image that isn't on the host (it never pulls; with a mirror, `docker pull` it first), and a Compose file that names botd's image without `SUPERBOT_IMAGE` (point it at the image there, or override it).
+
+**It refuses an older release** ([ADR 0327](../adr/0327-compose-upgrades-keep-a-way-back.md)). Before the settings, the image's own `botd support check` reads the stack's database, read-only. If a newer botd made it ("made by a newer botd") or ran on it last ("botd 0.3.0 ran on it last"), it stops: botd would start on that database anyway, and may not work on it. Go back with the data from before, [below](#going-back-with-compose). It stops too when the check fails the database for another reason, such as a master key that doesn't open it or a failed integrity check, and says what botd said. It doesn't take a backup itself: take a rollback point before you switch, and it says when you have one.
+
+### Going back with Compose
+
+Before you switch, take a rollback point from the stack's folder, with botd running on the release you are leaving ([ADR 0327](../adr/0327-compose-upgrades-keep-a-way-back.md)):
+
+```sh
+../deploy/offline-bundle.sh backup-compose
+```
+
+It runs that release's own `superbot-backup` in botd's container, so it is the stack's usual backup: a consistent copy of the database, encrypted to `SUPERBOT_BACKUP_AGE_RECIPIENTS` when the stack has them. It keeps it in `./superbot-rollback/` (or `--dir <folder>`), which only you can open, with a record of the image botd ran on (its tag and image ID), the archive's SHA-256, and which master key sealed its saved secrets (a digest of the database's key check, not the key). One is kept: the next replaces it. If the backup fails, the last one is kept. One `backup-compose` or `rollback-compose` runs at a time per folder. Then switch as above.
+
+If the new release isn't working, set `SUPERBOT_VERSION` (or `SUPERBOT_IMAGE`) in `.env` back to the image it names, keep that release's images loaded, and run:
+
+```sh
+../deploy/offline-bundle.sh rollback-compose --identity /path/to/backup-identity.txt
+```
+
+(`--identity` only for an encrypted point: your backup key, readable by the container's user, uid `10001`; bring it back if you moved it off the host.) **Everything saved since the rollback point is lost.** Before anything changes, it checks that the record and archive are as `backup-compose` left them, that they are of this Compose project, that Compose would now start botd from the recorded image and that the image on the host is that build, that the old botd would start with the stack's settings, that the master key hasn't been [rotated](master-key-rotation.md) since the point (or `SUPERBOT_MASTER_KEY_PREVIOUS` in `.env` gives the key from before), and that the old image's `superbot-restore --check` reads the archive. If any fails, it says which and changes nothing.
+
+Then it stops the stack, restores botd's data volume with the old image's `superbot-restore`, which keeps what it replaces in `.pre-restore-<stamp>/` in the volume, and starts the stack with `docker compose up -d --wait`. It removes the rollback point once the stack is healthy; if it doesn't come up, the point is kept, so you can fix what botd says and run it again. If the restore fails before it touches the data, the stack starts again as it was; if it fails while swapping, the stack stays stopped and it says where the data from before is. Compose's own options go after `--` for both commands, as for `check-compose`. Only botd's data goes back: the workspace, users' homes and the Hermes volume stay as they are. To go back further than one upgrade, restore a backup made on that release ([backup and restore](backup-restore.md#compose-same-host)).
 
 ## Registry mirrors
 
