@@ -255,7 +255,24 @@ pub fn audit_restores(db: &Db, dirs: &[(String, PathBuf)]) -> Vec<String> {
             let backup = note["backup"].as_str().map_or("a backup".to_string(), |b| clip(b, 200));
             if note["file"].as_u64().is_some_and(|f| files.contains(&f)) {
                 let mut details = json!({ "region": region });
-                for k in ["storeId", "backup", "from", "backupAt", "restoredAt", "kept", "replacedUnreadable", "held", "dropped", "erased", "signInsReplaced", "signedIn", "back", "gone", "uid"] {
+                for k in [
+                    "storeId",
+                    "backup",
+                    "from",
+                    "backupAt",
+                    "restoredAt",
+                    "kept",
+                    "replacedUnreadable",
+                    "held",
+                    "dropped",
+                    "erased",
+                    "signInsReplaced",
+                    "signedIn",
+                    "meterHeldBack",
+                    "back",
+                    "gone",
+                    "uid",
+                ] {
                     match &note[k] {
                         Value::String(v) => details[k] = json!(clip(v, 200)),
                         Value::Null => {}
@@ -539,6 +556,9 @@ pub struct Plan {
     /// People kept in it with no second factor in the backup, counted only when the store
     /// now is missing or doesn't open: one they set up since is lost (ADR 0299).
     without_factor: usize,
+    /// Usage records kept from it (the store now missing or not opening, ADR 0304) that were
+    /// still waiting for Stripe's meter, marked failed rather than sent again.
+    meter_held_back: usize,
 }
 
 /// Erasures the copy must have run again: each erased person and pseudonym, and the Bots
@@ -642,7 +662,7 @@ fn prepare(place: &Place, work: &Path, at: i64, current: &Current) -> Result<Pla
     } else {
         None
     };
-    (plan.sign_ins_replaced, plan.signed_in) = crate::db::sign_ins_from(&c, now, &kept).map_err(err)?;
+    (plan.sign_ins_replaced, plan.signed_in, plan.meter_held_back) = crate::db::sign_ins_from(&c, now, &kept).map_err(err)?;
     if now.is_some() {
         c.execute("DETACH DATABASE now_store", []).map_err(err)?;
     }
@@ -909,6 +929,7 @@ fn write_note(place: &Place, r: &Restore, work: &Path, at: i64) -> Result<PathBu
         "erased": r.plan.erased,
         "signInsReplaced": r.plan.sign_ins_replaced,
         "signedIn": r.plan.signed_in,
+        "meterHeldBack": r.plan.meter_held_back,
         "back": r.plan.back,
         "gone": r.plan.gone,
         "uid": euid(),
@@ -996,6 +1017,20 @@ impl Restore {
                 "  Its people's second factors ({}) are replaced by the store's now ({}), so one turned off or reset since stays so, and a recovery code spent since stays spent (ADR 0299).\n",
                 none_if_empty(&replaced),
                 none_if_empty(&now)
+            ));
+        }
+        let (replaced, now) = (p.sign_ins_replaced.usage(), p.signed_in.usage());
+        if replaced.total() + now.total() > 0 {
+            out.push_str(&format!(
+                "  Its model usage records ({}) are replaced by the store's now ({}), so none recorded since is lost and none metered since is sent to Stripe again (ADR 0304).\n",
+                none_if_empty(&replaced),
+                none_if_empty(&now)
+            ));
+        }
+        if p.meter_held_back > 0 {
+            out.push_str(&format!(
+                "  Model usage records in it still waiting for Stripe's meter: {}. With the store now gone nothing says whether they were sent since, so they are marked failed, not sent again. Check them against Stripe (ADR 0304).\n",
+                p.meter_held_back
             ));
         }
         if p.unopened > 0 {
@@ -1702,6 +1737,69 @@ mod tests {
         let r = restore(&place, &opts_gone("newest", true), now()).await.unwrap();
         assert_eq!(r.plan.unopened_secrets, 1);
         assert!(r.text("gb-lon").contains("1 people's own secrets in it don't open with the master key; botd drops them at start"), "{}", r.text("gb-lon"));
+    }
+
+    fn used(db: &Db, user: &str, bot: &str, run: &str) {
+        let row = crate::db::TokenRow {
+            user_id: user.into(),
+            bot_id: bot.into(),
+            run_id: run.into(),
+            message_id: None,
+            harness: "claude".into(),
+            model: None,
+            reported: true,
+            input: 10,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            at: now(),
+            meter: Some("cus_0304".into()),
+        };
+        db.record_tokens(&[row]).unwrap();
+    }
+
+    fn waiting(db: &Db) -> Vec<String> {
+        db.pending_meter(10).into_iter().map(|m| m.run_id).collect()
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_takes_its_usage_records_from_the_store_it_replaces_or_holds_its_unsent_ones_back() {
+        let (w, db) = World::new();
+        let (ada, adas) = pinned_bot(&db, "ada", "gb-lon");
+        used(&db, &ada, &adas, "run-sent-since");
+        backup_pass(&db, 7, now() - DAY);
+        let sent = db.pending_meter(10)[0].id;
+        db.meter_result(sent, Some("sent"));
+        used(&db, &ada, &adas, "run-made-since");
+        drop(db);
+
+        let r = restore(&w.place(), &opts("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.sign_ins_replaced.usage_records, r.plan.signed_in.usage_records, r.plan.meter_held_back), (1, 2, 0), "{r:?}");
+        let text = r.text("gb-lon");
+        assert!(
+            text.contains("Its model usage records (1 model usage record) are replaced by the store's now (2 model usage records), so none recorded since is lost and none metered since is sent to Stripe again"),
+            "{text}"
+        );
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!(db.tokens_used(&ada, 0, i64::MAX), 20, "one recorded since is kept");
+        assert_eq!(waiting(&db), ["run-made-since"], "one metered since isn't sent again");
+        backup_pass(&db, 8, now());
+        drop(db);
+
+        // With the store gone, the backup's are the only copy left: kept, but one still waiting
+        // may have been sent since, so it is held back from the meter rather than sent twice.
+        for f in ["chats.sqlite", "chats.sqlite-wal", "chats.sqlite-shm"] {
+            let _ = std::fs::remove_file(w.lon.join(f));
+        }
+        let r = restore(&w.place(), &opts_gone("newest", true), now()).await.unwrap();
+        assert_eq!((r.plan.sign_ins_replaced.usage_records, r.plan.signed_in.usage_records, r.plan.meter_held_back), (0, 0, 1), "{r:?}");
+        let text = r.text("gb-lon");
+        assert!(!text.contains("Its model usage records") && text.contains("Model usage records in it still waiting for Stripe's meter: 1."), "{text}");
+        let db = Db::open(&w.app).unwrap();
+        db.attach_chat_stores(&w.dirs(), &[], None).unwrap();
+        assert_eq!(db.tokens_used(&ada, 0, i64::MAX), 20);
+        assert!(waiting(&db).is_empty());
     }
 
     fn factor(user: &str, secret: &str) -> String {

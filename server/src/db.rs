@@ -7825,33 +7825,34 @@ impl Db {
 
     /// Notes a refused routine run. True for the user's first refusal that day, so the
     /// Bot says so once a day instead of at every firing.
-    /// Records one run's model tokens (ADR 0050), all rows or none.
+    /// Records one run's model tokens (ADR 0050), all rows or none, where the pin of the
+    /// person they are charged to keeps their usage records (ADR 0304).
     pub fn record_tokens(&self, rows: &[TokenRow]) -> rusqlite::Result<()> {
         let mut c = self.c();
         let tx = c.transaction()?;
+        let cols = [
+            "user_id",
+            "bot_id",
+            "run_id",
+            "message_id",
+            "harness",
+            "model",
+            "reported",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "at",
+            "meter_status",
+            "meter_customer",
+        ];
         for r in rows {
             let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-            tx.execute(
-                "INSERT INTO token_usage (user_id, bot_id, run_id, message_id, harness, model, reported,
-                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, at, meter_status, meter_customer)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    r.user_id,
-                    r.bot_id,
-                    r.run_id,
-                    r.message_id,
-                    r.harness,
-                    r.model,
-                    r.reported,
-                    n(r.input),
-                    n(r.output),
-                    n(r.cache_read),
-                    n(r.cache_write),
-                    r.at,
-                    r.meter.as_ref().map(|_| "pending"),
-                    r.meter
-                ],
-            )?;
+            let (input, output, cache_read, cache_write) = (n(r.input), n(r.output), n(r.cache_read), n(r.cache_write));
+            let status = r.meter.as_ref().map(|_| "pending");
+            let vals: [&dyn rusqlite::ToSql; 14] =
+                [&r.user_id, &r.bot_id, &r.run_id, &r.message_id, &r.harness, &r.model, &r.reported, &input, &output, &cache_read, &cache_write, &r.at, &status, &r.meter];
+            self.insert_usage_record(&tx, &r.user_id, &cols, &vals)?;
         }
         tx.commit()
     }
@@ -7908,10 +7909,13 @@ impl Db {
         .unwrap_or_default()
     }
 
-    /// Marks a token row `sent` or `failed` at Stripe, or counts one more try when None.
+    /// Marks a token row `sent` or `failed` at Stripe, or counts one more try when None, in
+    /// every place that holds it (ADR 0304).
     pub fn meter_result(&self, id: i64, status: Option<&str>) {
-        let _ = self.c().execute(
-            "UPDATE token_usage SET meter_status = COALESCE(?2, meter_status), meter_attempts = meter_attempts + 1 WHERE id = ?1",
+        let c = self.c();
+        let _ = self.on_places(
+            &c,
+            "UPDATE {token_usage} SET meter_status = COALESCE(?2, meter_status), meter_attempts = meter_attempts + 1 WHERE id = ?1",
             params![id, status],
         );
     }

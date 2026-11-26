@@ -1,12 +1,13 @@
 //! Pinned people's chats, routines, approvals, Bots' memory, owners' facts, sign-in
-//! sessions, own secrets and second factors in a database in their region (ADR 0215, ADR
-//! 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299), the first part of splitting
-//! botd's database by region. Each region in REGION_DATA_DIRS has a SQLite file of its own
-//! (`chats.sqlite`, keyed like botd's database), attached to botd's connection. A Bot's
-//! messages, routines, approvals and memory are kept in the store of its owner's residency
-//! pin (their team's, else their own, as `residency::of_user`), and a person's facts,
-//! sessions (with each session's SAML sign-in and push device), own secrets and second
-//! factor (with its recovery codes) in the store of their own pin by the same rule, or in
+//! sessions, own secrets, second factors and model usage records in a database in their
+//! region (ADR 0215, ADR 0228, ADR 0276, ADR 0277, ADR 0283, ADR 0293, ADR 0299, ADR 0304),
+//! the first part of splitting botd's database by region. Each region in REGION_DATA_DIRS
+//! has a SQLite file of its own (`chats.sqlite`, keyed like botd's database), attached to
+//! botd's connection. A Bot's messages, routines, approvals and memory are kept in the
+//! store of its owner's residency pin (their team's, else their own, as
+//! `residency::of_user`), and a person's facts, sessions (with each session's SAML sign-in
+//! and push device), own secrets, second factor (with its recovery codes) and the usage
+//! records of runs charged to them in the store of their own pin by the same rule, or in
 //! botd's own database when that region has no store or the person isn't pinned.
 //! Their secrets are read and written on the users' secrets' own connection, which attaches
 //! the stores too (`attach_to`, `secrets::sealed::UserSecrets`). botd's own copy of a
@@ -16,14 +17,15 @@
 //!
 //! Reads see every place at once: a TEMP view per table (`messages`, `routines`,
 //! `approvals`, `memories`, `facts`, `sessions`, `saml_sessions`, `push_devices`,
-//! `user_mfa`, `mfa_recovery_codes`) puts
+//! `user_mfa`, `mfa_recovery_codes`, `token_usage`) puts
 //! botd's own table and each store's together, and unqualified names find TEMP objects
 //! first. Writes name the table they change: new rows go where their Bot's or person's data
 //! belongs (a session's SAML sign-in and push device where the session is), and updates
 //! and deletes by id run on each place. Ids stay unique
-//! across all of them: a store's messages take the next id after botd's own sequence and
-//! every store's highest, and bump that sequence, so botd's table never hands the same id
-//! out again; a routine's or approval's id is drawn again while any place has it.
+//! across all of them: a store's messages and usage records take the next id after botd's
+//! own sequence for them and every store's highest, and bump that sequence, so botd's table
+//! never hands the same id out again; a routine's or approval's id is drawn again while any
+//! place has it.
 //!
 //! `place_chats` moves rows whose Bot belongs elsewhere now (a pin made or ended, a
 //! member joining or leaving a pinned team, a Bot given away): copied and committed, then
@@ -76,7 +78,7 @@ struct Kept {
 
 /// A parent comes before the tables that point at it, so a move into botd's own database
 /// copies it first, and deletes run in reverse.
-const KEPT: [Kept; 11] = [
+const KEPT: [Kept; 12] = [
     Kept { name: "messages", key: Key::Bot, pk: "id", indexes: &[("messages_bot", "bot_id, id"), ("messages_created", "created_at")], unique: &[], parent: None, rowid: false },
     Kept { name: "routines", key: Key::Bot, pk: "id", indexes: &[("routines_bot", "bot_id")], unique: &[], parent: None, rowid: false },
     Kept { name: "approvals", key: Key::Bot, pk: "id", indexes: &[("approvals_status", "status, created_at"), ("approvals_bot", "bot_id")], unique: &[], parent: None, rowid: true },
@@ -104,6 +106,15 @@ const KEPT: [Kept; 11] = [
     Kept { name: "user_secrets", key: Key::User, pk: "user_id, name", indexes: &[], unique: &[], parent: None, rowid: false },
     Kept { name: "user_mfa", key: Key::User, pk: "user_id", indexes: &[], unique: &[], parent: None, rowid: false },
     Kept { name: "mfa_recovery_codes", key: Key::User, pk: "user_id, code_hash", indexes: &[], unique: &[], parent: Some(("user_id", "user_mfa")), rowid: false },
+    Kept {
+        name: "token_usage",
+        key: Key::User,
+        pk: "id",
+        indexes: &[("token_usage_user_at", "user_id, at"), ("token_usage_run", "run_id"), ("token_usage_meter", "meter_status, id")],
+        unique: &[],
+        parent: None,
+        rowid: false,
+    },
 ];
 const N: usize = KEPT.len();
 const MESSAGES: usize = 0;
@@ -112,6 +123,10 @@ const PUSH_DEVICES: usize = 7;
 const USER_SECRETS: usize = 8;
 const SECOND_FACTORS: usize = 9;
 const RECOVERY_CODES: usize = 10;
+const USAGE_RECORDS: usize = 11;
+
+/// Kept tables whose integer ids come from botd's own sequence for them (`insert_numbered`).
+const NUMBERED: [&str; 2] = ["messages", USAGE];
 
 /// The tables of a person's sign-ins (ADR 0283): their sessions, and each one's SAML
 /// sign-in and push device.
@@ -125,9 +140,13 @@ pub const SECRETS: &str = "user_secrets";
 pub const SECOND_FACTOR: &str = "user_mfa";
 pub const RECOVERY_CODE: &str = "mfa_recovery_codes";
 
+/// The table of each person's model usage records (ADR 0050, ADR 0304): one row per model
+/// per run, charged to the Bot's owner.
+pub const USAGE: &str = "token_usage";
+
 /// Tables a restore takes from the store it replaces, but keeps from the backup when that
-/// store is gone, as the only copy left (ADR 0293, ADR 0299).
-const KEPT_WHEN_GONE: [&str; 3] = [SECRETS, SECOND_FACTOR, RECOVERY_CODE];
+/// store is gone, as the only copy left (ADR 0293, ADR 0299, ADR 0304).
+const KEPT_WHEN_GONE: [&str; 4] = [SECRETS, SECOND_FACTOR, RECOVERY_CODE, USAGE];
 
 fn kept(table: &str) -> Option<&'static Kept> {
     KEPT.iter().find(|k| k.name == table)
@@ -274,6 +293,9 @@ pub struct Held {
     pub second_factors: i64,
     /// Their recovery codes, as keyed hashes.
     pub recovery_codes: i64,
+    /// The model usage records of runs charged to them (ADR 0050, ADR 0304). Not named after
+    /// tokens in JSON, because the audit log hides the values of keys naming tokens.
+    pub usage_records: i64,
 }
 
 impl Held {
@@ -290,6 +312,7 @@ impl Held {
             user_secrets: n[USER_SECRETS],
             second_factors: n[SECOND_FACTORS],
             recovery_codes: n[RECOVERY_CODES],
+            usage_records: n[USAGE_RECORDS],
         }
     }
 
@@ -306,6 +329,7 @@ impl Held {
             self.user_secrets,
             self.second_factors,
             self.recovery_codes,
+            self.usage_records,
         ]
     }
 
@@ -334,6 +358,11 @@ impl Held {
         Held { second_factors: self.second_factors, recovery_codes: self.recovery_codes, ..Held::default() }
     }
 
+    /// A person's model usage records (ADR 0304).
+    pub fn usage(&self) -> Held {
+        Held { usage_records: self.usage_records, ..Held::default() }
+    }
+
     /// "3 chat messages, 1 routine, 2 approvals, 1 Bot memory and 1 person's facts", leaving
     /// out tables with none.
     pub fn describe(&self) -> String {
@@ -349,6 +378,7 @@ impl Held {
             (self.user_secrets, "personal secret", "personal secrets"),
             (self.second_factors, "second factor", "second factors"),
             (self.recovery_codes, "recovery code", "recovery codes"),
+            (self.usage_records, "model usage record", "model usage records"),
         ]
         .into_iter()
         .filter(|(n, _, _)| *n > 0)
@@ -384,6 +414,8 @@ pub struct ChatMove {
     /// Second factors, and their recovery codes (ADR 0299).
     pub second_factors: usize,
     pub recovery_codes: usize,
+    /// Model usage records (ADR 0304).
+    pub usage_records: usize,
 }
 
 impl ChatMove {
@@ -401,6 +433,7 @@ impl ChatMove {
             self.user_secrets,
             self.second_factors,
             self.recovery_codes,
+            self.usage_records,
         ];
         Held::of(n.map(|n| n as i64))
     }
@@ -435,7 +468,7 @@ fn columns(c: &Connection, schema: &str, table: &str) -> rusqlite::Result<Vec<Co
 }
 
 /// Makes the store's copy of `k` match botd's own table: the same columns, its primary key
-/// (without AUTOINCREMENT: message ids come from botd's sequence), and its indexes. No
+/// (without AUTOINCREMENT: message and usage record ids come from botd's sequence), and its indexes. No
 /// foreign key to `bots` or `users`, which are in another file: deleting a Bot deletes its
 /// rows here, and each pass deletes those of people gone and of sessions gone.
 fn ensure_table(c: &Connection, schema: &str, k: &Kept, main: &[Col]) -> rusqlite::Result<()> {
@@ -467,11 +500,15 @@ fn ensure_table(c: &Connection, schema: &str, k: &Kept, main: &[Col]) -> rusqlit
     Ok(())
 }
 
-/// Raises botd's own sequence for messages to at least `id`, so its table never reuses it.
-fn bump_sequence(c: &Connection, id: i64) -> rusqlite::Result<()> {
-    let n = c.execute("UPDATE main.sqlite_sequence SET seq = ?1 WHERE name = 'messages' AND seq < ?1", [id])?;
+/// Raises botd's own sequence for `table` (one of `NUMBERED`) to at least `id`, so its
+/// table never reuses it.
+fn bump_sequence(c: &Connection, table: &str, id: i64) -> rusqlite::Result<()> {
+    let n = c.execute("UPDATE main.sqlite_sequence SET seq = ?1 WHERE name = ?2 AND seq < ?1", params![id, table])?;
     if n == 0 {
-        c.execute("INSERT INTO main.sqlite_sequence (name, seq) SELECT 'messages', ?1 WHERE NOT EXISTS (SELECT 1 FROM main.sqlite_sequence WHERE name = 'messages')", [id])?;
+        c.execute(
+            "INSERT INTO main.sqlite_sequence (name, seq) SELECT ?2, ?1 WHERE NOT EXISTS (SELECT 1 FROM main.sqlite_sequence WHERE name = ?2)",
+            params![id, table],
+        )?;
     }
     Ok(())
 }
@@ -749,8 +786,10 @@ impl Db {
             for (k, main) in KEPT.iter().zip(&mains) {
                 ensure_table(&c, &schema, k, main).map_err(e)?;
             }
-            let top: i64 = c.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {schema}.messages"), [], |r| r.get(0)).map_err(e)?;
-            bump_sequence(&c, top).map_err(e)?;
+            for t in NUMBERED {
+                let top: i64 = c.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {schema}.{t}"), [], |r| r.get(0)).map_err(e)?;
+                bump_sequence(&c, t, top).map_err(e)?;
+            }
             stores.push(ChatStore { region: region.clone(), schema, path, id });
         }
         for (region, _) in &out.forgotten {
@@ -779,22 +818,37 @@ impl Db {
     /// the id. Its id.
     pub(super) fn insert_chat_message(&self, c: &Connection, bot_id: &str, cols: &[&str], vals: &[&dyn ToSql]) -> rusqlite::Result<i64> {
         let schema = self.place_for(c, bot_id)?;
+        self.insert_numbered(c, "messages", schema, cols, vals)
+    }
+
+    /// Inserts a model usage record of `user_id`'s into the place their pin keeps them
+    /// (ADR 0304): `cols` and `vals` without the id. Its id.
+    pub(super) fn insert_usage_record(&self, c: &Connection, user_id: &str, cols: &[&str], vals: &[&dyn ToSql]) -> rusqlite::Result<i64> {
+        let schema = self.place_for_user(c, user_id)?;
+        self.insert_numbered(c, USAGE, schema, cols, vals)
+    }
+
+    /// Inserts a row of `table` (one of `NUMBERED`) into `schema`. In a store, its id is
+    /// the next after botd's own sequence and every place's highest, and bumps that
+    /// sequence, so ids stay unique across places and botd's table never hands one out
+    /// again. Its id.
+    fn insert_numbered(&self, c: &Connection, table: &str, schema: &str, cols: &[&str], vals: &[&dyn ToSql]) -> rusqlite::Result<i64> {
         let marks = vec!["?"; vals.len()].join(", ");
         if schema == "main" {
-            c.execute(&format!("INSERT INTO main.messages ({}) VALUES ({marks})", cols.join(", ")), vals)?;
+            c.execute(&format!("INSERT INTO main.{table} ({}) VALUES ({marks})", cols.join(", ")), vals)?;
             return Ok(c.last_insert_rowid());
         }
         c.execute_batch("SAVEPOINT chat_insert")?;
         let r = (|| {
-            let mut top: i64 = c.query_row("SELECT COALESCE((SELECT seq FROM main.sqlite_sequence WHERE name = 'messages'), 0)", [], |r| r.get(0))?;
+            let mut top: i64 = c.query_row("SELECT COALESCE((SELECT seq FROM main.sqlite_sequence WHERE name = ?1), 0)", [table], |r| r.get(0))?;
             for s in schemas(self.chat_stores_set()) {
-                top = top.max(c.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {s}.messages"), [], |r| r.get(0))?);
+                top = top.max(c.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {s}.{table}"), [], |r| r.get(0))?);
             }
             let id = top + 1;
             let mut all: Vec<&dyn ToSql> = vec![&id];
             all.extend_from_slice(vals);
-            c.execute(&format!("INSERT INTO {schema}.messages (id, {}) VALUES (?, {marks})", cols.join(", ")), all.as_slice())?;
-            bump_sequence(c, id)?;
+            c.execute(&format!("INSERT INTO {schema}.{table} (id, {}) VALUES (?, {marks})", cols.join(", ")), all.as_slice())?;
+            bump_sequence(c, table, id)?;
             Ok(id)
         })();
         match r {
@@ -972,6 +1026,7 @@ impl Db {
                     user_secrets: n[USER_SECRETS],
                     second_factors: n[SECOND_FACTORS],
                     recovery_codes: n[RECOVERY_CODES],
+                    usage_records: n[USAGE_RECORDS],
                 });
             }
             for s in &set.stores {
@@ -1395,24 +1450,31 @@ fn delete_in_copy(c: &Connection, op: &str, whose: &Whose) -> rusqlite::Result<H
 /// the backup was made would otherwise work again, and one made since would end; a secret
 /// deleted since would come back, and one replaced since would turn back to its old value.
 /// Second factors and their recovery codes (ADR 0299) go as secrets do: one turned off or
-/// reset since, or a recovery code spent since, would otherwise come back.
+/// reset since, or a recovery code spent since, would otherwise come back. So do model
+/// usage records (ADR 0304): one sent to Stripe's meter since would be sent again, and one
+/// recorded since would be lost.
 /// Without `now`, the copy's sessions are dropped (their people sign in again) and its
-/// secrets and second factors kept, the only copy of them left. The caller has
-/// `secure_delete` on and VACUUMs. What of the copy's own was dropped, and what was taken
-/// from `now`.
-pub fn sign_ins_from(c: &Connection, now: Option<&str>, keep: &Whose) -> rusqlite::Result<(Held, Held)> {
+/// secrets, second factors and usage records kept, the only copy of them left; usage
+/// records it kept that were still waiting for the meter are marked `failed`, as nothing
+/// says whether the lost store sent them since, so none is sent twice. The caller has
+/// `secure_delete` on and VACUUMs. What of the copy's own was dropped, what was taken from
+/// `now`, and how many usage records were held back from the meter.
+pub fn sign_ins_from(c: &Connection, now: Option<&str>, keep: &Whose) -> rusqlite::Result<(Held, Held, usize)> {
     let users = keep.lists().1;
     let tx = c.unchecked_transaction()?;
-    let (mut dropped, mut taken) = ([0; N], [0; N]);
+    let (mut dropped, mut taken, mut held_back) = ([0; N], [0; N], 0);
     for (i, k) in KEPT.iter().enumerate().filter(|(_, k)| SIGN_INS.contains(&k.name) || KEPT_WHEN_GONE.contains(&k.name)) {
         let t = k.name;
         if !has_table(&tx, "main", t)? {
             continue;
         }
-        // A store from before ADR 0293 (secrets) or ADR 0299 (second factors) has none to put
-        // in place of the copy's.
+        // A store from before ADR 0293 (secrets), ADR 0299 (second factors) or ADR 0304 (usage
+        // records) has none to put in place of the copy's.
         let replaced = now.map(|now| has_table(&tx, now, t)).transpose()?.unwrap_or(false);
         if KEPT_WHEN_GONE.contains(&t) && !replaced {
+            if t == USAGE {
+                held_back = tx.execute("UPDATE main.token_usage SET meter_status = 'failed' WHERE meter_status = 'pending'", [])?;
+            }
             continue;
         }
         dropped[i] = tx.execute(&format!("DELETE FROM main.{t}"), [])? as i64;
@@ -1426,7 +1488,7 @@ pub fn sign_ins_from(c: &Connection, now: Option<&str>, keep: &Whose) -> rusqlit
         taken[i] = tx.execute(&format!("INSERT INTO main.{t} ({cols}) SELECT {cols} FROM {now}.{t} WHERE user_id IN (SELECT value FROM json_each(?1))"), [&users])? as i64;
     }
     tx.commit()?;
-    Ok((Held::of(dropped), Held::of(taken)))
+    Ok((Held::of(dropped), Held::of(taken), held_back))
 }
 
 /// Brings a copy of a store opened on `c` (a backup from an older botd, perhaps without
@@ -1578,6 +1640,7 @@ mod tests {
             user_secrets: 0,
             second_factors: 0,
             recovery_codes: 0,
+            usage_records: 0,
         }
     }
 
@@ -2848,6 +2911,152 @@ mod tests {
         assert_eq!(Held { user_secrets: 1, second_factors: 1, recovery_codes: 2, ..Held::default() }.describe(), "1 personal secret, 1 second factor and 2 recovery codes");
         assert_eq!(Held { sessions: 1, second_factors: 1, recovery_codes: 2, ..Held::default() }.second_factor(), Held { second_factors: 1, recovery_codes: 2, ..Held::default() });
         assert_eq!(Held { second_factors: 1, ..Held::default() }.sign_ins(), Held::default());
+    }
+
+    fn usage_move(from: Option<&str>, to: Option<&str>, n: usize) -> ChatMove {
+        ChatMove { usage_records: n, ..mv(from, to, 0, [0, 0, 0]) }
+    }
+
+    /// One run's usage record for `user`'s Bot `bot`, queued for Stripe's meter.
+    fn used(db: &Db, user: &str, bot: &str, run: &str, tokens: u64) {
+        let row = crate::db::TokenRow {
+            user_id: user.into(),
+            bot_id: bot.into(),
+            run_id: run.into(),
+            message_id: None,
+            harness: "claude".into(),
+            model: Some("m".into()),
+            reported: true,
+            input: tokens,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            at: 1_000,
+            meter: Some("cus_0304".into()),
+        };
+        db.record_tokens(&[row]).unwrap();
+    }
+
+    fn usage_ids(db: &Db, schema: &str) -> Vec<i64> {
+        db.c().prepare(&format!("SELECT id FROM {schema}.token_usage ORDER BY id")).unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn a_pinned_persons_usage_records_are_kept_in_their_store_and_move_with_the_pin() {
+        let d = Dirs::new();
+        let db = d.up();
+        let (ada, cy) = (user(&db, "ada"), user(&db, "cy"));
+        let (adas, cys) = (bot_of(&db, &ada), bot_of(&db, &cy));
+        used(&db, &ada, &adas, "r1", 100);
+        assert_eq!(usage_ids(&db, "main").len(), 1);
+
+        // Pinned, they move to the store, and usage, quotas and the meter still read them.
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![usage_move(None, Some("gb-lon"), 1)]);
+        assert_eq!((count(&db, "main", USAGE), count(&db, "chats_0", USAGE)), (0, 1));
+        assert_eq!(db.tokens_used(&ada, 0, i64::MAX), 100);
+        assert_eq!((db.token_summary(&ada, 0, i64::MAX).all.input, db.token_summary(&ada, 0, i64::MAX).by_bot.len()), (100, 1));
+        let pending = db.pending_meter(10);
+        assert_eq!(pending.iter().map(|m| (m.user_id.as_str(), m.tokens)).collect::<Vec<_>>(), [(ada.as_str(), 100)]);
+        db.meter_result(pending[0].id, Some("sent"));
+        assert!(db.pending_meter(10).is_empty(), "marked sent where it is kept");
+
+        // New ones go where each person's are kept, with ids no place repeats.
+        used(&db, &ada, &adas, "r2", 20);
+        used(&db, &cy, &cys, "r3", 3);
+        let (store, own) = (usage_ids(&db, "chats_0"), usage_ids(&db, "main"));
+        assert_eq!((store.len(), own.len()), (2, 1));
+        assert!(own[0] > store[1], "botd's own sequence passed the store's ids: {own:?} {store:?}");
+        assert_eq!(db.tokens_used(&ada, 0, i64::MAX), 120);
+        assert_eq!(db.tokens_used(&cy, 0, i64::MAX), 3);
+        assert_eq!(db.chat_counts(std::slice::from_ref(&ada)), vec![ChatCount { region: Some("gb-lon".into()), held: Held { usage_records: 2, ..Held::default() } }]);
+
+        // After a restart, a store's ids are still never handed out again.
+        drop(db);
+        let db = d.up();
+        used(&db, &ada, &adas, "r4", 1);
+        used(&db, &cy, &cys, "r5", 1);
+        let (store, own) = (usage_ids(&db, "chats_0"), usage_ids(&db, "main"));
+        let mut all: Vec<i64> = store.iter().chain(&own).copied().collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 5, "{store:?} {own:?}");
+
+        // Unpinned, they come back with their ids, and the move is recorded for the store's earlier backups.
+        db.unpin_residency(PinOn::User, &ada).unwrap();
+        assert_eq!(db.place_chats().unwrap(), vec![usage_move(Some("gb-lon"), None, 3)]);
+        assert_eq!((usage_ids(&db, "main"), usage_ids(&db, "chats_0")), (all, Vec::new()));
+        assert_eq!(db.tokens_used(&ada, 0, i64::MAX), 121);
+        let lon = db.chat_stores().into_iter().find(|s| s.region == "gb-lon").unwrap();
+        assert_eq!(db.moves_out_to_clear(&lon).unwrap().whose(), Whose { bots: Vec::new(), users: vec![ada.clone()] });
+        assert_eq!(db.pending_meter(10).len(), 4, "all but the one already sent, Ada's and Cy's");
+    }
+
+    #[test]
+    fn a_move_cut_off_after_its_copy_counts_usage_once_and_meters_it_once() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let adas = bot_of(&db, &ada);
+        used(&db, &ada, &adas, "r1", 100);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        CRASH_AFTER_COPY.with(|c| c.set(true));
+        assert!(db.place_chats().is_err());
+        assert_eq!((count(&db, "main", USAGE), count(&db, "chats_0", USAGE)), (1, 1), "in both places");
+        assert_eq!(db.tokens_used(&ada, 0, i64::MAX), 100, "counted once");
+        let pending = db.pending_meter(10);
+        assert_eq!(pending.len(), 1, "queued once");
+        db.meter_result(pending[0].id, Some("sent"));
+        let sent = |schema: &str| db.c().query_row(&format!("SELECT meter_status FROM {schema}.token_usage"), [], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!((sent("main"), sent("chats_0")), ("sent".to_string(), "sent".to_string()), "both copies");
+        assert_eq!(db.place_chats().unwrap(), vec![usage_move(None, Some("gb-lon"), 1)]);
+        assert!(db.pending_meter(10).is_empty(), "not sent again, whichever copy the pass kept");
+    }
+
+    #[test]
+    fn a_restored_copy_takes_usage_records_from_the_store_now_or_holds_its_unsent_ones_back() {
+        let d = Dirs::new();
+        let db = d.up();
+        let ada = user(&db, "ada");
+        let adas = bot_of(&db, &ada);
+        db.pin_residency(PinOn::User, &ada, "gb-lon", "DPA-1", None).unwrap();
+        used(&db, &ada, &adas, "r1", 100);
+        db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        let backup = d.dir.path().join("backup.sqlite");
+        std::fs::copy(d.lon.join("chats.sqlite"), &backup).unwrap();
+        // Since the backup: the first was metered, and a second recorded.
+        db.meter_result(db.pending_meter(10)[0].id, Some("sent"));
+        used(&db, &ada, &adas, "r2", 20);
+        db.c().query_row("PRAGMA chats_0.wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        let keep = Whose { bots: vec![adas.clone()], users: vec![ada.clone()] };
+        let statuses = |c: &Connection| -> Vec<String> {
+            c.prepare("SELECT meter_status FROM main.token_usage ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+
+        let copy = d.dir.path().join("copy.sqlite");
+        std::fs::copy(&backup, &copy).unwrap();
+        let c = Connection::open(&copy).unwrap();
+        c.execute("ATTACH DATABASE ?1 AS now_store", [d.lon.join("chats.sqlite").to_str().unwrap()]).unwrap();
+        let (dropped, taken, held_back) = sign_ins_from(&c, Some("now_store"), &keep).unwrap();
+        assert_eq!((dropped.usage(), taken.usage(), held_back), (Held { usage_records: 1, ..Held::default() }, Held { usage_records: 2, ..Held::default() }, 0));
+        assert_eq!(statuses(&c), ["sent", "pending"], "none metered since is sent again, none recorded since is lost");
+        drop(c);
+
+        // With the store gone, the backup's are the only copy: kept, but its unsent ones held back from the meter.
+        std::fs::copy(&backup, &copy).unwrap();
+        let c = Connection::open(&copy).unwrap();
+        let (dropped, taken, held_back) = sign_ins_from(&c, None, &keep).unwrap();
+        assert_eq!((dropped.usage(), taken.usage(), held_back), (Held::default(), Held::default(), 1));
+        assert_eq!(statuses(&c), ["failed"]);
+    }
+
+    #[test]
+    fn describing_what_a_place_holds_names_usage_records() {
+        assert_eq!(Held { second_factors: 1, usage_records: 2, ..Held::default() }.describe(), "1 second factor and 2 model usage records");
+        assert_eq!(Held { usage_records: 1, ..Held::default() }.describe(), "1 model usage record");
+        assert_eq!(Held { sessions: 1, usage_records: 2, ..Held::default() }.usage(), Held { usage_records: 2, ..Held::default() });
+        assert_eq!(Held { usage_records: 2, ..Held::default() }.sign_ins(), Held::default());
+        assert_eq!(Held { usage_records: 2, ..Held::default() }.of_bots(), Held::default());
     }
 
     #[test]
