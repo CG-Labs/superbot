@@ -55,6 +55,14 @@ function formatTime(ts: number): string {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
+/**
+ * Words from failed sends, per Bot. Kept outside the chat so a send that fails after the
+ * chat closes still comes back the next time that Bot's chat opens.
+ */
+const unsent: Record<string, string> = {};
+/** Each Bot's failed send whose Retry toast is still live; resending the same words by hand cancels it. */
+const retries: Record<string, { body: string; toast: number }> = {};
+
 export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, screenOpen, prefill, onPrefilled }: Props) {
   const {
     bots,
@@ -103,18 +111,23 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
     }
   }, []);
 
-  /** Words from failed sends, kept per Bot so they only come back in that Bot's chat. */
-  const unsentRef = useRef<Record<string, string>>({});
   const textRef = useRef(text);
   textRef.current = text;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!activeId) return;
     // Only into an empty box; otherwise it waits for the next visit or a Retry.
-    const unsent = unsentRef.current[activeId];
-    if (unsent && !textRef.current) {
-      delete unsentRef.current[activeId];
-      setText(unsent);
+    const words = unsent[activeId];
+    if (words && !textRef.current) {
+      delete unsent[activeId];
+      setText(words);
     }
     void load(activeId);
   }, [activeId, load]);
@@ -159,18 +172,22 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
   const send = (body: string, id: string) =>
     void sendText(body, undefined, id).catch((err) => {
       // Gives the words back unless something new was typed meanwhile.
-      if (shownRef.current !== id) unsentRef.current[id] = body;
+      if (!mountedRef.current || shownRef.current !== id) unsent[id] = body;
       else
         setText((cur) => {
           if (!cur) return body;
-          unsentRef.current[id] = body;
+          unsent[id] = body;
           return cur;
         });
-      toast.error(err, "Couldn't send your message", {
+      const retry = { body, toast: 0 };
+      retries[id] = retry;
+      retry.toast = toast.error(err, "Couldn't send your message", {
         label: "Retry",
         onPress: () => {
-          if (shownRef.current === id) setText((cur) => (cur === body ? "" : cur));
-          if (unsentRef.current[id] === body) delete unsentRef.current[id];
+          if (retries[id] !== retry) return;
+          delete retries[id];
+          if (mountedRef.current && shownRef.current === id) setText((cur) => (cur === body ? "" : cur));
+          if (unsent[id] === body) delete unsent[id];
           send(body, id);
         },
       });
@@ -179,6 +196,12 @@ export function ChatView({ onOpenDetails, onNewBot, onBack, onToggleScreen, scre
   const onSend = () => {
     const body = text.trim();
     if (!body) return;
+    const retry = retries[bot.id];
+    if (retry?.body === body) {
+      delete retries[bot.id];
+      toast.dismiss(retry.toast);
+    }
+    if (unsent[bot.id] === body) delete unsent[bot.id];
     setText("");
     send(body, bot.id);
   };

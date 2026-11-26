@@ -204,6 +204,41 @@ describe("ChatView", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("drops the old Retry once you resend the message yourself", async () => {
+    const sendText = jest.fn().mockRejectedValueOnce(new TypeError("Network request failed")).mockResolvedValue(undefined);
+    mockCtx.sendText = sendText;
+    await render(
+      <ToastProvider>
+        <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />
+      </ToastProvider>,
+    );
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Ship it"));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+    expect(screen.getByRole("button", { name: "Retry" })).toBeOnTheScreen();
+
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(sendText).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives back a message that fails after its chat closed", async () => {
+    let fail!: (err: Error) => void;
+    mockCtx.sendText = jest.fn(() => new Promise<void>((_, reject) => (fail = reject)));
+    const ui = () => (
+      <ToastProvider>
+        <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />
+      </ToastProvider>
+    );
+    const first = await render(ui());
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Message Bob"), "Ship it"));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Send" })));
+    await first.unmount();
+    await act(async () => fail(new TypeError("Network request failed")));
+
+    await render(ui());
+    expect(screen.getByLabelText("Message Bob")).toHaveDisplayValue("Ship it");
+  });
+
   it("keeps a failed message with its own Bot when you've moved to another", async () => {
     let fail!: (err: Error) => void;
     const sendText = jest

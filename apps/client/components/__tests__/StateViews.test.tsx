@@ -234,6 +234,26 @@ describe("toasts", () => {
     expect(screen.queryByTestId("toast")).toBeNull();
   });
 
+  it("can be hidden by id, without hiding a newer one", async () => {
+    await render(
+      <ToastProvider>
+        <Grab />
+      </ToastProvider>,
+    );
+    let first = 0;
+    await act(async () => {
+      first = api.show({ message: "First" });
+    });
+    let second = 0;
+    await act(async () => {
+      second = api.show({ message: "Second" });
+    });
+    await act(async () => api.dismiss(first));
+    expect(screen.getByText("Second")).toBeOnTheScreen();
+    await act(async () => api.dismiss(second));
+    expect(screen.queryByTestId("toast")).toBeNull();
+  });
+
   it("are read out on iOS, which has no live regions", async () => {
     const announce = jest.spyOn(AccessibilityInfo, "announceForAccessibility").mockImplementation(() => {});
     const os = Platform.OS;

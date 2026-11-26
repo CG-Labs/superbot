@@ -16,9 +16,12 @@ export interface ToastOptions {
 }
 
 export interface ToastApi {
-  show: (toast: ToastOptions) => void;
+  /** Returns the toast's id, for `dismiss`. */
+  show: (toast: ToastOptions) => number;
   /** An error toast: `what` failed, then why in plain words, e.g. "Couldn't send your message. Can't reach the server…". */
-  error: (err: unknown, what?: string, action?: ToastOptions["action"]) => void;
+  error: (err: unknown, what?: string, action?: ToastOptions["action"]) => number;
+  /** Hides that toast if it's still showing. */
+  dismiss: (id: number) => void;
 }
 
 export const TOAST_MS = 4000;
@@ -29,8 +32,13 @@ export const TOAST_LONG_MS = 6000;
 const dialogFallback: ToastApi = {
   show: (toast) => {
     if (toast.tone === "error") showError(new Error(toast.message));
+    return 0;
   },
-  error: (err, what) => showError(new Error(errorText(err, what))),
+  error: (err, what) => {
+    showError(new Error(errorText(err, what)));
+    return 0;
+  },
+  dismiss: () => {},
 };
 
 const ToastContext = createContext<ToastApi>(dialogFallback);
@@ -46,8 +54,16 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toast, setToast] = useState<Shown | null>(null);
   const next = useRef(0);
   const api = useMemo<ToastApi>(() => {
-    const show = (o: ToastOptions) => setToast({ ...o, id: ++next.current });
-    return { show, error: (err, what, action) => show({ message: errorText(err, what), tone: "error", action }) };
+    const show = (o: ToastOptions) => {
+      const id = ++next.current;
+      setToast({ ...o, id });
+      return id;
+    };
+    return {
+      show,
+      error: (err, what, action) => show({ message: errorText(err, what), tone: "error", action }),
+      dismiss: (id) => setToast((cur) => (cur?.id === id ? null : cur)),
+    };
   }, []);
 
   useEffect(() => {
