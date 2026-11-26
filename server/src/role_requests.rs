@@ -109,15 +109,64 @@ pub fn duration(hours: i64) -> String {
 
 /// Lapses the pending requests nobody can approve any more, each audited as
 /// `role.request_lapsed` by the server, with why: `expired`, `not_requestable` or `disabled`.
-pub fn lapse_due(app: &App) -> usize {
+/// The person who asked hears of the first two (ADR 0329).
+pub fn lapse_due(app: &AppState) -> usize {
     let gone = app.db.lapse_role_requests(crate::db::now());
     let by = Who::system("roles");
     for (q, reason) in &gone {
         let name = app.db.custom_role(&q.role_id).map(|r| r.name);
         let d = json!({ "request": q.id, "name": name, "user": q.user_id, "scope": scope(q), "team": q.team_id, "hours": q.hours, "why": reason });
         app.db.record(&by.event("role.request_lapsed").target("role", &q.role_id).details(d));
+        let name = name.unwrap_or_else(|| "a deleted role".into());
+        let (why, push) = match *reason {
+            "expired" => (format!("Nobody decided it within {PENDING_DAYS} days. You can ask again in Settings."), "It lapsed with no decision."),
+            "not_requestable" => (format!("{name} can't be requested any more. An admin can still give it by hand."), "It lapsed: the role can't be requested any more."),
+            _ => continue,
+        };
+        let lines = vec![why, format!("You asked for it {}, for {}.", place(app, q), duration(q.hours))];
+        tell_asker(app, q, "role.request_lapsed", format!("Your request for {name} lapsed"), lines, push);
     }
     gone.len()
+}
+
+/// "26 Nov 2026, 18:00 UTC".
+fn when(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%-d %b %Y, %H:%M UTC").to_string()).unwrap_or_default()
+}
+
+/// A person as notices name them: their email, else their name.
+fn named(app: &App, id: &str) -> String {
+    app.db.user(id).map_or_else(|| "Someone".into(), |u| u.email.unwrap_or(u.name))
+}
+
+fn actor_named(app: &App, by: &Who) -> String {
+    by.actor.email.clone().or_else(|| by.actor.name.clone()).unwrap_or_else(|| by.actor.id.as_deref().map_or_else(|| "Someone".into(), |id| named(app, id)))
+}
+
+/// "in the team Alpha", "across the server".
+fn place(app: &App, q: &RoleRequest) -> String {
+    match &q.team_id {
+        Some(t) => format!("in the team {}", app.db.team(t).map(|t| t.name).unwrap_or_default()),
+        None => "across the server".into(),
+    }
+}
+
+/// Tells the person who asked that `q` was decided or lapsed (ADR 0329): by email and on
+/// their phones, never the notification list or webhook, which hear only of new requests.
+/// Nobody once they're disabled. The push names no role, since a lock screen may show it.
+fn tell_asker(app: &AppState, q: &RoleRequest, event: &str, title: String, lines: Vec<String>, push_body: &str) {
+    let Some(u) = app.db.user(&q.user_id) else { return };
+    let audience = crate::notify::Audience {
+        people: vec![u],
+        who: "whoever asked".into(),
+        page: "settings",
+        push_title: "Your request for a role".into(),
+        push_body: push_body.into(),
+        push_type: "role_decision",
+        only: true,
+    };
+    let a = crate::notify::Alert { event: event.into(), title, lines, target_type: "role".into(), target_id: q.role_id.clone(), audience: Some(audience), ..Default::default() };
+    crate::notify::alert(app, a, "roles");
 }
 
 fn scope(q: &RoleRequest) -> &'static str {
@@ -323,6 +372,7 @@ fn requested_alert(app: &AppState, u: &User, r: &CustomRole, q: &RoleRequest) ->
         push_title: "Request for a team role".into(),
         push_body: format!("Someone on {t} is waiting for your decision."),
         push_type: "role_request",
+        only: false,
     });
     crate::notify::Alert {
         event: "role.requested".into(),
@@ -442,6 +492,7 @@ fn second_alert(app: &AppState, by: &Who, r: &CustomRole, q: &RoleRequest, f: &F
         push_title: "Request for a team role".into(),
         push_body: format!("A request on {t} needs a second approver."),
         push_type: "role_request",
+        only: false,
     });
     crate::notify::Alert {
         event: "role.request_first_approved".into(),
@@ -514,12 +565,20 @@ fn approve_as(app: &AppState, by: &Who, q: &RoleRequest, v: &Value, decider: Dec
     }
     decider.mark(&mut d);
     app.db.record(&by.event("role.assigned").target("role", &r.id).details(d));
+    let names = match &a.first {
+        Some(f) => format!("{} and {}", named(app, &f.by), actor_named(app, by)),
+        None => actor_named(app, by),
+    };
+    let mut lines = vec![format!("You hold it {} until {}, for {}.", place(app, &q), when(granted), duration(hours)), format!("Approved by {names}.")];
+    lines.extend(q.note.as_ref().map(|n| format!("Note: {n}")));
+    lines.push("It ends by itself then. You can ask again in Settings.".into());
+    tell_asker(app, &q, "role.request_approved", format!("Your request for {} was approved", r.name), lines, "It was approved.");
     let given = if a.first.is_some() { 2 } else { 1 };
     Ok(Json(json!({ "request": view(app, &q), "role": held(app, Some(&r.id), Some(granted)), "applies": applies, "approvals": { "needed": given, "given": given } })))
 }
 
 /// Denies `q`, with an optional note, and audits it. `team`: only while it's within that team.
-fn deny_as(app: &App, by: &Who, q: &RoleRequest, v: &Value, team: Option<&str>) -> Res {
+fn deny_as(app: &AppState, by: &Who, q: &RoleRequest, v: &Value, team: Option<&str>) -> Res {
     let note = parse_text(&v["note"], "note", false)?;
     let q = app
         .db
@@ -531,6 +590,11 @@ fn deny_as(app: &App, by: &Who, q: &RoleRequest, v: &Value, team: Option<&str>) 
         Decider::Team.mark(&mut d);
     }
     app.db.record(&by.event("role.request_denied").target("role", &q.role_id).details(d));
+    let name = name.unwrap_or_else(|| "a deleted role".into());
+    let mut lines = vec![format!("Denied by {}.", actor_named(app, by))];
+    lines.extend(q.note.as_ref().map(|n| format!("Note: {n}")));
+    lines.push(format!("You asked for it {}, for {}. You can ask again in Settings.", place(app, &q), duration(q.hours)));
+    tell_asker(app, &q, "role.request_denied", format!("Your request for {name} was denied"), lines, "It was denied.");
     Ok(Json(view(app, &q)))
 }
 

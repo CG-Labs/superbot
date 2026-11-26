@@ -110,7 +110,7 @@ export function PushCard({ api, device = pushDevice }: Props) {
         {d && view.available ? (
           <>
             <View style={styles.field} accessibilityLabel="Approvals">
-              <Text style={styles.label}>An approval is waiting for you</Text>
+              <Text style={styles.label}>An approval or request is waiting for you, or yours is decided</Text>
               <Chips
                 options={ON_OFF}
                 value={d.approvals ? "on" : "off"}
@@ -141,7 +141,7 @@ export function PushCard({ api, device = pushDevice }: Props) {
     <View style={styles.card} accessibilityLabel="Push notifications">
       <Text style={styles.cardTitle}>Push notifications</Text>
       <Text style={styles.dim}>
-        Hear about waiting approvals and finished routines when SuperBot is closed. A notification names the Bot and nothing it asked; tap it to see the details here. Signing out turns it off.
+        Hear about waiting approvals, requests for roles and finished routines when SuperBot is closed. A notification names the Bot and nothing it asked, and no role; tap it to see the details here. Signing out turns it off.
       </Text>
       {notice ? (
         <Text style={styles.good} accessibilityRole="alert">
