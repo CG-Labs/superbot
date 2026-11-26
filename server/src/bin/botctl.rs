@@ -1731,10 +1731,11 @@ fn team_roles_said(v: &Value) -> String {
     let Some(choices) = v["roleChoices"].as_array() else {
         return format!("Only {team}'s owners and admins, with write access, give roles in it. Ask one of them, or request one: botctl role request <role> --team --for <n>h --reason TEXT");
     };
-    if choices.is_empty() {
-        return format!("No custom role adds anything in a team yet, so there is nothing to give in {team}. A server admin makes roles with users.manage, billing.manage or machines.manage.");
-    }
-    let mut out = format!("Roles you may give in {team}:");
+    let mut out = if choices.is_empty() {
+        format!("No custom role adds anything in a team yet, so there is nothing to give in {team}. A server admin makes roles with users.manage, billing.manage or machines.manage.")
+    } else {
+        format!("Roles you may give in {team}:")
+    };
     for r in choices {
         let applies = r["applies"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
         let ends = r["maxDays"].as_i64().map(|d| format!(" (time-bound: give it --for at most {d} day{})", if d == 1 { "" } else { "s" })).unwrap_or_default();
@@ -5253,6 +5254,8 @@ mod tests {
         assert!(team_roles_said(&one).ends_with("Lead: users.manage, billing.manage\n1 request waits for a decision: botctl team requests"), "{}", team_roles_said(&one));
         assert!(!team_roles_said(&json!({ "name": "Ops", "roleChoices": [{ "name": "Lead", "applies": [] }], "roleRequests": 0 })).contains("wait"));
         assert!(team_roles_said(&json!({ "name": "Ops", "roleChoices": [] })).starts_with("No custom role adds anything in a team yet"));
+        let none_left = team_roles_said(&json!({ "name": "Ops", "roleChoices": [], "roleRequests": 1 }));
+        assert!(none_left.starts_with("No custom role adds anything") && none_left.ends_with("\n1 request waits for a decision: botctl team requests"), "{none_left}");
         assert!(team_roles_said(&json!({ "name": "Ops", "role": "member" })).starts_with("Only Ops's owners and admins"));
     }
 
