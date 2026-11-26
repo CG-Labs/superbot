@@ -4817,6 +4817,16 @@ mod tests {
     }
 
     #[test]
+    fn saml_summary_shows_every_idp_of_a_federation_by_count() {
+        let mut v = json!({ "provider": "fed", "label": "Fed", "idpEntityIds": [], "everyIdp": { "idps": 4200, "hidden": 0, "categories": [] } });
+        let out = saml_summary(&v);
+        assert!(out.contains("  IdPs:                     every IdP of the federation (4200 now), chosen at each sign-in\n") && !out.contains("IdP entity ID"), "{out}");
+        v["everyIdp"] = json!({ "idps": 900, "hidden": 3, "categories": ["https://refeds.org/sirtfi"] });
+        let out = saml_summary(&v);
+        assert!(out.contains("(900 now, 3 hidden from the chooser)") && out.contains("    Only those in category:  https://refeds.org/sirtfi\n"), "{out}");
+    }
+
+    #[test]
     fn saml_summary_shows_the_authentication_context_required() {
         let mut v = json!({ "provider": "corp", "label": "Corp", "idp": null, "authnContext": null });
         assert!(saml_summary(&v).contains("  Authentication context:   not checked (the IdP's MFA isn't required)\n"));
