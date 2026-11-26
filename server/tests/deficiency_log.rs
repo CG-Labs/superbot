@@ -165,7 +165,9 @@ fn control_testing_deviations_are_findings_of_their_rows() {
     assert_eq!(o.status.code(), Some(2), "{}", text(&o));
     let l = json_in(&unpack(&dir, "log.tar", "superbot-deficiencies-"), "deficiencies.json");
     let dev = l["findings"].as_array().unwrap().iter().find(|f| f["source"] == "audit-results" && f["exception"] == "deviations").unwrap_or_else(|| panic!("{:#}", l["findings"]));
-    assert_eq!((dev["item"].as_str(), dev["stillListed"].as_bool(), dev["scope"].as_str()), (Some("production-changes CHG-1"), Some(true), Some("2026-08-01_2026-10-01")), "{dev:#}");
+    let drawn = json_in(&unpack(&dir, "results.tar", "superbot-results-"), "manifest.json")["samples"]["manifestSha256"].as_str().unwrap().to_string();
+    let scope = format!("2026-08-01_2026-10-01, samples {}", &drawn[..16]);
+    assert_eq!((dev["item"].as_str(), dev["stillListed"].as_bool(), dev["scope"].as_str()), (Some("production-changes CHG-1"), Some(true), Some(scope.as_str())), "{dev:#}");
     assert_eq!((&dev["rows"], &dev["criteria"], &dev["owners"]), (&json!(["CC8.1-2"]), &json!(["CC8.1"]), &json!(["Engineering lead"])), "{dev:#}");
     assert_eq!(l["summary"]["testingDeviations"], 1);
     assert_eq!(l["testing"].as_array().map(Vec::len), Some(1));

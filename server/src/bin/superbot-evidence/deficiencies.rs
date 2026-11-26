@@ -54,9 +54,10 @@ fn text(v: &Value) -> Option<String> {
 /// item as its id followed by its state in brackets (`CHG-2 emergency on hosting (made
 /// 2027-01-06, not reviewed, due 2027-01-08)`), so a string is known by what comes before
 /// its first ` (`, or before a `: ` that starts a date span (`Engineering lead: 2026-08-01
-/// to 2026-09-01`), with the bundle's own period boundaries, which only clip a condition
-/// to the bundle (`none in the year to 2026-09-01`), read as such; a number (a pull
-/// request) by itself; an object by its `id` or `number`, or else whole.
+/// to 2026-09-01`), with a trailing ` to <the bundle's period end>`, which only clips a
+/// condition to the bundle (`none in the year to 2026-09-01`), read as such; dates
+/// anywhere else name a record and are kept. A number (a pull request) is itself; an
+/// object is its `id` or `number`, or else whole.
 pub fn key(item: &Value, p: &Period) -> String {
     match item {
         Value::String(s) => {
@@ -64,7 +65,11 @@ pub fn key(item: &Value, p: &Period) -> String {
             if let Some((at, _)) = k.match_indices(": ").find(|(i, _)| k[i + 2..].starts_with(|c: char| c.is_ascii_digit())) {
                 k = &k[..at];
             }
-            k.trim().replace(&p.from.to_string(), "<period start>").replace(&p.to.to_string(), "<period end>")
+            let k = k.trim();
+            match k.strip_suffix(&format!(" to {}", p.to)) {
+                Some(rest) => format!("{rest} to <period end>"),
+                None => k.to_string(),
+            }
         }
         Value::Object(o) => ["id", "number"].iter().find_map(|k| o.get(*k).and_then(text)).unwrap_or_else(|| item.to_string()),
         Value::Number(n) => n.to_string(),
@@ -141,7 +146,7 @@ struct Finding {
 }
 
 /// Where a finding comes from: its source (a kind of bundle, or results), scope (the
-/// repository, or the samples' period), file and exception list.
+/// repository, or the samples a results bundle tested), file and exception list.
 type Group = (String, Option<String>, String, String);
 
 #[derive(Default)]
@@ -239,9 +244,12 @@ pub fn log(i: &Inputs, p: &Period, now_ms: i64) -> Result<Value, String> {
         let mp = &manifest["period"];
         let (Some(from), Some(to)) = (day(&mp["from"]), day(&mp["to"])) else { return Err(format!("{name}: its manifest doesn't say the period tested")) };
         let tp = Period { from, to };
+        // Only results of the same samples replace each other: a later sample that didn't
+        // draw an item can't say its deviation was put right.
+        let Some(drawn) = manifest["samples"]["manifestSha256"].as_str().filter(|d| d.len() == 64) else { return Err(format!("{name}: its manifest doesn't name the samples bundle it tested")) };
         let manifest_sha256 = sha256(&files["manifest.json"]);
         let at = Listing { bundle: name.clone(), ident: ident(name, &manifest_sha256), period: tp, created: manifest["createdAt"].as_str().unwrap_or_default().to_string(), item: Value::Null };
-        g.add(RESULTS, "Results bundle", Some(tp.label()), sample::RESULTS_FILE, &r, &at, &tested);
+        g.add(RESULTS, "Results bundle", Some(format!("{}, samples {}", tp.label(), &drawn[..16])), sample::RESULTS_FILE, &r, &at, &tested);
         testing.push(json!({ "bundle": name, "manifestSha256": manifest_sha256, "periodTested": { "from": from.to_string(), "to": to.to_string() }, "samples": manifest["samples"]["name"], "summary": r["summary"] }));
     }
 
@@ -329,7 +337,7 @@ pub fn log(i: &Inputs, p: &Period, now_ms: i64) -> Result<Value, String> {
     }
     let deviations = findings.iter().filter(|f| f["source"] == RESULTS && f["exception"] == "deviations" && f["stillListed"] == true).count();
     Ok(json!({
-        "basis": "every exception listed by a bundle in the store whose SHA256SUMS and manifest check and whose period overlaps this one, and by each results bundle given; an item is tracked by its source (the kind of bundle, or results), scope (the repository of a change-management, vulnerability or drill bundle, or the period a results bundle tested), file, exception list and key (a string up to its first ' (' or a ': ' that starts a date span, with the bundle's own period boundaries read as such, so a condition that runs on is one finding; a number; or an object's id or number), and is still listed when the newest bundle of that source, scope and file that has the list lists it (for botd's evidence bundles, which name no server, any bundle of the latest period). An item no longer listed was either put right or was about something past, such as a pull request merged without an approval; the register says which. This lists what the bundles flagged, not every deficiency, and is not a SOC 2 opinion",
+        "basis": "every exception listed by a bundle in the store whose SHA256SUMS and manifest check and whose period overlaps this one, and by each results bundle given; an item is tracked by its source (the kind of bundle, or results), scope (the repository of a change-management, vulnerability or drill bundle, or the samples a results bundle tested, by their period and manifest digest, so only results of the same samples replace each other), file, exception list and key (a string up to its first ' (' or a ': ' that starts a date span, with a trailing ' to <the bundle's period end>' read as such, so a condition that runs on is one finding, and any other date kept, as it names a record; a number; or an object's id or number), and is still listed when the newest bundle of that source, scope and file that has the list lists it (for botd's evidence bundles, which name no server, any bundle of the latest period). An item no longer listed was either put right or was about something past, such as a pull request merged without an approval; the register says which. This lists what the bundles flagged, not every deficiency, and is not a SOC 2 opinion",
         "periodCovered": { "from": p.from.to_string(), "to": p.to.to_string(), "days": p.days() },
         "summary": {
             "findings": findings.len(),
@@ -725,6 +733,10 @@ mod tests {
         assert_eq!(super::key(&json!("Engineering lead: 2027-02-01 to 2027-03-01"), &feb), "Engineering lead");
         assert_eq!(key(json!("none in the year to 2027-02-01")), "none in the year to <period end>");
         assert_eq!(super::key(&json!("none in the year to 2027-03-01"), &feb), "none in the year to <period end>");
+        // A date that names a record is kept, even on the period's first or last day.
+        assert_eq!(key(json!("F-1 of hosting on 2027-01-01")), "F-1 of hosting on 2027-01-01");
+        assert_eq!(super::key(&json!("F-1 of hosting on 2027-01-01"), &feb), "F-1 of hosting on 2027-01-01");
+        assert_eq!(super::key(&json!("botd-1 on 2027-03-01: no sign-off"), &feb), "botd-1 on 2027-03-01: no sign-off");
         assert_eq!(finding_id("a", None, "f", "l", "k"), finding_id("a", None, "f", "l", "k"));
         assert_ne!(finding_id("a", Some("o/r"), "f", "l", "k"), finding_id("a", Some("o/s"), "f", "l", "k"));
         assert_eq!(finding_id("a", None, "f", "l", "k").len(), 16);
@@ -812,11 +824,11 @@ mod tests {
         assert_eq!(find(&l, "evidence", "TEAMS")["stillListed"], false);
     }
 
-    fn results(name: &str, tested: (&str, &str), made: &str, deviations: Value) -> (String, Files) {
+    fn results(name: &str, samples: &str, made: &str, deviations: Value) -> (String, Files) {
         let r = json!({ "summary": { "sampled": 3, "tested": 3, "deviations": deviations.as_array().unwrap().len(), "untested": 0 }, "exceptions": { "deviations": deviations, "untested": [], "populationsIncomplete": ["pages"] } });
         let mut files = Files::new();
         files.insert(sample::RESULTS_FILE.into(), json_file(&r));
-        files.insert("manifest.json".into(), json_file(&json!({ "product": "SuperBot", "kind": RESULTS, "createdAt": made, "period": { "from": tested.0, "to": tested.1 }, "samples": { "name": "superbot-samples-x" } })));
+        files.insert("manifest.json".into(), json_file(&json!({ "product": "SuperBot", "kind": RESULTS, "createdAt": made, "period": { "from": "2027-01-01", "to": "2027-04-01" }, "samples": { "name": "superbot-samples-x", "manifestSha256": sha256(samples.as_bytes()) } })));
         (name.to_string(), files)
     }
 
@@ -824,18 +836,28 @@ mod tests {
     fn control_testing_deviations_are_findings_of_their_tests_rows() {
         let st = store();
         let rs = vec![
-            results("superbot-results-2027-01-01_2027-04-01-20270405T100000Z", ("2027-01-01", "2027-04-01"), "2027-04-05T10:00:00Z", json!(["access-grants p-c/hosting/admin/2027-01-05", "merged-pull-requests o/r#7"])),
-            results("superbot-results-2027-01-01_2027-04-01-20270410T100000Z", ("2027-01-01", "2027-04-01"), "2027-04-10T10:00:00Z", json!(["access-grants p-c/hosting/admin/2027-01-05"])),
+            results("superbot-results-2027-01-01_2027-04-01-20270405T100000Z", "first", "2027-04-05T10:00:00Z", json!(["access-grants p-c/hosting/admin/2027-01-05", "merged-pull-requests o/r#7"])),
+            results("superbot-results-2027-01-01_2027-04-01-20270410T100000Z", "first", "2027-04-10T10:00:00Z", json!(["access-grants p-c/hosting/admin/2027-01-05"])),
         ];
         let i = Inputs { store: &st, other: &[], results: &rs, since: None, checklist: Some("| CC6.2-2 | Grants | Process | Security owner | x | Partial | y |\n") };
         let l = log(&i, &quarter(), 0).unwrap();
         let grant = find(&l, RESULTS, "access-grants p-c/hosting/admin/2027-01-05");
         assert_eq!((grant["stillListed"].as_bool(), grant["rows"].clone(), grant["owners"].clone()), (Some(true), json!(["CC6.2-2"]), json!(["Security owner"])));
-        assert_eq!(grant["scope"], "2027-01-01_2027-04-01");
+        assert_eq!(grant["scope"], format!("2027-01-01_2027-04-01, samples {}", &sha256(b"first")[..16]));
         assert_eq!(find(&l, RESULTS, "merged-pull-requests o/r#7")["stillListed"], false, "the newer results of the same samples no longer list it");
         assert_eq!(find(&l, RESULTS, "pages")["rows"], json!(["CC7.2-1"]));
         assert_eq!(l["summary"]["testingDeviations"], 1);
         assert_eq!(l["testing"].as_array().unwrap().len(), 2);
+
+        // Results of other samples, drawn with another seed or size, never clear a deviation.
+        let other = vec![rs[0].clone(), results("superbot-results-2027-01-01_2027-04-01-20270410T100000Z", "second", "2027-04-10T10:00:00Z", json!([]))];
+        let l = log(&Inputs { results: &other, ..i }, &quarter(), 0).unwrap();
+        assert_eq!(find(&l, RESULTS, "merged-pull-requests o/r#7")["stillListed"], true, "the second samples didn't test it");
+        assert_eq!(l["summary"]["testingDeviations"], 2);
+
+        let mut bare = rs[0].clone();
+        bare.1.insert("manifest.json".into(), json_file(&json!({ "period": { "from": "2027-01-01", "to": "2027-04-01" }, "samples": { "name": "superbot-samples-x" } })));
+        assert!(log(&Inputs { results: std::slice::from_ref(&bare), ..i }, &quarter(), 0).unwrap_err().contains("doesn't name the samples bundle"));
     }
 
     #[test]
