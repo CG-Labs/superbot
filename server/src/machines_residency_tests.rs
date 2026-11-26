@@ -1583,6 +1583,38 @@ async fn the_audit_export_holds_back_a_pinned_persons_audit_details_from_sinks_o
     let (_, v) = call_json(port, "GET", "/api/audit/verify?archive=on", &admin, "").await;
     assert_eq!(v["archive"]["ok"].as_bool(), Some(true), "{v}");
     assert!(v["archive"]["heldBack"].as_u64().unwrap() >= 2, "{v}");
+    // A copy of a batch with an event botd sent whole stripped to look sealed: its hash still
+    // follows, but botd didn't send it so, so the copy was changed.
+    let holds = |k: &String| String::from_utf8_lossy(&bucket.w().objects[k]).lines().any(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| v["id"] == theirs));
+    let original = bucket.keys().into_iter().find(holds).unwrap();
+    let stripped: Vec<String> = String::from_utf8(bucket.w().objects[&original].clone())
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: Value = serde_json::from_str(l).unwrap();
+            if v["id"] == theirs {
+                for f in crate::audit_line::ERASABLE_FIELDS {
+                    v[f] = Value::Null;
+                }
+                v["details"] = json!({ "inChatStore": "gb-lon" });
+                v.as_object_mut().unwrap().remove("chainSalt");
+                assert_eq!(check(&v), Ok(Bound::Fixed));
+            }
+            v.to_string()
+        })
+        .collect();
+    let copy = format!("audit/prod/2099/01/01/{}", original.rsplit('/').next().unwrap());
+    let (meta, _) = bucket.w().meta[&original].clone();
+    let body = stripped.join("\n") + "\n";
+    let sum = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, body.as_bytes()).as_ref());
+    let mut h: Vec<(&str, String)> = meta.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    h.push(("x-amz-checksum-sha256", sum));
+    let s3 = crate::machines::s3::S3::new(bucket.settings()).unwrap();
+    s3.put_with(&copy, body.into_bytes(), &h).await.unwrap();
+    let (_, v) = call_json(port, "GET", "/api/audit/verify?archive=on", &admin, "").await;
+    let reasons: Vec<&str> = v["archive"]["firstProblems"].as_array().unwrap().iter().filter_map(|p| p["reason"].as_str()).collect();
+    assert_eq!((v["archive"]["ok"].as_bool(), reasons), (Some(false), vec!["contents"]), "{v}");
+    s3.delete(&copy).await.unwrap();
 
     // Her report names what each sink gets, and the one with no stated region as not covered.
     let (_, r) = call_json(port, "GET", &format!("/api/users/{ada}/residency/report"), &admin, "").await;

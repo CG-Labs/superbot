@@ -1058,7 +1058,7 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
                     tokio::time::sleep(IDLE).await;
                     continue 'export;
                 };
-                let held = match held_back(&app, &x.sink, &rows, retry_to) {
+                let held = match held_back(&app, &x.sink, &rows, x.delivered(), retry_to) {
                     Ok(h) => h,
                     Err(e) => break 'batch Err(("unreadable", format!("couldn't read where audit events' details are kept: {e}"))),
                 };
@@ -1079,20 +1079,17 @@ async fn run(app: Arc<App>, x: Arc<Exporter>, sealed_after: i64) {
                             None => app.db.set_audit_export_cursor(&start_key, rows[0].id).map_err(|e| ("cursor_unsaved", format!("couldn't save where the archive starts: {e}"))),
                             Some(_) => Ok(()),
                         };
-                        let held = first.and_then(|()| match save_held(&app, &x.sink.id, last, &held) {
-                            true => Ok(()),
-                            false => Err(("cursor_unsaved", "couldn't save which events the archive's next batch holds back".to_string())),
-                        });
-                        held.and_then(|()| app.db.set_audit_export_cursor(&batch_key, last).map_err(|e| ("cursor_unsaved", format!("couldn't save the archive's next batch: {e}"))))
+                        first.and_then(|()| app.db.cut_audit_export_batch(&x.sink.id, x.delivered(), last, &held).map_err(|e| ("cursor_unsaved", format!("couldn't save the archive's next batch: {e}"))))
                     }
                     false => Ok(()),
                 };
+                // A batch whose cut wasn't saved is cut again: nothing of it was sent.
                 let r = match cut {
                     Ok(()) => out
                         .send(&x.sink, &rows, &extras, &host, sealed_after)
                         .await
                         .and_then(|object| app.db.set_audit_export_cursor(&x.sink.id, last).map(|()| object).map_err(|e| ("cursor_unsaved", format!("couldn't save the export cursor: {e}")))),
-                    Err(e) => Err(e),
+                    Err(e) => break 'batch Err(e),
                 };
                 if x.sink.archive().is_some() {
                     retry_to = r.is_err().then_some(last);
@@ -1142,37 +1139,16 @@ type Held = std::collections::BTreeMap<i64, String>;
 
 /// The events of `rows` whose details `sink` doesn't get (ADR 0330): with its region stated,
 /// those a chat store of another region keeps. An archive's retry (`retry_to`) holds back
-/// what its batch's first try did, so it writes the same object whoever has moved since.
-fn held_back(app: &App, sink: &Sink, rows: &[AuditEvent], retry_to: Option<i64>) -> rusqlite::Result<Held> {
-    if let Some(to) = retry_to.filter(|_| sink.archive().is_some())
-        && let Some(held) = saved_held(app, &sink.id, to)
-    {
-        return Ok(held);
+/// what its batch's cut recorded, so it writes the same object whoever has moved since; a
+/// batch cut before botd recorded that went whole, so it goes whole again.
+fn held_back(app: &App, sink: &Sink, rows: &[AuditEvent], delivered: i64, retry_to: Option<i64>) -> rusqlite::Result<Held> {
+    if let Some(to) = retry_to.filter(|_| sink.archive().is_some()) {
+        return Ok(app.db.audit_export_held_for_batch(&sink.id, delivered, to)?.unwrap_or_default());
     }
     let (Some(region), Some(first), Some(last)) = (sink.region.as_deref(), rows.first(), rows.last()) else { return Ok(Held::new()) };
     let mut kept = app.db.audit_kept_in(first.id, last.id)?;
     kept.retain(|_, r| r != region);
     Ok(kept)
-}
-
-/// `audit_export:<id>#held`: what the archive's batch up to `to` holds back.
-fn held_key(id: &str) -> String {
-    format!("audit_export:{id}#held")
-}
-
-fn saved_held(app: &App, id: &str, to: i64) -> Option<Held> {
-    let v: Value = serde_json::from_str(&app.db.setting(&held_key(id))?).ok()?;
-    if v["to"].as_i64() != Some(to) {
-        return None;
-    }
-    v["ids"].as_object()?.iter().map(|(k, r)| Some((k.parse().ok()?, r.as_str()?.to_string()))).collect()
-}
-
-/// Saved with the batch's cut, before its last id, so a retry or a restart finds it.
-fn save_held(app: &App, id: &str, to: i64, held: &Held) -> bool {
-    let ids: serde_json::Map<String, Value> = held.iter().map(|(k, r)| (k.to_string(), json!(r))).collect();
-    let v = json!({ "to": to, "ids": ids }).to_string();
-    app.db.write_settings(&[(held_key(id).as_str(), Some(v.as_str()))])
 }
 
 /// Event `e` as botd's own log holds it while `region`'s chat store keeps its details (ADR
@@ -1197,17 +1173,24 @@ pub(crate) fn sealed_row(e: &AuditEvent, region: &str) -> AuditEvent {
 }
 
 /// For a residency report on a pin to `region` (ADR 0330): each sink, the region it is said
-/// to be in, and whether it gets the details of the pin's people's events whole. `store`:
-/// whether `region` has a chat store; without one their details are in botd's log, which
-/// goes whole to every sink.
-pub fn for_pin(app: &App, region: &str, store: bool) -> Vec<Value> {
+/// to be in, and whether it gets the details of the pin's people's events `whole`, only
+/// their sealed rows (`heldBack`), or sealed rows but for the `wholeEvents` whose details are
+/// still in botd's own log (`partly`: a move into the store that hasn't happened yet). `store`:
+/// whether `region` has a chat store; without one their details are all in botd's log, which
+/// goes whole to every sink. `in_botd`: how many of their events' details are in botd's log.
+pub fn for_pin(app: &App, region: &str, store: bool, in_botd: i64) -> Vec<Value> {
     let Some(xs) = app.audit_export.get() else { return Vec::new() };
     xs.sinks
         .iter()
         .map(|x| {
             let s = &x.sink;
-            let whole = !store || s.region.as_deref().is_none_or(|r| r == region);
-            json!({ "kind": s.kind(), "name": s.name, "dataRegion": s.region, "inRegion": s.region.as_deref() == Some(region), "details": if whole { "whole" } else { "heldBack" } })
+            let details = match () {
+                _ if !store || s.region.as_deref().is_none_or(|r| r == region) => "whole",
+                _ if in_botd > 0 => "partly",
+                _ => "heldBack",
+            };
+            let whole_events = (details == "partly").then_some(in_botd);
+            json!({ "kind": s.kind(), "name": s.name, "dataRegion": s.region, "inRegion": s.region.as_deref() == Some(region), "details": details, "wholeEvents": whole_events })
         })
         .collect()
 }
