@@ -488,7 +488,7 @@ async fn view(port: u16, token: &str) -> String {
 }
 
 fn uid_of(account: &str) -> u32 {
-    crate::passwd::by_name(account).unwrap_or_else(|| panic!("no account {account}")).uid
+    crate::passwd::by_name(account).expect("the account exists").uid
 }
 
 /// SysV shared memory segments of `uid` that another account may attach.
