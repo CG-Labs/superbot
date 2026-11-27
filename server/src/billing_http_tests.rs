@@ -596,6 +596,7 @@ pub(crate) async fn fake_stripe() -> (String, FakeStripe) {
                 let quantity = seen.get("quantity").and_then(|q| q.parse::<i64>().ok());
                 (200, json!({ "id": p.trim_start_matches("/v1/subscription_items/"), "object": "subscription_item", "quantity": quantity }))
             }
+            (p, _) if p.starts_with("/v1/subscriptions/") => (200, json!({ "id": p.trim_start_matches("/v1/subscriptions/"), "object": "subscription", "status": "active" })),
             ("/v1/checkout/sessions", _) => (200, json!({ "id": format!("cs_test_{n}"), "object": "checkout.session", "url": format!("https://checkout.stripe.com/c/pay/cs_test_{n}") })),
             (p, Some(_)) if p.ends_with("/expire") && paid => (400, json!({ "error": { "type": "invalid_request_error", "message": "Only Checkout Sessions with a status of open can be expired." } })),
             (_, Some(id)) => (200, json!({ "id": id, "object": "checkout.session", "status": if paid { "complete" } else { "expired" } })),

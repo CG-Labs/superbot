@@ -60,7 +60,7 @@ No table is written and no route answers without billing; self-host is unchanged
 ## Remaining
 
 - Team-only prices (a tier sold only to teams, or per-seat prices that differ from a person's). (Done in [ADR 0346](0346-yearly-and-team-only-prices-at-checkout.md).)
-- Telling members with a personal plan, by email, that they can cancel it once their team pays.
+- Telling members with a personal plan, by email, that they can cancel it once their team pays. (Done in [ADR 0347](0347-server-admins-change-a-teams-plan.md).)
 - Yearly prices at checkout (as for people). (Done in [ADR 0346](0346-yearly-and-team-only-prices-at-checkout.md).)
 - SCIM groups as teams, so seats follow the IdP. (Done in [ADR 0095](0095-scim-groups-as-teams.md).)
-- Server admins changing a team's plan from the console.
+- Server admins changing a team's plan from the console. (Done in [ADR 0347](0347-server-admins-change-a-teams-plan.md).)

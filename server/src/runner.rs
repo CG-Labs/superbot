@@ -497,18 +497,20 @@ impl App {
         usage::period_at(period, at)
     }
 
-    /// The tier a user is on: the one their team pays for (ADR 0093), else theirs, else
-    /// the default.
+    /// The tier a user is on: the one their team pays for (ADR 0093) or a server admin
+    /// gave it (ADR 0347), else theirs, else the default.
     pub fn tier_of(&self, user_id: &str) -> &Tier {
-        let team = self.db.team_plan_of(user_id).and_then(|s| s.tier);
+        let team = self.db.team_tier_of(user_id).map(|(_, t)| t);
         self.tiers().of(team.or_else(|| self.db.user(user_id).and_then(|u| u.tier)).as_deref())
     }
 
     /// The Stripe customer a user's tokens are metered to: their team's while it pays
-    /// for their plan (ADR 0093), else their own.
+    /// for their plan (ADR 0093), none while their plan is one an admin gave their team
+    /// (ADR 0347), else their own.
     pub fn meter_customer(&self, user_id: &str) -> Option<String> {
         match self.db.team_plan_of(user_id) {
             Some(t) => self.db.team_customer(&t.team_id),
+            None if self.db.team_tier_of(user_id).is_some() => None,
             None => self.db.customer_of(user_id),
         }
     }

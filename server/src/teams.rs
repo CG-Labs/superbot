@@ -261,7 +261,16 @@ fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, sight: Sight) ->
     if let Some(b) = crate::team_billing::view(app, &t.id, sight.billing) {
         v["billing"] = b;
     }
+    // Server admins see and change the team's plan, with billing on or off (ADR 0347).
+    if me.is_none() {
+        v["plan"] = crate::team_plan::admin_view(app, t);
+    }
     v
+}
+
+/// A team as server admins see it.
+pub(crate) fn admin_view(app: &AppState, t: &Team) -> Value {
+    team_view(app, t, None, ALL)
 }
 
 // Joining and leaving.
@@ -1088,7 +1097,7 @@ fn need_team(app: &AppState, id: &str) -> Res<Team> {
 /// `GET /api/teams`: every team, with its members.
 pub async fn list(State(app): State<AppState>) -> Res {
     let list: Vec<Value> = app.db.teams().iter().map(|t| team_view(&app, t, None, ALL)).collect();
-    Ok(Json(json!({ "teams": list, "settings": { "strict": settings(&app).strict, "machineDays": settings(&app).machine_days, "work": work_policies(&app) } })))
+    Ok(Json(json!({ "teams": list, "settings": { "strict": settings(&app).strict, "machineDays": settings(&app).machine_days, "work": work_policies(&app) }, "plans": crate::team_plan::choices(&app) })))
 }
 
 /// `POST /api/teams` `{name, owner}`: makes a team with its first owner.

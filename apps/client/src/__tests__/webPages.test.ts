@@ -257,3 +257,74 @@ describe("the setup wizard's first run", () => {
     expect(css).toContain("@media (prefers-color-scheme: dark)");
   });
 });
+
+describe("the console's team plans (ADR 0347)", () => {
+  const PLANS = [
+    { name: "starter", label: "Starter", priced: true },
+    { name: "pro", label: "Pro", priced: true },
+    { name: "self-host", label: "Self-host", priced: false },
+  ];
+  const team = (plan: Record<string, unknown>) => ({ id: "team_1", name: "Alpha", machines: false, members: [], plan });
+  let reply: (body?: Record<string, unknown>) => Reply;
+  let teamList: Record<string, unknown>[];
+  afterEach(() => win.close());
+
+  const open = async (plan: Record<string, unknown>, answer = true) => {
+    teamList = [team(plan)];
+    reply = () => ({ body: team({ ...plan, given: "pro", current: { name: "pro", label: "Pro", source: "admin" } }) });
+    load(CONSOLE, "http://localhost/console/#teams", (m, p, b) => {
+      if (p === "/api/auth/me") return { body: { permissions: ["admin"], user: { id: "u1", name: "Ada" } } };
+      if (p === "/api/teams") return { body: { teams: teamList, settings: {}, plans: PLANS } };
+      if (m === "PUT" && p === "/api/teams/team_1/plan") return reply(b);
+      return { body: [] };
+    }, [CONSOLE_JS]);
+    win.confirm = () => answer;
+    await flush();
+  };
+  const picker = () => win.document.querySelector<HTMLSelectElement>('#teams-list select[data-act="team-plan"]')!;
+  const pick = async (value: string) => {
+    picker().value = value;
+    picker().dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush();
+  };
+
+  it("offers every plan, with the team's own picked, and puts the team on another", async () => {
+    await open({ current: null, given: null, paid: false });
+    expect([...picker().options].map((o) => [o.value, o.textContent, o.disabled])).toEqual([
+      ["", "No team plan", false],
+      ["starter", "Starter", false],
+      ["pro", "Pro", false],
+      ["self-host", "Self-host", false],
+    ]);
+    expect(picker().value).toBe("");
+    expect(picker().closest("label")?.textContent).toContain("Plan");
+    await pick("pro");
+    expect(posts("/api/teams/team_1/plan").map((c) => [c.method, c.body])).toEqual([["PUT", { tier: "pro" }]]);
+    await pick("");
+    expect(posts("/api/teams/team_1/plan").map((c) => c.body)).toEqual([{ tier: "pro" }, { tier: null }]);
+  });
+
+  it("asks first, and sends nothing when the admin says no", async () => {
+    await open({ current: null, given: null, paid: false }, false);
+    await pick("starter");
+    expect(posts("/api/teams/team_1/plan")).toEqual([]);
+  });
+
+  it("only offers a team that pays in Stripe a plan Stripe sells, and says Stripe is moving it", async () => {
+    await open({ current: { name: "pro", label: "Pro", source: "stripe" }, given: null, paid: true });
+    expect(picker().value).toBe("pro");
+    expect([...picker().options].filter((o) => o.disabled).map((o) => o.value)).toEqual(["", "self-host"]);
+    reply = () => ({ status: 202, body: team({ current: { name: "pro", label: "Pro", source: "stripe" }, given: null, paid: true }) });
+    await pick("starter");
+    expect(posts("/api/teams/team_1/plan").map((c) => c.body)).toEqual([{ tier: "starter" }]);
+    expect($("error").textContent).toBe("Stripe is moving Alpha's subscription to Starter. Everyone moves when Stripe confirms it.");
+    // Until Stripe reports it, the picker shows Starter, so picking Pro again undoes it.
+    expect(picker().value).toBe("starter");
+    await pick("pro");
+    expect(posts("/api/teams/team_1/plan").map((c) => c.body)).toEqual([{ tier: "starter" }, { tier: "pro" }]);
+    expect(picker().value).toBe("pro");
+    reply = () => ({ status: 409, body: { error: "The Self-host plan has no Stripe price." } });
+    await pick("starter");
+    expect($("error").textContent).toBe("The Self-host plan has no Stripe price.");
+  });
+});

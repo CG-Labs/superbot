@@ -204,7 +204,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
             <Text style={styles.cardTitle} role="heading">
               {plan.label} plan
             </Text>
-            {team ? <Text style={styles.dim}>{`${team.name ?? "Your team"} pays for this plan for everyone on it.`}</Text> : status ? <Text style={styles.dim}>{status}</Text> : null}
+            {team ? <Text style={styles.dim}>{team.source === "admin" ? `A server admin put ${team.name ?? "your team"} on this plan for everyone on it.` : `${team.name ?? "Your team"} pays for this plan for everyone on it.`}</Text> : status ? <Text style={styles.dim}>{status}</Text> : null}
             {planUsageLines(plan).map((l) => (
               <Text key={l} style={styles.line}>
                 {l}
@@ -274,7 +274,9 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
         {subscribed || !canChange ? (
           <Text style={styles.dim}>
             {team
-              ? "Your team's owners and admins change its plan on the Team screen."
+              ? team.source === "admin"
+                ? "A server admin changes your team's plan."
+                : "Your team's owners and admins change its plan on the Team screen."
               : view?.portal && canChange
                 ? "To change or cancel your plan, use Manage billing."
                 : "To change your plan, ask an admin."}
