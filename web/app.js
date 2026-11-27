@@ -555,7 +555,7 @@ $("machines-reconcile").addEventListener("click", async () => {
   loadMachines();
 });
 
-// Teams (ADR 0087, 0088, 0093): every team, its people, roles, machine states and plan. Each team's
+// Teams (ADR 0087, 0088, 0093, 0347): every team, its people, roles, machine states and plan. Each team's
 // own owners and admins manage it in the app; this is the server admins' fallback.
 
 const TEAM_ROLES = { owner: "Owner", admin: "Admin", member: "Member" };
@@ -580,13 +580,32 @@ function teamMachine(m) {
   return `${esc(m.state)}<div class="sub">${esc(whose)} · ${esc(m.tier)} · ${esc(m.enrollment)}</div>${released}`;
 }
 
-// The team's plan and seats (ADR 0093), when this server sells plans. Changed in Stripe or by the team's managers.
+// The team's plan and seats (ADR 0093), when this server sells plans. Changed in Stripe, by the team's managers, or here (ADR 0347).
 function teamPlan(b) {
   if (!b) return "";
   if (!b.plan) return " · no team plan";
+  if (b.plan.source === "admin") return ` · on ${b.plan.label}, given here`;
   const seats = b.seats ? ` · ${b.seats.billed ?? 0} of ${b.seats.members} seats billed${b.seats.error ? " (Stripe hasn't caught up; retrying)" : b.seats.syncing ? " (updating)" : ""}` : "";
   const status = b.subscription ? ` (${b.subscription.status}${b.subscription.cancelAt ? `, ends ${fmt(b.subscription.cancelAt * 1000)}` : ""})` : "";
   return ` · team pays for ${b.plan.label}${status}${seats}`;
+}
+
+// The plan everyone on the team is on (ADR 0347). A team that pays in Stripe can only move to a plan Stripe sells.
+function teamPlanPicker(t) {
+  const p = t.plan;
+  if (!p) return "";
+  const chosen = p.paid ? p.current?.name : p.given;
+  const none = `<option value="" ${chosen ? "" : "selected"} ${p.paid ? "disabled" : ""}>No team plan</option>`;
+  const plans = (teams.plans || []).map((x) => `<option value="${esc(x.name)}" ${x.name === chosen ? "selected" : ""} ${p.paid && !x.priced ? "disabled" : ""}>${esc(x.label)}</option>`).join("");
+  return `<label class="push">Plan <select data-act="team-plan" title="The plan everyone on the team is on">${none}${plans}</select></label>`;
+}
+
+function teamPlanNote(t, to) {
+  if (!to) return `Take ${t.name}'s plan away? Everyone on it goes back to the plan they had.`;
+  const how = t.plan?.paid
+    ? "The team pays in Stripe: its subscription moves to this plan, with prorations, and everyone moves when Stripe confirms it."
+    : "Nothing is charged: the plan is recorded here.";
+  return `Put everyone on ${t.name} on ${to.label}? ${how} Anyone still paying for a plan of their own is emailed that they may cancel it.`;
 }
 
 function renderTeams() {
@@ -595,7 +614,8 @@ function renderTeams() {
   $("teams-empty").hidden = teams.teams.length > 0;
   $("teams-list").innerHTML = teams.teams.map((t) => `<div class="card" data-team="${esc(t.id)}">
       <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"} · data in ${esc(t.region || "the default region")}${t.residency ? ` · pinned under ${esc(t.residency.reference || "an agreement")}` : ""}${esc(teamPlan(t.billing))}</span>
-        <button type="button" class="btn push" data-act="team-region">Data region</button>
+        ${teamPlanPicker(t)}
+        <button type="button" class="btn${t.plan ? "" : " push"}" data-act="team-region">Data region</button>
         <button type="button" class="btn" data-act="team-residency">${t.residency ? "Unpin" : "Pin region"}</button>
         <button type="button" class="btn" data-act="delete-team">Delete team</button></div>
       <table class="grid">
@@ -668,10 +688,16 @@ function teamCustomRoleCell(m) {
 
 $("teams-list").addEventListener("change", async (e) => {
   const act = e.target.dataset.act;
-  if (act !== "team-role" && act !== "team-custom-role") return;
+  if (act !== "team-role" && act !== "team-custom-role" && act !== "team-plan") return;
   const t = teamOf(e.target);
-  const userId = e.target.closest("tr").dataset.user;
+  const userId = e.target.closest("tr")?.dataset.user;
   try {
+    if (act === "team-plan") {
+      const to = (teams.plans || []).find((x) => x.name === e.target.value);
+      if (!confirm(teamPlanNote(t, to))) return loadTeams();
+      const r = await api("PUT", `/api/teams/${key(t.id)}/plan`, { tier: to ? to.name : null });
+      if (r.plan?.paid && r.plan.current?.name !== to?.name) notice(`Stripe is moving ${t.name}'s subscription to ${to.label}. Everyone moves when Stripe confirms it.`, false);
+    }
     if (act === "team-role") await api("PUT", `/api/teams/${key(t.id)}/members/${key(userId)}`, { role: e.target.value });
     if (act === "team-custom-role") {
       const held = t.members.find((x) => x.id === userId)?.customRole?.id;
