@@ -121,6 +121,10 @@ When the build finishes, install via:
 
 You cannot produce a signed `.ipa` on Linux/Windows locally; use **EAS Build** (documented above).
 
+## Store listings
+
+The App Store and Google Play listing text, screenshots, privacy answers and the `eas submit` production profile are in [`docs/store/`](../../docs/store/README.md) ([ADR 0349](../../docs/adr/0349-store-listings-and-privacy-answers.md)). `submit.production` in `eas.json` holds placeholders for the owner's Apple team id and App Store Connect app id, and reads the Play service account key's path from `GOOGLE_SERVICE_ACCOUNT_KEY_PATH`.
+
 ## Scripts
 
 | Command | Purpose |
@@ -129,6 +133,8 @@ You cannot produce a signed `.ipa` on Linux/Windows locally; use **EAS Build** (
 | `npm run lint` | ESLint |
 | `npm test` | Jest (`jest-expo`) unit and component tests |
 | `npm run tokens` | Write the design tokens (`src/tokens.json`) into `web/styles.css`; `tokens:check` verifies them (CI) |
+| `npm run store:check` | Store listing text, the submit profile and screenshot sizes (CI); `store:ready` also refuses owner placeholders |
+| `npm run store:screenshots` | Draft store screenshots from the web build, with made-up data |
 | `npm run build:web` | Static web bundle (CI) |
 | `npm run build:web:server` | Web bundle for the server's `/app/` path |
 | `npm run desktop` | Electron dev |

@@ -1,0 +1,18 @@
+{
+  "defaultLanguage": "en-US",
+  "appName": "SuperBot: AI Teammates",
+  "shortDescription": "AI agents with their own computer. Chat, approve risky steps, schedule routines.",
+  "fullDescription": "SuperBot gives you AI teammates that each have their own computer. Ask a Bot to research a market, tidy a spreadsheet, draft a report or fix a bug, and it does the work on its own machine while you get on with yours.\n\nThe app connects to a SuperBot server: one your organization runs for you, or one you host yourself. SuperBot is open source.\n\nWHAT YOU CAN DO\n• Chat with your Bots. Each has its own name, look, memory and computer.\n• Watch a Bot's screen live, and take over when it needs a hand.\n• Approve or deny risky steps, like pushing code or deleting files, before they happen.\n• Schedule routines: a Monday digest, a nightly report, a daily check.\n• Get a notification when a Bot is waiting for you or a routine finishes. A notification names only the Bot, never what it is doing.\n• Share Bots with your team. Admins can manage people and roles and read the audit log.\n\nBUILT FOR WORK\n• Sign in with your organization's single sign-on, or a one-time code from your admin.\n• Two-factor authentication.\n• Optional App lock with your fingerprint or face.\n• Works with the AI coding agents your server runs.\n• No ads, no analytics and no tracking.\n\nYou need an account on a SuperBot server to use the app. Ask your admin for one, or set up your own server from the project's website.",
+  "releaseNotes": "The first release of SuperBot.",
+  "appCategory": "Productivity",
+  "tags": ["Productivity", "Business"],
+  "contactEmail": "owner-todo@owner-todo.invalid",
+  "contactWebsite": "https://owner-todo.invalid/superbot",
+  "privacyPolicyUrl": "https://owner-todo.invalid/privacy",
+  "accountDeletionUrl": "https://owner-todo.invalid/delete-account",
+  "graphics": {
+    "icon": "apps/client/assets/brand/store/play-store-icon.png",
+    "featureGraphic": "apps/client/assets/brand/store/feature-graphic.png",
+    "phoneScreenshots": "docs/store/screenshots/android-phone/"
+  }
+}
