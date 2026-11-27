@@ -241,6 +241,59 @@ pub const MAX_PRICE_AMOUNT: u64 = 1_000_000_000;
 pub const MAX_FEATURES: usize = 10;
 pub const MAX_FEATURE_CHARS: usize = 120;
 
+/// How often a checkout's price bills (ADR 0346).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interval {
+    Month,
+    Year,
+}
+
+impl Interval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Interval::Month => "month",
+            Interval::Year => "year",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Interval> {
+        match raw.trim() {
+            "month" => Some(Interval::Month),
+            "year" => Some(Interval::Year),
+            _ => None,
+        }
+    }
+}
+
+/// Who a checkout is for: a person's own plan, or a team's (ADR 0093).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Buyer {
+    Person,
+    Team,
+}
+
+/// `checkoutPrices` (ADR 0346): which of the tier's `stripePrices` each checkout sells.
+/// People buy `month` or `year`; teams buy `teamMonth` or `teamYear` when either is
+/// named, else the same as people. Naming only team prices sells the tier to teams only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CheckoutPrices {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub month: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_month: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_year: Option<String>,
+}
+
+impl CheckoutPrices {
+    fn team(&self) -> bool {
+        self.team_month.is_some() || self.team_year.is_some()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tier {
     pub name: String,
@@ -250,6 +303,9 @@ pub struct Tier {
     pub limits: Limits,
     /// Stripe price ids that pay for this tier (ADR 0040). Admins only see them.
     pub stripe_prices: Vec<String>,
+    /// Which of `stripe_prices` checkout sells, by buyer and interval (ADR 0346). None:
+    /// people and teams both buy the first of `stripe_prices`, as before.
+    pub checkout_prices: Option<CheckoutPrices>,
     /// What the pricing page says the tier costs (ADR 0121), as the operator wrote it.
     /// Stripe's price decides what's charged; botd never asks Stripe for amounts.
     pub published_prices: Vec<ListPrice>,
@@ -341,11 +397,53 @@ impl Tier {
         !self.stripe_prices.is_empty() || !self.published_prices.is_empty()
     }
 
+    /// The Stripe price a checkout by `buyer`, billed every `interval`, sells (ADR 0346).
+    /// None: the tier isn't sold to them at that interval.
+    pub fn checkout_price(&self, buyer: Buyer, interval: Interval) -> Option<&str> {
+        let Some(c) = &self.checkout_prices else {
+            return match interval {
+                Interval::Month => self.stripe_prices.first().map(String::as_str),
+                Interval::Year => None,
+            };
+        };
+        let (month, year) = match buyer {
+            Buyer::Team if c.team() => (&c.team_month, &c.team_year),
+            _ => (&c.month, &c.year),
+        };
+        match interval {
+            Interval::Month => month.as_deref(),
+            Interval::Year => year.as_deref(),
+        }
+    }
+
+    /// The intervals `buyer` can check out this tier at, monthly first. Empty: not sold to them.
+    pub fn checkout_intervals(&self, buyer: Buyer) -> Vec<Interval> {
+        [Interval::Month, Interval::Year].into_iter().filter(|i| self.checkout_price(buyer, *i).is_some()).collect()
+    }
+
+    /// Sold to teams, and not to people (ADR 0346).
+    pub fn team_only(&self) -> bool {
+        self.checkout_intervals(Buyer::Person).is_empty() && !self.checkout_intervals(Buyer::Team).is_empty()
+    }
+
+    /// `view()` for a plan on sale to `buyer`: with `checkoutPrices`, the intervals it's
+    /// sold at, so the apps offer each. Never a price id.
+    pub fn sale_view(&self, buyer: Buyer) -> Value {
+        let mut v = self.view();
+        if self.checkout_prices.is_some() {
+            v["intervals"] = json!(self.checkout_intervals(buyer).iter().map(|i| i.as_str()).collect::<Vec<_>>());
+        }
+        v
+    }
+
     /// For admins: the routes too.
     pub fn admin_view(&self) -> Value {
         let mut v = self.view();
         v["routes"] = self.routes.as_ref().map_or(json!("any"), |r| json!(r));
         v["stripePrices"] = json!(self.stripe_prices);
+        if let Some(c) = &self.checkout_prices {
+            v["checkoutPrices"] = json!(c);
+        }
         v["defaultHarness"] = json!(self.default_harness);
         v
     }
@@ -456,6 +554,8 @@ struct TierCfg {
     limits: Limits,
     #[serde(default, rename = "stripePrices")]
     stripe_prices: Vec<String>,
+    #[serde(default, rename = "checkoutPrices")]
+    checkout_prices: Option<CheckoutPrices>,
     #[serde(default, rename = "defaultHarness")]
     default_harness: Option<String>,
     #[serde(default, rename = "publishedPrices")]
@@ -495,6 +595,34 @@ fn published_prices(raw: Vec<ListPrice>) -> Result<Vec<ListPrice>, String> {
         out.push(ListPrice { amount: p.amount, currency, interval });
     }
     Ok(out)
+}
+
+/// `checkoutPrices`, checked: each names one of the tier's `stripePrices` (so the webhook
+/// places what it sells), at least one is named, and an interval's price isn't also the
+/// other interval's for the same buyer.
+fn checkout_prices(raw: CheckoutPrices, prices: &[String]) -> Result<CheckoutPrices, String> {
+    let clean = |field: &str, p: Option<String>| -> Result<Option<String>, String> {
+        let Some(p) = p.map(|p| p.trim().to_string()) else { return Ok(None) };
+        match prices.contains(&p) {
+            true => Ok(Some(p)),
+            false => Err(format!("checkoutPrices.{field}: \"{}\" must be one of the tier's stripePrices", crate::audit::clip(&p, 100))),
+        }
+    };
+    let c = CheckoutPrices {
+        month: clean("month", raw.month)?,
+        year: clean("year", raw.year)?,
+        team_month: clean("teamMonth", raw.team_month)?,
+        team_year: clean("teamYear", raw.team_year)?,
+    };
+    if c == CheckoutPrices::default() {
+        return Err("checkoutPrices: name at least one of month, year, teamMonth and teamYear, or leave it out to sell the first of stripePrices".into());
+    }
+    for (who, m, y) in [("month and year", &c.month, &c.year), ("teamMonth and teamYear", &c.team_month, &c.team_year)] {
+        if m.is_some() && m == y {
+            return Err(format!("checkoutPrices: {who} name the same price; a Stripe price bills at one interval"));
+        }
+    }
+    Ok(c)
 }
 
 fn features(raw: Vec<String>) -> Result<Vec<String>, String> {
@@ -546,6 +674,7 @@ impl Tiers {
             routes: None,
             limits: Limits::default(),
             stripe_prices: Vec::new(),
+            checkout_prices: None,
             published_prices: Vec::new(),
             features: Vec::new(),
             default_harness: None,
@@ -681,9 +810,20 @@ impl Tiers {
                 (Some(r), Some(h)) if r.iter().any(|r| r.harness == h) => Some(h.to_string()),
                 (Some(_), Some(h)) => return Err(format!("tier \"{name}\": defaultHarness \"{h}\" must be one of the tier's routes' harnesses")),
             };
+            let checkout_prices = t.checkout_prices.map(|c| checkout_prices(c, &prices)).transpose().map_err(|e| format!("tier \"{name}\": {e}"))?;
             let published_prices = published_prices(t.published_prices).map_err(|e| format!("tier \"{name}\": {e}"))?;
             let features = features(t.features).map_err(|e| format!("tier \"{name}\": {e}"))?;
-            list.push(Tier { label: label.unwrap_or_else(|| name.clone()), name, routes, limits, stripe_prices: prices, published_prices, features, default_harness });
+            list.push(Tier {
+                label: label.unwrap_or_else(|| name.clone()),
+                name,
+                routes,
+                limits,
+                stripe_prices: prices,
+                checkout_prices,
+                published_prices,
+                features,
+                default_harness,
+            });
         }
         let default = match default.or(cfg.default.as_deref()).map(str::trim) {
             None => 0,
@@ -1019,6 +1159,47 @@ mod tests {
     }
 
     #[test]
+    fn checkout_prices_sell_yearly_and_team_only_plans() {
+        let raw = r#"{"tiers":[
+          { "name": "pro", "routes": "any",
+            "stripePrices": ["price_pro_m", "price_pro_y", "price_pro_team_m", "price_pro_old"],
+            "checkoutPrices": { "month": " price_pro_m ", "year": "price_pro_y", "teamMonth": "price_pro_team_m" } },
+          { "name": "yearly", "routes": "any", "stripePrices": ["price_yearly_y"], "checkoutPrices": { "year": "price_yearly_y" } },
+          { "name": "business", "label": "Business", "routes": "any",
+            "stripePrices": ["price_biz_m", "price_biz_y"], "checkoutPrices": { "teamMonth": "price_biz_m", "teamYear": "price_biz_y" } }
+        ]}"#;
+        let t = Tiers::parse(raw, None).unwrap();
+        let (pro, yearly, biz) = (t.get("pro").unwrap(), t.get("yearly").unwrap(), t.get("business").unwrap());
+        // People buy month or year; teams their own price, and only at the intervals it's named for.
+        assert_eq!((pro.checkout_price(Buyer::Person, Interval::Month), pro.checkout_price(Buyer::Person, Interval::Year)), (Some("price_pro_m"), Some("price_pro_y")));
+        assert_eq!((pro.checkout_price(Buyer::Team, Interval::Month), pro.checkout_price(Buyer::Team, Interval::Year)), (Some("price_pro_team_m"), None));
+        assert_eq!((pro.checkout_intervals(Buyer::Person), pro.checkout_intervals(Buyer::Team)), (vec![Interval::Month, Interval::Year], vec![Interval::Month]));
+        // Without team prices, teams buy what people do.
+        assert_eq!((yearly.checkout_intervals(Buyer::Team), yearly.checkout_price(Buyer::Team, Interval::Year)), (vec![Interval::Year], Some("price_yearly_y")));
+        // Only team prices: sold to teams only.
+        assert!(biz.team_only() && !pro.team_only() && !yearly.team_only());
+        assert!(biz.checkout_intervals(Buyer::Person).is_empty());
+        // Every listed price still sets the tier, sold or not.
+        assert_eq!(t.by_stripe_price("price_pro_old").unwrap().name, "pro");
+        // People see the intervals, never the ids; admins see which price sells.
+        assert_eq!(pro.sale_view(Buyer::Person)["intervals"], json!(["month", "year"]));
+        assert_eq!(pro.sale_view(Buyer::Team)["intervals"], json!(["month"]));
+        assert!(!pro.sale_view(Buyer::Person).to_string().contains("price_"));
+        assert_eq!(pro.admin_view()["checkoutPrices"], json!({ "month": "price_pro_m", "year": "price_pro_y", "teamMonth": "price_pro_team_m" }));
+        assert!(pro.view().get("intervals").is_none(), "the pricing page's view is unchanged");
+
+        let bad = |c: &str| Tiers::parse(&format!(r#"{{"tiers":[{{"name":"a","routes":"any","stripePrices":["price_1","price_2"],"checkoutPrices":{c}}}]}}"#), None).unwrap_err();
+        assert!(bad(r#"{"year":"price_3"}"#).contains("checkoutPrices.year: \"price_3\" must be one of the tier's stripePrices"));
+        assert!(bad(r#"{"teamMonth":"price_9"}"#).starts_with("tier \"a\": checkoutPrices.teamMonth"));
+        assert!(bad("{}").contains("name at least one"));
+        assert!(bad(r#"{"month":"price_1","year":"price_1"}"#).contains("month and year name the same price"));
+        assert!(bad(r#"{"teamMonth":"price_2","teamYear":"price_2"}"#).contains("teamMonth and teamYear"));
+        assert!(bad(r#"{"monthly":"price_1"}"#).contains("unknown field"));
+        let same = r#"{"tiers":[{"name":"a","routes":"any","stripePrices":["price_1","price_2"],"checkoutPrices":{"month":"price_1","year":"price_2","teamMonth":"price_1"}}]}"#;
+        assert!(Tiers::parse(same, None).is_ok(), "a team may buy the people's price");
+    }
+
+    #[test]
     fn limits_for_routines_machines_and_prices() {
         let t = tiers();
         let starter = t.get("starter").unwrap();
@@ -1037,6 +1218,13 @@ mod tests {
         let l = &open.default_tier().limits;
         assert_eq!((l.daily_routine_runs, l.machine_type.as_deref(), open.by_stripe_price("price_x").is_none()), (None, None, true));
         assert_eq!((l.concurrent_runs, l.max_storage_mb), (None, None));
+        // Without checkoutPrices, people and teams buy the first price, monthly, as before.
+        for b in [Buyer::Person, Buyer::Team] {
+            assert_eq!((pro.checkout_price(b, Interval::Month), pro.checkout_price(b, Interval::Year)), (Some("price_pro_monthly"), None));
+            assert_eq!(pro.checkout_intervals(b), [Interval::Month]);
+            assert!(open.default_tier().checkout_intervals(b).is_empty());
+        }
+        assert!(!pro.team_only() && pro.sale_view(Buyer::Person).get("intervals").is_none() && pro.admin_view().get("checkoutPrices").is_none());
     }
 
     #[test]
