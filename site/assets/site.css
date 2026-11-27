@@ -161,7 +161,7 @@ code, kbd, pre { font-family: var(--font-mono); }
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: var(--space-sm);
   min-height: 48px; padding: 0 var(--space-xl); border-radius: var(--radius-pill); border: 1px solid transparent;
-  font: inherit; font-size: var(--fs-md); font-weight: 600; text-decoration: none; cursor: pointer;
+  font: inherit; font-size: var(--fs-md); font-weight: 600; text-align: center; text-decoration: none; cursor: pointer;
   transition: background-color var(--motion-fast) ease, border-color var(--motion-fast) ease, transform var(--motion-fast) ease, filter var(--motion-fast) ease;
 }
 .btn-primary { background: var(--c-accent); color: var(--c-on-accent); box-shadow: var(--shadow-card); }
@@ -309,15 +309,22 @@ section { padding: 96px 0; }
 .card:has(h3 a:focus-visible) { outline: 3px solid var(--c-accent); outline-offset: 2px; }
 .card h3 a:focus-visible { outline: none; }
 
-/* Plans, on the public site's landing page */
+/* Plans, on the public site's landing page and a server's /pricing */
 .plans { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-lg); }
 .plan { display: flex; flex-direction: column; }
+.plan h2 { font-size: var(--fs-lg); line-height: var(--lh-lg); letter-spacing: -0.01em; font-weight: 600; margin-bottom: var(--space-sm); }
 .plan .plan-kind { color: var(--c-accent-text); font-weight: 600; font-size: var(--fs-xs); letter-spacing: .06em; text-transform: uppercase; margin-bottom: var(--space-sm); }
 .plan-limits { margin: var(--space-md) 0; padding-left: 1.1em; color: var(--c-text-muted); font-size: var(--fs-md); line-height: var(--lh-md); flex: 1; }
 .plan-limits li + li { margin-top: 4px; }
 .plan .plan-price { color: var(--c-text); font-weight: 600; margin: 0 0 var(--space-md); }
-.plan .btn { align-self: flex-start; }
+.plan .btn { align-self: stretch; }
 .plans-note { text-align: center; margin-top: var(--space-xxl); }
+.plan-price + .plan-price { margin-top: calc(-1 * var(--space-sm)); color: var(--c-text-muted); font-weight: 500; }
+.plans-links { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-xl); margin: var(--space-lg) 0 0; font-size: var(--fs-md); }
+
+/* A server's /pricing: the plans alone, under the site's header */
+.page-pricing main section { padding: 56px 0 88px; }
+.page-pricing h1 { font-size: clamp(32px, 5vw, 44px); }
 
 /* Trust strip */
 .trust { padding: 56px 0; }
