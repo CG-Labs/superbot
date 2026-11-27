@@ -72,7 +72,8 @@
     "brand:test": "node --test scripts/brand.test.mjs",
     "tokens": "node scripts/tokens.mjs",
     "tokens:check": "node scripts/tokens.mjs --check",
-    "tokens:test": "node --test scripts/tokens.test.mjs"
+    "tokens:test": "node --test scripts/tokens.test.mjs",
+    "store:screenshots": "node scripts/store-screenshots.mjs"
   },
   "build": {
     "appId": "com.cglabs.superbot",
