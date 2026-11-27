@@ -17,6 +17,7 @@ use crate::db::{Applied, Linked, Subscription};
 use crate::runner::App;
 use crate::secrets::SecretStore;
 use crate::stripe::{self, Stripe};
+use crate::tiers::{Buyer, Interval, Tier};
 use crate::users::Caller;
 use crate::{AppState, Auth};
 use aws_lc_rs::hmac;
@@ -251,6 +252,20 @@ pub fn meter_event(raw: &str) -> Result<Option<String>, String> {
     Ok(Some(name.into()))
 }
 
+/// How a tier with `checkoutPrices` is sold, for the startup line: "; people monthly and
+/// yearly, teams yearly". Empty without them: checkout sells the first price, as before.
+fn sold_as(t: &Tier) -> String {
+    if t.checkout_prices.is_none() {
+        return String::new();
+    }
+    let at = |b: Buyer| {
+        let i: Vec<String> = t.checkout_intervals(b).iter().map(|i| format!("{}ly", i.as_str())).collect();
+        if i.is_empty() { None } else { Some(i.join(" and ")) }
+    };
+    let sold: Vec<String> = [("people", at(Buyer::Person)), ("teams", at(Buyer::Team))].into_iter().filter_map(|(who, i)| i.map(|i| format!("{who} {i}"))).collect();
+    format!("; {}", sold.join(", "))
+}
+
 /// What startup prints. Takes only whether each part is on, so nothing secret can reach the log.
 pub fn describe(enabled: bool, checkout: bool, metering: bool, tiers: &crate::tiers::Tiers) -> String {
     if !enabled {
@@ -260,7 +275,7 @@ pub fn describe(enabled: bool, checkout: bool, metering: bool, tiers: &crate::ti
         true => "; reporting run tokens to a Stripe meter",
         false => "",
     };
-    let priced: Vec<String> = tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| format!("{} ({})", t.name, t.stripe_prices.len())).collect();
+    let priced: Vec<String> = tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| format!("{} ({}{})", t.name, t.stripe_prices.len(), sold_as(t))).collect();
     let pages = match checkout {
         true => format!("; checkout and the customer portal on{pages}"),
         false => "; checkout off (set STRIPE_SECRET_KEY to sell plans in the app)".into(),
@@ -638,9 +653,9 @@ pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
         .tiers()
         .all()
         .iter()
-        .filter(|t| !t.stripe_prices.is_empty())
+        .filter(|t| !t.checkout_intervals(Buyer::Person).is_empty())
         .map(|t| {
-            let mut v = t.view();
+            let mut v = t.sale_view(Buyer::Person);
             v["current"] = json!(t.name == current);
             v
         })
@@ -762,11 +777,40 @@ pub(crate) fn session(what: &str, user: &str, res: Result<Value, stripe::Error>)
     })
 }
 
-/// `POST /api/billing/checkout {tier}`: a Stripe Checkout Session for the tier's first
-/// price, for the person asking; returns `{url}`, Stripe's page to pay on. Their
-/// subscription carries their user id, and their customer if they have one. Refused
-/// for tiers without a price, and while a subscription already pays for a plan (that
-/// one is changed in the portal, or they'd pay twice).
+/// The interval a checkout asked for (ADR 0346). Left out (or null): the first the
+/// tier is sold at, monthly before yearly, so older apps that never send one still
+/// buy what they did. Err: neither month nor year.
+pub(crate) fn asked_interval(raw: &Value) -> Result<Option<Interval>, String> {
+    match raw {
+        Value::Null => Ok(None),
+        Value::String(s) => Interval::parse(s).map(Some).ok_or_else(|| "Say month or year: {\"tier\": \"<name>\", \"interval\": \"year\"}.".to_string()),
+        _ => Err("Say month or year: {\"tier\": \"<name>\", \"interval\": \"year\"}.".into()),
+    }
+}
+
+/// The price `buyer` checks `tier` out at, and its interval (ADR 0346). Err: a plain
+/// reason it can't be bought that way.
+pub(crate) fn sale_price(tier: &Tier, buyer: Buyer, asked: Option<Interval>) -> Result<(String, Interval), String> {
+    let sold = tier.checkout_intervals(buyer);
+    if sold.is_empty() {
+        return Err(match buyer == Buyer::Person && tier.team_only() {
+            true => format!("The {} plan is for teams only. A team's owners and admins buy it on the Team screen.", tier.label),
+            false => format!("The {} plan can't be bought here.", tier.label),
+        });
+    }
+    let interval = asked.unwrap_or(sold[0]);
+    match tier.checkout_price(buyer, interval) {
+        Some(p) => Ok((p.to_string(), interval)),
+        None => Err(format!("The {} plan isn't sold {}ly here.", tier.label, interval.as_str())),
+    }
+}
+
+/// `POST /api/billing/checkout {tier, interval?}`: a Stripe Checkout Session for the
+/// tier's price at that interval (`month` or `year`; ADR 0346), for the person asking;
+/// returns `{url}`, Stripe's page to pay on. Their subscription carries their user id,
+/// and their customer if they have one. Refused for tiers without a price for people,
+/// at an interval it isn't sold at, and while a subscription already pays for a plan
+/// (that one is changed in the portal, or they'd pay twice).
 pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, body: Bytes) -> Response {
     let Some(co) = &a.payments.checkout else { return off() };
     let u = match person(&app, &c) {
@@ -778,13 +822,19 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     let Some(name) = v["tier"].as_str().map(str::trim).filter(|t| !t.is_empty()) else {
         return bad(StatusCode::BAD_REQUEST, "Say which plan: {\"tier\": \"<name>\"}.".into());
     };
+    let asked = match asked_interval(&v["interval"]) {
+        Ok(i) => i,
+        Err(e) => return bad(StatusCode::BAD_REQUEST, e),
+    };
     let tiers = app.tiers();
     let Some(tier) = tiers.get(name) else {
         return bad(StatusCode::BAD_REQUEST, format!("There's no plan called \"{name}\"."));
     };
-    let Some(price) = tier.stripe_prices.first() else {
-        return bad(StatusCode::BAD_REQUEST, format!("The {} plan can't be bought here.", tier.label));
+    let (price, interval) = match sale_price(tier, Buyer::Person, asked) {
+        Ok(x) => x,
+        Err(e) => return bad(StatusCode::BAD_REQUEST, e),
     };
+    let interval = interval.as_str();
     let event = |outcome: Outcome, d: Value| by.event("billing.checkout_created").target("user", &u.id).outcome(outcome).details(d);
     if let Some(s) = paying(&app, &u.id) {
         app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "already_subscribed", "subscription": s.subscription_id })));
@@ -844,11 +894,11 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     match session("checkout", &u.id, co.stripe.post("/v1/checkout/sessions", &form, &key).await) {
         Ok((id, url)) => {
             app.db.set_open_checkout(&u.id, &id, expires_at);
-            app.db.record(&event(Outcome::Success, json!({ "tier": tier.name, "price": price, "session": id, "customer": customer })));
+            app.db.record(&event(Outcome::Success, json!({ "tier": tier.name, "price": price, "interval": interval, "session": id, "customer": customer })));
             reply(StatusCode::OK, json!({ "url": url }))
         }
         Err((r, reason)) => {
-            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "price": price, "reason": reason })));
+            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "price": price, "interval": interval, "reason": reason })));
             r
         }
     }

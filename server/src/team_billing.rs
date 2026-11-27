@@ -16,6 +16,7 @@ use crate::billing::{self, Last, Payer, Sub, reply};
 use crate::db::{Applied, Linked, Team, TeamSubscription};
 use crate::runner::App;
 use crate::stripe::{self, Stripe};
+use crate::tiers::Buyer;
 use crate::users::Caller;
 use crate::{AppState, Auth};
 use axum::Json;
@@ -442,7 +443,7 @@ pub fn view(app: &App, team_id: &str, manager: bool) -> Option<Value> {
         "error": s.seat_error.as_ref().map(|_| "Stripe didn't take the new seat count yet. SuperBot keeps trying."),
     })));
     v["portal"] = json!(app.db.team_customer(team_id).is_some());
-    v["plans"] = json!(tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| t.view()).collect::<Vec<_>>());
+    v["plans"] = json!(tiers.all().iter().filter(|t| !t.checkout_intervals(Buyer::Team).is_empty()).map(|t| t.sale_view(Buyer::Team)).collect::<Vec<_>>());
     Some(v)
 }
 
@@ -458,11 +459,15 @@ fn managed(app: &AppState, c: &Caller) -> Result<(crate::db::User, Team), Respon
 #[serde(deny_unknown_fields)]
 pub struct Buy {
     tier: String,
+    #[serde(default)]
+    interval: Value,
 }
 
-/// `POST /api/team/billing/checkout {tier}`: a Stripe Checkout Session for the team's
-/// plan, a seat for each member; returns `{url}`. Owners and admins only. Refused for
-/// tiers without a price, and while a subscription already pays for the team's plan.
+/// `POST /api/team/billing/checkout {tier, interval?}`: a Stripe Checkout Session for
+/// the team's plan at that interval (`month` or `year`), at the tier's team price when
+/// it has one (ADR 0346), a seat for each member; returns `{url}`. Owners and admins
+/// only. Refused for tiers without a price, at an interval it isn't sold at, and while
+/// a subscription already pays for the team's plan.
 pub async fn checkout(
     State(app): State<AppState>,
     Extension(a): Extension<Arc<Auth>>,
@@ -478,16 +483,22 @@ pub async fn checkout(
         Err(r) => return r,
     };
     let bad = |code: StatusCode, msg: String| reply(code, json!({ "error": msg }));
-    let Some(name) = body.ok().map(|Json(b)| b.tier).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) else {
+    let Some((name, asked)) = body.ok().map(|Json(b)| (b.tier.trim().to_string(), b.interval)).filter(|(t, _)| !t.is_empty()) else {
         return bad(StatusCode::BAD_REQUEST, "Say which plan: {\"tier\": \"<name>\"}.".into());
+    };
+    let asked = match billing::asked_interval(&asked) {
+        Ok(i) => i,
+        Err(e) => return bad(StatusCode::BAD_REQUEST, e),
     };
     let tiers = app.tiers();
     let Some(tier) = tiers.get(&name) else {
         return bad(StatusCode::BAD_REQUEST, format!("There's no plan called \"{name}\"."));
     };
-    let Some(price) = tier.stripe_prices.first() else {
-        return bad(StatusCode::BAD_REQUEST, format!("The {} plan can't be bought here.", tier.label));
+    let (price, interval) = match billing::sale_price(tier, Buyer::Team, asked) {
+        Ok(x) => x,
+        Err(e) => return bad(StatusCode::BAD_REQUEST, e),
     };
+    let interval = interval.as_str();
     let event = |outcome: Outcome, d: Value| team_event(&by, "billing.checkout_created", &t.id, d).outcome(outcome);
     if !billing::may_start(co, &u.id) {
         return bad(StatusCode::TOO_MANY_REQUESTS, "Too many checkouts at once. Try again in a minute.".into());
@@ -546,11 +557,11 @@ pub async fn checkout(
     match billing::session("checkout", &payer.key(), sync.stripe.post("/v1/checkout/sessions", &form, &key).await) {
         Ok((id, url)) => {
             app.db.set_team_open_checkout(&t.id, &id, expires_at);
-            app.db.record(&event(Outcome::Success, json!({ "tier": tier.name, "price": price, "session": id, "customer": customer, "seats": seats })));
+            app.db.record(&event(Outcome::Success, json!({ "tier": tier.name, "price": price, "interval": interval, "session": id, "customer": customer, "seats": seats })));
             reply(StatusCode::OK, json!({ "url": url }))
         }
         Err((r, reason)) => {
-            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "price": price, "seats": seats, "reason": reason })));
+            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "price": price, "interval": interval, "seats": seats, "reason": reason })));
             r
         }
     }

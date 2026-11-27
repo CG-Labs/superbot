@@ -61,7 +61,7 @@ The server tests run a fake Stripe on loopback that checks the bearer key, the i
 - Token metering and enforcing `monthlyTokens`; storage limits.
 - Resizing machines when a user's tier changes.
 - Billing emails (receipts, failed payments, limit warnings); Stripe's own emails can cover receipts meanwhile. (Built by [ADR 0091](0091-billing-emails.md), which leaves receipts to Stripe.)
-- More than one price per tier at checkout (yearly and monthly), and linking a customer by hand.
+- More than one price per tier at checkout (yearly and monthly), and linking a customer by hand. (Yearly and monthly prices: done in [ADR 0346](0346-yearly-and-team-only-prices-at-checkout.md).)
 
 ## Consequences
 
