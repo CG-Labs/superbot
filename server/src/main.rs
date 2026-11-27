@@ -1187,7 +1187,11 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/me/residency/report", get(machines::residency_me::report))
         .route("/tiers", get(list_tiers))
         .route("/tiers/{name}/move-bots", post(move_bots))
-        .route("/tiers/stripe-check", get(price_check::handler))
+        .route("/tiers/stripe-check", {
+            // Captured, not extracted: what botd passes to Stripe never comes from the request.
+            let (app, auth) = (app.clone(), auth_state.clone());
+            get(move || price_check::handler(app.clone(), auth.clone()))
+        })
         .route("/usage", get(admin_usage))
         .route("/billing", get(billing::info))
         .route("/billing/checkout", post(billing::checkout))
