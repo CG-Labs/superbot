@@ -116,7 +116,8 @@ async function launchChrome() {
     if (process.env.STORE_SHOTS_DEBUG && (msg.method === "Runtime.exceptionThrown" || msg.method === "Runtime.consoleAPICalled")) {
       console.error(JSON.stringify(msg.params).slice(0, 600));
     }
-    if (msg.method) listeners.get(msg.method)?.(msg.params, msg.sessionId);
+    const listener = typeof msg.method === "string" && listeners.has(msg.method) ? listeners.get(msg.method) : undefined;
+    if (typeof listener === "function") listener(msg.params, msg.sessionId);
     const p = pending.get(msg.id);
     if (!p) return;
     pending.delete(msg.id);
