@@ -320,7 +320,7 @@ The minimum left on each open roadmap issue for a credible Enterprise v1, as of 
 | [#42](https://github.com/CG-Labs/superbot/issues/42) Published plans | `/pricing` and `/api/plans` built ([ADR 0121](adr/0121-published-plans.md)); slice 1 done: the licensed self-host plan on `/pricing`, linked from the public site ([ADR 0348](adr/0348-licensed-self-host-plan-on-pricing.md)) | 2. Published prices checked against Stripe's | Real prices: owner decision ([still open](#still-open)) | 1 |
 | [#43](https://github.com/CG-Labs/superbot/issues/43) Managed substrate | Evaluated; [ADR 0120](adr/0120-managed-substrate.md) proposed | Accept or change ADR 0120 and update this roadmap | Owner decision on ADR 0120 | 1 |
 | [#44](https://github.com/CG-Labs/superbot/issues/44) Site and docs portal | Generator built, checked in CI, never published ([ADR 0119](adr/0119-public-site-and-docs-portal.md)) | 1. Publish the site to the chosen host and domain. 2. A sales contact and prices on the landing page | Owner: hosting, the docs domain's DNS, sales contact, prices | 2 |
-| [#45](https://github.com/CG-Labs/superbot/issues/45) Store production release | Not started | 1. Store listings: text, screenshots, privacy and data-safety answers, `eas submit` settings. 2. Submit and fix what review finds | Slice 2, owner: #38, store accounts, legal review of the privacy policy, a public privacy URL (#44) | 2 |
+| [#45](https://github.com/CG-Labs/superbot/issues/45) Store production release | Slice 1 done: listing text, draft screenshots, privacy and data-safety answers, and `eas submit` settings, checked in CI ([store listings](store/README.md), [ADR 0349](adr/0349-store-listings-and-privacy-answers.md)) | 2. Submit and fix what review finds | Slice 2, owner: #38, store accounts, legal review of the privacy policy, a public privacy URL (#44) | 1 |
 | [#52](https://github.com/CG-Labs/superbot/issues/52) Full SAML | Delivered in 27 slices ([note](#delivered-52-58-and-60)) | None; the rest are [follow-ups](#follow-ups-from-52-58-and-60) | — | 0 |
 | [#53](https://github.com/CG-Labs/superbot/issues/53) Advanced RBAC | Delivered ([ADR 0272](adr/0272-advanced-rbac-delivered.md)); follow-up: the asker hears when their request is decided ([ADR 0329](adr/0329-the-asker-hears-when-their-request-is-decided.md)) | None | — | 0 |
 | [#55](https://github.com/CG-Labs/superbot/issues/55) Vault integrations | Delivered: HashiCorp Vault, Azure Key Vault, GCP Secret Manager and AWS | None | — | 0 |
@@ -330,7 +330,7 @@ The minimum left on each open roadmap issue for a credible Enterprise v1, as of 
 | [#60](https://github.com/CG-Labs/superbot/issues/60) Support playbooks | Delivered in code in 21 slices ([note](#delivered-52-58-and-60)) | None in code; the rest are [follow-ups](#follow-ups-from-52-58-and-60) | Owner: contacts, TAMs and on-call rota | 0 |
 | Close-out | Done: [delivered notes](#delivered-52-58-and-60) and [follow-ups](#follow-ups-from-52-58-and-60) for #52, #58 and #60 below | None | — | 0 |
 
-**Totals.** 5 engineering-only slices: #31 (2), #42 (1), #45 (1), #59 (1). 8 slices blocked on the owner: #11, #29, #38, #43, #44 (2), #45, #59. And 10 owner actions with no code:
+**Totals.** 4 engineering-only slices: #31 (2), #42 (1), #59 (1). 8 slices blocked on the owner: #11, #29, #38, #43, #44 (2), #45, #59. And 10 owner actions with no code:
 
 1. A CG-Labs Expo account for `eas init` (#11; unblocks #36, #38, #45).
 2. Apple Developer and Play Console accounts, with APNs and FCM keys (#36, #38, #45).
