@@ -555,7 +555,7 @@ struct TierCfg {
     #[serde(default, rename = "stripePrices")]
     stripe_prices: Vec<String>,
     #[serde(default, rename = "checkoutPrices")]
-    checkout_prices: Option<CheckoutPrices>,
+    checkout_prices: Option<Value>,
     #[serde(default, rename = "defaultHarness")]
     default_harness: Option<String>,
     #[serde(default, rename = "publishedPrices")]
@@ -598,9 +598,10 @@ fn published_prices(raw: Vec<ListPrice>) -> Result<Vec<ListPrice>, String> {
 }
 
 /// `checkoutPrices`, checked: each names one of the tier's `stripePrices` (so the webhook
-/// places what it sells), at least one is named, and an interval's price isn't also the
-/// other interval's for the same buyer.
-fn checkout_prices(raw: CheckoutPrices, prices: &[String]) -> Result<CheckoutPrices, String> {
+/// places what it sells), at least one is named, and no monthly price (people's or the
+/// team's) is also a yearly one. Read here, not with the file, so a typo names the tier.
+fn checkout_prices(raw: Value, prices: &[String]) -> Result<CheckoutPrices, String> {
+    let raw: CheckoutPrices = serde_json::from_value(raw).map_err(|e| format!("checkoutPrices: {e}"))?;
     let clean = |field: &str, p: Option<String>| -> Result<Option<String>, String> {
         let Some(p) = p.map(|p| p.trim().to_string()) else { return Ok(None) };
         match prices.contains(&p) {
@@ -617,9 +618,11 @@ fn checkout_prices(raw: CheckoutPrices, prices: &[String]) -> Result<CheckoutPri
     if c == CheckoutPrices::default() {
         return Err("checkoutPrices: name at least one of month, year, teamMonth and teamYear, or leave it out to sell the first of stripePrices".into());
     }
-    for (who, m, y) in [("month and year", &c.month, &c.year), ("teamMonth and teamYear", &c.team_month, &c.team_year)] {
-        if m.is_some() && m == y {
-            return Err(format!("checkoutPrices: {who} name the same price; a Stripe price bills at one interval"));
+    for (mf, m) in [("month", &c.month), ("teamMonth", &c.team_month)] {
+        for (yf, y) in [("year", &c.year), ("teamYear", &c.team_year)] {
+            if m.is_some() && m == y {
+                return Err(format!("checkoutPrices: {mf} and {yf} name the same price; a Stripe price bills at one interval"));
+            }
         }
     }
     Ok(c)
@@ -1194,7 +1197,11 @@ mod tests {
         assert!(bad("{}").contains("name at least one"));
         assert!(bad(r#"{"month":"price_1","year":"price_1"}"#).contains("month and year name the same price"));
         assert!(bad(r#"{"teamMonth":"price_2","teamYear":"price_2"}"#).contains("teamMonth and teamYear"));
-        assert!(bad(r#"{"monthly":"price_1"}"#).contains("unknown field"));
+        // One price can't bill people monthly and teams yearly.
+        assert!(bad(r#"{"month":"price_1","teamYear":"price_1"}"#).contains("month and teamYear name the same price"));
+        assert!(bad(r#"{"year":"price_2","teamMonth":"price_2"}"#).contains("teamMonth and year name the same price"));
+        let typo = bad(r#"{"teamYer":"price_1"}"#);
+        assert!(typo.starts_with("tier \"a\": checkoutPrices:") && typo.contains("unknown field"), "{typo}");
         let same = r#"{"tiers":[{"name":"a","routes":"any","stripePrices":["price_1","price_2"],"checkoutPrices":{"month":"price_1","year":"price_2","teamMonth":"price_1"}}]}"#;
         assert!(Tiers::parse(same, None).is_ok(), "a team may buy the people's price");
     }
