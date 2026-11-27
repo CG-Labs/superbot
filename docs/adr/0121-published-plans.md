@@ -45,7 +45,7 @@ Routing holds a subscriber to the promise of the plan they're on now, not only t
 
 Each tier may list `publishedPrices`: `[{amount, currency, interval}]`, the amount in the currency's smallest unit as Stripe's `unit_amount` counts it, a currency from a fixed list of ISO 4217 codes with their decimal places (`tiers::CURRENCIES`: two-decimal ones such as `gbp`, `eur` and `usd`, Stripe's zero-decimal ones such as `jpy`, and the three-decimal `bhd`, `jod`, `kwd`, `omr`, `tnd`), and `month` or `year`; at most four, one per currency and interval, and never zero (ADR 0068: no free tier). The tiers file is checked at start, as for every other field, and botd refuses to start on a bad one. The fixed list means a typo such as `gpb` is refused rather than published, and every amount is shown at its currency's real scale (`KWD 1.500`, `JPY 3,000`, `£29`).
 
-**Why not read amounts from Stripe.** botd would have to call Stripe for a public, unauthenticated page: an amplifier anyone could hit, a page that breaks when Stripe is slow, and a `STRIPE_SECRET_KEY` dependency for something self-hosters without billing might still want. Caching at startup would still need the key and still drift until a restart. Writing the amount next to the Stripe price id keeps one file as the source and costs the operator one line per price. The deploy guide says to keep them equal, since Stripe charges its own price. Reconciling them (a startup check against Stripe when the key is set) is a follow-up.
+**Why not read amounts from Stripe.** botd would have to call Stripe for a public, unauthenticated page: an amplifier anyone could hit, a page that breaks when Stripe is slow, and a `STRIPE_SECRET_KEY` dependency for something self-hosters without billing might still want. Caching at startup would still need the key and still drift until a restart. Writing the amount next to the Stripe price id keeps one file as the source and costs the operator one line per price. The deploy guide says to keep them equal, since Stripe charges its own price. Reconciling them is [ADR 0350](0350-published-prices-checked-against-stripe.md): a startup check against Stripe when the key is set, and `botctl plans check-stripe`.
 
 A sold tier without `publishedPrices` shows "Contact us", linked to `PLANS_CONTACT_URL` when set; botd's startup log names each one, so an operator sees what the page is missing. No price is ever shipped: `deploy/tiers.example.json` has none.
 
@@ -88,7 +88,7 @@ The public site and docs portal ([PR #182](https://github.com/CG-Labs/superbot/p
 
 ## Consequences
 
-- Operators write each price twice, as a Stripe price and as `publishedPrices`, and must keep them equal. The startup warning catches a missing one, not a wrong one.
+- Operators write each price twice, as a Stripe price and as `publishedPrices`, and must keep them equal. The startup warning catches a missing one; a wrong one is caught by checking against Stripe ([ADR 0350](0350-published-prices-checked-against-stripe.md)).
 - Linode machine sizes aren't shown yet: the provider only knows a type's size by asking Linode's API. Operators can describe it in `features` until botd caches Linode types.
 - A currency outside the list needs a code change to add, with its decimal places.
 - Prices are shown as written, with no tax wording; operators who must show tax-inclusive prices write them that way and can say so in `features`. A page-wide note setting is a follow-up.

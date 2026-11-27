@@ -721,7 +721,21 @@ Prices are yours to write: `botd` never reads them from Stripe and ships none. A
   "features": ["Hermes Agent and Claude Code", "Email support"], ... }
 ```
 
-Keep `publishedPrices` the same as the Stripe prices in `stripePrices`: Stripe charges its own price, whatever the page says. A tier without `publishedPrices` shows "Contact us", and `botd`'s startup log names it. The page says prices are per person and that a team pays one seat per member ([ADR 0093](../docs/adr/0093-team-billing.md)); it links to the app's Plan screen when checkout is on, to `/get-started` when sign-ups are on, and to `/status` while it is on. Restart `botd` after editing the file. A public site can link to `/pricing`, or read `/api/plans` to show the same numbers; `superbot-site --pricing-url https://<your-host>/pricing` points its "Pricing" links there.
+Keep `publishedPrices` the same as the Stripe prices in `stripePrices`: Stripe charges its own price, whatever the page says, and `botctl plans check-stripe` (below) tells you when they differ. A tier without `publishedPrices` shows "Contact us", and `botd`'s startup log names it. The page says prices are per person and that a team pays one seat per member ([ADR 0093](../docs/adr/0093-team-billing.md)); it links to the app's Plan screen when checkout is on, to `/get-started` when sign-ups are on, and to `/status` while it is on. Restart `botd` after editing the file. A public site can link to `/pricing`, or read `/api/plans` to show the same numbers; `superbot-site --pricing-url https://<your-host>/pricing` points its "Pricing" links there.
+
+**Checking them against Stripe** ([ADR 0350](../docs/adr/0350-published-prices-checked-against-stripe.md)). With checkout on (`STRIPE_SECRET_KEY` set), `botd` reads each tier's Stripe prices once at startup, in the background, and logs a warning for each difference; it starts either way. Run the same check any time, for example after changing a price in Stripe or the tiers file:
+
+```sh
+botctl plans check-stripe        # or: botctl plans check-stripe json
+```
+
+It needs `billing.manage` (admins have it) and only reads prices (`GET /v1/prices/<id>`, so a restricted key needs read access to Prices); it never creates or charges anything, and never prints the key. For each tier it lists its Stripe prices, marks the one checkout sells (the first in `stripePrices`), and reports drift when:
+
+- a published price isn't charged by any active Stripe price of the tier at the same amount, currency and interval (month or year; a price's other currencies count too);
+- a price in `stripePrices` doesn't exist at Stripe (often a live price id with a test key, or the other way round);
+- the price checkout sells is archived, has no fixed amount (tiered or customer-chosen), doesn't renew every month or year, or charges an amount or currency the page doesn't show.
+
+Other prices in `stripePrices` that are archived or charge another amount are notes, not drift: checkout doesn't sell them, and subscribers already on them keep their plan. A tier without `publishedPrices` ("Contact us") is a note too. It exits 0 when everything matches or billing is off (it then says so and calls nothing), 1 on drift, and 2 when Stripe couldn't be read (no answer, a bad key, a rate limit), so it can gate a deploy. The check is also `GET /api/tiers/stripe-check`, limited to ten a minute.
 
 The licensed self-host plan is listed first, as `selfHost` in the JSON, whenever `PLANS_LICENSE_URL` or `PLANS_CONTACT_URL` says where to ask for a license ([ADR 0348](../docs/adr/0348-licensed-self-host-plan-on-pricing.md)). It says it is the business edition, priced per seat (one for each active person, none for the owner account), what a license includes, and a "Get a license" link. Its prices are the `self-host` tier's `publishedPrices`, read per seat (`£<amount> per seat / year`), and its `features` are listed under it; without `publishedPrices` it says "Contact us". The `self-host` tier is never listed as a managed plan, even with prices.
 
