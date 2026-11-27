@@ -59,9 +59,12 @@ pub enum Kind {
     TokensUsedUp,
     StorageLow,
     StorageFull,
+    /// Their team moved onto a plan that covers them while they still pay for their own
+    /// (ADR 0347): they may cancel it.
+    PersonalPlanCovered,
 }
 
-pub const KINDS: [Kind; 11] = [
+pub const KINDS: [Kind; 12] = [
     Kind::PlanStarted,
     Kind::PlanChanged,
     Kind::PaymentFailed,
@@ -73,6 +76,7 @@ pub const KINDS: [Kind; 11] = [
     Kind::TokensUsedUp,
     Kind::StorageLow,
     Kind::StorageFull,
+    Kind::PersonalPlanCovered,
 ];
 
 impl Kind {
@@ -89,11 +93,18 @@ impl Kind {
             Kind::TokensUsedUp => "tokens_used_up",
             Kind::StorageLow => "storage_low",
             Kind::StorageFull => "storage_full",
+            Kind::PersonalPlanCovered => "personal_plan_covered",
         }
     }
 
     pub fn parse(s: &str) -> Option<Kind> {
         KINDS.into_iter().find(|k| k.as_str() == s)
+    }
+
+    /// Sent to a team's owners and admins about the team's own plan. A member told their
+    /// team's plan covers them gets it about their own plan, with the Plan screen's link.
+    fn to_managers(self, f: &Facts) -> bool {
+        f.team.is_some() && self != Kind::PersonalPlanCovered
     }
 
     /// About what the person pays for or their computer: always sent. Usage emails
@@ -184,7 +195,7 @@ fn percent(used: u64, limit: u64) -> u64 {
 /// An email's subject and body. Pure: `link` is the Plan screen (None without a public
 /// address), `computer` what the person's computer is doing about the change.
 pub fn render(kind: Kind, f: &Facts, link: Option<&str>, computer: Option<&str>) -> Rendered {
-    if let Some(team) = &f.team {
+    if let Some(team) = f.team.as_deref().filter(|_| kind.to_managers(f)) {
         return render_team(kind, f, team, link);
     }
     let plan = f.plan.as_deref().unwrap_or("your");
@@ -280,6 +291,18 @@ pub fn render(kind: Kind, f: &Facts, link: Option<&str>, computer: Option<&str>)
             ));
             body.push_str(&open("See your plan"));
             "Your storage is full".to_string()
+        }
+        Kind::PersonalPlanCovered => {
+            let team = f.team.as_deref().unwrap_or("Your team");
+            let own = f.from_plan.as_deref().map_or("own".to_string(), |p| format!("own {p}"));
+            body.push_str(&format!(
+                "{team} is on the {plan} plan now, and while you're on the team it's your plan too: its limits apply to you instead of your {own} plan's.\n\n"
+            ));
+            body.push_str(&format!(
+                "You still pay for your {own} plan. You don't need it while you're on {team}, so you may cancel it. SuperBot doesn't cancel it for you, and nothing changes until you do.\n\n"
+            ));
+            body.push_str(&open("To cancel it, choose Manage billing on your plan"));
+            format!("{team}'s plan covers you: you may cancel your {own} plan")
         }
     };
     if let Some(c) = computer {
@@ -461,6 +484,37 @@ pub struct TeamSubEvent<'a> {
     /// The team's name, and who's told: its owners and admins.
     pub team: &'a str,
     pub to: &'a [String],
+    /// Members paying for a plan of their own, and its label (ADR 0347).
+    pub payers: &'a [(String, String)],
+}
+
+/// Tells each member who still pays for a plan of their own (`payers`: their id and that
+/// plan's label) that their team moved onto `plan`, which covers them, so they may cancel
+/// theirs (ADR 0347). `key` names the change, so each is told once per change. Pure.
+pub fn covered(key: &str, team: &str, plan: &str, payers: &[(String, String)], event_id: Option<&str>) -> Vec<NewEmail> {
+    let kind = Kind::PersonalPlanCovered;
+    payers
+        .iter()
+        .map(|(user, own)| NewEmail {
+            key: format!("{key}:{}:{user}", kind.as_str()),
+            user_id: user.clone(),
+            kind,
+            facts: Facts { plan: Some(plan.to_string()), from_plan: Some(own.clone()), team: Some(team.to_string()), ..Default::default() },
+            event_id: event_id.map(String::from),
+        })
+        .collect()
+}
+
+/// Each member of `team_id` paying for a plan of their own, with that plan's label.
+pub fn personal_payers(app: &App, team_id: &str) -> Vec<(String, String)> {
+    app.db
+        .team_members(team_id)
+        .into_iter()
+        .filter_map(|m| {
+            let s = app.db.user_paying(&m.user_id)?;
+            Some((m.user_id, app.tiers().of(s.tier.as_deref()).label.clone()))
+        })
+        .collect()
 }
 
 /// The emails a team subscription event asks for: the same as a person's, to each of
@@ -487,6 +541,11 @@ pub fn for_team_subscription(ev: &TeamSubEvent, c: &crate::db::TeamChange, tiers
         for user in ev.to {
             out.push(NewEmail { key: format!("{key}:{user}"), user_id: user.clone(), kind, facts: facts.clone(), event_id: Some(ev.event_id.to_string()) });
         }
+    }
+    // The team moved onto a paid plan: whoever still pays for their own may cancel it.
+    if let Applied::Changed { to: Some(to), .. } = c.applied {
+        let plan = tiers.of(Some(to)).label.clone();
+        out.extend(covered(&format!("stripe:{}", ev.event_id), ev.team, &plan, ev.payers, Some(ev.event_id)));
     }
     out
 }
@@ -710,6 +769,10 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
     if !kind.essential() && !u.active() {
         return skip("inactive", d);
     }
+    // Cancelled since, or off the team: there's nothing left to tell them.
+    if kind == Kind::PersonalPlanCovered && (app.db.user_paying(&u.id).is_none() || app.db.team_tier_of(&u.id).is_none()) {
+        return skip("not_needed", d);
+    }
     // Tries are counted when claimed, so one whose outcome was never saved (botd stopped
     // mid-send) still counts towards the limit.
     if q.attempts >= MAX_ATTEMPTS {
@@ -724,9 +787,10 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
     if !app.db.claim_billing_email(q.id, crate::db::now() + backoff_ms(attempts))? {
         return Ok(false);
     }
-    let r = match q.facts.team {
-        Some(_) => render(kind, &q.facts, m.team_link.as_deref(), None),
-        None => render(kind, &q.facts, m.plan_link.as_deref(), computer(app, q, kind).as_deref()),
+    let r = if kind.to_managers(&q.facts) {
+        render(kind, &q.facts, m.team_link.as_deref(), None)
+    } else {
+        render(kind, &q.facts, m.plan_link.as_deref(), computer(app, q, kind).as_deref())
     };
     let mail = smtp::Mail { to: to.clone(), subject: r.subject, body: r.body };
     d["to"] = json!(to);

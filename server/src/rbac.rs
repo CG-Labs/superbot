@@ -751,6 +751,7 @@ mod tests {
             ("GET", "/api/teams/t1", Perm::Admin),
             ("PATCH", "/api/teams/t1", Perm::Admin),
             ("DELETE", "/api/teams/t1", Perm::Admin),
+            ("PUT", "/api/teams/t1/plan", Perm::Admin),
             ("PUT", "/api/teams/t1/members/u1", Perm::Admin),
             ("DELETE", "/api/teams/t1/members/u1", Perm::Admin),
             // Custom roles (ADR 0123): routes a delegate may use, and what stays with admins.

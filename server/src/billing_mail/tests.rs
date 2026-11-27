@@ -219,7 +219,7 @@ fn team_sub(status: &str, tier: Option<&str>) -> crate::db::TeamSubscription {
 fn a_team_plans_emails_go_to_each_owner_and_admin_once() {
     let row = team_sub("active", Some("pro"));
     let to = ["u_ada".to_string(), "u_cy".to_string()];
-    let ev = TeamSubEvent { event_id: "evt_1", row: &row, ending: false, team: "Alpha", to: &to };
+    let ev = TeamSubEvent { event_id: "evt_1", row: &row, ending: false, team: "Alpha", to: &to, payers: &[] };
     let applied = changed(None, Some("pro"));
     let c = crate::db::TeamChange { applied: &applied, before: None, paying_before: None, paying_after: Some(&row), other_paying: None };
     let e = for_team_subscription(&ev, &c, &tiers());
@@ -238,6 +238,49 @@ fn a_team_plans_emails_go_to_each_owner_and_admin_once() {
     let same = Applied::Unchanged;
     let e = for_team_subscription(&ev, &crate::db::TeamChange { applied: &same, before: Some(&row), paying_before: Some(&row), paying_after: Some(&ending), other_paying: None }, &tiers());
     assert_eq!(e.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["stripe:sub_test_alpha:plan_ending:1797582000:u_ada", "stripe:sub_test_alpha:plan_ending:1797582000:u_cy"]);
+}
+
+#[test]
+fn members_still_paying_for_their_own_plan_are_told_once_per_team_plan_change() {
+    let row = team_sub("active", Some("pro"));
+    let to = ["u_ada".to_string()];
+    let payers = [("u_bea".to_string(), "Starter".to_string()), ("u_ada".to_string(), "Pro".to_string())];
+    let ev = TeamSubEvent { event_id: "evt_1", row: &row, ending: false, team: "Alpha", to: &to, payers: &payers };
+    let started = changed(None, Some("pro"));
+    let c = crate::db::TeamChange { applied: &started, before: None, paying_before: None, paying_after: Some(&row), other_paying: None };
+    let e: Vec<_> = for_team_subscription(&ev, &c, &tiers()).into_iter().filter(|e| e.kind == Kind::PersonalPlanCovered).collect();
+    assert_eq!(e.iter().map(|e| (e.user_id.as_str(), e.key.as_str())).collect::<Vec<_>>(), [
+        ("u_bea", "stripe:evt_1:personal_plan_covered:u_bea"),
+        ("u_ada", "stripe:evt_1:personal_plan_covered:u_ada")
+    ]);
+    assert_eq!(e[0].facts, Facts { plan: Some("Pro".into()), from_plan: Some("Starter".into()), team: Some("Alpha".into()), ..Default::default() });
+    assert_eq!(e[0].event_id.as_deref(), Some("evt_1"));
+    // A plan change tells them again; a team plan ending, or nothing applied, doesn't.
+    let moved = changed(Some("starter"), Some("pro"));
+    assert_eq!(for_team_subscription(&ev, &crate::db::TeamChange { applied: &moved, ..c }, &tiers()).iter().filter(|e| e.kind == Kind::PersonalPlanCovered).count(), 2);
+    for applied in [changed(Some("pro"), None), Applied::Unchanged, Applied::Duplicate, Applied::Stale, Applied::Superseded] {
+        let e = for_team_subscription(&ev, &crate::db::TeamChange { applied: &applied, ..c }, &tiers());
+        assert!(e.iter().all(|e| e.kind != Kind::PersonalPlanCovered), "{applied:?}: {e:?}");
+    }
+    // An admin's change is keyed by its own id.
+    let e = covered("team_plan:t_alpha:c1", "Alpha", "Max", &payers[..1], None);
+    assert_eq!((e[0].key.as_str(), e[0].event_id.as_deref(), e[0].facts.plan.as_deref()), ("team_plan:t_alpha:c1:personal_plan_covered:u_bea", None, Some("Max")));
+}
+
+#[test]
+fn the_personal_plan_email_says_they_may_cancel_and_links_to_their_plan() {
+    let f = Facts { plan: Some("Pro".into()), from_plan: Some("Starter".into()), team: Some("Alpha".into()), ..Default::default() };
+    assert!(!Kind::PersonalPlanCovered.to_managers(&f) && Kind::PlanStarted.to_managers(&f));
+    let r = render(Kind::PersonalPlanCovered, &f, Some(LINK), None);
+    assert_plain(&r);
+    assert_eq!(r.subject, "[SuperBot] Alpha's plan covers you: you may cancel your own Starter plan");
+    assert!(r.body.contains("Alpha is on the Pro plan now") && r.body.contains("You still pay for your own Starter plan"), "{}", r.body);
+    assert!(r.body.contains("SuperBot doesn't cancel it for you"), "{}", r.body);
+    assert!(r.body.contains(&format!("choose Manage billing on your plan:\n  {LINK}")) && !r.body.contains("/app/team"), "{}", r.body);
+    assert!(!r.body.contains("owners and admins") && r.body.contains("when your plan, its billing or your computer changes"), "{}", r.body);
+    assert!(Kind::PersonalPlanCovered.essential());
+    let bare = render(Kind::PersonalPlanCovered, &f, None, None);
+    assert!(!bare.body.contains("https://") && bare.body.contains("open Plan in SuperBot"), "{}", bare.body);
 }
 
 #[test]

@@ -522,8 +522,8 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         Applied::CustomerOfAnotherUser => return ignore("customer_of_another_user", Some(&user), json!({ "subscription": sub.id, "customer": sub.customer })),
         Applied::Unchanged => "unchanged",
         Applied::Changed { from, to } => {
-            // While their team pays (ADR 0093), its plan is theirs whatever their own says.
-            let team = app.db.team_plan_of(&user).and_then(|s| s.tier);
+            // While their team has a plan (ADR 0093, 0347), it's theirs whatever their own says.
+            let team = app.db.team_tier_of(&user).map(|(_, t)| t);
             let effective = |t: &Option<String>| tiers.of(team.as_deref().or(t.as_deref())).name.clone();
             let mut d = json!({ "from": from, "to": to, "effectiveFrom": effective(&from), "effectiveTo": effective(&to), "source": "stripe" });
             if let (Some(d), Value::Object(x)) = (d.as_object_mut(), details.clone()) {
@@ -646,9 +646,11 @@ pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
         })
         .collect();
     let sub = paying(&app, &u.id);
-    let team = app.db.team_plan_of(&u.id).map(|s| {
-        let name = app.db.team(&s.team_id).map(|t| t.name);
-        json!({ "id": s.team_id, "name": name, "tier": s.tier, "periodEnd": s.period_end })
+    let team = app.db.team_tier_of(&u.id).map(|(id, tier)| {
+        let name = app.db.team(&id).map(|t| t.name);
+        let paying = app.db.team_paying(&id);
+        let source = if paying.is_some() { "stripe" } else { "admin" };
+        json!({ "id": id, "name": name, "tier": tier, "periodEnd": paying.and_then(|s| s.period_end), "source": source })
     });
     reply(
         StatusCode::OK,
@@ -788,8 +790,8 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
         app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "already_subscribed", "subscription": s.subscription_id })));
         return reply(StatusCode::CONFLICT, json!({ "error": "You already pay for a plan. Change it under Manage billing.", "portal": true }));
     }
-    if let Some(s) = app.db.team_plan_of(&u.id) {
-        app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "team_pays", "team": s.team_id })));
+    if let Some((team, _)) = app.db.team_tier_of(&u.id) {
+        app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "team_pays", "team": team })));
         return reply(StatusCode::CONFLICT, json!({ "error": "Your team pays for your plan. Its owners and admins change it on the Team screen.", "teamPays": true }));
     }
     if !may_start(co, &u.id) {

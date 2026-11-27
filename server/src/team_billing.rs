@@ -54,6 +54,11 @@ impl Seats {
         Seats { stripe, wake: tokio::sync::Notify::new(), busy: tokio::sync::Mutex::new(()), teams: Default::default() }
     }
 
+    /// The Stripe client, for a server admin moving a team's subscription (ADR 0347).
+    pub(crate) fn stripe(&self) -> &Stripe {
+        &self.stripe
+    }
+
     async fn hold(&self, team_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self.teams.lock().unwrap_or_else(|e| e.into_inner()).entry(team_id.to_string()).or_default().clone();
         lock.lock_owned().await
@@ -98,14 +103,14 @@ fn ignored(app: &App, event_id: &str, kind: &str, reason: &str, team: Option<&st
 }
 
 /// Each member and the tier they're on now, to tell whose a change moved.
-fn tiers_now(app: &App, team_id: &str) -> Vec<(String, String)> {
+pub(crate) fn tiers_now(app: &App, team_id: &str) -> Vec<(String, String)> {
     app.db.team_members(team_id).into_iter().map(|m| (m.user_id.clone(), app.tier_of(&m.user_id).name.clone())).collect()
 }
 
 /// After a team's plan or members changed: each member whose tier moved from `before`
 /// is audited (`user.tier_changed`, source `team`) and their computer follows it, as
 /// it does an admin's or Stripe's change for them (ADR 0085). Returns how many moved.
-fn follow(app: &App, team_id: &str, before: &[(String, String)], why: &Value, event_id: Option<&str>, fresh: bool) -> usize {
+pub(crate) fn follow(app: &App, team_id: &str, before: &[(String, String)], why: &Value, event_id: Option<&str>, fresh: bool) -> usize {
     let mut moved = 0;
     for (user, was) in before {
         let now = app.tier_of(user).name.clone();
@@ -235,7 +240,8 @@ fn apply(
     };
     let before = tiers_now(app, &team.id);
     let to: Vec<String> = app.db.team_members(&team.id).into_iter().filter(|m| m.role == crate::teams::OWNER || m.role == crate::teams::ADMIN).map(|m| m.user_id).collect();
-    let ev = crate::billing_mail::TeamSubEvent { event_id, row: &row, ending: plan.ending, team: &team.name, to: &to };
+    let payers = crate::billing_mail::personal_payers(app, &team.id);
+    let ev = crate::billing_mail::TeamSubEvent { event_id, row: &row, ending: plan.ending, team: &team.name, to: &to, payers: &payers };
     let (applied, linked, emails) = app.db.apply_team_subscription(event_id, kind, &row, plan.set_tier, &|c| crate::billing_mail::team_subscription_emails(app, &ev, c))?;
     let by = billing::system(None);
     if let (Some(Linked::New), Some(cus)) = (&linked, sub.customer) {
@@ -257,7 +263,9 @@ fn apply(
         Applied::CustomerOfAnotherUser => return ignore("customer_of_another_payer", Some(&team.id), json!({ "subscription": sub.id, "customer": sub.customer })),
         Applied::Unchanged => "unchanged",
         Applied::Changed { from, to } => {
-            let effective = |t: &Option<String>| app.tiers().of(t.as_deref()).name.clone();
+            // Without a paid plan, the one a server admin gave the team, if any (ADR 0347).
+            let given = app.db.team(&team.id).and_then(|t| t.tier);
+            let effective = |t: &Option<String>| app.tiers().of(t.as_deref().or(given.as_deref())).name.clone();
             let mut d = json!({ "from": from, "to": to, "effectiveFrom": effective(&from), "effectiveTo": effective(&to), "source": "stripe" });
             if let (Some(d), Value::Object(x)) = (d.as_object_mut(), details.clone()) {
                 d.extend(x);
@@ -412,9 +420,9 @@ pub fn view(app: &App, team_id: &str, manager: bool) -> Option<Value> {
     }
     let paying = app.db.team_paying(team_id);
     let tiers = app.tiers();
-    let plan = paying.as_ref().and_then(|s| s.tier.as_deref()).map(|t| {
-        let t = tiers.of(Some(t));
-        json!({ "name": t.name, "label": t.label })
+    let plan = crate::team_plan::of(app, team_id).map(|(t, source)| {
+        let t = tiers.of(Some(&t));
+        json!({ "name": t.name, "label": t.label, "source": source })
     });
     let mut v = json!({ "plan": plan });
     if !manager {

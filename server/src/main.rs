@@ -314,6 +314,9 @@ mod teammate_removals_http_tests;
 mod team_billing;
 #[cfg(test)]
 mod team_billing_http_tests;
+mod team_plan;
+#[cfg(test)]
+mod team_plan_http_tests;
 mod teams;
 #[cfg(test)]
 mod team_roles_http_tests;
@@ -1292,6 +1295,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/isolation/teammate-removals", get(teammate_removals::list_all))
         .route("/teams", get(teams::list).post(teams::create))
         .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
+        .route("/teams/{id}/plan", put(team_plan::put))
         .route("/teams/{id}/region", get(machines::region::get_team).put(machines::region::set_team))
         .route("/teams/{id}/residency", get(machines::region::get_team).put(machines::residency::pin_team).delete(machines::residency::unpin_team))
         .route("/teams/{id}/residency/report", get(machines::residency_report::team))
