@@ -292,7 +292,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("POST", ["users", _, "handover"]) => ManageBots,
         ("POST", ["tiers", _, "move-bots"]) => ManageBots,
         ("GET", ["audit"] | ["audit", "export.csv"] | ["access-review"] | ["access-review", "export.csv"]) => ViewAudit,
-        ("GET", ["usage"] | ["tiers"] | ["users", _, "usage"]) => ManageBilling,
+        ("GET", ["usage"] | ["tiers"] | ["tiers", "stripe-check"] | ["users", _, "usage"]) => ManageBilling,
         ("GET", ["signups"] | ["signups", _]) | ("POST", ["signups", _, "approve" | "reject"]) => ApproveSignups,
         // A machine's lifecycle, never its logins, screens, files or teammates, and never
         // deleting its backups: those stay Admin.
@@ -594,6 +594,8 @@ mod tests {
             ("GET", "/api/me/secrets", Perm::Read),
             ("GET", "/api/me/tier", Perm::Read),
             ("GET", "/api/tiers", Perm::ManageBilling),
+            // Published prices checked against Stripe's (ADR 0350).
+            ("GET", "/api/tiers/stripe-check", Perm::ManageBilling),
             // Moving a managed tier's Bots onto its default harness (ADR 0079).
             ("POST", "/api/tiers/pro/move-bots", Perm::ManageBots),
             // Everyone's plan and use, against their limits (ADR 0040).
