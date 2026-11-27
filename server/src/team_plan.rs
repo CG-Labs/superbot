@@ -151,9 +151,7 @@ async fn move_subscription(app: &App, by: &Who, t: &Team, sub: &crate::db::TeamS
     let Some(tier) = tier else {
         return refuse("team_pays", "The team pays for its plan in Stripe. To end it, its owners or admins cancel it under Manage billing on the Team screen.".into());
     };
-    if from.as_deref() == Some(tier.name.as_str()) {
-        return Ok(StatusCode::OK);
-    }
+    // Sent even for the plan Stripe last said, which undoes a change still on its way.
     let Some(price) = tier.stripe_prices.first() else {
         return refuse("no_price", format!("The {} plan has no Stripe price, so a team that pays can't move to it. Its owners or admins cancel the team's plan first.", tier.label));
     };

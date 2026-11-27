@@ -415,8 +415,12 @@ pub fn start(app: Arc<App>) {
 /// on: the plan for everyone on it; for its owners and admins (`manager`) and server
 /// admins, the subscription, its seats, and the plans for sale. Never a Stripe id.
 pub fn view(app: &App, team_id: &str, manager: bool) -> Option<Value> {
+    // Without billing, only a plan a server admin gave the team, which no one here changes (ADR 0347).
     if !on(app) {
-        return None;
+        let given = app.db.team(team_id)?.tier?;
+        let tiers = app.tiers();
+        let t = tiers.of(Some(&given));
+        return Some(json!({ "plan": { "name": t.name, "label": t.label, "source": crate::team_plan::ADMIN }, "canChange": false }));
     }
     let paying = app.db.team_paying(team_id);
     let tiers = app.tiers();

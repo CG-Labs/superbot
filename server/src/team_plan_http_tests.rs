@@ -89,9 +89,10 @@ async fn with_billing_off_an_admin_records_the_teams_plan() {
     let names: Vec<&str> = list["plans"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["starter", "pro", "self-host"]);
     assert_eq!(list["plans"][2]["priced"], false);
-    // Members don't see the admin's view.
-    let (_, mine) = json_call(port, "GET", "/api/team", &w.a, "").await;
+    // Members don't see the admin's view, but do see the plan, with nothing to change.
+    let (_, mine) = json_call(port, "GET", "/api/team", &w.b, "").await;
     assert!(mine.get("plan").is_none(), "{mine}");
+    assert_eq!(mine["billing"], json!({ "plan": { "name": "pro", "label": "Pro", "source": "admin" }, "canChange": false }), "{mine}");
 
     // The same plan again changes nothing; taking it away moves everyone back.
     assert_eq!(set(&w, &team, json!("pro")).await.0, 200);
@@ -100,6 +101,7 @@ async fn with_billing_off_an_admin_records_the_teams_plan() {
     assert_eq!((code, &v["plan"]["current"], &v["plan"]["given"]), (200, &Value::Null, &Value::Null), "{v}");
     assert_eq!((tier(&w, &w.a_id), tier(&w, &w.b_id)), ("starter".into(), "starter".into()));
     assert_eq!(audit(port, &w.admin, "action=user.tier_changed").await.len(), 4);
+    assert!(json_call(port, "GET", "/api/team", &w.b, "").await.1.get("billing").is_none());
     // Nothing was queued to email with billing off.
     assert!(w.app.db.billing_emails_of(&w.b_id, 10).is_empty());
 }
@@ -200,9 +202,6 @@ async fn a_team_that_pays_has_its_subscription_moved_in_stripe() {
     reasons.sort();
     assert_eq!(reasons, ["no_price", "team_pays"]);
     assert_eq!(stripe.seen().len(), before);
-    // Already on it: nothing to do.
-    assert_eq!(set(&w, &team, json!("pro")).await.0, 200);
-    assert_eq!(stripe.seen().len(), before);
 
     // Starter: the subscription moves to its price, with prorations, for every seat.
     let (code, v) = set(&w, &team, json!("starter")).await;
@@ -222,9 +221,15 @@ async fn a_team_that_pays_has_its_subscription_moved_in_stripe() {
     let keys: Vec<String> = stripe.seen().into_iter().filter(|s| s.path == "/v1/subscriptions/sub_test_alpha").map(|s| s.key).collect();
     assert_eq!(keys.len(), 2);
     assert_ne!(keys[0], keys[1]);
+    // Back to Pro before Starter's event: Stripe is asked for Pro's price, which undoes it,
+    // though Pro is the plan Stripe last said.
+    assert_eq!(set(&w, &team, json!("pro")).await.0, 202);
+    let prices: Vec<String> = stripe.seen().into_iter().filter(|s| s.path == "/v1/subscriptions/sub_test_alpha").filter_map(|s| s.get("items[0][price]").map(String::from)).collect();
+    assert_eq!(prices, ["price_starter_monthly", "price_starter_monthly", "price_pro_monthly"]);
     let asked = audit(w.port, &w.admin, "action=team.plan_change_requested&outcome=success").await;
-    assert_eq!((asked.len(), asked[0]["details"]["to"].as_str(), asked[0]["details"]["price"].as_str()), (2, Some("starter"), Some("price_starter_monthly")), "{asked:?}");
+    assert_eq!(asked.len(), 3, "{asked:?}");
     assert_eq!(tier(&w, &w.b_id), "pro", "nothing changes until Stripe says so");
+    assert_eq!(set(&w, &team, json!("starter")).await.0, 202);
 
     // Stripe's event applies it, and Bea is told once more, once.
     let starter = team_event(&team, "evt_t2", 1_795_000_100, |v| v["data"]["object"]["items"]["data"][0]["price"]["id"] = json!("price_starter_monthly"));
