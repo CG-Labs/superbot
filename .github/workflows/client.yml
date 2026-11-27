@@ -9,6 +9,7 @@ on:
       - "web/app.js"
       - "web/styles.css"
       - "site/assets/site.css"
+      - "docs/store/**"
       - ".github/workflows/client.yml"
   pull_request:
     paths:
@@ -18,6 +19,7 @@ on:
       - "web/app.js"
       - "web/styles.css"
       - "site/assets/site.css"
+      - "docs/store/**"
       - ".github/workflows/client.yml"
 
 permissions:
@@ -44,4 +46,6 @@ jobs:
       - run: npm run brand:check
       - run: npm run tokens:test
       - run: npm run tokens:check
+      - run: npm run store:test
+      - run: npm run store:check
       - run: npm run build:web

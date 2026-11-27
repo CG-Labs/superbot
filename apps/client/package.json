@@ -73,6 +73,9 @@
     "tokens": "node scripts/tokens.mjs",
     "tokens:check": "node scripts/tokens.mjs --check",
     "tokens:test": "node --test scripts/tokens.test.mjs",
+    "store:check": "node scripts/store.mjs",
+    "store:ready": "node scripts/store.mjs --ready",
+    "store:test": "node --test scripts/store.test.mjs",
     "store:screenshots": "node scripts/store-screenshots.mjs"
   },
   "build": {
