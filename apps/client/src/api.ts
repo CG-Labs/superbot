@@ -15,6 +15,7 @@ import type {
   BotNotificationsPatch,
   BotNotificationsView,
   BotView,
+  CheckoutInterval,
   CustomRole,
   CustomRoleRef,
   KeptBotsResult,
@@ -572,9 +573,9 @@ export class SuperBotApi {
     return { text: await res.text(), fileName };
   }
 
-  /** A Stripe Checkout page for the plan; open `url` to pay. */
-  async checkout(tier: string): Promise<{ url: string }> {
-    return this.request<{ url: string }>("POST", "/api/billing/checkout", { tier });
+  /** A Stripe Checkout page for the plan, billed every `interval` (the server's default when left out); open `url` to pay. */
+  async checkout(tier: string, interval?: CheckoutInterval): Promise<{ url: string }> {
+    return this.request<{ url: string }>("POST", "/api/billing/checkout", interval ? { tier, interval } : { tier });
   }
 
   /** Your Stripe billing portal: change or cancel the plan, cards, invoices. */
@@ -659,8 +660,8 @@ export class SuperBotApi {
   }
 
   /** A Stripe Checkout page for the team's plan, a seat for each teammate (ADR 0093). Owners and admins only. */
-  async teamCheckout(tier: string): Promise<{ url: string }> {
-    return this.request<{ url: string }>("POST", "/api/team/billing/checkout", { tier });
+  async teamCheckout(tier: string, interval?: CheckoutInterval): Promise<{ url: string }> {
+    return this.request<{ url: string }>("POST", "/api/team/billing/checkout", interval ? { tier, interval } : { tier });
   }
 
   /** The team's Stripe billing portal: change or cancel its plan, cards, invoices. */

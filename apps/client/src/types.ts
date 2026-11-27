@@ -173,10 +173,15 @@ export interface MyUsage {
   byModel?: (TokenTotals & { model: string | null })[];
 }
 
+/** How often a checkout's price bills (ADR 0346). */
+export type CheckoutInterval = "month" | "year";
+
 /** A plan for sale through Stripe Checkout (ADR 0042). */
 export interface BillingPlan extends TierView {
   /** The plan the user is on now. */
   current: boolean;
+  /** The intervals it's sold at (ADR 0346); missing when the server sells one price, as before. */
+  intervals?: CheckoutInterval[];
 }
 
 /** `/api/billing`: your plan and use, the plans you can buy, and your billing account. */
@@ -1465,7 +1470,8 @@ export interface TeamBilling {
   seats?: { members: number; billed: number | null; syncing: boolean; error: string | null } | null;
   /** The team has a Stripe customer, so "Manage billing" works. */
   portal?: boolean;
-  plans?: TierView[];
+  /** Plans sold to teams; `intervals` as on `BillingPlan`. */
+  plans?: (TierView & { intervals?: CheckoutInterval[] })[];
   /** You manage the team and may change its plan. */
   canChange?: boolean;
 }

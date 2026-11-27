@@ -429,6 +429,12 @@ async fn retention_reaches_the_machine_for_sessions_and_archived_work() {
     )
     .unwrap();
 
+    // A reply lands before its run lets go of the Bot's session files; the pass skips a
+    // Bot whose run still holds them.
+    wait_until("the last run lets go of the Bot's session files", || {
+        w.env.app.sweeping_session_files(&team).is_some()
+    })
+    .await;
     // Everything here is from today: a pass 100 days on finds it old.
     let later = crate::db::now() + 100 * 86_400_000;
     let p = crate::file_retention::prune_sessions(&w.env.app, 30, later).await;

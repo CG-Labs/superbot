@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
-import { checkoutNotice, limitSummary, openBillingPage } from "../src/billing";
+import { checkoutChoices, checkoutNotice, limitSummary, openBillingPage } from "../src/billing";
 import { confirmAsync } from "../src/dialogs";
 import { errorText, friendlyError } from "../src/errors";
 import { defaultEnd, endChoices, endNear, endsAt } from "../src/roles";
@@ -26,7 +26,7 @@ import {
   teamSubscriptionLine,
 } from "../src/team";
 import { hairline, themedStyles, type } from "../src/theme";
-import type { CustomRoleRef, MyTeamInvite, RoleRequest, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
+import type { CheckoutInterval, CustomRoleRef, MyTeamInvite, RoleRequest, Team, TeamBilling, TeamMember, TeamRole, TeamRoleChoice } from "../src/types";
 import { Chips } from "./Chips";
 import { EmptyState } from "./EmptyState";
 import { ErrorState, InlineError } from "./ErrorState";
@@ -188,7 +188,7 @@ function MemberRow({
 }
 
 /** The team's plan (ADR 0093): who pays for everyone's, and for owners and admins, its seats and Stripe's pages. */
-function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage: boolean; busy: boolean; onBuy: (tier: string) => void; onPortal: () => void }) {
+function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage: boolean; busy: boolean; onBuy: (tier: string, interval?: CheckoutInterval) => void; onPortal: () => void }) {
   const styles = useStyles();
   const status = teamSubscriptionLine(b);
   const seats = seatsLine(b);
@@ -218,9 +218,21 @@ function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage
                 {p.label}
               </Text>
               <Text style={styles.faint}>{limitSummary(p.limits).join(" · ")}</Text>
-              <Pressable style={[styles.primaryBtn, styles.self]} disabled={busy} onPress={() => onBuy(p.name)} accessibilityRole="link" accessibilityLabel={`Buy ${p.label} for the team`} accessibilityHint="Opens Stripe Checkout to pay">
-                <Text style={styles.primaryText}>Buy {p.label} for the team</Text>
-              </Pressable>
+              {checkoutChoices(p.intervals).map(({ interval, suffix }) => (
+                <Pressable
+                  key={interval ?? "default"}
+                  style={[styles.primaryBtn, styles.self]}
+                  disabled={busy}
+                  onPress={() => onBuy(p.name, interval)}
+                  accessibilityRole="link"
+                  accessibilityLabel={`Buy ${p.label} for the team${suffix}`}
+                  accessibilityHint="Opens Stripe Checkout to pay"
+                >
+                  <Text style={styles.primaryText}>
+                    Buy {p.label} for the team{suffix}
+                  </Text>
+                </Pressable>
+              ))}
             </View>
           ))
         : null}
@@ -424,7 +436,7 @@ export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBil
             {!manage ? <Text style={styles.faint}>Only the team's owners and admins can change the team.</Text> : null}
 
             {team.billing ? (
-              <TeamPlan b={team.billing} manage={manage} busy={busy} onBuy={(tier) => pay(() => api.teamCheckout(tier))} onPortal={() => pay(() => api.teamBillingPortal())} />
+              <TeamPlan b={team.billing} manage={manage} busy={busy} onBuy={(tier, interval) => pay(() => (interval ? api.teamCheckout(tier, interval) : api.teamCheckout(tier)))} onPortal={() => pay(() => api.teamBillingPortal())} />
             ) : null}
 
             {manage ? (
