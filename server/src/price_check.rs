@@ -18,7 +18,6 @@
 use crate::stripe::{self, Stripe};
 use crate::tiers::{Buyer, Interval, ListPrice, Tier, Tiers};
 use crate::{AppState, Auth};
-use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::{Value, json};
@@ -149,6 +148,8 @@ fn cadence_words(c: &Cadence) -> String {
 pub enum Unread {
     /// Stripe has no such price: drift as much as a wrong amount.
     Missing,
+    /// Not shaped like a Stripe price id, so never sent: it would name another endpoint.
+    Invalid,
     /// No answer, or a refusal that says nothing about the price (a bad key, a rate limit).
     Failed(String),
 }
@@ -246,6 +247,12 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
             Err(Unread::Missing) => {
                 line["error"] = json!("no such price");
                 r.problems.push(format!("Stripe has no price {id}: it may be in another Stripe account, or a live price id read with a test key"));
+            }
+            Err(Unread::Invalid) => {
+                line["error"] = json!("not a Stripe price id");
+                r.problems.push(format!(
+                    "{id:?} in stripePrices isn't a Stripe price id (letters, digits and _ only)"
+                ));
             }
             Err(Unread::Failed(e)) => {
                 line["error"] = json!(e);
@@ -538,6 +545,9 @@ impl Report {
 
 /// Reads one price, with its other currencies.
 async fn read(s: &Stripe, id: &str) -> Result<StripePrice, Unread> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(Unread::Invalid);
+    }
     match s
         .get(&format!("/v1/prices/{id}?expand%5B%5D=currency_options"))
         .await
@@ -623,7 +633,7 @@ pub fn start(a: Arc<Auth>, app: AppState) {
 
 /// `GET /api/tiers/stripe-check` (billing.manage): the check, now. 200 with its `status`
 /// (`off` without a Stripe key), so a caller tells drift from a failed request.
-pub async fn handler(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Response {
+pub async fn handler(app: AppState, a: Arc<Auth>) -> Response {
     if let Some(co) = a.payments.checkout()
         && !crate::billing::may_start(co, LIMIT_KEY)
     {
@@ -1015,6 +1025,34 @@ mod tests {
             r.unchecked,
             ["couldn't read price_pro_yearly from Stripe (HTTP 401 invalid_request_error)"]
         );
+
+        let mut read = good();
+        read[1] = Err(Unread::Invalid);
+        assert_eq!(
+            pro(read).problems,
+            [
+                "\"price_pro_yearly\" in stripePrices isn't a Stripe price id (letters, digits and _ only)"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_that_isnt_a_price_id_is_never_sent() {
+        // Nothing listens here: a request would come back Failed, not Invalid.
+        let s = Stripe::new("sk_test_placeholder", "http://127.0.0.1:9");
+        for id in [
+            "",
+            "../customers",
+            "price_1?expand[]=x",
+            "price/1",
+            "price 1",
+        ] {
+            assert!(matches!(read(&s, id).await, Err(Unread::Invalid)), "{id:?}");
+        }
+        assert!(matches!(
+            read(&s, "price_1Abc").await,
+            Err(Unread::Failed(_))
+        ));
     }
 
     #[test]
