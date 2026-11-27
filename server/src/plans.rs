@@ -381,7 +381,7 @@ fn self_host_html(h: &mut String, s: &Value) {
     let mut items: Vec<String> = s["seats"].as_str().map(String::from).into_iter().collect();
     items.extend(strings(&s["includes"]));
     items.extend(strings(&s["features"]));
-    let cta = format!("<a class=\"btn btn-ghost btn-small\" href=\"{}\">Request a license</a>", esc(url));
+    let cta = format!("<a class=\"btn btn-ghost btn-small\" href=\"{}\">Get a license</a>", esc(url));
     card(h, &offer::kind(), s["label"].as_str().unwrap_or(offer::LABEL), &items, &price_html(&s["prices"], None), &cta);
 }
 
@@ -606,7 +606,7 @@ mod tests {
         assert!(h.contains("<p class=\"plan-kind\">Licensed, business edition</p><h2>Self-host</h2>"), "{h}");
         assert!(h.contains(offer::SEATS) && offer::INCLUDES.iter().all(|i| h.contains(i)) && h.contains("<li>Help with your install</li>"), "{h}");
         assert!(h.contains("<p class=\"plan-price\">£40 per seat / year</p>"), "{h}");
-        assert!(h.contains("<a class=\"btn btn-ghost btn-small\" href=\"https://example.com/license?from=pricing&amp;x=1\">Request a license</a>"), "{h}");
+        assert!(h.contains("<a class=\"btn btn-ghost btn-small\" href=\"https://example.com/license?from=pricing&amp;x=1\">Get a license</a>"), "{h}");
         assert!(h.find("Self-host").unwrap() < h.find("<h2>Starter</h2>").unwrap(), "listed first, as on the public site: {h}");
 
         // No price on the self-host tier, or no self-host tier at all: "Contact us".
@@ -627,7 +627,7 @@ mod tests {
         let none = render_html(&snapshot(&Tiers::self_host(), &on(None), None, &sizes, &no_kernel), false);
         assert!(none.contains("No plans are published yet."), "{none}");
         let only = render_html(&snapshot(&Tiers::self_host(), &s, None, &sizes, &no_kernel), false);
-        assert!(only.contains("Request a license") && !only.contains("No plans are published yet.") && !only.contains("per person"), "{only}");
+        assert!(only.contains("Get a license") && !only.contains("No plans are published yet.") && !only.contains("per person"), "{only}");
     }
 
     #[test]

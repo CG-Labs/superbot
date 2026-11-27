@@ -39,7 +39,7 @@ Every line is something a license gives today.
 
 **Prices only from configuration.** They come from the same file and field as every other plan's, so one `publishedPrices` check covers them (currency list, no zero, at most four) and botd still ships none. Without them the card says "Contact us". The `self-host` tier is never listed as a managed plan, even with prices or a Stripe price id: a license pays for it, not checkout. Its limits and machine aren't shown, since a license's limit is its seats.
 
-The card comes first, as on the public site, with "Licensed, business edition", the seats and includes lines, the operator's features, the prices or "Contact us", and a "Request a license" button. Nothing else on the page changes: managed plans, Enterprise, the per-person note and the links are as ADR 0121 has them.
+The card comes first, as on the public site, with "Licensed, business edition", the seats and includes lines, the operator's features, the prices or "Contact us", and a "Get a license" button. Nothing else on the page changes: managed plans, Enterprise, the per-person note and the links are as ADR 0121 has them.
 
 ### /pricing on the design tokens
 
@@ -47,7 +47,7 @@ The page now links `/site/site.css`, the landing page's stylesheet, whose token 
 
 ### Linked from the public site
 
-`superbot-site --pricing-url URL` (or `SUPERBOT_SITE_PRICING_URL`) is a managed server's `/pricing`. The nav and footer's "Plans" link becomes "Pricing", to that URL when given, else to the landing page's plans section, the public site's own equivalent. With a URL, the plans note says current prices are there. The landing page's Self-host card now uses `offer.rs`'s lines and a "Request a license" button to the contact URL. It still shows no prices ("Pricing to be published"): prices on the landing page are [#44](https://github.com/CG-Labs/superbot/issues/44)'s slice 2.
+`superbot-site --pricing-url URL` (or `SUPERBOT_SITE_PRICING_URL`) is a managed server's `/pricing`. The nav and footer's "Plans" link becomes "Pricing", to that URL when given, else to the landing page's plans section, the public site's own equivalent. With a URL, the plans note says current prices are there. The landing page's Self-host card now uses `offer.rs`'s lines and a "Get a license" button to the contact URL. It still shows no prices ("Pricing to be published"): prices on the landing page are [#44](https://github.com/CG-Labs/superbot/issues/44)'s slice 2.
 
 The server's own landing page (`site/index.html`) doesn't link to `/pricing`. Every server shows it, mostly from disk through Caddy, and most servers publish no plans, so the link would be a 404 there.
 
@@ -60,9 +60,9 @@ The server's own landing page (`site/index.html`) doesn't link to `/pricing`. Ev
 
 ## Tests
 
-- `plans::tests`: `PLANS_LICENSE_URL` is checked like `PLANS_CONTACT_URL` and falls back to it, and alone adds no Enterprise entry; prices read per seat; the self-host entry has its edition, seats, includes, per-seat prices and features, no limits, machine or Stripe id, and comes first on the page with "Request a license"; with no price, or no `self-host` tier, it says "Contact us" and no currency appears; with nowhere to ask it isn't listed; the `self-host` tier is never a managed plan; the page links `site.css`, has no inline style or script, and every class it uses is in `site.css`; the startup line names the self-host entry.
+- `plans::tests`: `PLANS_LICENSE_URL` is checked like `PLANS_CONTACT_URL` and falls back to it, and alone adds no Enterprise entry; prices read per seat; the self-host entry has its edition, seats, includes, per-seat prices and features, no limits, machine or Stripe id, and comes first on the page with "Get a license"; with no price, or no `self-host` tier, it says "Contact us" and no currency appears; with nowhere to ask it isn't listed; the `self-host` tier is never a managed plan; the page links `site.css`, has no inline style or script, and every class it uses is in `site.css`; the startup line names the self-host entry.
 - `plans_http_tests.rs`, on the real router: `selfHost` from `PLANS_LICENSE_URL` in `/api/plans` and on `/pricing`, with the new CSP and `/site/site.css` served to anyone; no entry without a URL.
-- `superbot-site`: `--pricing-url` takes only http(s); "Pricing" links to it in the nav and footer, else to `index.html#plans`; the Self-host card has `offer.rs`'s lines and "Request a license"; still no prices; the real build has no broken links.
+- `superbot-site`: `--pricing-url` takes only http(s); "Pricing" links to it in the nav and footer, else to `index.html#plans`; the Self-host card has `offer.rs`'s lines and "Get a license"; still no prices; the real build has no broken links.
 
 ## Consequences
 

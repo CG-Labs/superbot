@@ -99,7 +99,7 @@ pub fn shared(index: &str, name: &str) -> Result<String, String> {
 pub fn landing(plans: &[Plan], index: &str, contact_url: &str, pricing_url: Option<&str>, repo_url: &str) -> Result<String, String> {
     let contact = esc(contact_url);
     let sales = format!(r#"<a class="btn btn-ghost btn-small" href="{contact}">Contact sales</a>"#);
-    let license = format!(r#"<a class="btn btn-ghost btn-small" href="{contact}">Request a license</a>"#);
+    let license = format!(r#"<a class="btn btn-ghost btn-small" href="{contact}">Get a license</a>"#);
     let mut includes = vec![offer::SEATS.to_string()];
     includes.extend(offer::INCLUDES.iter().map(|i| i.to_string()));
     let mut cards = plan_card(
@@ -262,7 +262,7 @@ mod tests {
         for line in std::iter::once(offer::SEATS).chain(offer::INCLUDES.iter().copied()) {
             assert!(html.contains(&format!("<li>{}</li>", esc(line))), "{line}");
         }
-        assert!(html.contains(r#"<a class="btn btn-ghost btn-small" href="mailto:sales@example.com">Request a license</a>"#));
+        assert!(html.contains(r#"<a class="btn btn-ghost btn-small" href="mailto:sales@example.com">Get a license</a>"#));
         assert_eq!(html.matches(r#"<a href="https://app.example.com/pricing">Pricing</a>"#).count(), 2, "nav and footer");
         assert!(html.contains(r#"Current prices are on the <a href="https://app.example.com/pricing">pricing page</a>."#));
         for price in ["$", "€", "£", "/month", "per month", "free trial"] {

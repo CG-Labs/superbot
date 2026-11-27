@@ -193,7 +193,7 @@ async fn the_licensed_self_host_plan_is_published_with_where_to_ask() {
     assert_eq!(code, 200, "{page}");
     assert!(header(&head, "content-security-policy").is_some_and(|v| v.contains("style-src 'self'")), "{head}");
     assert!(page.contains("<h2>Self-host</h2>") && page.contains("Licensed, business edition") && page.contains("€30 per seat / year"), "{page}");
-    assert!(page.contains("href=\"https://example.com/license\">Request a license</a>") && page.contains("<li>Onboarding call</li>"), "{page}");
+    assert!(page.contains("href=\"https://example.com/license\">Get a license</a>") && page.contains("<li>Onboarding call</li>"), "{page}");
     assert!(page.contains("<link rel=\"stylesheet\" href=\"/site/site.css\">") && !page.contains("<script") && !page.contains("<style"), "{page}");
     // The stylesheet the page names is served, by botd as by Caddy, to anyone.
     let (code, css) = call(port, "GET", "/site/site.css", "", "").await;
@@ -208,5 +208,5 @@ async fn no_self_host_entry_without_somewhere_to_ask() {
     let (_, body) = call(port, "GET", "/api/plans", "", "").await;
     assert_eq!(parse(&body)["selfHost"], Value::Null, "{body}");
     let (_, page) = call(port, "GET", "/pricing", "", "").await;
-    assert!(!page.contains("Self-host") && !page.contains("Request a license"), "{page}");
+    assert!(!page.contains("Self-host") && !page.contains("Get a license"), "{page}");
 }

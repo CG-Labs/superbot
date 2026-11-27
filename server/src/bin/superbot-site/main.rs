@@ -29,7 +29,7 @@ internal link in it. Exits 1 on any broken link.
   --out DIR          where to write the site (default: <repo>/target/site)
   --repo DIR         the repository to read (default: this checkout)
   --tiers FILE       tiers file the managed plans come from (default: <repo>/deploy/tiers.example.json)
-  --contact-url URL  where \"Contact sales\" and \"Request a license\" link (default: $SUPERBOT_SITE_CONTACT_URL, else the repository)
+  --contact-url URL  where \"Contact sales\" and \"Get a license\" link (default: $SUPERBOT_SITE_CONTACT_URL, else the repository)
   --pricing-url URL  a managed server's /pricing, which \"Pricing\" links to (default: $SUPERBOT_SITE_PRICING_URL,
                      else the landing page's plans)
   --repo-url URL     the repository on GitHub, for links to files outside the portal
