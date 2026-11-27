@@ -330,7 +330,7 @@ The minimum left on each open roadmap issue for a credible Enterprise v1, as of 
 | [#60](https://github.com/CG-Labs/superbot/issues/60) Support playbooks | Delivered in code in 21 slices ([note](#delivered-52-58-and-60)) | None in code; the rest are [follow-ups](#follow-ups-from-52-58-and-60) | Owner: contacts, TAMs and on-call rota | 0 |
 | Close-out | Done: [delivered notes](#delivered-52-58-and-60) and [follow-ups](#follow-ups-from-52-58-and-60) for #52, #58 and #60 below | None | — | 0 |
 
-**Totals.** 3 engineering-only slices: #31 (1), #42 (1), #59 (1). 8 slices blocked on the owner: #11, #29, #38, #43, #44 (2), #45, #59. And 10 owner actions with no code:
+**Totals.** 2 engineering-only slices: #42 (1), #59 (1). 8 slices blocked on the owner: #11, #29, #38, #43, #44 (2), #45, #59. And 10 owner actions with no code:
 
 1. A CG-Labs Expo account for `eas init` (#11; unblocks #36, #38, #45).
 2. Apple Developer and Play Console accounts, with APNs and FCM keys (#36, #38, #45).
