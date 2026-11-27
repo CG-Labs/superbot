@@ -44,7 +44,8 @@ pub struct StripePrice {
     pub active: bool,
     pub cadence: Cadence,
     /// Its own currency first, then any `currency_options`, each with its `unit_amount`;
-    /// None where the amount isn't fixed (tiered, or chosen by the customer).
+    /// None where the amount isn't fixed per seat (tiered, quantity transformed, or
+    /// chosen by the customer): team checkout sends one seat per member as the quantity.
     pub amounts: Vec<(String, Option<u64>)>,
 }
 
@@ -60,15 +61,16 @@ impl StripePrice {
             .as_str()
             .map(str::to_ascii_lowercase)
             .ok_or_else(|| format!("{id}: Stripe's answer has no currency"))?;
+        let per_seat = v["transform_quantity"].is_null();
         let fixed = |o: &Value| match o["billing_scheme"].as_str() {
             Some("tiered") => None,
-            _ => o["unit_amount"].as_u64(),
+            _ => o["unit_amount"].as_u64().filter(|_| per_seat),
         };
         let mut amounts = vec![(currency.clone(), fixed(v))];
         if let Some(opts) = v["currency_options"].as_object() {
             let mut more: Vec<(String, Option<u64>)> = opts
                 .iter()
-                .map(|(c, o)| (c.to_ascii_lowercase(), o["unit_amount"].as_u64()))
+                .map(|(c, o)| (c.to_ascii_lowercase(), fixed(o)))
                 .filter(|(c, _)| *c != currency)
                 .collect();
             more.sort();
@@ -310,7 +312,7 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
             continue;
         }
         if amount.is_none() {
-            r.problems.push(format!("{who} sells {}, which has no fixed amount per person (tiered, or chosen by the customer)", p.id));
+            r.problems.push(format!("{who} sells {}, which has no fixed amount per person (tiered, quantity transformed, or chosen by the customer)", p.id));
             claim(Some(interval));
             continue;
         }
@@ -732,6 +734,15 @@ mod tests {
                 ("usd".into(), Some(3500))
             ]
         );
+        multi["transform_quantity"] = json!({ "divide_by": 5, "round": "up" });
+        assert_eq!(
+            StripePrice::parse(&multi).unwrap().amounts,
+            vec![
+                ("gbp".into(), None),
+                ("eur".into(), None),
+                ("usd".into(), None)
+            ]
+        );
         assert!(StripePrice::parse(&json!({ "object": "price" })).is_err());
     }
 
@@ -903,6 +914,18 @@ mod tests {
             r.problems,
             r.notes
         );
+
+        // Team checkout's quantity is the member count, so a transformed quantity
+        // (five members billed as one unit) doesn't charge the page's seat price.
+        let mut packed = price("price_biz_team_m", 4900, "gbp", "month");
+        packed["transform_quantity"] = json!({ "divide_by": 5, "round": "up" });
+        let r = compare(biz, &[("price_biz_team_m".into(), ok(packed))]);
+        assert_eq!(
+            r.problems,
+            [
+                "team checkout sells price_biz_team_m, which has no fixed amount per person (tiered, quantity transformed, or chosen by the customer)"
+            ]
+        );
     }
 
     #[test]
@@ -938,7 +961,7 @@ mod tests {
         assert_eq!(
             pro(read).problems,
             [
-                "checkout sells price_pro_monthly, which has no fixed amount per person (tiered, or chosen by the customer)"
+                "checkout sells price_pro_monthly, which has no fixed amount per person (tiered, quantity transformed, or chosen by the customer)"
             ]
         );
     }
