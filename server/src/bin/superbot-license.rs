@@ -5,6 +5,9 @@
 
 #[path = "../license/token.rs"]
 mod token;
+#[allow(dead_code)]
+#[path = "../license/offer.rs"]
+mod offer;
 
 use std::io::{Read, Write};
 use token::{Claims, Key};
@@ -145,7 +148,7 @@ fn sign(mut a: Args) -> Res<String> {
         nbf: a.take("--starts")?.map(|d| day(&d)).transpose()?,
         exp,
         seats,
-        edition: a.take("--edition")?.unwrap_or_else(|| "business".into()),
+        edition: a.take("--edition")?.unwrap_or_else(|| offer::EDITION.into()),
         features: a.all("--feature")?,
     };
     a.rest(0)?;

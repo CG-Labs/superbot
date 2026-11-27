@@ -1,10 +1,13 @@
 //! The marketing landing page. Managed plans and their limits come from the tiers file
 //! SuperBot ships (`deploy/tiers.example.json`); prices aren't published yet, so the
-//! page names the plans and says so rather than showing any.
+//! page names the plans and says so rather than showing any. The licensed self-host plan
+//! says what botd's `/pricing` says (`license/offer.rs`, ADR 0348), and "Pricing" links
+//! to that page when the site is given its address.
 
 use serde_json::Value;
 
-use crate::layout::{Shell, esc, page};
+use crate::layout::{Shell, esc, page, pricing_href};
+use crate::offer;
 
 #[derive(Debug, PartialEq)]
 pub struct Plan {
@@ -91,21 +94,21 @@ pub fn shared(index: &str, name: &str) -> Result<String, String> {
 }
 
 /// The public landing page. `index` is the server's landing page, whose product picture,
-/// value rows, feature grid and security strip it shares.
-pub fn landing(plans: &[Plan], index: &str, contact_url: &str, repo_url: &str) -> Result<String, String> {
+/// value rows, feature grid and security strip it shares. `pricing_url` is a managed
+/// server's `/pricing`, when there is one to link to.
+pub fn landing(plans: &[Plan], index: &str, contact_url: &str, pricing_url: Option<&str>, repo_url: &str) -> Result<String, String> {
     let contact = esc(contact_url);
     let sales = format!(r#"<a class="btn btn-ghost btn-small" href="{contact}">Contact sales</a>"#);
+    let license = format!(r#"<a class="btn btn-ghost btn-small" href="{contact}">Get a license</a>"#);
+    let mut includes = vec![offer::SEATS.to_string()];
+    includes.extend(offer::INCLUDES.iter().map(|i| i.to_string()));
     let mut cards = plan_card(
-        "Self-host",
-        "Licensed",
+        offer::LABEL,
+        &esc(&offer::kind()),
         "Run SuperBot on your own servers, with a license key for your seats.",
-        &[
-            "Your servers and your data".into(),
-            "Any harness: Claude Code, Codex, Pi or Hermes Agent".into(),
-            "Single sign-on, SCIM, approvals and audit".into(),
-        ],
+        &includes,
         "Pricing to be published",
-        &sales,
+        &license,
     );
     for p in plans {
         cards.push_str(&plan_card(
@@ -153,7 +156,7 @@ pub fn landing(plans: &[Plan], index: &str, contact_url: &str, repo_url: &str) -
         </div>
         <ul class="plans">
 {cards}        </ul>
-        <p class="fine plans-note">Managed plan limits are those of the plans SuperBot ships with (<a href="{repo}/blob/main/deploy/tiers.example.json">tiers file</a>). Prices are not published yet. Uptime targets are in the <a href="docs/slo.html">SLO</a>.</p>
+        <p class="fine plans-note">Managed plan limits are those of the plans SuperBot ships with (<a href="{repo}/blob/main/deploy/tiers.example.json">tiers file</a>). {prices} Uptime targets are in the <a href="docs/slo.html">SLO</a>.</p>
       </div>
     </section>
 
@@ -188,6 +191,10 @@ pub fn landing(plans: &[Plan], index: &str, contact_url: &str, repo_url: &str) -
         shot = shared(index, "shot")?,
         values = shared(index, "values")?,
         repo = esc(repo_url),
+        prices = match pricing_url {
+            Some(_) => format!(r#"Current prices are on the <a href="{}">pricing page</a>."#, pricing_href(pricing_url, "")),
+            None => "Prices are not published yet.".into(),
+        },
     );
     Ok(page(
         &Shell {
@@ -195,6 +202,7 @@ pub fn landing(plans: &[Plan], index: &str, contact_url: &str, repo_url: &str) -
             title: "SuperBot · Your always-on AI team",
             description: "SuperBot gives every person on your team always-on AI agents that work on their own computer. Self-host it with a license, even air-gapped, or choose a managed plan per person.",
             repo_url,
+            pricing_url,
             docs: false,
         },
         &main,
@@ -230,10 +238,12 @@ mod tests {
         let labels: Vec<&str> = plans.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(labels, ["Starter", "Pro", "Max"]);
         let index = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../site/index.html")).unwrap();
-        let html = landing(&plans, &index, "https://example.com/contact", "https://github.com/o/r").unwrap();
+        let html = landing(&plans, &index, "https://example.com/contact", None, "https://github.com/o/r").unwrap();
         for label in ["Self-host", "Starter", "Pro", "Max", "Enterprise", "Contact sales", "Pricing to be published", "3 Bots"] {
             assert!(html.contains(label), "{label}");
         }
+        assert!(html.contains(r#"<a href="index.html#plans">Pricing</a>"#) && html.contains(r#"id="plans""#), "Pricing is the plans here");
+        assert!(html.contains("Prices are not published yet."));
         for price in ["$", "€", "£", "/month", "per month", "free trial"] {
             assert!(!html.contains(price), "{price}");
         }
@@ -242,6 +252,22 @@ mod tests {
             assert!(html.contains(shared), "{shared}");
         }
         assert!(!html.contains("\"/site/"));
+    }
+
+    #[test]
+    fn the_self_host_license_says_what_the_server_says_and_pricing_links_to_the_server() {
+        let index = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../site/index.html")).unwrap();
+        let html = landing(&[], &index, "mailto:sales@example.com", Some("https://app.example.com/pricing"), "https://github.com/o/r").unwrap();
+        assert!(html.contains(r#"<p class="plan-kind">Licensed, business edition</p>"#), "{html}");
+        for line in std::iter::once(offer::SEATS).chain(offer::INCLUDES.iter().copied()) {
+            assert!(html.contains(&format!("<li>{}</li>", esc(line))), "{line}");
+        }
+        assert!(html.contains(r#"<a class="btn btn-ghost btn-small" href="mailto:sales@example.com">Get a license</a>"#));
+        assert_eq!(html.matches(r#"<a href="https://app.example.com/pricing">Pricing</a>"#).count(), 2, "nav and footer");
+        assert!(html.contains(r#"Current prices are on the <a href="https://app.example.com/pricing">pricing page</a>."#));
+        for price in ["$", "€", "£", "/month", "per month", "free trial"] {
+            assert!(!html.contains(price), "{price}");
+        }
     }
 
     #[test]
