@@ -1,6 +1,6 @@
 import { Linking } from "react-native";
 import { ApiError, SuperBotApi } from "../api";
-import { billingAvailable, checkoutNotice, limitSummary, openBillingPage, planAvailable, subscriptionLine } from "../billing";
+import { billingAvailable, checkoutChoices, checkoutNotice, limitSummary, openBillingPage, planAvailable, subscriptionLine } from "../billing";
 
 const BASE = "https://bots.example.com";
 
@@ -44,6 +44,12 @@ describe("billing API (ADR 0042)", () => {
     answer(200, { url: "https://checkout.stripe.com/c/pay/cs_1" });
     expect(await api().checkout("pro")).toEqual({ url: "https://checkout.stripe.com/c/pay/cs_1" });
     expect(globalThis.fetch).toHaveBeenCalledWith(`${BASE}/api/billing/checkout`, expect.objectContaining({ method: "POST", body: JSON.stringify({ tier: "pro" }) }));
+    answer(200, { url: "https://checkout.stripe.com/c/pay/cs_2" });
+    await api().checkout("pro", "year");
+    expect(globalThis.fetch).toHaveBeenCalledWith(`${BASE}/api/billing/checkout`, expect.objectContaining({ body: JSON.stringify({ tier: "pro", interval: "year" }) }));
+    answer(200, { url: "https://checkout.stripe.com/c/pay/cs_3" });
+    await api().teamCheckout("business", "month");
+    expect(globalThis.fetch).toHaveBeenCalledWith(`${BASE}/api/team/billing/checkout`, expect.objectContaining({ body: JSON.stringify({ tier: "business", interval: "month" }) }));
     answer(409, { error: "You already pay for a plan. Change it under Manage billing." });
     await expect(api().checkout("pro")).rejects.toThrow("You already pay for a plan");
     answer(200, { url: "https://billing.stripe.com/p/session/1" });
@@ -53,6 +59,16 @@ describe("billing API (ADR 0042)", () => {
 });
 
 describe("billing helpers", () => {
+  it("offers one checkout per interval a plan is sold at, and one as before without them (ADR 0346)", () => {
+    expect(checkoutChoices(undefined)).toEqual([{ suffix: "" }]);
+    expect(checkoutChoices([])).toEqual([{ suffix: "" }]);
+    expect(checkoutChoices(["month", "year"])).toEqual([
+      { interval: "month", suffix: ", paid monthly" },
+      { interval: "year", suffix: ", paid yearly" },
+    ]);
+    expect(checkoutChoices(["year"])).toEqual([{ interval: "year", suffix: ", paid yearly" }]);
+  });
+
   it("sums up what a plan allows", () => {
     expect(limitSummary({ maxBots: 1, monthlyRuns: 3000, dailyRoutineRuns: 24, machineType: "g6-standard-1" })).toEqual([
       "1 Bot",
