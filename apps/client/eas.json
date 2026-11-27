@@ -19,6 +19,18 @@
     }
   },
   "submit": {
-    "production": {}
+    "production": {
+      "ios": {
+        "appleTeamId": "OWNER_TODO_APPLE_TEAM_ID",
+        "ascAppId": "OWNER_TODO_ASC_APP_ID",
+        "language": "en-US",
+        "metadataPath": "../../docs/store/app-store.config.json"
+      },
+      "android": {
+        "serviceAccountKeyPath": "$GOOGLE_SERVICE_ACCOUNT_KEY_PATH",
+        "track": "production",
+        "releaseStatus": "draft"
+      }
+    }
   }
 }
