@@ -16,7 +16,8 @@ const TIERS: &str = r#"{
       "stripePrices": ["price_starter_monthly_secret"],
       "publishedPrices": [{ "amount": 1900, "currency": "eur", "interval": "month" }] },
     { "name": "max", "label": "Max", "routes": "any", "limits": { "maxBots": 30 }, "stripePrices": ["price_max_monthly_secret"] },
-    { "name": "self-host", "routes": "any" }
+    { "name": "self-host", "label": "Self-host", "routes": "any",
+      "publishedPrices": [{ "amount": 3000, "currency": "eur", "interval": "year" }], "features": ["Onboarding call"] }
   ]
 }"#;
 
@@ -34,7 +35,7 @@ async fn server(plans: Option<Settings>) -> (u16, AppState, String) {
 }
 
 fn published(contact: Option<&str>) -> Settings {
-    Settings { mode: Mode::On, published: true, contact: contact.map(String::from), checkout: false, signups: true }
+    Settings { mode: Mode::On, published: true, contact: contact.map(String::from), license: contact.map(String::from), checkout: false, signups: true }
 }
 
 #[tokio::test]
@@ -140,7 +141,7 @@ async fn the_pricing_page_renders_the_same_plans() {
     let (code, head, body) = call_with(port, "GET", "/pricing", "", "", "").await;
     assert_eq!(code, 200, "{body}");
     assert!(header(&head, "content-type").is_some_and(|v| v.starts_with("text/html")), "{head}");
-    assert!(header(&head, "content-security-policy").is_some_and(|v| v.contains("default-src 'none'") && !v.contains("script")), "{head}");
+    assert!(header(&head, "content-security-policy").is_some_and(|v| v.contains("default-src 'none'") && v.contains("style-src 'self'") && !v.contains("script") && !v.contains("unsafe")), "{head}");
     assert!(body.contains("<h2>Starter</h2>") && body.contains("€19 / month") && body.contains("3 Bots") && body.contains("5 GB of storage"), "{body}");
     assert!(body.contains("<h2>Max</h2>") && body.contains("<a href=\"mailto:sales@example.com\">Contact us</a>"), "{body}");
     assert!(body.contains("Contact sales") && body.contains("href=\"/get-started\"") && body.contains("href=\"/status\""), "{body}");
@@ -157,5 +158,55 @@ async fn signed_in_people_see_published_prices_but_not_stripe_ids() {
     assert!(!body.contains("price_starter"), "{body}");
     // Without a contact link there's no Enterprise entry, and Max says Contact us without one.
     let (_, page) = call(port, "GET", "/pricing", "", "").await;
-    assert!(!page.contains("Contact sales") && page.contains("<p class=\"price\">Contact us</p>"), "{page}");
+    assert!(!page.contains("Contact sales") && page.contains("<p class=\"plan-price\">Contact us</p>"), "{page}");
+}
+
+#[tokio::test]
+async fn the_licensed_self_host_plan_is_published_with_where_to_ask() {
+    let env = |k: &str| match k {
+        "PLANS_PAGE" => "on".to_string(),
+        "PLANS_LICENSE_URL" => "https://example.com/license".to_string(),
+        _ => String::new(),
+    };
+    let (port, _, _) = server(Some(Settings::from_env(&env, false, false, true).unwrap())).await;
+    let (code, body) = call(port, "GET", "/api/plans", "", "").await;
+    assert_eq!(code, 200, "{body}");
+    let v = parse(&body);
+    let names: Vec<&str> = v["plans"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["starter", "max"], "self-host is its own entry, not a managed plan: {v}");
+    let sh = &v["selfHost"];
+    assert_eq!(
+        (sh["label"].as_str(), sh["edition"].as_str(), sh["perSeat"].as_bool(), sh["licenseUrl"].as_str()),
+        (Some("Self-host"), Some("business"), Some(true), Some("https://example.com/license")),
+        "{v}"
+    );
+    assert_eq!(sh["seats"], crate::license::offer::SEATS);
+    assert_eq!(sh["prices"], json!([{ "amount": 3000, "currency": "eur", "interval": "year", "display": "€30 per seat / year" }]));
+    assert_eq!(sh["includes"], json!(crate::license::offer::INCLUDES));
+    assert_eq!(sh["features"], json!(["Onboarding call"]));
+    assert_eq!(v["enterprise"], Value::Null, "PLANS_LICENSE_URL alone adds no Enterprise entry");
+    for private in ["price_", "hidden-model", "openrouter", "routes"] {
+        assert!(!body.contains(private), "{private} leaked: {body}");
+    }
+
+    let (code, head, page) = call_with(port, "GET", "/pricing", "", "", "").await;
+    assert_eq!(code, 200, "{page}");
+    assert!(header(&head, "content-security-policy").is_some_and(|v| v.contains("style-src 'self'")), "{head}");
+    assert!(page.contains("<h2>Self-host</h2>") && page.contains("Licensed, business edition") && page.contains("€30 per seat / year"), "{page}");
+    assert!(page.contains("href=\"https://example.com/license\">Get a license</a>") && page.contains("<li>Onboarding call</li>"), "{page}");
+    assert!(page.contains("<link rel=\"stylesheet\" href=\"/site/site.css\">") && !page.contains("<script") && !page.contains("<style"), "{page}");
+    // The stylesheet the page names is served, by botd as by Caddy, to anyone.
+    let (code, css) = call(port, "GET", "/site/site.css", "", "").await;
+    assert_eq!(code, 200);
+    assert!(css.contains(".plans-links") && css.contains("--c-accent"), "the design tokens");
+}
+
+#[tokio::test]
+async fn no_self_host_entry_without_somewhere_to_ask() {
+    let env = |k: &str| if k == "PLANS_PAGE" { "on".to_string() } else { String::new() };
+    let (port, _, _) = server(Some(Settings::from_env(&env, false, false, true).unwrap())).await;
+    let (_, body) = call(port, "GET", "/api/plans", "", "").await;
+    assert_eq!(parse(&body)["selfHost"], Value::Null, "{body}");
+    let (_, page) = call(port, "GET", "/pricing", "", "").await;
+    assert!(!page.contains("Self-host") && !page.contains("Get a license"), "{page}");
 }
