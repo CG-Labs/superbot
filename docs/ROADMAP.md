@@ -317,7 +317,7 @@ The minimum left on each open roadmap issue for a credible Enterprise v1, as of 
 | [#36](https://github.com/CG-Labs/superbot/issues/36) Push notifications | Built ([ADR 0080](adr/0080-client-push-notifications.md)) | None in code; check on a real phone once #11 and #38 are done | Owner: EAS project, APNs and FCM keys | 0 |
 | [#38](https://github.com/CG-Labs/superbot/issues/38) TestFlight and Play internal | Not started; `eas.json` has build profiles | EAS build and submit to TestFlight and Play internal | Owner: #11, Apple Developer and Play Console accounts | 1 |
 | [#41](https://github.com/CG-Labs/superbot/issues/41) Sales/security pack | Done: written in M3 ([pack](security/README.md)), refreshed for M5 (native SAML, external secret stores, residency pins, the SIEM export, air-gapped installs) | None | — | 0 |
-| [#42](https://github.com/CG-Labs/superbot/issues/42) Published plans | `/pricing` and `/api/plans` built ([ADR 0121](adr/0121-published-plans.md)); slice 1 done: the licensed self-host plan on `/pricing`, linked from the public site ([ADR 0348](adr/0348-licensed-self-host-plan-on-pricing.md)) | 2. Published prices checked against Stripe's | Real prices: owner decision ([still open](#still-open)) | 1 |
+| [#42](https://github.com/CG-Labs/superbot/issues/42) Published plans | `/pricing` and `/api/plans` built ([ADR 0121](adr/0121-published-plans.md)); slice 1 done: the licensed self-host plan on `/pricing`, linked from the public site ([ADR 0348](adr/0348-licensed-self-host-plan-on-pricing.md)); slice 2 done: published prices checked against Stripe's at startup and with `botctl plans check-stripe` ([ADR 0350](adr/0350-published-prices-checked-against-stripe.md)) | None in code | Real prices: owner decision ([still open](#still-open)) | 0 |
 | [#43](https://github.com/CG-Labs/superbot/issues/43) Managed substrate | Evaluated; [ADR 0120](adr/0120-managed-substrate.md) proposed | Accept or change ADR 0120 and update this roadmap | Owner decision on ADR 0120 | 1 |
 | [#44](https://github.com/CG-Labs/superbot/issues/44) Site and docs portal | Generator built, checked in CI, never published ([ADR 0119](adr/0119-public-site-and-docs-portal.md)) | 1. Publish the site to the chosen host and domain. 2. A sales contact and prices on the landing page | Owner: hosting, the docs domain's DNS, sales contact, prices | 2 |
 | [#45](https://github.com/CG-Labs/superbot/issues/45) Store production release | Slice 1 done: listing text, draft screenshots, privacy and data-safety answers, and `eas submit` settings, checked in CI ([store listings](store/README.md), [ADR 0349](adr/0349-store-listings-and-privacy-answers.md)) | 2. Submit and fix what review finds | Slice 2, owner: #38, store accounts, legal review of the privacy policy, a public privacy URL (#44) | 1 |
@@ -326,11 +326,11 @@ The minimum left on each open roadmap issue for a credible Enterprise v1, as of 
 | [#55](https://github.com/CG-Labs/superbot/issues/55) Vault integrations | Delivered: HashiCorp Vault, Azure Key Vault, GCP Secret Manager and AWS | None | — | 0 |
 | [#57](https://github.com/CG-Labs/superbot/issues/57) SOC 2 Type II | Tooling done: policies drafted, evidence bundles, register, samples, deficiency log | None in code; the owner work in "Remaining on #57" | Owner: approve policies, name role holders, screening and training, branch protection, a penetration test, the observation period, an auditor (spend) | 0 |
 | [#58](https://github.com/CG-Labs/superbot/issues/58) Data residency | Delivered for v1 in 24 slices ([note](#delivered-52-58-and-60)): pins, in-region models, reports, and each pinned person's data in their region's store | None; accounts by region is an XL change ([ADR 0321](adr/0321-events-about-a-pinned-person-in-their-store.md)), accepted as a [follow-up](#follow-ups-from-52-58-and-60) | Owner: legal review of the [DPA residency annex](security/dpa-template.md#annex-iv-data-residency) | 0 |
-| [#59](https://github.com/CG-Labs/superbot/issues/59) Air-gapped self-host | Twenty slices merged; Compose rollback in review ([PR #389](https://github.com/CG-Labs/superbot/pull/389)) | 1. Merge PR #389. 2. Fix what the first tagged release's check finds | Slice 2, owner: make the ghcr.io packages public, tag the first release | 2 |
+| [#59](https://github.com/CG-Labs/superbot/issues/59) Air-gapped self-host | Twenty-one slices merged; slice 1 done: Compose rollback ([PR #389](https://github.com/CG-Labs/superbot/pull/389), merged 26 Nov 2026) | 2. Fix what the first tagged release's check finds | Slice 2, owner: make the ghcr.io packages public, tag the first release | 1 |
 | [#60](https://github.com/CG-Labs/superbot/issues/60) Support playbooks | Delivered in code in 21 slices ([note](#delivered-52-58-and-60)) | None in code; the rest are [follow-ups](#follow-ups-from-52-58-and-60) | Owner: contacts, TAMs and on-call rota | 0 |
 | Close-out | Done: [delivered notes](#delivered-52-58-and-60) and [follow-ups](#follow-ups-from-52-58-and-60) for #52, #58 and #60 below | None | — | 0 |
 
-**Totals.** 2 engineering-only slices: #42 (1), #59 (1). 8 slices blocked on the owner: #11, #29, #38, #43, #44 (2), #45, #59. And 10 owner actions with no code:
+**Totals.** 1 engineering-only slice: #59 (1). 8 slices blocked on the owner: #11, #29, #38, #43, #44 (2), #45, #59. And 10 owner actions with no code:
 
 1. A CG-Labs Expo account for `eas init` (#11; unblocks #36, #38, #45).
 2. Apple Developer and Play Console accounts, with APNs and FCM keys (#36, #38, #45).
@@ -343,7 +343,7 @@ The minimum left on each open roadmap issue for a credible Enterprise v1, as of 
 9. The SOC 2 programme: people, policies, a penetration test, an auditor (#57).
 10. Support contacts, TAMs and the on-call rota (#60).
 
-Closing #13, #52, #53 and #55 needs nothing more; #36, #57, #58 and #60 close once their owner actions are done.
+Closing #13, #52, #53 and #55 needs nothing more; #36, #42, #57, #58 and #60 close once their owner actions are done.
 
 ### Delivered: #52, #58 and #60
 

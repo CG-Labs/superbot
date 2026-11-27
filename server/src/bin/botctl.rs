@@ -168,6 +168,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl usage me [json]                           Your own model tokens and runs this billing period
   botctl usage user <user> [json]                  A user's tokens and runs this billing period, by Bot
                                                    and model (admins)
+  botctl plans check-stripe [json]                 Check the published prices (/pricing, /api/plans) against
+                                                   the Stripe prices checkout charges (billing.manage, ADR 0350);
+                                                   exits 1 on drift, 2 if Stripe couldn't be read, 0 with
+                                                   billing off
   botctl user isolation <user>                     With ISOLATION=users: the user's own account and folders
   botctl user isolate <user>                       Make that account and its folders now
   botctl user teammates <user>                     Teammates' accounts for the user's shared Bots here, the
@@ -2478,6 +2482,47 @@ fn storage_text(s: &Value) -> Option<String> {
     Some(out)
 }
 
+/// `botctl plans check-stripe` (ADR 0350): each tier's Stripe prices, then what differs
+/// from the published prices, then the verdict.
+fn price_check_summary(v: &Value) -> String {
+    let mut out = String::new();
+    let strs = |x: &Value| x.as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>();
+    for t in v["tiers"].as_array().into_iter().flatten() {
+        out += &format!("{} ({}):\n", t["label"].as_str().unwrap_or_default(), t["name"].as_str().unwrap_or_default());
+        for p in t["prices"].as_array().into_iter().flatten() {
+            let what = match p["error"].as_str() {
+                Some(e) => format!("not read: {e}"),
+                None => format!("{}{}", strs(&p["charges"]).join(", "), if p["active"] == false { ", archived" } else { "" }),
+            };
+            let sold = if p["soldAtCheckout"] == true { " (sold at checkout)" } else { "" };
+            out += &format!("  {}{sold}: {what}\n", p["id"].as_str().unwrap_or_default());
+        }
+        for (tag, key) in [("DRIFT", "problems"), ("UNCHECKED", "unchecked"), ("note", "notes")] {
+            for line in strs(&t[key]) {
+                out += &format!("  {tag}: {line}\n");
+            }
+        }
+    }
+    let verdict = match v["status"].as_str() {
+        Some("ok") => "OK",
+        Some("drift") => "DRIFT",
+        Some("unchecked") => "UNCHECKED",
+        Some("off") => "OFF",
+        _ => "UNKNOWN",
+    };
+    out += &format!("{verdict}: {}", v["detail"].as_str().unwrap_or_default());
+    out
+}
+
+/// 1 on drift, 2 when some prices couldn't be read (or the answer is unknown), else 0.
+fn price_check_exit(v: &Value) -> i32 {
+    match v["status"].as_str() {
+        Some("ok" | "off") => 0,
+        Some("drift") => 1,
+        _ => 2,
+    }
+}
+
 fn usage_summary(v: &Value) -> String {
     let of = |used: &Value, limit: &Value| match limit.as_u64() {
         Some(l) => format!("{}/{l}", used.as_u64().unwrap_or(0)),
@@ -2892,6 +2937,24 @@ fn run(args: &[String]) -> Result<String, String> {
         ["usage", "me", "json"] => op("GET", "/api/me/usage", None),
         ["usage", "user", key] => Ok(period_summary(&serde_json::from_str(&op("GET", &format!("/api/users/{}/usage", encode(key)), None)?).map_err(|e| e.to_string())?)),
         ["usage", "user", key, "json"] => op("GET", &format!("/api/users/{}/usage", encode(key)), None),
+        ["plans", "check-stripe", rest @ ..] => {
+            let json = match rest {
+                [] => false,
+                ["json"] => true,
+                _ => return Err("Usage: botctl plans check-stripe [json]".into()),
+            };
+            let res = api(Cred::Operator, "GET", "/api/tiers/stripe-check", None)?;
+            let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
+            let out = if json { pretty(res) } else { price_check_summary(&v) };
+            // Drift exits 1 and an incomplete check 2, so a deploy step or cron job notices,
+            // with the report still on stdout.
+            let code = price_check_exit(&v);
+            if code != 0 {
+                println!("{}", out.trim_end());
+                std::process::exit(code);
+            }
+            Ok(out)
+        }
         ["license"] | ["license", "status"] => Ok(license_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/license", None)?).map_err(|e| e.to_string())?)),
         ["license", "json"] => op("GET", "/api/license", None),
         ["license", "install", rest @ ..] if rest.len() <= 1 => {
@@ -4871,6 +4934,26 @@ mod tests {
         down["folders"] = json!([{ "folder": "bots", "ok": false, "names": null, "added": [], "removed": [] }]);
         let err = refresh_summary(&down).unwrap_err();
         assert!(err.contains("OPENAI_API_KEY in users (user u1): unavailable") && err.contains("Folder bots: couldn't be listed."), "{err}");
+    }
+
+    #[test]
+    fn price_check_summary_shows_drift_and_exits_by_status() {
+        let v = json!({ "status": "drift", "detail": "1 difference between the published prices and Stripe's.", "tiers": [
+            { "name": "pro", "label": "Pro", "prices": [
+                { "id": "price_pro_monthly", "soldAtCheckout": true, "active": true, "charges": ["£34 / month"], "error": null },
+                { "id": "price_pro_yearly", "soldAtCheckout": false, "active": false, "charges": ["£290 / year"], "error": null },
+                { "id": "price_pro_gone", "soldAtCheckout": false, "active": null, "charges": null, "error": "no such price" } ],
+              "problems": ["the page shows £29 / month, but checkout charges £34 / month (price_pro_monthly)"], "unchecked": [], "notes": ["price_pro_yearly is archived at Stripe"] } ] });
+        assert_eq!(
+            price_check_summary(&v),
+            "Pro (pro):\n  price_pro_monthly (sold at checkout): £34 / month\n  price_pro_yearly: £290 / year, archived\n  price_pro_gone: not read: no such price\n  \
+             DRIFT: the page shows £29 / month, but checkout charges £34 / month (price_pro_monthly)\n  note: price_pro_yearly is archived at Stripe\n\
+             DRIFT: 1 difference between the published prices and Stripe's."
+        );
+        let status = |s: &str| price_check_exit(&json!({ "status": s }));
+        assert_eq!((status("ok"), status("off"), status("drift"), status("unchecked"), status("new")), (0, 0, 1, 2, 2));
+        let off = json!({ "status": "off", "detail": "Billing is off.", "tiers": [] });
+        assert_eq!(price_check_summary(&off), "OFF: Billing is off.");
     }
 
     #[test]

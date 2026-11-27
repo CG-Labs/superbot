@@ -186,7 +186,7 @@ pub fn display_per_seat(p: &ListPrice) -> String {
     format!("{} per seat / {}", amount(p), p.interval)
 }
 
-fn amount(p: &ListPrice) -> String {
+pub(crate) fn amount(p: &ListPrice) -> String {
     let decimals = crate::tiers::currency_decimals(&p.currency).unwrap_or(2);
     let scale = 10u64.pow(decimals);
     let n = match p.amount.is_multiple_of(scale) {

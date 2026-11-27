@@ -171,6 +171,9 @@ mod passwd;
 mod plans;
 #[cfg(test)]
 mod plans_http_tests;
+mod price_check;
+#[cfg(test)]
+mod price_check_http_tests;
 mod signin_watch;
 #[cfg(test)]
 mod signin_watch_http_tests;
@@ -884,6 +887,7 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     let _ = app.plans.set(plans);
+    price_check::start(auth_state.clone(), app.clone());
     if let Some(m) = billing_mail {
         let _ = app.billing_mail.set(Arc::new(m));
     }
@@ -1186,6 +1190,11 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/me/residency/report", get(machines::residency_me::report))
         .route("/tiers", get(list_tiers))
         .route("/tiers/{name}/move-bots", post(move_bots))
+        .route("/tiers/stripe-check", {
+            // Captured, not extracted: what botd passes to Stripe never comes from the request.
+            let (app, auth) = (app.clone(), auth_state.clone());
+            get(move || price_check::handler(app.clone(), auth.clone()))
+        })
         .route("/usage", get(admin_usage))
         .route("/billing", get(billing::info))
         .route("/billing/checkout", post(billing::checkout))
