@@ -17,6 +17,7 @@
 //! installer's `--license-file`.
 
 pub mod check;
+pub mod offer;
 // botd only verifies; the signing half is for superbot-license, and tests.
 #[allow(dead_code)]
 pub mod token;

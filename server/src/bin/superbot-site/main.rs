@@ -3,12 +3,14 @@
 //! the install guide, security policy and changelog), with navigation and search, and
 //! the build fails on any broken internal link. ADR 0119.
 //!
-//! Usage: superbot-site [--out DIR] [--repo DIR] [--tiers FILE] [--contact-url URL] [--repo-url URL]
+//! Usage: superbot-site [--out DIR] [--repo DIR] [--tiers FILE] [--contact-url URL] [--pricing-url URL] [--repo-url URL]
 
 mod check;
 mod landing;
 mod layout;
 mod markdown;
+#[path = "../../license/offer.rs"]
+mod offer;
 mod pages;
 
 use std::collections::HashMap;
@@ -19,7 +21,7 @@ use std::process::ExitCode;
 use layout::{Shell, esc, root_of};
 use pages::Page;
 
-const USAGE: &str = "Usage: superbot-site [--out DIR] [--repo DIR] [--tiers FILE] [--contact-url URL] [--repo-url URL]
+const USAGE: &str = "Usage: superbot-site [--out DIR] [--repo DIR] [--tiers FILE] [--contact-url URL] [--pricing-url URL] [--repo-url URL]
 
 Builds the public site (landing page and docs portal) as static files and checks every
 internal link in it. Exits 1 on any broken link.
@@ -27,7 +29,9 @@ internal link in it. Exits 1 on any broken link.
   --out DIR          where to write the site (default: <repo>/target/site)
   --repo DIR         the repository to read (default: this checkout)
   --tiers FILE       tiers file the managed plans come from (default: <repo>/deploy/tiers.example.json)
-  --contact-url URL  where \"Contact sales\" links (default: $SUPERBOT_SITE_CONTACT_URL, else the repository)
+  --contact-url URL  where \"Contact sales\" and \"Request a license\" link (default: $SUPERBOT_SITE_CONTACT_URL, else the repository)
+  --pricing-url URL  a managed server's /pricing, which \"Pricing\" links to (default: $SUPERBOT_SITE_PRICING_URL,
+                     else the landing page's plans)
   --repo-url URL     the repository on GitHub, for links to files outside the portal
 ";
 
@@ -41,6 +45,7 @@ pub struct Args {
     pub out: PathBuf,
     pub tiers: PathBuf,
     pub contact_url: String,
+    pub pricing_url: Option<String>,
     pub repo_url: String,
 }
 
@@ -52,7 +57,7 @@ impl Args {
             if a == "-h" || a == "--help" {
                 return Err(String::new());
             }
-            let known = ["--out", "--repo", "--tiers", "--contact-url", "--repo-url"];
+            let known = ["--out", "--repo", "--tiers", "--contact-url", "--pricing-url", "--repo-url"];
             if !known.contains(&a.as_str()) {
                 return Err(format!("unknown argument {a}"));
             }
@@ -69,11 +74,16 @@ impl Args {
         if !["https://", "http://", "mailto:"].iter().any(|s| contact_url.starts_with(s)) {
             return Err(format!("--contact-url must be an https:, http: or mailto: URL, not {contact_url}"));
         }
+        let pricing_url = flags.remove("--pricing-url").or_else(|| std::env::var("SUPERBOT_SITE_PRICING_URL").ok()).filter(|v| !v.is_empty());
+        if let Some(u) = pricing_url.as_deref().filter(|u| !["https://", "http://"].iter().any(|s| u.starts_with(s))) {
+            return Err(format!("--pricing-url must be an https: or http: URL, not {u}"));
+        }
         Ok(Args {
             out: flags.remove("--out").map(PathBuf::from).unwrap_or_else(|| repo.join("target/site")),
             tiers: flags.remove("--tiers").map(PathBuf::from).unwrap_or_else(|| repo.join("deploy/tiers.example.json")),
             repo,
             contact_url,
+            pricing_url,
             repo_url,
         })
     }
@@ -194,7 +204,7 @@ fn sweep(out: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn docs_page(pages: &[Page], page: &Page, article: &str, repo_url: &str) -> String {
+fn docs_page(pages: &[Page], page: &Page, article: &str, repo_url: &str, pricing_url: Option<&str>) -> String {
     let main = format!(
         r#"  <div class="wrap docs-layout">
 {sidebar}    <main id="main" class="doc">
@@ -213,10 +223,10 @@ fn docs_page(pages: &[Page], page: &Page, article: &str, repo_url: &str) -> Stri
     );
     let title = format!("{} · SuperBot docs", page.title);
     let description = format!("{}: {} in the SuperBot documentation.", page.title, page.section);
-    layout::page(&Shell { out: &page.out, title: &title, description: &description, repo_url, docs: true }, &main)
+    layout::page(&Shell { out: &page.out, title: &title, description: &description, repo_url, pricing_url, docs: true }, &main)
 }
 
-fn docs_index(pages: &[Page], repo_url: &str) -> String {
+fn docs_index(pages: &[Page], repo_url: &str, pricing_url: Option<&str>) -> String {
     let out = "docs/index.html";
     let mut body = String::new();
     let mut sections: Vec<&str> = Vec::new();
@@ -251,6 +261,7 @@ fn docs_index(pages: &[Page], repo_url: &str) -> String {
         title: "SuperBot docs",
         description: "Guides, single sign-on, operations, the security pack and every design decision for SuperBot.",
         repo_url,
+        pricing_url,
         docs: true,
     };
     layout::page(&shell, &main)
@@ -327,11 +338,11 @@ fn build_into(args: &Args, dir: &Path) -> Result<Summary, Vec<String>> {
             "x": squash(&r.text, SEARCH_TEXT_CHARS),
         }));
         let indented: String = r.html.lines().map(|l| format!("{l}\n")).collect();
-        write(dir, &page.out, docs_page(&pages, page, &indented, &args.repo_url).as_bytes()).map_err(one)?;
+        write(dir, &page.out, docs_page(&pages, page, &indented, &args.repo_url, args.pricing_url.as_deref()).as_bytes()).map_err(one)?;
     }
-    write(dir, "docs/index.html", docs_index(&pages, &args.repo_url).as_bytes()).map_err(one)?;
+    write(dir, "docs/index.html", docs_index(&pages, &args.repo_url, args.pricing_url.as_deref()).as_bytes()).map_err(one)?;
     let server_landing = fs::read_to_string(args.repo.join("site/index.html")).map_err(|e| vec![format!("site/index.html: {e}")])?;
-    write(dir, "index.html", landing::landing(&plans, &server_landing, &args.contact_url, &args.repo_url).map_err(one)?.as_bytes()).map_err(one)?;
+    write(dir, "index.html", landing::landing(&plans, &server_landing, &args.contact_url, args.pricing_url.as_deref(), &args.repo_url).map_err(one)?.as_bytes()).map_err(one)?;
     assets.sort();
     assets.dedup();
     assets.push(("site/assets/site.css".into(), "assets/site.css".into()));
@@ -369,6 +380,7 @@ mod tests {
             out: out.to_path_buf(),
             tiers: repo().join("deploy/tiers.example.json"),
             contact_url: "mailto:sales@example.com".into(),
+            pricing_url: None,
             repo_url: "https://github.com/CG-Labs/superbot".into(),
         }
     }
@@ -392,6 +404,10 @@ mod tests {
         assert!(parse(&["--contact-url", "/get-started"]).is_err());
         assert!(parse(&["--contact-url", "javascript:alert(1)"]).is_err());
         assert_eq!(parse(&["--contact-url", "mailto:sales@example.com"]).unwrap().contact_url, "mailto:sales@example.com");
+        assert_eq!(parse(&["--pricing-url", "https://app.example.com/pricing"]).unwrap().pricing_url.as_deref(), Some("https://app.example.com/pricing"));
+        for bad in ["/pricing", "javascript:alert(1)", "mailto:sales@example.com"] {
+            assert!(parse(&["--pricing-url", bad]).err().unwrap().contains("--pricing-url"), "{bad}");
+        }
     }
 
     /// The real docs build with no broken links, every page is in the search index, and

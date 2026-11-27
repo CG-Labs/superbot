@@ -29,6 +29,8 @@ pub struct Shell<'a> {
     pub title: &'a str,
     pub description: &'a str,
     pub repo_url: &'a str,
+    /// The managed server's `/pricing` (`--pricing-url`). None: the landing page's plans.
+    pub pricing_url: Option<&'a str>,
     /// Whether this is a docs page, which gets the docs styles, search and Docs marked current.
     pub docs: bool,
 }
@@ -71,7 +73,7 @@ pub fn page(s: &Shell, main: &str) -> String {
         <ul class="nav">
           <li class="nav-extra"><a href="{root}index.html#computer">Product</a></li>
           <li class="nav-extra"><a href="{root}index.html#security">Security</a></li>
-          <li class="nav-extra"><a href="{root}index.html#plans">Plans</a></li>
+          <li class="nav-extra"><a href="{pricing}">Pricing</a></li>
           <li><a href="{root}docs/index.html"{current}>Docs</a></li>
           <li><a class="btn btn-primary btn-small" href="{repo}">GitHub</a></li>
         </ul>
@@ -92,7 +94,7 @@ pub fn page(s: &Shell, main: &str) -> String {
             <li><a href="{root}index.html#computer">Your own computer</a></li>
             <li><a href="{root}index.html#features">Features</a></li>
             <li><a href="{root}index.html#self-host">Self-host</a></li>
-            <li><a href="{root}index.html#plans">Plans</a></li>
+            <li><a href="{pricing}">Pricing</a></li>
           </ul>
         </nav>
         <nav aria-labelledby="foot-docs">
@@ -122,7 +124,17 @@ pub fn page(s: &Shell, main: &str) -> String {
         title = esc(s.title),
         description = esc(s.description),
         repo = esc(s.repo_url),
+        pricing = pricing_href(s.pricing_url, &root),
     )
+}
+
+/// Where "Pricing" links: the managed server's `/pricing` when the site is given one,
+/// else the plans on this site's landing page.
+pub fn pricing_href(pricing_url: Option<&str>, root: &str) -> String {
+    match pricing_url {
+        Some(u) => esc(u),
+        None => format!("{root}index.html#plans"),
+    }
 }
 
 /// The docs sidebar: search (shown once its script runs) and every page by section, with
@@ -176,6 +188,16 @@ mod tests {
     fn roots() {
         assert_eq!(root_of("index.html"), "");
         assert_eq!(root_of("docs/sso/entra.html"), "../../");
+    }
+
+    #[test]
+    fn pricing_links_to_the_server_page_or_the_plans() {
+        let shell = |out, pricing_url| Shell { out, title: "t", description: "d", repo_url: "https://github.com/o/r", pricing_url, docs: false };
+        let html = page(&shell("docs/sso/entra.html", None), "");
+        assert_eq!(html.matches(r#"<a href="../../index.html#plans">Pricing</a>"#).count(), 2, "nav and footer: {html}");
+        assert!(!html.contains(">Plans<"));
+        let html = page(&shell("index.html", Some("https://app.example.com/pricing?a=1&b=2")), "");
+        assert_eq!(html.matches(r#"<a href="https://app.example.com/pricing?a=1&amp;b=2">Pricing</a>"#).count(), 2, "{html}");
     }
 
     #[test]
