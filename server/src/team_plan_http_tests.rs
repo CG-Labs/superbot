@@ -97,6 +97,10 @@ async fn with_billing_off_an_admin_records_the_teams_plan() {
     // The same plan again changes nothing; taking it away moves everyone back.
     assert_eq!(set(&w, &team, json!("pro")).await.0, 200);
     assert_eq!(audit(port, &w.admin, "action=team.tier_changed").await.len(), 1);
+    // A request that read the plan before another changed it saves nothing, emails included.
+    let late = billing_mail::covered("team_plan:late", &team, "Alpha", "Pro", &[(w.b_id.clone(), "pro".into())], None);
+    assert_eq!(w.app.db.set_team_tier(&team, None, Some("pro"), &late).ok(), Some(false));
+    assert!(w.app.db.billing_emails_of(&w.b_id, 10).is_empty());
     let (code, v) = set(&w, &team, Value::Null).await;
     assert_eq!((code, &v["plan"]["current"], &v["plan"]["given"]), (200, &Value::Null, &Value::Null), "{v}");
     assert_eq!((tier(&w, &w.a_id), tier(&w, &w.b_id)), ("starter".into(), "starter".into()));

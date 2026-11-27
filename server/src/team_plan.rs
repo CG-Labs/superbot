@@ -106,9 +106,10 @@ fn give(app: &App, by: &Who, t: &Team, tier: Option<&Tier>) -> Res<StatusCode> {
         }
         _ => Vec::new(),
     };
-    match app.db.set_team_tier(&t.id, to.as_deref(), &emails) {
+    match app.db.set_team_tier(&t.id, t.tier.as_deref(), to.as_deref(), &emails) {
         Ok(true) => crate::billing_mail::wake(app),
-        Ok(false) => return Err(not_found("Team")),
+        // Gone, or changed by another request since we read it: that one's emails stand, not these.
+        Ok(false) => return give(app, by, &app.db.team(&t.id).ok_or_else(|| not_found("Team"))?, tier),
         Err(e) => {
             crate::obs::log::log_warn!("botd: couldn't save team {}'s plan: {e}", t.id);
             return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "The team's plan couldn't be saved. Nothing changed; try again.".into()));

@@ -8548,12 +8548,13 @@ impl Db {
 
     /// Sets or clears the plan a server admin gives the team (ADR 0347), with the emails
     /// the change asks for in the same transaction, so none is lost if botd stops between.
-    /// False: no such team.
-    pub fn set_team_tier(&self, id: &str, tier: Option<&str>, emails: &[crate::billing_mail::NewEmail]) -> rusqlite::Result<bool> {
+    /// Only from the plan `from` the caller read, so two requests for one change don't
+    /// both queue emails. False: no such team, or its plan isn't `from` now.
+    pub fn set_team_tier(&self, id: &str, from: Option<&str>, tier: Option<&str>, emails: &[crate::billing_mail::NewEmail]) -> rusqlite::Result<bool> {
         let mut c = self.c();
         let tx = c.transaction()?;
         let now = now();
-        if tx.execute("UPDATE teams SET tier = ?1, updated_at = ?2 WHERE id = ?3", params![tier, now, id])? == 0 {
+        if tx.execute("UPDATE teams SET tier = ?1, updated_at = ?2 WHERE id = ?3 AND tier IS ?4", params![tier, now, id, from])? == 0 {
             return Ok(false);
         }
         for e in emails {

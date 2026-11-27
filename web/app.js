@@ -590,11 +590,16 @@ function teamPlan(b) {
   return ` · team pays for ${b.plan.label}${status}${seats}`;
 }
 
+// Plans asked of Stripe in this console, by team, until Stripe reports them. The picker shows the
+// one asked for, so picking the current plan again undoes it.
+const teamPlanAsked = {};
+
 // The plan everyone on the team is on (ADR 0347). A team that pays in Stripe can only move to a plan Stripe sells.
 function teamPlanPicker(t) {
   const p = t.plan;
   if (!p) return "";
-  const chosen = p.paid ? p.current?.name : p.given;
+  if (!p.paid || teamPlanAsked[t.id] === p.current?.name) delete teamPlanAsked[t.id];
+  const chosen = p.paid ? teamPlanAsked[t.id] || p.current?.name : p.given;
   const none = `<option value="" ${chosen ? "" : "selected"} ${p.paid ? "disabled" : ""}>No team plan</option>`;
   const plans = (teams.plans || []).map((x) => `<option value="${esc(x.name)}" ${x.name === chosen ? "selected" : ""} ${p.paid && !x.priced ? "disabled" : ""}>${esc(x.label)}</option>`).join("");
   return `<label class="push">Plan <select data-act="team-plan" title="The plan everyone on the team is on">${none}${plans}</select></label>`;
@@ -696,7 +701,9 @@ $("teams-list").addEventListener("change", async (e) => {
       const to = (teams.plans || []).find((x) => x.name === e.target.value);
       if (!confirm(teamPlanNote(t, to))) return loadTeams();
       const r = await api("PUT", `/api/teams/${key(t.id)}/plan`, { tier: to ? to.name : null });
-      if (r.plan?.paid && r.plan.current?.name !== to?.name) notice(`Stripe is moving ${t.name}'s subscription to ${to.label}. Everyone moves when Stripe confirms it.`, false);
+      if (r.plan?.paid && r.plan.current?.name !== to?.name) teamPlanAsked[t.id] = to.name;
+      else delete teamPlanAsked[t.id];
+      if (teamPlanAsked[t.id]) notice(`Stripe is moving ${t.name}'s subscription to ${to.label}. Everyone moves when Stripe confirms it.`, false);
     }
     if (act === "team-role") await api("PUT", `/api/teams/${key(t.id)}/members/${key(userId)}`, { role: e.target.value });
     if (act === "team-custom-role") {

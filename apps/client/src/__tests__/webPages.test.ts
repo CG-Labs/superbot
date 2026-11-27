@@ -318,6 +318,11 @@ describe("the console's team plans (ADR 0347)", () => {
     await pick("starter");
     expect(posts("/api/teams/team_1/plan").map((c) => c.body)).toEqual([{ tier: "starter" }]);
     expect($("error").textContent).toBe("Stripe is moving Alpha's subscription to Starter. Everyone moves when Stripe confirms it.");
+    // Until Stripe reports it, the picker shows Starter, so picking Pro again undoes it.
+    expect(picker().value).toBe("starter");
+    await pick("pro");
+    expect(posts("/api/teams/team_1/plan").map((c) => c.body)).toEqual([{ tier: "starter" }, { tier: "pro" }]);
+    expect(picker().value).toBe("pro");
     reply = () => ({ status: 409, body: { error: "The Self-host plan has no Stripe price." } });
     await pick("starter");
     expect($("error").textContent).toBe("The Self-host plan has no Stripe price.");
