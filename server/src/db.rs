@@ -2507,7 +2507,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 75] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 76] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -2583,7 +2583,17 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 75] = [
     migrate_scim_token_idp,
     migrate_two_approvers,
     migrate_audit_export_held,
+    migrate_team_plans,
 ];
+
+/// The plan a server admin gives a team (ADR 0347), under any its own subscription pays for.
+fn migrate_team_plans(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('teams') WHERE name = 'tier'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE teams ADD COLUMN tier TEXT;")
+}
 
 /// The events an archive was sent only the sealed rows of (ADR 0330), with the region whose
 /// chat store kept their details: botd's own record, which the archive's check holds those
@@ -8518,6 +8528,42 @@ impl Db {
             .flatten()
     }
 
+    /// The team plan `user_id` is on (ADR 0347): their team and the tier its paying
+    /// subscription is for (ADR 0093), else the one a server admin gave it. One query, as
+    /// every run asks.
+    pub fn team_tier_of(&self, user_id: &str) -> Option<(String, String)> {
+        self.c()
+            .query_row(
+                "SELECT m.team_id, COALESCE((SELECT s.tier FROM team_subscriptions s WHERE s.team_id = m.team_id AND s.tier IS NOT NULL
+                   ORDER BY s.started DESC, s.subscription_id DESC LIMIT 1), t.tier)
+                 FROM team_members m JOIN teams t ON t.id = m.team_id WHERE m.user_id = ?",
+                [user_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|(team, tier)| Some((team, tier?)))
+    }
+
+    /// Sets or clears the plan a server admin gives the team (ADR 0347), with the emails
+    /// the change asks for in the same transaction, so none is lost if botd stops between.
+    /// Only from the plan `from` the caller read, so two requests for one change don't
+    /// both queue emails. False: no such team, or its plan isn't `from` now.
+    pub fn set_team_tier(&self, id: &str, from: Option<&str>, tier: Option<&str>, emails: &[crate::billing_mail::NewEmail]) -> rusqlite::Result<bool> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let now = now();
+        if tx.execute("UPDATE teams SET tier = ?1, updated_at = ?2 WHERE id = ?3 AND tier IS ?4", params![tier, now, id, from])? == 0 {
+            return Ok(false);
+        }
+        for e in emails {
+            queue_email(&tx, e, now)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Every team's paying subscription, for syncing seats.
     pub fn teams_paying(&self) -> Vec<TeamSubscription> {
         let c = self.c();
@@ -11755,6 +11801,10 @@ pub struct Team {
     /// Where its members' machines and their backups live (ADR 0117). None: the
     /// server's default.
     pub region: Option<String>,
+    /// The plan a server admin gave the team (ADR 0347): every member's while no Stripe
+    /// subscription pays for one. None: none given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub updated_at: i64,
@@ -11854,6 +11904,7 @@ fn team_row(r: &Row) -> rusqlite::Result<Team> {
         name: r.get("name")?,
         machines: r.get("machines")?,
         region: r.get("region")?,
+        tier: r.get("tier")?,
         created_at: r.get("created_at")?,
         created_by: r.get("created_by")?,
         updated_at: r.get("updated_at")?,

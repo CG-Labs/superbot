@@ -16,6 +16,7 @@ import {
   teamApproveBlocked,
   TEAM_LINK_EVERY_MS,
   teamLinkWanted,
+  teamPays,
   teamPlanLine,
   teamRegionLine,
   teamSubscriptionLine,
@@ -84,6 +85,14 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
     expect(canLeave({ role: "owner", members: [member("me", "owner")], billing: { plan: null } })).toBe(true);
     expect(canLeave({ role: "member", members: [member("me", "member"), member("a", "owner")], billing: paying })).toBe(true);
     expect(leaveBlocked({ role: "owner", members: [member("me", "owner"), member("a", "member")] })).toMatch(/only owner/);
+  });
+
+  it("lets the last person leave a team on a plan a server admin gave it, which nobody pays for (ADR 0347)", () => {
+    const given: TeamBilling = { plan: { name: "pro", label: "Pro", source: "admin" } };
+    expect(canLeave({ role: "owner", members: [member("me", "owner")], billing: given })).toBe(true);
+    expect(teamPays(given)).toBe(false);
+    expect(teamPays({ plan: { name: "pro", label: "Pro", source: "stripe" } })).toBe(true);
+    expect(teamPlanLine(given)).toBe("A server admin put everyone on the team on the Pro plan.");
   });
 
   it("says who pays for the team's plan and how its seats stand", () => {

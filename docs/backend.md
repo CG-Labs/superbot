@@ -375,7 +375,7 @@ While billing is on and botd has an SMTP server ([ADR 0061](adr/0061-approval-no
 - **Usage** (on by default, off from the Plan screen or `PUT /api/me/emails`): tokens at 80% and 100% of `monthlyTokens`, storage at ADR 0082's warning and full. Once per billing period and tier.
 - **Once**: each email has a key (the Stripe event, the subscription's end date, the period, or the resize request). A Stripe event's emails are queued in the transaction that records the event, so redeliveries send nothing, and held until the webhook has asked for any resize (a minute at most).
 - **Content**: the plan's label, dates, counts, and a link to `{PUBLIC_URL}/app/plan`. Never Stripe ids, prices, portal links, provider details or secrets.
-- **Sending**: one message each, the try counted before it's sent, retried after 1, 4, 16 and 64 minutes, then given up. If an outcome can't be saved, sending stops until the next pass. Audited as `billing.email_sent`, `billing.email_skipped` (`no_user`, `no_address`, `opted_out`, `inactive`) and `billing.email_failed`.
+- **Sending**: one message each, the try counted before it's sent, retried after 1, 4, 16 and 64 minutes, then given up. If an outcome can't be saved, sending stops until the next pass. Audited as `billing.email_sent`, `billing.email_skipped` (`no_user`, `no_address`, `opted_out`, `inactive`, `not_needed`) and `billing.email_failed`.
 
 ### Team billing
 
@@ -389,6 +389,8 @@ With checkout on ([ADR 0042](adr/0042-billing-checkout-portal-customers.md)), a 
 - **Meter**: with `STRIPE_METER_EVENT`, a member's tokens go to the team's customer while it pays, fixed when the run is recorded.
 - **See it**: `GET /api/team` adds `billing` (the plan for everyone; status, seats, plans and `portal` for managers); `GET /api/billing` adds `teamPlan`; `GET /api/teams` shows each team's for server admins. The Team screen, the Plan screen and the console's Teams tab use these.
 - **Emails**: ADR 0091's plan and payment emails for a team plan go to its owners and admins, linking to `/app/team`.
+- **Server admins** ([ADR 0347](adr/0347-server-admins-change-a-teams-plan.md)): `PUT /api/teams/{id}/plan {tier}` (or `null`), the console's Plan picker on each team. Without a paid team plan, it's recorded on the team and is every member's, with no Stripe call, billing on or off (`team.tier_changed`, source `admin`). A team paying in Stripe has its subscription moved to the tier's first price with prorations (202, `team.plan_change_requested`) and the webhook applies it; taking the plan away, a tier with no price, or billing off here is a 409. `GET /api/teams` shows each team's `plan` and the `plans` to pick.
+- **Personal plans covered**: when a team moves to a plan, from Stripe or an admin, each member still paying for a plan of their own is emailed once (`personal_plan_covered`) that they may cancel it; skipped (`not_needed`) if they've cancelled or left by then.
 
 ### One Unix account per user
 
