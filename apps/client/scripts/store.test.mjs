@@ -19,9 +19,18 @@ test("the committed listings, submit profile and screenshots pass", () => {
 
 test("only the owner's values are left as placeholders, and store:ready refuses them", () => {
   const { placeholders: left, errors } = checkAll({ ready: true });
-  assert.ok(left.length > 0);
   assert.equal(errors.length, left.length);
   for (const l of left) assert.match(l, /(copyright|Url|contactEmail|contactWebsite|appleTeamId|ascAppId):/, l);
+});
+
+test("placeholders are found in every kind of owner field", () => {
+  const e = eas();
+  e.submit.production.ios.appleTeamId = "OWNER_TODO_APPLE_TEAM_ID";
+  const g = googlePlay();
+  g.contactEmail = "owner-todo@owner-todo.invalid";
+  assert.deepEqual(placeholders(e.submit.production.ios.appleTeamId, "team"), ["team: OWNER_TODO_APPLE_TEAM_ID"]);
+  assert.deepEqual(placeholders(g.contactEmail, "email"), ["email: owner-todo@owner-todo.invalid"]);
+  assert.deepEqual(placeholders({ ...e.submit.production.ios, appleTeamId: "AB12CD34EF", ascAppId: "1234567890" }), []);
 });
 
 test("text over a store's limit fails", () => {
@@ -75,6 +84,10 @@ test("the submit profile keeps credentials out of the repo", () => {
   const errors = checkEas(e);
   assert.ok(errors.some((x) => x.includes("serviceAccountKeyPath")));
   assert.ok(errors.some((x) => x.includes("ascApiKeyPath")));
+
+  const stored = eas();
+  delete stored.submit.production.android.serviceAccountKeyPath;
+  assert.deepEqual(checkEas(stored), []);
 });
 
 test("the submit profile checks real ids' shape once the owner fills them in", () => {

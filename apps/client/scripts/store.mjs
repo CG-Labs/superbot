@@ -120,8 +120,8 @@ export function checkEas(eas, easDir = path.join(repo, "apps/client")) {
     if (ios[k] && !String(ios[k]).startsWith("$")) errors.push(`eas.json submit.production.ios.${k}: give it as an environment variable, never in the repo`);
   }
   const android = p.android ?? {};
-  // The key is a credential: it comes from the environment (or EAS's own store), never a file in the repo.
-  if (typeof android.serviceAccountKeyPath !== "string" || !android.serviceAccountKeyPath.startsWith("$")) {
+  // The key is a credential: it comes from the environment, or is left out when EAS stores it, never a file in the repo.
+  if (android.serviceAccountKeyPath !== undefined && (typeof android.serviceAccountKeyPath !== "string" || !android.serviceAccountKeyPath.startsWith("$"))) {
     errors.push("eas.json submit.production.android.serviceAccountKeyPath: must be an environment variable, like $GOOGLE_SERVICE_ACCOUNT_KEY_PATH");
   }
   if (!PLAY_TRACKS.includes(android.track)) errors.push(`eas.json submit.production.android.track: one of ${PLAY_TRACKS.join(", ")}`);
