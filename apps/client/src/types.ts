@@ -192,7 +192,7 @@ export interface BillingView {
   /** Billing emails (ADR 0091). Missing from older servers. */
   emails?: BillingEmails;
   /** Your team pays for your plan (ADR 0093): then it's the team's, changed on the Team screen. */
-  teamPlan?: { id: string; name: string | null; tier: string | null; periodEnd: number | null } | null;
+  teamPlan?: { id: string; name: string | null; tier: string | null; periodEnd: number | null; source?: "stripe" | "admin" } | null;
 }
 
 /** `/api/me/emails`: whether this server sends billing emails, and whether you get the usage ones. */
@@ -1457,8 +1457,8 @@ export interface TeamRoleChoice {
 
 /** A team's plan, paid for by the team for everyone on it (ADR 0093). Never a Stripe id. */
 export interface TeamBilling {
-  /** The plan the team pays for; null while it pays for none. */
-  plan: { name: string; label: string } | null;
+  /** The team's plan; null while it has none. `admin`: a server admin gave it and nobody pays for it (ADR 0347). */
+  plan: { name: string; label: string; source?: "stripe" | "admin" } | null;
   /** Owners and admins only, from here down. */
   subscription?: { status: string; tier: string | null; periodEnd: number | null; cancelAt: number | null } | null;
   /** Seats Stripe bills, against the people on the team; null while nothing pays. */

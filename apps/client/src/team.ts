@@ -87,13 +87,18 @@ export function ownerCount(team: Pick<Team, "members">): number {
   return team.members.filter((m) => m.role === "owner").length;
 }
 
+/** Whether the team pays for its plan in Stripe, rather than having one a server admin gave it (ADR 0347). */
+export function teamPays(b: TeamBilling | undefined): boolean {
+  return !!b?.plan && b.plan.source !== "admin";
+}
+
 /**
  * Why you can't leave, or null when you may: the last owner can't while others are on
  * the team, and the last person can't while the team pays for a plan (ADR 0093).
  */
 export function leaveBlocked(team: Pick<Team, "members" | "role" | "billing">): string | null {
   if (team.role === "owner" && team.members.length > 1 && ownerCount(team) === 1) return "You're the team's only owner. Make someone else an owner before you leave.";
-  if (team.members.length === 1 && team.billing?.plan) return "The team pays for a plan. Cancel it under Manage billing before you leave; the team goes when you do.";
+  if (team.members.length === 1 && teamPays(team.billing)) return "The team pays for a plan. Cancel it under Manage billing before you leave; the team goes when you do.";
   return null;
 }
 
@@ -112,6 +117,7 @@ export function teamRegionLine(team: Pick<Team, "region">): string | null {
 export function teamPlanLine(b: TeamBilling | undefined): string | null {
   if (!b) return null;
   if (!b.plan) return "The team doesn't pay for a plan: everyone is on their own.";
+  if (b.plan.source === "admin") return `A server admin put everyone on the team on the ${b.plan.label} plan.`;
   return `The team pays for the ${b.plan.label} plan for everyone on it.`;
 }
 
