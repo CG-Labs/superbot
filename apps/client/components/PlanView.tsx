@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AppState, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
-import { BILLING_OFF, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
+import { BILLING_OFF, checkoutChoices, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
 import { errorText, friendlyError } from "../src/errors";
 import { overLimits, planUsageLines, storageWarning, usageLines } from "../src/plan";
 import { themedStyles, type } from "../src/theme";
@@ -251,17 +251,23 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
             {p.current ? (
               <Text style={styles.tag}>Your plan</Text>
             ) : subscribed || !canChange ? null : (
-              <Pressable
-                style={[styles.primaryBtn, busy && styles.busy]}
-                disabled={!!busy}
-                onPress={() => void go(p.name, () => api.checkout(p.name))}
-                accessibilityRole="link"
-                accessibilityLabel={`Upgrade to ${p.label}`}
-                aria-busy={busy === p.name}
-                accessibilityHint="Opens Stripe Checkout to pay"
-              >
-                <Text style={styles.primaryText}>{busy === p.name ? "Opening…" : `Upgrade to ${p.label}`}</Text>
-              </Pressable>
+              checkoutChoices(p.intervals).map(({ interval, suffix }) => {
+                const key = interval ? `${p.name}:${interval}` : p.name;
+                return (
+                  <Pressable
+                    key={key}
+                    style={[styles.primaryBtn, busy && styles.busy]}
+                    disabled={!!busy}
+                    onPress={() => void go(key, () => (interval ? api.checkout(p.name, interval) : api.checkout(p.name)))}
+                    accessibilityRole="link"
+                    accessibilityLabel={`Upgrade to ${p.label}${suffix}`}
+                    aria-busy={busy === key}
+                    accessibilityHint="Opens Stripe Checkout to pay"
+                  >
+                    <Text style={styles.primaryText}>{busy === key ? "Opening…" : `Upgrade to ${p.label}${suffix}`}</Text>
+                  </Pressable>
+                );
+              })
             )}
           </View>
         ))}

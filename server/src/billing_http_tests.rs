@@ -43,6 +43,11 @@ pub(crate) async fn world_with(payments: Option<Billing>) -> World {
 
 /// `world_with`, with `tweak` applied to the server's settings.
 pub(crate) async fn world_with_auth(payments: Option<Billing>, tweak: impl FnOnce(&mut Auth)) -> World {
+    world_on(payments, EXAMPLE, tweak).await
+}
+
+/// `world_with_auth` on another tiers file than the example's.
+pub(crate) async fn world_on(payments: Option<Billing>, tiers: &str, tweak: impl FnOnce(&mut Auth)) -> World {
     let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
     let meter = payments.as_ref().and_then(Billing::meter);
     let seats = payments.as_ref().and_then(Billing::seats);
@@ -54,7 +59,7 @@ pub(crate) async fn world_with_auth(payments: Option<Billing>, tweak: impl FnOnc
         tweak(a);
     })
     .await;
-    app.tiers.set(Arc::new(Tiers::parse(EXAMPLE, None).unwrap())).unwrap();
+    app.tiers.set(Arc::new(Tiers::parse(tiers, None).unwrap())).unwrap();
     if let Some(m) = meter {
         let _ = app.meter.set(m);
     }

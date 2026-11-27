@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 const TIERS: &str = r#"{ "default": "pro", "tiers": [
   { "name": "pro", "label": "Pro", "routes": "any", "stripePrices": ["price_pro_monthly", "price_pro_yearly"],
+    "checkoutPrices": { "month": "price_pro_monthly", "year": "price_pro_yearly" },
     "publishedPrices": [{ "amount": 2900, "currency": "gbp", "interval": "month" }, { "amount": 29000, "currency": "gbp", "interval": "year" }] },
   { "name": "max", "label": "Max", "routes": "any", "stripePrices": ["price_max_monthly"] }
 ] }"#;
@@ -94,7 +95,7 @@ async fn matching_prices_pass_and_drift_is_reported() {
         v["tiers"][0]["problems"],
         json!([
             "the page shows £29 / month, but checkout charges £34 / month (price_pro_monthly)",
-            "the page shows £290 / year, but no active Stripe price of the tier charges it: price_pro_yearly £290 / year (archived)"
+            "checkout sells price_pro_yearly, which is archived at Stripe, so that checkout fails"
         ])
     );
     let body = v.to_string();

@@ -72,6 +72,18 @@ describe("PlanView (ADR 0042)", () => {
     expect(open).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/pro");
   });
 
+  it("offers a plan sold monthly and yearly at each interval (ADR 0346)", async () => {
+    const api = fakeApi(billing({ plans: [{ ...starter, current: true }, { ...pro, current: false, intervals: ["month", "year"] }] }));
+    const open = jest.fn(async () => {});
+    const user = userEvent.setup();
+    await render(<PlanView api={api} onBack={jest.fn()} open={open} />);
+    expect(await screen.findByRole("link", { name: "Upgrade to Pro, paid monthly" })).toBeOnTheScreen();
+    expect(screen.queryByRole("link", { name: "Upgrade to Pro" })).toBeNull();
+    await user.press(screen.getByRole("link", { name: "Upgrade to Pro, paid yearly" }));
+    expect(api.checkout).toHaveBeenCalledWith("pro", "year");
+    expect(open).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/pro");
+  });
+
   it("warns when storage is nearly full, and says how to free it when full (ADR 0082)", async () => {
     const storage = { used: 950_000, limit: 1_000_000, percent: 95, state: "warning" as const, warnAt: 90, partial: false, measuredAt: 1 };
     const plan = { ...starter, limits: { maxStorageMb: 1 }, usage: { period: "2026-11", runs: 0, bots: 0, storage } };

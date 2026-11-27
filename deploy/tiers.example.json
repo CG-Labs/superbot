@@ -25,7 +25,8 @@
         { "harness": "claude", "model": "claude-sonnet-4-5", "effort": "high" }
       ],
       "limits": { "maxBots": 10, "monthlyRuns": 3000, "monthlyTokens": 20000000, "dailyRoutineRuns": 200, "machineType": "g6-standard-2", "concurrentRuns": 8, "maxStorageMb": 25000 },
-      "stripePrices": ["price_replace_with_pro_monthly", "price_replace_with_pro_yearly"]
+      "stripePrices": ["price_replace_with_pro_monthly", "price_replace_with_pro_yearly"],
+      "checkoutPrices": { "month": "price_replace_with_pro_monthly", "year": "price_replace_with_pro_yearly" }
     },
     {
       "name": "max",

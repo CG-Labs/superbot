@@ -4,6 +4,9 @@
 !.env.example
 *.pem
 *.key
+# App Store Connect API keys and Google Play service account keys (docs/store/README.md).
+*.p8
+*service-account*.json
 secrets/
 # The backup age identity deploy/docker/init.sh makes (docs/adr/0114-backups-encrypted-by-default.md).
 backup-identity.txt

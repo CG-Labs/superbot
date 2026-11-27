@@ -104,6 +104,16 @@ describe("TeamView", () => {
     expect(openPage).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/pro");
   });
 
+  it("offers team-only and yearly plans at the intervals the team can buy them (ADR 0346)", async () => {
+    const business = { name: "business", label: "Business", managed: true, limits: { maxBots: 50 }, intervals: ["year" as const] };
+    const { api, user } = await open({ ...teamAs("owner"), billing: { plan: null, subscription: null, seats: null, portal: false, plans: [...plans, business], canChange: true } });
+    const plan = within(screen.getByTestId("team-plan"));
+    expect(plan.getByRole("link", { name: "Buy Pro for the team" })).toBeOnTheScreen();
+    expect(plan.queryByRole("link", { name: "Buy Business for the team, paid monthly" })).toBeNull();
+    await user.press(plan.getByRole("link", { name: "Buy Business for the team, paid yearly" }));
+    expect(api.teamCheckout).toHaveBeenCalledWith("business", "year");
+  });
+
   it("shows managers the team's plan and seats, and sends them to Stripe's portal", async () => {
     const { api, user, openPage } = await open({ ...teamAs("admin"), billing: paying }, { meId: "al" });
     const plan = within(screen.getByTestId("team-plan"));

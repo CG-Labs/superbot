@@ -284,6 +284,8 @@ mod tiers_http_tests;
 mod billing_http_tests;
 #[cfg(test)]
 mod billing_mail_http_tests;
+#[cfg(test)]
+mod checkout_prices_http_tests;
 mod usage;
 #[cfg(test)]
 mod usage_http_tests;
