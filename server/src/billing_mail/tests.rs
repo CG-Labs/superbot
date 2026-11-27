@@ -152,11 +152,13 @@ fn every_email_is_plain_text_with_a_link_and_no_provider_details() {
         why: None,
         message: Some("Storage is 1.2 MB used of the Small plan's 1 MB.".into()),
         team: None,
+        team_id: Some("team_never_shown".into()),
     };
     for k in KINDS {
         let r = render(k, &f, Some(LINK), None);
         assert_plain(&r);
         assert!(r.body.contains(LINK), "{k:?}: {}", r.body);
+        assert!(!r.body.contains("team_never_shown") && !r.subject.contains("team_never_shown"), "{k:?}: {}", r.body);
         assert!(r.body.contains("Pro") || r.subject.contains("Pro") || !matches!(k, Kind::PlanStarted | Kind::PlanChanged), "{r:?}");
         // Usage emails say how to stop them; the rest can't be stopped.
         assert_eq!(r.body.contains("turn off usage emails"), !k.essential(), "{k:?}: {}", r.body);
@@ -253,7 +255,7 @@ fn members_still_paying_for_their_own_plan_are_told_once_per_team_plan_change() 
         ("u_bea", "stripe:evt_1:personal_plan_covered:u_bea"),
         ("u_ada", "stripe:evt_1:personal_plan_covered:u_ada")
     ]);
-    assert_eq!(e[0].facts, Facts { plan: Some("Pro".into()), from_plan: Some("Starter".into()), team: Some("Alpha".into()), ..Default::default() });
+    assert_eq!(e[0].facts, Facts { plan: Some("Pro".into()), from_plan: Some("Starter".into()), team: Some("Alpha".into()), team_id: Some("t_alpha".into()), ..Default::default() });
     assert_eq!(e[0].event_id.as_deref(), Some("evt_1"));
     // A plan change tells them again; a team plan ending, or nothing applied, doesn't.
     let moved = changed(Some("starter"), Some("pro"));
@@ -263,7 +265,7 @@ fn members_still_paying_for_their_own_plan_are_told_once_per_team_plan_change() 
         assert!(e.iter().all(|e| e.kind != Kind::PersonalPlanCovered), "{applied:?}: {e:?}");
     }
     // An admin's change is keyed by its own id.
-    let e = covered("team_plan:t_alpha:c1", "Alpha", "Max", &payers[..1], None);
+    let e = covered("team_plan:t_alpha:c1", "t_alpha", "Alpha", "Max", &payers[..1], None);
     assert_eq!((e[0].key.as_str(), e[0].event_id.as_deref(), e[0].facts.plan.as_deref()), ("team_plan:t_alpha:c1:personal_plan_covered:u_bea", None, Some("Max")));
 }
 

@@ -121,6 +121,8 @@ async fn members_still_paying_for_their_own_plan_are_told_once_per_change() {
     let (code, v) = set(&w, &team, json!("pro")).await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(stripe.seen().len(), before, "no Stripe call");
+    // Queued with the plan, before anything is sent.
+    assert!(w.app.db.billing_emails_of(&w.b_id, 10).iter().any(|q| q.kind == "personal_plan_covered" && q.facts.team_id.as_deref() == Some(team.as_str())));
     assert_eq!(tier(&w, &w.b_id), "pro", "the team's plan is over her own");
     billing_mail::send_due(&w.app).await;
     assert_eq!(covered(&mailer, "bea@example.com"), ["[SuperBot] Alpha's plan covers you: you may cancel your own Starter plan"]);
@@ -151,6 +153,26 @@ async fn members_still_paying_for_their_own_plan_are_told_once_per_change() {
     assert_eq!(covered(&mailer, "bea@example.com").len(), 2);
     let skipped = audit(w.port, &w.admin, "action=billing.email_skipped").await;
     assert!(skipped.iter().any(|e| e["details"]["reason"] == "not_needed"), "{skipped:?}");
+}
+
+#[tokio::test]
+async fn an_email_about_a_team_they_left_isnt_sent() {
+    let (w, _stripe) = shop().await;
+    let alpha = alpha(&w).await;
+    bea_pays(&w).await;
+    let mailer = billing_mail::fake::install(&w.app, Some(PUBLIC));
+    billing_mail::send_due(&w.app).await;
+
+    // Alpha's plan is queued to tell Bea, but she moves to Beta, on a plan too, first.
+    assert_eq!(set(&w, &alpha, json!("pro")).await.0, 200);
+    assert_eq!(json_call(w.port, "DELETE", &format!("/api/teams/{alpha}/members/{}", w.b_id), &w.admin, "").await.0, 200);
+    let (code, v) = json_call(w.port, "POST", "/api/teams", &w.admin, &json!({ "name": "Beta", "owner": w.b_id }).to_string()).await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(set(&w, v["id"].as_str().unwrap(), json!("starter")).await.0, 200);
+    billing_mail::send_due(&w.app).await;
+    assert_eq!(covered(&mailer, "bea@example.com"), ["[SuperBot] Beta's plan covers you: you may cancel your own Starter plan"]);
+    let skipped = audit(w.port, &w.admin, "action=billing.email_skipped").await;
+    assert_eq!(skipped.iter().filter(|e| e["details"]["reason"] == "not_needed").count(), 1, "{skipped:?}");
 }
 
 #[tokio::test]
@@ -194,8 +216,14 @@ async fn a_team_that_pays_has_its_subscription_moved_in_stripe() {
         (Some("si_test_alpha"), Some("price_starter_monthly"), Some("2"), Some("create_prorations"))
     );
     assert!(p.key.starts_with("superbot-team-plan-"), "{}", p.key);
+    // Asked again (before Stripe's event, or after a round trip to another plan): it
+    // reaches Stripe again under a key of its own, not the first one's answer.
+    assert_eq!(set(&w, &team, json!("starter")).await.0, 202);
+    let keys: Vec<String> = stripe.seen().into_iter().filter(|s| s.path == "/v1/subscriptions/sub_test_alpha").map(|s| s.key).collect();
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0], keys[1]);
     let asked = audit(w.port, &w.admin, "action=team.plan_change_requested&outcome=success").await;
-    assert_eq!((asked.len(), asked[0]["details"]["to"].as_str(), asked[0]["details"]["price"].as_str()), (1, Some("starter"), Some("price_starter_monthly")), "{asked:?}");
+    assert_eq!((asked.len(), asked[0]["details"]["to"].as_str(), asked[0]["details"]["price"].as_str()), (2, Some("starter"), Some("price_starter_monthly")), "{asked:?}");
     assert_eq!(tier(&w, &w.b_id), "pro", "nothing changes until Stripe says so");
 
     // Stripe's event applies it, and Bea is told once more, once.

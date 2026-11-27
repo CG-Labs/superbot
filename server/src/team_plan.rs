@@ -78,36 +78,48 @@ pub async fn put(State(app): State<AppState>, Extension(by): Extension<Who>, Pat
     let tier = wanted(&app, body)?;
     let code = match app.db.team_paying(&t.id) {
         Some(sub) => move_subscription(&app, &by, &t, &sub, tier).await?,
-        None => give(&app, &by, &t, tier),
+        None => give(&app, &by, &t, tier)?,
     };
     let t = app.db.team(&t.id).ok_or_else(|| not_found("Team"))?;
     Ok((code, Json(crate::teams::admin_view(&app, &t))))
 }
 
-/// No subscription pays: the plan is recorded on the team, with no Stripe call. Each
-/// member it moves is audited and their computer follows (ADR 0085), as when the team
-/// pays; members paying for a plan of their own are told they may cancel it.
-fn give(app: &App, by: &Who, t: &Team, tier: Option<&Tier>) -> StatusCode {
+/// No subscription pays: the plan is recorded on the team, with no Stripe call, and in
+/// the same transaction the emails telling members paying for a plan of their own that
+/// they may cancel it. Each member it moves is audited and their computer follows (ADR
+/// 0085), as when the team pays. The same plan again changes nothing, but asks again
+/// for any resize a change left unasked (botd stopped between, say).
+fn give(app: &App, by: &Who, t: &Team, tier: Option<&Tier>) -> Res<StatusCode> {
     let to = tier.map(|x| x.name.clone());
+    let why = |change: &str| json!({ "via": ADMIN, "change": change });
     if t.tier == to {
-        return StatusCode::OK;
+        let now = crate::team_billing::tiers_now(app, &t.id);
+        crate::team_billing::follow(app, &t.id, &now, &why(""), None, false);
+        return Ok(StatusCode::OK);
     }
     let before = crate::team_billing::tiers_now(app, &t.id);
-    app.db.set_team_tier(&t.id, to.as_deref());
     let change = crate::random_hex(8);
-    let tiers = app.tiers();
-    let effective = |x: &Option<String>| tiers.of(x.as_deref()).name.clone();
-    let mut emailed = 0;
-    if let Some(tier) = tier {
-        let payers = crate::billing_mail::personal_payers(app, &t.id);
-        for e in crate::billing_mail::covered(&format!("team_plan:{}:{change}", t.id), &t.name, &tier.label, &payers, None) {
-            emailed += usize::from(crate::billing_mail::queue(app, e));
+    let emails = match tier {
+        Some(tier) if app.billing_mail.get().is_some() => {
+            let payers = crate::billing_mail::personal_payers(app, &t.id);
+            crate::billing_mail::covered(&format!("team_plan:{}:{change}", t.id), &t.id, &t.name, &tier.label, &payers, None)
+        }
+        _ => Vec::new(),
+    };
+    match app.db.set_team_tier(&t.id, to.as_deref(), &emails) {
+        Ok(true) => crate::billing_mail::wake(app),
+        Ok(false) => return Err(not_found("Team")),
+        Err(e) => {
+            crate::obs::log::log_warn!("botd: couldn't save team {}'s plan: {e}", t.id);
+            return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "The team's plan couldn't be saved. Nothing changed; try again.".into()));
         }
     }
-    let d = json!({ "from": t.tier, "to": to, "effectiveFrom": effective(&t.tier), "effectiveTo": effective(&to), "source": ADMIN, "change": change, "emailed": emailed });
+    let tiers = app.tiers();
+    let effective = |x: &Option<String>| tiers.of(x.as_deref()).name.clone();
+    let d = json!({ "from": t.tier, "to": to, "effectiveFrom": effective(&t.tier), "effectiveTo": effective(&to), "source": ADMIN, "change": change, "emailed": emails.len() });
     app.db.record(&crate::teams::team_event(by, "team.tier_changed", &t.id, d));
-    crate::team_billing::follow(app, &t.id, &before, &json!({ "via": ADMIN, "change": change }), None, true);
-    StatusCode::OK
+    crate::team_billing::follow(app, &t.id, &before, &why(&change), None, true);
+    Ok(StatusCode::OK)
 }
 
 /// A Stripe subscription id or item id, safe to put in a path.
@@ -156,7 +168,11 @@ async fn move_subscription(app: &App, by: &Who, t: &Team, sub: &crate::db::TeamS
         ("items[0][quantity]".into(), seats_now.to_string()),
         ("proration_behavior".into(), "create_prorations".into()),
     ];
-    let key = stripe::idempotency_key("team-plan", &crate::billing::Payer::Team(&t.id).key(), &form, crate::db::now());
+    // Its own key per request, kept across the client's retries of it: the same change
+    // asked for again after the webhook (Pro, Starter, Pro) must reach Stripe again.
+    let mut keyed = form.clone();
+    keyed.push(("request".into(), crate::random_hex(8)));
+    let key = stripe::idempotency_key("team-plan", &crate::billing::Payer::Team(&t.id).key(), &keyed, crate::db::now());
     match seats.stripe().post(&format!("/v1/subscriptions/{}", sub.subscription_id), &form, &key).await {
         Ok(_) => {
             app.db.record(&event(Outcome::Success, json!({ "price": price, "seats": seats_now })));

@@ -144,6 +144,10 @@ pub struct Facts {
     /// The team whose plan it is (ADR 0093), by name: told to its owners and admins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    /// That team's id, never shown: a member told its plan covers them must still be on
+    /// it when the email goes (ADR 0347).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
 }
 
 /// An email to queue.
@@ -489,9 +493,10 @@ pub struct TeamSubEvent<'a> {
 }
 
 /// Tells each member who still pays for a plan of their own (`payers`: their id and that
-/// plan's label) that their team moved onto `plan`, which covers them, so they may cancel
-/// theirs (ADR 0347). `key` names the change, so each is told once per change. Pure.
-pub fn covered(key: &str, team: &str, plan: &str, payers: &[(String, String)], event_id: Option<&str>) -> Vec<NewEmail> {
+/// plan's label) that their team (`team_id`, named `team`) moved onto `plan`, which covers
+/// them, so they may cancel theirs (ADR 0347). `key` names the change, so each is told
+/// once per change. Pure.
+pub fn covered(key: &str, team_id: &str, team: &str, plan: &str, payers: &[(String, String)], event_id: Option<&str>) -> Vec<NewEmail> {
     let kind = Kind::PersonalPlanCovered;
     payers
         .iter()
@@ -499,7 +504,7 @@ pub fn covered(key: &str, team: &str, plan: &str, payers: &[(String, String)], e
             key: format!("{key}:{}:{user}", kind.as_str()),
             user_id: user.clone(),
             kind,
-            facts: Facts { plan: Some(plan.to_string()), from_plan: Some(own.clone()), team: Some(team.to_string()), ..Default::default() },
+            facts: Facts { plan: Some(plan.to_string()), from_plan: Some(own.clone()), team: Some(team.to_string()), team_id: Some(team_id.to_string()), ..Default::default() },
             event_id: event_id.map(String::from),
         })
         .collect()
@@ -545,7 +550,7 @@ pub fn for_team_subscription(ev: &TeamSubEvent, c: &crate::db::TeamChange, tiers
     // The team moved onto a paid plan: whoever still pays for their own may cancel it.
     if let Applied::Changed { to: Some(to), .. } = c.applied {
         let plan = tiers.of(Some(to)).label.clone();
-        out.extend(covered(&format!("stripe:{}", ev.event_id), ev.team, &plan, ev.payers, Some(ev.event_id)));
+        out.extend(covered(&format!("stripe:{}", ev.event_id), &ev.row.team_id, ev.team, &plan, ev.payers, Some(ev.event_id)));
     }
     out
 }
@@ -769,8 +774,8 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
     if !kind.essential() && !u.active() {
         return skip("inactive", d);
     }
-    // Cancelled since, or off the team: there's nothing left to tell them.
-    if kind == Kind::PersonalPlanCovered && (app.db.user_paying(&u.id).is_none() || app.db.team_tier_of(&u.id).is_none()) {
+    // Cancelled since, or off the team that covers them: there's nothing left to tell them.
+    if kind == Kind::PersonalPlanCovered && (app.db.user_paying(&u.id).is_none() || app.db.team_tier_of(&u.id).map(|(t, _)| t) != q.facts.team_id) {
         return skip("not_needed", d);
     }
     // Tries are counted when claimed, so one whose outcome was never saved (botd stopped
