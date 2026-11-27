@@ -12,7 +12,7 @@ use crate::audit::{Outcome, Who};
 use crate::db::Team;
 use crate::runner::App;
 use crate::stripe;
-use crate::tiers::Tier;
+use crate::tiers::{Buyer, Interval, Tier, Tiers};
 use crate::{ApiError, AppState, Res, bad, not_found};
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -46,9 +46,9 @@ pub fn admin_view(app: &App, t: &Team) -> Value {
 }
 
 /// The plans an admin can pick for a team. `priced`: a team that pays in Stripe can move
-/// to it, as it has a Stripe price.
+/// to it, as it has a Stripe price teams buy it at.
 pub fn choices(app: &App) -> Value {
-    json!(app.tiers().all().iter().map(|t| json!({ "name": t.name, "label": t.label, "priced": !t.stripe_prices.is_empty() })).collect::<Vec<_>>())
+    json!(app.tiers().all().iter().map(|t| json!({ "name": t.name, "label": t.label, "priced": !t.checkout_intervals(Buyer::Team).is_empty() })).collect::<Vec<_>>())
 }
 
 fn conflict(msg: impl Into<String>) -> ApiError {
@@ -56,7 +56,7 @@ fn conflict(msg: impl Into<String>) -> ApiError {
 }
 
 /// The tier asked for: Some(None) takes the plan away.
-fn wanted<'a>(app: &'a App, body: Result<Json<Value>, JsonRejection>) -> Res<Option<&'a Tier>> {
+fn wanted(app: &App, body: Result<Json<Value>, JsonRejection>) -> Res<Option<&Tier>> {
     const SAY: &str = "Send {\"tier\": \"<plan>\"}, or {\"tier\": null} to take the team's plan away.";
     let Ok(Json(v)) = body else { return Err(bad(SAY)) };
     let Some(o) = v.as_object().filter(|o| o.len() == 1) else { return Err(bad(SAY)) };
@@ -123,12 +123,24 @@ fn give(app: &App, by: &Who, t: &Team, tier: Option<&Tier>) -> Res<StatusCode> {
     Ok(StatusCode::OK)
 }
 
+/// The price a paying team moves to on `tier`: what a team checks it out at (ADR 0346),
+/// at the interval the team's `current` price bills at when the tier is sold to teams at
+/// it, else at the tier's first interval for teams. None: no team can buy it.
+fn team_price(tiers: &Tiers, tier: &Tier, current: Option<&str>) -> Option<String> {
+    let yearly = current.is_some_and(|p| {
+        tiers.by_stripe_price(p).is_some_and(|t| [Buyer::Team, Buyer::Person].into_iter().any(|b| t.checkout_price(b, Interval::Year) == Some(p)))
+    });
+    let interval = if yearly { Interval::Year } else { Interval::Month };
+    let first = tier.checkout_intervals(Buyer::Team).first().copied();
+    tier.checkout_price(Buyer::Team, interval).or_else(|| first.and_then(|i| tier.checkout_price(Buyer::Team, i))).map(str::to_string)
+}
+
 /// A Stripe subscription id or item id, safe to put in a path.
 fn id_ok(id: &str, prefix: &str) -> bool {
     id.len() > prefix.len() && id.len() <= 255 && id.starts_with(prefix) && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A subscription pays: it's moved to the tier's price in Stripe, with prorations, and
+/// A subscription pays: it's moved to the tier's team price in Stripe, with prorations, and
 /// the webhook applies the plan once Stripe says it's done (202). Refused when billing is
 /// off here, when the plan would go (only the team's managers cancel what they pay for),
 /// and for a plan Stripe can't charge for.
@@ -153,7 +165,7 @@ async fn move_subscription(app: &App, by: &Who, t: &Team, sub: &crate::db::TeamS
         return refuse("team_pays", "The team pays for its plan in Stripe. To end it, its owners or admins cancel it under Manage billing on the Team screen.".into());
     };
     // Sent even for the plan Stripe last said, which undoes a change still on its way.
-    let Some(price) = tier.stripe_prices.first() else {
+    let Some(price) = team_price(app.tiers(), tier, sub.price_id.as_deref()) else {
         return refuse("no_price", format!("The {} plan has no Stripe price, so a team that pays can't move to it. Its owners or admins cancel the team's plan first.", tier.label));
     };
     let item = sub.item_id.as_deref().filter(|i| id_ok(i, "si_"));
@@ -195,5 +207,30 @@ mod tests {
         for bad in ["", "sub_", "si_test", "sub_../x", "sub_a/b", "sub_a?b=1", "cus_test"] {
             assert!(!id_ok(bad, "sub_"), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_paying_team_moves_to_the_team_price_at_its_interval() {
+        let tiers = Tiers::parse(
+            r#"{"tiers":[
+              { "name": "starter", "routes": "any", "stripePrices": ["price_s_m", "price_s_y"], "checkoutPrices": { "month": "price_s_m", "year": "price_s_y" } },
+              { "name": "pro", "routes": "any", "stripePrices": ["price_p_m", "price_p_tm", "price_p_ty"],
+                "checkoutPrices": { "month": "price_p_m", "teamMonth": "price_p_tm", "teamYear": "price_p_ty" } },
+              { "name": "biz", "routes": "any", "stripePrices": ["price_b_ty"], "checkoutPrices": { "teamYear": "price_b_ty" } },
+              { "name": "old", "routes": "any", "stripePrices": ["price_o"] },
+              { "name": "free", "routes": "any" }
+            ]}"#,
+            None,
+        )
+        .unwrap();
+        let to = |name: &str, current: Option<&str>| team_price(&tiers, tiers.get(name).unwrap(), current);
+        assert_eq!(to("pro", Some("price_s_m")).as_deref(), Some("price_p_tm"));
+        assert_eq!(to("pro", Some("price_s_y")).as_deref(), Some("price_p_ty"));
+        assert_eq!(to("starter", Some("price_p_ty")).as_deref(), Some("price_s_y"));
+        // Not sold to teams at that interval: the tier's first one for teams.
+        assert_eq!(to("biz", Some("price_p_tm")).as_deref(), Some("price_b_ty"));
+        assert_eq!(to("pro", None).as_deref(), Some("price_p_tm"));
+        assert_eq!(to("old", Some("price_s_y")).as_deref(), Some("price_o"));
+        assert_eq!(to("free", Some("price_s_m")), None);
     }
 }
