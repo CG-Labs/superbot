@@ -21,7 +21,7 @@ use crate::{AppState, Auth};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// The limiter key for on-demand checks: shared by every caller, so the route can't be
@@ -51,28 +51,51 @@ pub struct StripePrice {
 impl StripePrice {
     /// From a Stripe Price object, read with `expand[]=currency_options`.
     pub fn parse(v: &Value) -> Result<StripePrice, String> {
-        let id = v["id"].as_str().filter(|s| !s.is_empty()).ok_or("Stripe's answer has no price id")?.to_string();
-        let currency = v["currency"].as_str().map(str::to_ascii_lowercase).ok_or_else(|| format!("{id}: Stripe's answer has no currency"))?;
+        let id = v["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("Stripe's answer has no price id")?
+            .to_string();
+        let currency = v["currency"]
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| format!("{id}: Stripe's answer has no currency"))?;
         let fixed = |o: &Value| match o["billing_scheme"].as_str() {
             Some("tiered") => None,
             _ => o["unit_amount"].as_u64(),
         };
         let mut amounts = vec![(currency.clone(), fixed(v))];
         if let Some(opts) = v["currency_options"].as_object() {
-            let mut more: Vec<(String, Option<u64>)> = opts.iter().map(|(c, o)| (c.to_ascii_lowercase(), o["unit_amount"].as_u64())).filter(|(c, _)| *c != currency).collect();
+            let mut more: Vec<(String, Option<u64>)> = opts
+                .iter()
+                .map(|(c, o)| (c.to_ascii_lowercase(), o["unit_amount"].as_u64()))
+                .filter(|(c, _)| *c != currency)
+                .collect();
             more.sort();
             amounts.extend(more);
         }
         let r = &v["recurring"];
-        let cadence = match (v["type"].as_str(), r["interval"].as_str(), r["interval_count"].as_u64().unwrap_or(1), r["usage_type"].as_str()) {
-            (Some("recurring"), Some(i), _, Some("metered")) => Cadence::Other(format!("metered per {i}")),
+        let cadence = match (
+            v["type"].as_str(),
+            r["interval"].as_str(),
+            r["interval_count"].as_u64().unwrap_or(1),
+            r["usage_type"].as_str(),
+        ) {
+            (Some("recurring"), Some(i), _, Some("metered")) => {
+                Cadence::Other(format!("metered per {i}"))
+            }
             (Some("recurring"), Some(i @ ("month" | "year")), 1, _) => Cadence::Every(i.into()),
             (Some("recurring"), Some(i), 1, _) => Cadence::Other(format!("every {i}")),
             (Some("recurring"), Some(i), n, _) => Cadence::Other(format!("every {n} {i}s")),
             (Some("one_time"), _, _, _) => Cadence::Other("one-time".into()),
             (t, _, _, _) => Cadence::Other(t.unwrap_or("unknown").replace('_', " ")),
         };
-        Ok(StripePrice { id, active: v["active"].as_bool().unwrap_or(false), cadence, amounts })
+        Ok(StripePrice {
+            id,
+            active: v["active"].as_bool().unwrap_or(false),
+            cadence,
+            amounts,
+        })
     }
 
     fn interval(&self) -> Option<&str> {
@@ -85,9 +108,17 @@ impl StripePrice {
     /// `£29 / month`, `$35 every 3 months`, or `no fixed amount, one-time`.
     fn charges(&self, currency: &str, amount: Option<u64>) -> String {
         match (amount, &self.cadence) {
-            (Some(a), Cadence::Every(i)) => crate::plans::display(&ListPrice { amount: a, currency: currency.into(), interval: i.clone() }),
+            (Some(a), Cadence::Every(i)) => crate::plans::display(&ListPrice {
+                amount: a,
+                currency: currency.into(),
+                interval: i.clone(),
+            }),
             (Some(a), Cadence::Other(o)) => format!("{} {o}", money(currency, a)),
-            (None, c) => format!("no fixed amount in {}, {}", currency.to_ascii_uppercase(), cadence_words(c)),
+            (None, c) => format!(
+                "no fixed amount in {}, {}",
+                currency.to_ascii_uppercase(),
+                cadence_words(c)
+            ),
         }
     }
 
@@ -97,7 +128,11 @@ impl StripePrice {
 }
 
 fn money(currency: &str, amount: u64) -> String {
-    crate::plans::amount(&ListPrice { amount, currency: currency.into(), interval: String::new() })
+    crate::plans::amount(&ListPrice {
+        amount,
+        currency: currency.into(),
+        interval: String::new(),
+    })
 }
 
 fn cadence_words(c: &Cadence) -> String {
@@ -131,21 +166,39 @@ struct Sold<'a> {
 
 impl Sold<'_> {
     fn who(&self) -> &'static str {
-        if self.team { "team checkout" } else { "checkout" }
+        if self.team {
+            "team checkout"
+        } else {
+            "checkout"
+        }
     }
 }
 
 /// Every price the tier's checkouts sell, once per interval.
 fn sold(t: &Tier) -> Vec<Sold<'_>> {
-    let page = if t.team_only() { Buyer::Team } else { Buyer::Person };
+    let page = if t.team_only() {
+        Buyer::Team
+    } else {
+        Buyer::Person
+    };
     let mut out: Vec<Sold> = Vec::new();
     for buyer in [Buyer::Person, Buyer::Team] {
         for i in [Interval::Month, Interval::Year] {
-            let Some(id) = t.checkout_price(buyer, i) else { continue };
+            let Some(id) = t.checkout_price(buyer, i) else {
+                continue;
+            };
             let interval = t.checkout_prices.is_some().then_some(i);
-            match out.iter_mut().find(|s| s.id == id && s.interval == interval) {
+            match out
+                .iter_mut()
+                .find(|s| s.id == id && s.interval == interval)
+            {
                 Some(s) => s.held |= buyer == page,
-                None => out.push(Sold { id, interval, held: buyer == page, team: buyer == Buyer::Team }),
+                None => out.push(Sold {
+                    id,
+                    interval,
+                    held: buyer == page,
+                    team: buyer == Buyer::Team,
+                }),
             }
         }
     }
@@ -167,7 +220,11 @@ pub struct TierReport {
 
 /// Compares one tier's published prices with what Stripe said of its `stripePrices`.
 pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> TierReport {
-    let mut r = TierReport { name: t.name.clone(), label: t.label.clone(), ..Default::default() };
+    let mut r = TierReport {
+        name: t.name.clone(),
+        label: t.label.clone(),
+        ..Default::default()
+    };
     let sold = sold(t);
     let is_sold = |id: &str| sold.iter().any(|s| s.id == id);
     let mut got: Vec<&StripePrice> = Vec::new();
@@ -176,7 +233,12 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
         match res {
             Ok(p) => {
                 line["active"] = json!(p.active);
-                line["charges"] = json!(p.amounts.iter().map(|(c, a)| p.charges(c, *a)).collect::<Vec<_>>());
+                line["charges"] = json!(
+                    p.amounts
+                        .iter()
+                        .map(|(c, a)| p.charges(c, *a))
+                        .collect::<Vec<_>>()
+                );
                 got.push(p);
             }
             Err(Unread::Missing) => {
@@ -185,20 +247,27 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
             }
             Err(Unread::Failed(e)) => {
                 line["error"] = json!(e);
-                r.unchecked.push(format!("couldn't read {id} from Stripe ({e})"));
+                r.unchecked
+                    .push(format!("couldn't read {id} from Stripe ({e})"));
             }
         }
         r.prices.push(line);
     }
     let published = &t.published_prices;
-    let shown = |currency: &str, interval: &str| published.iter().find(|p| p.currency == currency && p.interval == interval);
+    let shown = |currency: &str, interval: &str| {
+        published
+            .iter()
+            .find(|p| p.currency == currency && p.interval == interval)
+    };
     // (currency, interval) pairs a sold price already has a problem for, so the
     // published-price pass doesn't say the same thing twice.
     let mut flagged: Vec<(String, String)> = Vec::new();
     // Intervals the page's buyer can check out at, as Stripe bills them.
     let mut sold_at: Vec<String> = Vec::new();
     for s in &sold {
-        let Some(p) = got.iter().find(|p| p.id == s.id) else { continue };
+        let Some(p) = got.iter().find(|p| p.id == s.id) else {
+            continue;
+        };
         let (who, (currency, amount)) = (s.who(), p.own());
         // A sold price with a problem of its own: the page's prices at the interval it is
         // sold at (every interval, when that's unknown) aren't reported again.
@@ -206,24 +275,37 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
             if !s.held {
                 return;
             }
-            for l in published.iter().filter(|l| at.is_none_or(|i| l.interval == i)) {
+            for l in published
+                .iter()
+                .filter(|l| at.is_none_or(|i| l.interval == i))
+            {
                 sold_at.push(l.interval.clone());
                 flagged.push((l.currency.clone(), l.interval.clone()));
             }
         };
         let want = s.interval.map(Interval::as_str);
         let Some(interval) = p.interval() else {
-            r.problems.push(format!("{who} sells {}, which charges {}, not per month or year", p.id, p.charges(currency, *amount)));
+            r.problems.push(format!(
+                "{who} sells {}, which charges {}, not per month or year",
+                p.id,
+                p.charges(currency, *amount)
+            ));
             claim(want);
             continue;
         };
         if let Some(want) = want.filter(|w| *w != interval) {
-            r.problems.push(format!("checkoutPrices sells {} per {want}, but Stripe bills it per {interval}", p.id));
+            r.problems.push(format!(
+                "checkoutPrices sells {} per {want}, but Stripe bills it per {interval}",
+                p.id
+            ));
             claim(Some(want));
             continue;
         }
         if !p.active {
-            r.problems.push(format!("{who} sells {}, which is archived at Stripe, so that checkout fails", p.id));
+            r.problems.push(format!(
+                "{who} sells {}, which is archived at Stripe, so that checkout fails",
+                p.id
+            ));
             claim(Some(interval));
             continue;
         }
@@ -236,7 +318,11 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
             sold_at.push(interval.into());
         }
         if published.is_empty() {
-            r.notes.push(format!("no publishedPrices, so the page says \"Contact us\"; {who} charges {} ({})", p.charges(currency, *amount), p.id));
+            r.notes.push(format!(
+                "no publishedPrices, so the page says \"Contact us\"; {who} charges {} ({})",
+                p.charges(currency, *amount),
+                p.id
+            ));
             continue;
         }
         for (i, (c, a)) in p.amounts.iter().enumerate() {
@@ -274,23 +360,53 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
                 continue;
             }
         }
-        let at: Vec<(&StripePrice, Option<u64>)> =
-            got.iter().filter(|p| p.interval() == Some(l.interval.as_str())).filter_map(|p| p.amounts.iter().find(|(c, _)| *c == l.currency).map(|(_, a)| (*p, *a))).collect();
-        if at.iter().any(|(p, a)| p.active && *a == Some(l.amount)) || flagged.contains(&(l.currency.clone(), l.interval.clone())) {
+        let at: Vec<(&StripePrice, Option<u64>)> = got
+            .iter()
+            .filter(|p| p.interval() == Some(l.interval.as_str()))
+            .filter_map(|p| {
+                p.amounts
+                    .iter()
+                    .find(|(c, _)| *c == l.currency)
+                    .map(|(_, a)| (*p, *a))
+            })
+            .collect();
+        if at.iter().any(|(p, a)| p.active && *a == Some(l.amount))
+            || flagged.contains(&(l.currency.clone(), l.interval.clone()))
+        {
             continue;
         }
         let page = crate::plans::display(l);
         match at.is_empty() {
-            true => r.problems.push(format!("the page shows {page}, but none of the tier's Stripe prices charges {} per {}", l.currency.to_ascii_uppercase(), l.interval)),
+            true => r.problems.push(format!(
+                "the page shows {page}, but none of the tier's Stripe prices charges {} per {}",
+                l.currency.to_ascii_uppercase(),
+                l.interval
+            )),
             false => {
-                let found: Vec<String> = at.iter().map(|(p, a)| format!("{} {}{}", p.id, p.charges(&l.currency, *a), if p.active { "" } else { " (archived)" })).collect();
-                r.problems.push(format!("the page shows {page}, but no active Stripe price of the tier charges it: {}", found.join(", ")));
+                let found: Vec<String> = at
+                    .iter()
+                    .map(|(p, a)| {
+                        format!(
+                            "{} {}{}",
+                            p.id,
+                            p.charges(&l.currency, *a),
+                            if p.active { "" } else { " (archived)" }
+                        )
+                    })
+                    .collect();
+                r.problems.push(format!(
+                    "the page shows {page}, but no active Stripe price of the tier charges it: {}",
+                    found.join(", ")
+                ));
             }
         }
     }
     for p in got.iter().filter(|p| !is_sold(&p.id)) {
         let (currency, amount) = p.own();
-        let differs = p.interval().and_then(|i| shown(currency, i)).is_some_and(|l| Some(l.amount) != *amount);
+        let differs = p
+            .interval()
+            .and_then(|i| shown(currency, i))
+            .is_some_and(|l| Some(l.amount) != *amount);
         match (p.active, differs) {
             (false, _) => r.notes.push(format!("{} is archived at Stripe; checkout doesn't sell it, and subscribers already on it keep the plan", p.id)),
             (true, true) => r.notes.push(format!("{} charges {}, not the published price; checkout doesn't sell it, so only subscribers already on it pay that", p.id, p.charges(currency, *amount))),
@@ -298,7 +414,8 @@ pub fn compare(t: &Tier, read: &[(String, Result<StripePrice, Unread>)]) -> Tier
         }
     }
     if t.stripe_prices.is_empty() && !published.is_empty() {
-        r.notes.push("no stripePrices: not sold through Stripe, so there is nothing to check".into());
+        r.notes
+            .push("no stripePrices: not sold through Stripe, so there is nothing to check".into());
     }
     r
 }
@@ -333,7 +450,11 @@ pub struct Report {
 
 impl Report {
     pub fn off(detail: &str) -> Report {
-        Report { status: Status::Off, detail: detail.into(), tiers: Vec::new() }
+        Report {
+            status: Status::Off,
+            detail: detail.into(),
+            tiers: Vec::new(),
+        }
     }
 
     fn of(tiers: Vec<TierReport>) -> Report {
@@ -343,13 +464,38 @@ impl Report {
         let (status, detail) = if checked == 0 {
             (Status::Ok, "No tier lists stripePrices: nothing is sold through Stripe, so there is nothing to check.".to_string())
         } else if problems > 0 {
-            (Status::Drift, format!("{problems} {} between the published prices and Stripe's.", if problems == 1 { "difference" } else { "differences" }))
+            (
+                Status::Drift,
+                format!(
+                    "{problems} {} between the published prices and Stripe's.",
+                    if problems == 1 {
+                        "difference"
+                    } else {
+                        "differences"
+                    }
+                ),
+            )
         } else if unread > 0 {
-            (Status::Unchecked, format!("{unread} of {checked} Stripe prices couldn't be read, so the check is incomplete. Try again in a minute."))
+            (
+                Status::Unchecked,
+                format!(
+                    "{unread} of {checked} Stripe prices couldn't be read, so the check is incomplete. Try again in a minute."
+                ),
+            )
         } else {
-            (Status::Ok, format!("Every published price matches Stripe's ({checked} Stripe {} read).", if checked == 1 { "price" } else { "prices" }))
+            (
+                Status::Ok,
+                format!(
+                    "Every published price matches Stripe's ({checked} Stripe {} read).",
+                    if checked == 1 { "price" } else { "prices" }
+                ),
+            )
         };
-        Report { status, detail, tiers }
+        Report {
+            status,
+            detail,
+            tiers,
+        }
     }
 
     pub fn json(&self) -> Value {
@@ -376,7 +522,10 @@ impl Report {
             }
         }
         match self.status {
-            Status::Ok | Status::Off => (Some(format!("{} (ADR 0350)", self.detail.trim_end_matches('.'))), warnings),
+            Status::Ok | Status::Off => (
+                Some(format!("{} (ADR 0350)", self.detail.trim_end_matches('.'))),
+                warnings,
+            ),
             Status::Drift | Status::Unchecked => {
                 warnings.push(format!("published prices: {} Fix the tiers file or the Stripe prices, then run botctl plans check-stripe (ADR 0350).", self.detail));
                 (None, warnings)
@@ -387,7 +536,10 @@ impl Report {
 
 /// Reads one price, with its other currencies.
 async fn read(s: &Stripe, id: &str) -> Result<StripePrice, Unread> {
-    match s.get(&format!("/v1/prices/{id}?expand%5B%5D=currency_options")).await {
+    match s
+        .get(&format!("/v1/prices/{id}?expand%5B%5D=currency_options"))
+        .await
+    {
         Ok(v) => StripePrice::parse(&v).map_err(Unread::Failed),
         Err(stripe::Error::Refused { status: 404, .. }) => Err(Unread::Missing),
         Err(e) => Err(Unread::Failed(e.to_string())),
@@ -396,16 +548,31 @@ async fn read(s: &Stripe, id: &str) -> Result<StripePrice, Unread> {
 
 /// Reads every tier's Stripe prices at once and compares them with its published ones.
 pub async fn check(s: &Stripe, tiers: &Tiers) -> Report {
-    let ids: Vec<&str> = tiers.all().iter().flat_map(|t| t.stripe_prices.iter().map(String::as_str)).collect();
+    let ids: Vec<&str> = tiers
+        .all()
+        .iter()
+        .flat_map(|t| t.stripe_prices.iter().map(String::as_str))
+        .collect();
     let answers = futures_util::future::join_all(ids.iter().map(|id| read(s, id))).await;
-    let mut by_id: std::collections::HashMap<&str, Result<StripePrice, Unread>> = ids.into_iter().zip(answers).collect();
+    let mut by_id: std::collections::HashMap<&str, Result<StripePrice, Unread>> =
+        ids.into_iter().zip(answers).collect();
     let reports = tiers
         .all()
         .iter()
         .filter(|t| t.published())
         .map(|t| {
-            let read: Vec<(String, Result<StripePrice, Unread>)> =
-                t.stripe_prices.iter().map(|id| (id.clone(), by_id.remove(id.as_str()).unwrap_or(Err(Unread::Failed("not read".into()))))).collect();
+            let read: Vec<(String, Result<StripePrice, Unread>)> = t
+                .stripe_prices
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        by_id
+                            .remove(id.as_str())
+                            .unwrap_or(Err(Unread::Failed("not read".into()))),
+                    )
+                })
+                .collect();
             compare(t, &read)
         })
         .collect();
@@ -415,8 +582,12 @@ pub async fn check(s: &Stripe, tiers: &Tiers) -> Report {
 /// Why there is nothing to check, given billing's state.
 fn off_detail(a: &Auth) -> &'static str {
     match a.payments.enabled() {
-        false => "Billing is off (BILLING and STRIPE_WEBHOOK_SECRET aren't both set), so botd has no Stripe key and checks nothing.",
-        true => "Billing is on without STRIPE_SECRET_KEY, so botd can't read Stripe's prices and checks nothing.",
+        false => {
+            "Billing is off (BILLING and STRIPE_WEBHOOK_SECRET aren't both set), so botd has no Stripe key and checks nothing."
+        }
+        true => {
+            "Billing is on without STRIPE_SECRET_KEY, so botd can't read Stripe's prices and checks nothing."
+        }
     }
 }
 
@@ -431,7 +602,9 @@ pub async fn run(a: &Auth, tiers: &Tiers) -> Report {
 /// At startup, with checkout on and something sold through Stripe: checks in the
 /// background and logs what it finds. botd starts either way.
 pub fn start(a: Arc<Auth>, app: AppState) {
-    if a.payments.checkout().is_none() || app.tiers().all().iter().all(|t| t.stripe_prices.is_empty()) {
+    if a.payments.checkout().is_none()
+        || app.tiers().all().iter().all(|t| t.stripe_prices.is_empty())
+    {
         return;
     }
     tokio::spawn(async move {
@@ -452,7 +625,10 @@ pub async fn handler(State(app): State<AppState>, Extension(a): Extension<Arc<Au
     if let Some(co) = a.payments.checkout()
         && !crate::billing::may_start(co, LIMIT_KEY)
     {
-        return crate::billing::reply(StatusCode::TOO_MANY_REQUESTS, json!({ "error": "Too many price checks at once. Try again in a minute." }));
+        return crate::billing::reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "error": "Too many price checks at once. Try again in a minute." }),
+        );
     }
     crate::billing::reply(StatusCode::OK, run(&a, app.tiers()).await.json())
 }
@@ -486,45 +662,104 @@ mod tests {
     fn pro(read: Vec<Result<StripePrice, Unread>>) -> TierReport {
         let t = tiers();
         let tier = t.get("pro").unwrap();
-        compare(tier, &tier.stripe_prices.iter().cloned().zip(read).collect::<Vec<_>>())
+        compare(
+            tier,
+            &tier
+                .stripe_prices
+                .iter()
+                .cloned()
+                .zip(read)
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn good() -> Vec<Result<StripePrice, Unread>> {
-        vec![ok(price("price_pro_monthly", 2900, "gbp", "month")), ok(price("price_pro_yearly", 29000, "gbp", "year")), ok(price("price_pro_old", 1900, "gbp", "month"))]
+        vec![
+            ok(price("price_pro_monthly", 2900, "gbp", "month")),
+            ok(price("price_pro_yearly", 29000, "gbp", "year")),
+            ok(price("price_pro_old", 1900, "gbp", "month")),
+        ]
     }
 
     #[test]
     fn stripe_prices_are_read_as_checkout_charges_them() {
         let p = StripePrice::parse(&price("price_1", 2900, "GBP", "month")).unwrap();
-        assert_eq!((p.active, p.cadence.clone(), p.amounts.clone()), (true, Cadence::Every("month".into()), vec![("gbp".into(), Some(2900))]));
+        assert_eq!(
+            (p.active, p.cadence.clone(), p.amounts.clone()),
+            (
+                true,
+                Cadence::Every("month".into()),
+                vec![("gbp".into(), Some(2900))]
+            )
+        );
         let mut v = price("price_1", 900, "usd", "month");
         v["recurring"]["interval_count"] = json!(3);
-        assert_eq!(StripePrice::parse(&v).unwrap().cadence, Cadence::Other("every 3 months".into()));
+        assert_eq!(
+            StripePrice::parse(&v).unwrap().cadence,
+            Cadence::Other("every 3 months".into())
+        );
         v["recurring"]["interval_count"] = json!(1);
         v["recurring"]["interval"] = json!("week");
-        assert_eq!(StripePrice::parse(&v).unwrap().cadence, Cadence::Other("every week".into()));
+        assert_eq!(
+            StripePrice::parse(&v).unwrap().cadence,
+            Cadence::Other("every week".into())
+        );
         v["recurring"]["usage_type"] = json!("metered");
-        assert_eq!(StripePrice::parse(&v).unwrap().cadence, Cadence::Other("metered per week".into()));
+        assert_eq!(
+            StripePrice::parse(&v).unwrap().cadence,
+            Cadence::Other("metered per week".into())
+        );
         let one = json!({ "id": "price_2", "active": false, "currency": "eur", "unit_amount": 500, "type": "one_time", "recurring": null });
         let p = StripePrice::parse(&one).unwrap();
-        assert_eq!((p.active, p.cadence), (false, Cadence::Other("one-time".into())));
+        assert_eq!(
+            (p.active, p.cadence),
+            (false, Cadence::Other("one-time".into()))
+        );
         let mut tiered = price("price_3", 0, "gbp", "month");
         tiered["billing_scheme"] = json!("tiered");
         tiered["unit_amount"] = Value::Null;
-        assert_eq!(StripePrice::parse(&tiered).unwrap().amounts, vec![("gbp".into(), None)]);
+        assert_eq!(
+            StripePrice::parse(&tiered).unwrap().amounts,
+            vec![("gbp".into(), None)]
+        );
         let mut multi = price("price_4", 2900, "gbp", "month");
         multi["currency_options"] = json!({ "usd": { "unit_amount": 3500 }, "gbp": { "unit_amount": 2900 }, "eur": { "unit_amount": 3300 } });
-        assert_eq!(StripePrice::parse(&multi).unwrap().amounts, vec![("gbp".into(), Some(2900)), ("eur".into(), Some(3300)), ("usd".into(), Some(3500))]);
+        assert_eq!(
+            StripePrice::parse(&multi).unwrap().amounts,
+            vec![
+                ("gbp".into(), Some(2900)),
+                ("eur".into(), Some(3300)),
+                ("usd".into(), Some(3500))
+            ]
+        );
         assert!(StripePrice::parse(&json!({ "object": "price" })).is_err());
     }
 
     #[test]
     fn matching_prices_are_no_problem() {
         let r = pro(good());
-        assert!(r.problems.is_empty() && r.unchecked.is_empty(), "{:?}", r.problems);
-        assert_eq!(r.notes, ["price_pro_old charges £19 / month, not the published price; checkout doesn't sell it, so only subscribers already on it pay that"]);
-        assert_eq!(r.prices[0], json!({ "id": "price_pro_monthly", "soldAtCheckout": true, "active": true, "charges": ["£29 / month"], "error": null }));
-        assert_eq!((r.prices[1]["soldAtCheckout"].clone(), r.prices[2]["soldAtCheckout"].clone()), (json!(true), json!(false)));
+        assert!(
+            r.problems.is_empty() && r.unchecked.is_empty(),
+            "{:?}",
+            r.problems
+        );
+        assert_eq!(
+            r.notes,
+            [
+                "price_pro_old charges £19 / month, not the published price; checkout doesn't sell it, so only subscribers already on it pay that"
+            ]
+        );
+        assert_eq!(
+            r.prices[0],
+            json!({ "id": "price_pro_monthly", "soldAtCheckout": true, "active": true, "charges": ["£29 / month"], "error": null })
+        );
+        assert_eq!(
+            (
+                r.prices[1]["soldAtCheckout"].clone(),
+                r.prices[2]["soldAtCheckout"].clone()
+            ),
+            (json!(true), json!(false))
+        );
     }
 
     #[test]
@@ -532,24 +767,38 @@ mod tests {
         let mut read = good();
         read[0] = ok(price("price_pro_monthly", 2500, "gbp", "month"));
         let r = pro(read);
-        assert_eq!(r.problems, ["the page shows £29 / month, but checkout charges £25 / month (price_pro_monthly)"], "said once");
+        assert_eq!(
+            r.problems,
+            ["the page shows £29 / month, but checkout charges £25 / month (price_pro_monthly)"],
+            "said once"
+        );
 
         let mut read = good();
         read[1] = ok(price("price_pro_yearly", 30000, "gbp", "year"));
-        assert_eq!(pro(read).problems, ["the page shows £290 / year, but checkout charges £300 / year (price_pro_yearly)"]);
+        assert_eq!(
+            pro(read).problems,
+            ["the page shows £290 / year, but checkout charges £300 / year (price_pro_yearly)"]
+        );
 
         let mut read = good();
         read[0] = ok(price("price_pro_monthly", 2900, "usd", "month"));
         let r = pro(read);
         assert_eq!(
             r.problems,
-            ["checkout charges $29 / month (price_pro_monthly), which the page doesn't show", "the page shows £29 / month, but no active Stripe price of the tier charges it: price_pro_old £19 / month"]
+            [
+                "checkout charges $29 / month (price_pro_monthly), which the page doesn't show",
+                "the page shows £29 / month, but no active Stripe price of the tier charges it: price_pro_old £19 / month"
+            ]
         );
 
         let mut read = good();
         read[1] = ok(price("price_pro_yearly", 29000, "gbp", "month"));
         let r = pro(read);
-        assert_eq!(r.problems, ["checkoutPrices sells price_pro_yearly per year, but Stripe bills it per month"], "said once");
+        assert_eq!(
+            r.problems,
+            ["checkoutPrices sells price_pro_yearly per year, but Stripe bills it per month"],
+            "said once"
+        );
     }
 
     #[test]
@@ -560,8 +809,19 @@ mod tests {
         let t = Tiers::parse(src, None).unwrap();
         let mut y = price("price_y", 29000, "gbp", "year");
         y["active"] = json!(false);
-        let r = compare(t.get("pro").unwrap(), &[("price_m".into(), ok(price("price_m", 2900, "gbp", "month"))), ("price_y".into(), ok(y))]);
-        assert_eq!(r.problems, ["the page shows £290 / year, but no active Stripe price of the tier charges it: price_y £290 / year (archived)"]);
+        let r = compare(
+            t.get("pro").unwrap(),
+            &[
+                ("price_m".into(), ok(price("price_m", 2900, "gbp", "month"))),
+                ("price_y".into(), ok(y)),
+            ],
+        );
+        assert_eq!(
+            r.problems,
+            [
+                "the page shows £290 / year, but no active Stripe price of the tier charges it: price_y £290 / year (archived)"
+            ]
+        );
         assert_eq!(
             r.notes,
             [
@@ -582,17 +842,67 @@ mod tests {
         ] }"#;
         let t = Tiers::parse(src, None).unwrap();
         let pro = t.get("pro").unwrap();
-        let r = compare(pro, &[("price_pro_m".into(), ok(price("price_pro_m", 2900, "gbp", "month"))), ("price_pro_team_m".into(), ok(price("price_pro_team_m", 2500, "gbp", "month")))]);
-        assert_eq!(r.problems, ["the page shows a price per year, but checkoutPrices sells people none at that interval"]);
-        assert_eq!(r.notes, ["teams pay £25 / month a seat (price_pro_team_m), not the published £29 / month: the page shows people's prices"]);
-        assert_eq!((r.prices[0]["soldAtCheckout"].clone(), r.prices[1]["soldAtCheckout"].clone()), (json!(true), json!(true)));
+        let r = compare(
+            pro,
+            &[
+                (
+                    "price_pro_m".into(),
+                    ok(price("price_pro_m", 2900, "gbp", "month")),
+                ),
+                (
+                    "price_pro_team_m".into(),
+                    ok(price("price_pro_team_m", 2500, "gbp", "month")),
+                ),
+            ],
+        );
+        assert_eq!(
+            r.problems,
+            [
+                "the page shows a price per year, but checkoutPrices sells people none at that interval"
+            ]
+        );
+        assert_eq!(
+            r.notes,
+            [
+                "teams pay £25 / month a seat (price_pro_team_m), not the published £29 / month: the page shows people's prices"
+            ]
+        );
+        assert_eq!(
+            (
+                r.prices[0]["soldAtCheckout"].clone(),
+                r.prices[1]["soldAtCheckout"].clone()
+            ),
+            (json!(true), json!(true))
+        );
 
         // A team-only plan's page price is the team's seat price.
         let biz = t.get("business").unwrap();
-        let r = compare(biz, &[("price_biz_team_m".into(), ok(price("price_biz_team_m", 4500, "gbp", "month")))]);
-        assert_eq!(r.problems, ["the page shows £49 / month, but team checkout charges £45 / month (price_biz_team_m)"]);
-        let r = compare(biz, &[("price_biz_team_m".into(), ok(price("price_biz_team_m", 4900, "gbp", "month")))]);
-        assert!(r.problems.is_empty() && r.notes.is_empty(), "{:?} {:?}", r.problems, r.notes);
+        let r = compare(
+            biz,
+            &[(
+                "price_biz_team_m".into(),
+                ok(price("price_biz_team_m", 4500, "gbp", "month")),
+            )],
+        );
+        assert_eq!(
+            r.problems,
+            [
+                "the page shows £49 / month, but team checkout charges £45 / month (price_biz_team_m)"
+            ]
+        );
+        let r = compare(
+            biz,
+            &[(
+                "price_biz_team_m".into(),
+                ok(price("price_biz_team_m", 4900, "gbp", "month")),
+            )],
+        );
+        assert!(
+            r.problems.is_empty() && r.notes.is_empty(),
+            "{:?} {:?}",
+            r.problems,
+            r.notes
+        );
     }
 
     #[test]
@@ -602,18 +912,35 @@ mod tests {
         m["active"] = json!(false);
         read[0] = ok(m);
         let r = pro(read);
-        assert_eq!(r.problems, ["checkout sells price_pro_monthly, which is archived at Stripe, so that checkout fails"], "said once");
+        assert_eq!(
+            r.problems,
+            [
+                "checkout sells price_pro_monthly, which is archived at Stripe, so that checkout fails"
+            ],
+            "said once"
+        );
 
         let mut read = good();
-        read[0] = ok(json!({ "id": "price_pro_monthly", "active": true, "currency": "gbp", "unit_amount": 2900, "type": "one_time" }));
+        read[0] = ok(
+            json!({ "id": "price_pro_monthly", "active": true, "currency": "gbp", "unit_amount": 2900, "type": "one_time" }),
+        );
         let r = pro(read);
-        assert_eq!(r.problems, ["checkout sells price_pro_monthly, which charges £29 one-time, not per month or year"], "said once");
+        assert_eq!(
+            r.problems,
+            ["checkout sells price_pro_monthly, which charges £29 one-time, not per month or year"],
+            "said once"
+        );
 
         let mut read = good();
         let mut tiered = price("price_pro_monthly", 0, "gbp", "month");
         tiered["billing_scheme"] = json!("tiered");
         read[0] = ok(tiered);
-        assert_eq!(pro(read).problems, ["checkout sells price_pro_monthly, which has no fixed amount per person (tiered, or chosen by the customer)"]);
+        assert_eq!(
+            pro(read).problems,
+            [
+                "checkout sells price_pro_monthly, which has no fixed amount per person (tiered, or chosen by the customer)"
+            ]
+        );
     }
 
     #[test]
@@ -623,12 +950,21 @@ mod tests {
         let t = Tiers::parse(src, None).unwrap();
         let tier = t.get("pro").unwrap();
         let mut p = price("price_pro", 2900, "gbp", "month");
-        p["currency_options"] = json!({ "usd": { "unit_amount": 3500 }, "eur": { "unit_amount": 3300 } });
+        p["currency_options"] =
+            json!({ "usd": { "unit_amount": 3500 }, "eur": { "unit_amount": 3300 } });
         let r = compare(tier, &[("price_pro".into(), ok(p.clone()))]);
         assert!(r.problems.is_empty(), "{:?}", r.problems);
-        assert_eq!(r.notes, ["checkout may also charge €33 / month (price_pro, one of its currency options), which the page doesn't show"]);
+        assert_eq!(
+            r.notes,
+            [
+                "checkout may also charge €33 / month (price_pro, one of its currency options), which the page doesn't show"
+            ]
+        );
         p["currency_options"]["usd"]["unit_amount"] = json!(3600);
-        assert_eq!(compare(tier, &[("price_pro".into(), ok(p))]).problems, ["the page shows $35 / month, but checkout charges $36 / month (price_pro)"]);
+        assert_eq!(
+            compare(tier, &[("price_pro".into(), ok(p))]).problems,
+            ["the page shows $35 / month, but checkout charges $36 / month (price_pro)"]
+        );
     }
 
     #[test]
@@ -636,43 +972,112 @@ mod tests {
         let mut read = good();
         read[1] = Err(Unread::Missing);
         let r = pro(read);
-        assert_eq!(r.problems, ["Stripe has no price price_pro_yearly: it may be in another Stripe account, or a live price id read with a test key"]);
+        assert_eq!(
+            r.problems,
+            [
+                "Stripe has no price price_pro_yearly: it may be in another Stripe account, or a live price id read with a test key"
+            ]
+        );
         assert_eq!(r.prices[1]["error"], "no such price");
 
         let mut read = good();
         read[1] = Err(Unread::Failed("HTTP 401 invalid_request_error".into()));
         let r = pro(read);
-        assert!(r.problems.is_empty(), "the yearly price might be the unreadable one: {:?}", r.problems);
-        assert_eq!(r.unchecked, ["couldn't read price_pro_yearly from Stripe (HTTP 401 invalid_request_error)"]);
+        assert!(
+            r.problems.is_empty(),
+            "the yearly price might be the unreadable one: {:?}",
+            r.problems
+        );
+        assert_eq!(
+            r.unchecked,
+            ["couldn't read price_pro_yearly from Stripe (HTTP 401 invalid_request_error)"]
+        );
     }
 
     #[test]
     fn tiers_without_published_prices_or_stripe_prices_say_so() {
         let t = tiers();
         let max = t.get("max").unwrap();
-        let r = compare(max, &[("price_max_monthly".into(), ok(price("price_max_monthly", 9900, "eur", "month")))]);
+        let r = compare(
+            max,
+            &[(
+                "price_max_monthly".into(),
+                ok(price("price_max_monthly", 9900, "eur", "month")),
+            )],
+        );
         assert!(r.problems.is_empty());
-        assert_eq!(r.notes, ["no publishedPrices, so the page says \"Contact us\"; checkout charges €99 / month (price_max_monthly)"]);
+        assert_eq!(
+            r.notes,
+            [
+                "no publishedPrices, so the page says \"Contact us\"; checkout charges €99 / month (price_max_monthly)"
+            ]
+        );
         let r = compare(t.get("self-host").unwrap(), &[]);
         assert!(r.problems.is_empty() && r.prices.is_empty());
-        assert_eq!(r.notes, ["no stripePrices: not sold through Stripe, so there is nothing to check"]);
+        assert_eq!(
+            r.notes,
+            ["no stripePrices: not sold through Stripe, so there is nothing to check"]
+        );
     }
 
     #[test]
     fn the_report_says_drift_before_unchecked_and_logs_without_secrets() {
-        let drift = TierReport { name: "pro".into(), prices: vec![json!({})], problems: vec!["x".into()], unchecked: vec!["y".into()], ..Default::default() };
+        let drift = TierReport {
+            name: "pro".into(),
+            prices: vec![json!({})],
+            problems: vec!["x".into()],
+            unchecked: vec!["y".into()],
+            ..Default::default()
+        };
         let r = Report::of(vec![drift]);
-        assert_eq!((r.status, r.detail.as_str()), (Status::Drift, "1 difference between the published prices and Stripe's."));
+        assert_eq!(
+            (r.status, r.detail.as_str()),
+            (
+                Status::Drift,
+                "1 difference between the published prices and Stripe's."
+            )
+        );
         let (line, warnings) = r.lines();
         assert!(line.is_none());
-        assert_eq!(warnings[..2], ["published prices: tier \"pro\": x.", "published prices: tier \"pro\": y."]);
-        assert!(warnings[2].contains("botctl plans check-stripe"), "{warnings:?}");
+        assert_eq!(
+            warnings[..2],
+            [
+                "published prices: tier \"pro\": x.",
+                "published prices: tier \"pro\": y."
+            ]
+        );
+        assert!(
+            warnings[2].contains("botctl plans check-stripe"),
+            "{warnings:?}"
+        );
 
-        let unread = TierReport { name: "pro".into(), prices: vec![json!({}), json!({})], unchecked: vec!["y".into()], ..Default::default() };
+        let unread = TierReport {
+            name: "pro".into(),
+            prices: vec![json!({}), json!({})],
+            unchecked: vec!["y".into()],
+            ..Default::default()
+        };
         assert_eq!(Report::of(vec![unread]).status, Status::Unchecked);
-        let fine = Report::of(vec![TierReport { prices: vec![json!({})], ..Default::default() }]);
-        assert_eq!((fine.status, fine.lines().0.unwrap()), (Status::Ok, "Every published price matches Stripe's (1 Stripe price read) (ADR 0350)".to_string()));
-        assert_eq!(Report::of(vec![]).status, Status::Ok, "nothing sold through Stripe");
-        assert_eq!(Report::off("Billing is off.").json(), json!({ "status": "off", "detail": "Billing is off.", "tiers": [] }));
+        let fine = Report::of(vec![TierReport {
+            prices: vec![json!({})],
+            ..Default::default()
+        }]);
+        assert_eq!(
+            (fine.status, fine.lines().0.unwrap()),
+            (
+                Status::Ok,
+                "Every published price matches Stripe's (1 Stripe price read) (ADR 0350)"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            Report::of(vec![]).status,
+            Status::Ok,
+            "nothing sold through Stripe"
+        );
+        assert_eq!(
+            Report::off("Billing is off.").json(),
+            json!({ "status": "off", "detail": "Billing is off.", "tiers": [] })
+        );
     }
 }

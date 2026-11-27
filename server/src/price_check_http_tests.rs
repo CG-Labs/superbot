@@ -37,17 +37,38 @@ impl FakePrices {
 
 async fn fake_prices() -> (String, FakePrices) {
     use axum::extract::{Path as P, RawQuery, State as S};
-    async fn price(S(f): S<FakePrices>, P(id): P<String>, RawQuery(q): RawQuery, headers: axum::http::HeaderMap) -> (StatusCode, Json<Value>) {
-        let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
-        f.seen.lock().unwrap().push((id.clone(), q.unwrap_or_default(), auth));
+    async fn price(
+        S(f): S<FakePrices>,
+        P(id): P<String>,
+        RawQuery(q): RawQuery,
+        headers: axum::http::HeaderMap,
+    ) -> (StatusCode, Json<Value>) {
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        f.seen
+            .lock()
+            .unwrap()
+            .push((id.clone(), q.unwrap_or_default(), auth));
         match f.prices.lock().unwrap().get(&id) {
             Some(v) => (StatusCode::OK, Json(v.clone())),
-            None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "type": "invalid_request_error", "code": "resource_missing", "message": format!("No such price: '{id}'") } }))),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(
+                    json!({ "error": { "type": "invalid_request_error", "code": "resource_missing", "message": format!("No such price: '{id}'") } }),
+                ),
+            ),
         }
     }
     let f = FakePrices::default();
-    let r = axum::Router::new().route("/v1/prices/{id}", axum::routing::get(price)).with_state(f.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let r = axum::Router::new()
+        .route("/v1/prices/{id}", axum::routing::get(price))
+        .with_state(f.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
     (url, f)
@@ -55,7 +76,9 @@ async fn fake_prices() -> (String, FakePrices) {
 
 async fn server(payments: Billing) -> (u16, AppState, String) {
     let (port, app, admin, _) = serve_app_with(|a| a.payments = payments).await;
-    app.tiers.set(Arc::new(Tiers::parse(TIERS, None).unwrap())).unwrap();
+    app.tiers
+        .set(Arc::new(Tiers::parse(TIERS, None).unwrap()))
+        .unwrap();
     (port, app, admin)
 }
 
@@ -75,13 +98,28 @@ async fn matching_prices_pass_and_drift_is_reported() {
     let (code, v) = check(port, &admin).await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["status"], "ok", "{v}");
-    assert_eq!(v["detail"], "Every published price matches Stripe's (3 Stripe prices read).");
-    assert_eq!(v["tiers"][0]["prices"][0], json!({ "id": "price_pro_monthly", "soldAtCheckout": true, "active": true, "charges": ["£29 / month"], "error": null }));
-    assert_eq!(v["tiers"][1]["notes"][0], "no publishedPrices, so the page says \"Contact us\"; checkout charges £99 / month (price_max_monthly)");
+    assert_eq!(
+        v["detail"],
+        "Every published price matches Stripe's (3 Stripe prices read)."
+    );
+    assert_eq!(
+        v["tiers"][0]["prices"][0],
+        json!({ "id": "price_pro_monthly", "soldAtCheckout": true, "active": true, "charges": ["£29 / month"], "error": null })
+    );
+    assert_eq!(
+        v["tiers"][1]["notes"][0],
+        "no publishedPrices, so the page says \"Contact us\"; checkout charges £99 / month (price_max_monthly)"
+    );
     let seen = f.seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 3, "each price once: {seen:?}");
     for (_, query, auth) in &seen {
-        assert_eq!((query.as_str(), auth.as_str()), ("expand%5B%5D=currency_options", format!("Bearer {KEY}").as_str()));
+        assert_eq!(
+            (query.as_str(), auth.as_str()),
+            (
+                "expand%5B%5D=currency_options",
+                format!("Bearer {KEY}").as_str()
+            )
+        );
     }
 
     // Stripe's monthly price moved; the published one didn't.
@@ -111,15 +149,36 @@ async fn a_price_stripe_doesnt_have_is_drift_and_a_dead_stripe_leaves_it_uncheck
     let (_, v) = check(port, &admin).await;
     assert_eq!(v["status"], "drift", "{v}");
     assert_eq!(v["tiers"][0]["prices"][1]["error"], "no such price");
-    assert!(v["tiers"][0]["problems"][0].as_str().unwrap().starts_with("Stripe has no price price_pro_yearly"), "{v}");
+    assert!(
+        v["tiers"][0]["problems"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("Stripe has no price price_pro_yearly"),
+        "{v}"
+    );
 
     // Nothing listens: every price is unread, so nothing is known to drift.
-    let closed = { tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap().local_addr().unwrap() };
-    let (port, _, admin) = server(Billing::with_checkout(SECRET, KEY, &format!("http://{closed}"), PUBLIC)).await;
+    let closed = {
+        tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    };
+    let (port, _, admin) = server(Billing::with_checkout(
+        SECRET,
+        KEY,
+        &format!("http://{closed}"),
+        PUBLIC,
+    ))
+    .await;
     let (code, v) = check(port, &admin).await;
     assert_eq!(code, 200);
     assert_eq!(v["status"], "unchecked", "{v}");
-    assert_eq!(v["tiers"][0]["unchecked"][0], "couldn't read price_pro_monthly from Stripe (no answer from Stripe)");
+    assert_eq!(
+        v["tiers"][0]["unchecked"][0],
+        "couldn't read price_pro_monthly from Stripe (no answer from Stripe)"
+    );
 }
 
 #[tokio::test]
@@ -128,11 +187,20 @@ async fn nothing_is_called_while_billing_or_checkout_is_off() {
     let (code, v) = check(port, &admin).await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["status"], "off");
-    assert!(v["detail"].as_str().unwrap().starts_with("Billing is off"), "{v}");
+    assert!(
+        v["detail"].as_str().unwrap().starts_with("Billing is off"),
+        "{v}"
+    );
     let (port, _, admin) = server(Billing::with_secret(SECRET)).await;
     let (_, v) = check(port, &admin).await;
     assert_eq!(v["status"], "off");
-    assert!(v["detail"].as_str().unwrap().contains("without STRIPE_SECRET_KEY"), "{v}");
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap()
+            .contains("without STRIPE_SECRET_KEY"),
+        "{v}"
+    );
 }
 
 #[tokio::test]
@@ -145,13 +213,31 @@ async fn only_billing_managers_run_it_and_not_too_often() {
     let (_, member) = user_with(port, &admin, "ada@example.com", "member").await;
     assert_eq!(check(port, &member).await.0, 403);
     assert_eq!(check(port, "").await.0, 401);
-    assert!(f.seen.lock().unwrap().is_empty(), "refused before Stripe is called");
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "refused before Stripe is called"
+    );
 
-    let (code, body) = call(port, "POST", "/api/roles", &admin, &json!({ "name": "Billing", "base": "member", "permissions": ["billing.manage"] }).to_string()).await;
+    let (code, body) = call(
+        port,
+        "POST",
+        "/api/roles",
+        &admin,
+        &json!({ "name": "Billing", "base": "member", "permissions": ["billing.manage"] })
+            .to_string(),
+    )
+    .await;
     assert_eq!(code, 201, "{body}");
     let role = parse(&body)["id"].as_str().unwrap().to_string();
     let (bea_id, bea) = user_with(port, &admin, "bea@example.com", "member").await;
-    let (code, body) = call(port, "PUT", &format!("/api/roles/{role}/users/{bea_id}"), &admin, "").await;
+    let (code, body) = call(
+        port,
+        "PUT",
+        &format!("/api/roles/{role}/users/{bea_id}"),
+        &admin,
+        "",
+    )
+    .await;
     assert_eq!(code, 200, "{body}");
     assert_eq!(check(port, &bea).await, (200, check(port, &admin).await.1));
 
@@ -161,5 +247,8 @@ async fn only_billing_managers_run_it_and_not_too_often() {
         codes.push(check(port, &admin).await.0);
     }
     assert!(codes.contains(&429), "{codes:?}");
-    assert!(f.seen.lock().unwrap().len() <= 30, "at most ten checks of three prices");
+    assert!(
+        f.seen.lock().unwrap().len() <= 30,
+        "at most ten checks of three prices"
+    );
 }
